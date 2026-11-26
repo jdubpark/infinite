@@ -186,7 +186,7 @@ setInterval(() => {}, 1000);
     await host.stopApi(); await host.start();
     const attached = await host.fetchApi(`/sessions/${initial.requestId}/resume`, "owner", { requestId: randomUUID() });
     assert.equal(attached.body.runtime.id, resumed.body.runtime.id, "admission survives API restart");
-    const socket = join(host.config.runDir, `${resumed.body.id}.sock`);
+    const socket = socketPath(host.config, resumed.body.id);
     renameSync(socket, `${socket}.held`);
     try {
       const refused = await host.fetchApi(`/sessions/${initial.requestId}/resume`, "owner", { requestId: randomUUID() });

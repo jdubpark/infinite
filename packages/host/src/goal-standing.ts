@@ -1,4 +1,5 @@
 import type { CycleClass, CycleWake, GoalCycle, ProductGoal } from "./goal-types.js";
+import { SHARED_INPUT_LIMITS } from "./schema-primitives.js";
 import type { TeamView } from "./team-types.js";
 import { maxPendingWakeSignals, type PendingWake } from "./signals/types.js";
 
@@ -6,7 +7,7 @@ export const keptCycles = 50;
 export const maxFailedCycles = 3;
 export const defaultWakeMinGapMinutes = 5;
 export const maxPreviousWork = 16;
-export const runObjectiveLimitBytes = 24000;
+export const runObjectiveLimitBytes = SHARED_INPUT_LIMITS.runObjectiveChars;
 const maxWakeLines = 8;
 const reviewedStatuses = new Set(["ready-for-review", "merged"]);
 
@@ -33,13 +34,15 @@ export function classifyCycle(input: {
   return "failed";
 }
 
-export function unresolvedOperation(team: Pick<TeamView, "status" | "headCommit" | "deliveryReceipt" | "deliveryRecovery" | "pendingOperation" | "publication">, deliveryAttempt: boolean): string | undefined {
+export function unresolvedOperation(team: Pick<TeamView, "status" | "headCommit" | "deliveryReceipt" | "deliveryRecovery" | "pendingOperation" | "publication" | "publishing">, deliveryAttempt: boolean): string | undefined {
   if (team.deliveryReceipt && team.status !== "merged")
     return "A cycle reported a merge that the host has not validated as a baseline. Inspect its delivery before more work starts.";
   if (team.deliveryRecovery && team.deliveryRecovery.status !== "complete")
     return "A cycle stopped during delivery recovery. Inspect its remote branch and pull request before more work starts.";
   if (team.pendingOperation?.sourceRole === "delivery" || deliveryAttempt)
     return "A cycle stopped with an unresolved delivery attempt. Inspect its remote branch and pull request before more work starts.";
+  if (team.publishing)
+    return "A cycle's head publication to GitHub is still running. Wait for publication to settle before more work starts.";
   const failure = team.publication?.failure;
   if (team.headCommit && failure?.commit === team.headCommit && team.publication?.commit !== team.headCommit)
     return "The host could not confirm that a cycle's head reached GitHub. Inspect the run branch before more work starts.";
@@ -66,7 +69,7 @@ export function wakeObjective(base: string, pending: PendingWake | undefined, li
   let text = base;
   for (const signal of pending.signals) {
     if (signal.kind !== "owner" || !signal.text?.trim()) continue;
-    const next = `${text}\n\nUser direction: ${signal.text.trim().slice(0, 8000)}`;
+    const next = `${text}\n\nUser direction: ${signal.text.trim().slice(0, SHARED_INPUT_LIMITS.steeringChars)}`;
     if (fits(next)) text = next;
   }
   const lines = pending.signals.map(wakeLine).filter((line): line is string => line !== undefined);

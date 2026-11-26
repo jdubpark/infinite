@@ -30,10 +30,11 @@ export type WaitReasonsRun = Pick<
 };
 
 function holdsSlot(member: TeamView["members"][number], revision: number): boolean {
+  const deferred = member.status === "queued" && (member.pendingLimit === true || member.pendingCapacity === true);
   return (
     member.revision === revision &&
     (member.role === "scout" || member.role === "implementer") &&
-    (["queued", "running", "unavailable"].includes(member.status) || (member.status === "reported" && !member.exitConfirmedAt))
+    ((!deferred && ["queued", "running", "unavailable"].includes(member.status)) || (member.status === "reported" && !member.exitConfirmedAt))
   );
 }
 
@@ -210,6 +211,16 @@ export function describeTeamWaitReasons(
     }
 
     let slotEmitted = false;
+    for (const member of activeMembers) {
+      if (member.status !== "queued" || member.pendingCapacity !== true) continue;
+      slotEmitted = true;
+      reasons.push({
+        kind: "worker-slot",
+        memberId: member.memberId,
+        ...(member.taskId ? { taskId: member.taskId } : {}),
+        summary: `${member.title} is waiting for an available worker capacity slot.`,
+      });
+    }
     if (run.discovery && !run.discovery.completedAt && run.discovery.revision === run.revision) {
       const scoutSlots = run.members.filter(
         member =>

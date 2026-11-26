@@ -426,7 +426,7 @@ export class ProjectSync {
     return root;
   }
   private async refuseHostPaths(root: string) {
-    const own = await Promise.all([this.config.stateDir, this.config.runDir, dirname(this.config.keyFile)].map(canonical));
+    const own = await Promise.all([this.config.stateDir, this.config.runDir, ...(this.config.socketDir ? [this.config.socketDir] : []), dirname(this.config.keyFile)].map(canonical));
     if (root === "/" || root === await canonical(homedir()) || own.some(dir => inside(root, dir)))
       throw new ProjectSyncError("The project path is the root or home directory or holds the host's own state; sync refuses it", "invalid-manifest", 500);
     return root;

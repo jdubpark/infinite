@@ -697,15 +697,15 @@ export class TeamPermissionReview extends TeamPermissionRecovery {
       try {
         const target = run.members.find(member => member.memberId === decision.targetMemberId && member.sessionId === decision.targetSessionId);
         if (!target) return { status: "escalated" as const, reason: "The target assignment disappeared before the answer." };
-        const sourceDecision = decision.reusedFromDecisionId ? run.permissionDecisions?.find(item => item.id === decision.reusedFromDecisionId) : undefined;
-        const sourceCoordinatorMemberId = sourceDecision?.coordinatorMemberId;
-        const deliveryDecision = decision.coordinatorMemberId ? decision : sourceCoordinatorMemberId
-          ? new Proxy(decision, { get: (current, property, receiver) => property === "coordinatorMemberId"
-            ? sourceCoordinatorMemberId : Reflect.get(current, property, receiver) })
-          : undefined;
-        if (!deliveryDecision) return { status: "escalated" as const, reason: "The recorded reviewer assignment for this reused approval is unavailable. The request remains with the user." };
+        const sourceCoordinatorMemberId = decision.coordinatorMemberId
+          ? undefined
+          : decision.reusedFromDecisionId
+            ? run.permissionDecisions?.find(item => item.id === decision.reusedFromDecisionId)?.coordinatorMemberId
+            : undefined;
+        if (!decision.coordinatorMemberId && !sourceCoordinatorMemberId)
+          return { status: "escalated" as const, reason: "The recorded reviewer assignment for this reused approval is unavailable. The request remains with the user." };
         const receipt = await this.host.manager.answerTeamPermission(decision.targetSessionId, decision.answerRequestId,
-          assignment(target), deliveryDecision, () => !this.agentEligible(stored));
+          assignment(target), decision, () => !this.agentEligible(stored), sourceCoordinatorMemberId);
         return receipt.state === "delivered" && receipt.result === "closed"
           ? { status: "answered" as const, receipt }
           : receipt.state === "uncertain" ? { status: "uncertain" as const, receipt, reason: "The host could not confirm whether the target prompt closed. Inspect the target session before acting." }

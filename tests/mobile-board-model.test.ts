@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { attemptLabel, attemptsOf, boardStatusLabel, foldAttempts, groupBoard, filterBoard, missionControls, missionExtendChoices, missionLeftLabel, missionShowsReason, missionStatusLabel, missionStopLine, missionStoppedAtLimit, missionTimeLeftMs, openMissionDecisions } from "../apps/mobile/src/features/board/model.ts";
+import { attemptLabel, attemptsOf, boardStatusLabel, foldAttempts, groupBoard, filterBoard, missionControls, missionExtendChoices, missionLeftLabel, missionShowsReason, missionStatusLabel, missionStopLine, missionStoppedAtLimit, missionTimeLeftMs, openMissionDecisions, subtaskProgressLabel } from "../apps/mobile/src/features/board/model.ts";
 import { shortDate } from "../apps/mobile/src/features/teams/model.ts";
 import type { BoardItem, Mission } from "../apps/mobile/src/api/client.ts";
 
@@ -42,8 +42,17 @@ test("superseded attempts fold behind the newest, and a live older attempt keeps
 });
 
 test("an item's attempts come back oldest first, and an item with one start has none", () => {
-  const rows = [attempt(3, false), attempt(1, true), attempt(2, true), item({ id: "other", attempt: { workId: "other", number: 1, of: 2, superseded: false } })];
-  assert.deepEqual(attemptsOf(rows, rows[0]!).map(row => row.id), ["run-1", "run-2", "run-3"]);
+  const rows = [
+    attempt(3, false, { detail: "", subtasks: { total: 3, running: 0, done: 1 } }),
+    attempt(1, true, { detail: "", subtasks: { total: 1, running: 0, done: 0 } }),
+    attempt(2, true, { detail: "Running: API", subtasks: { total: 2, running: 1, done: 1 } }),
+    item({ id: "other", attempt: { workId: "other", number: 1, of: 2, superseded: false } }),
+  ];
+  const history = attemptsOf(rows, rows[0]!);
+  assert.deepEqual(history.map(row => row.id), ["run-1", "run-2", "run-3"]);
+  assert.deepEqual(history.map(subtaskProgressLabel), ["0/1", "1/2", "1/3"]);
+  assert.equal(subtaskProgressLabel(item({ detail: "", subtasks: { total: 0, running: 0, done: 0 } })), undefined);
+  assert.equal(subtaskProgressLabel(item({ detail: "" })), undefined);
   assert.deepEqual(attemptsOf(rows, item({ id: "plain" })), []);
 });
 

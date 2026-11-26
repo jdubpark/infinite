@@ -60,7 +60,7 @@ export class DesktopFiles {
       throw new DesktopError("invalid-path", "Choose a relative path inside this project", 400);
     const root = await realpath(project.path), file = resolve(root, path || ".");
     if (!inside(root, file)) throw new DesktopError("invalid-path", "Path is outside this project", 403);
-    for (const privatePath of [this.config.stateDir, this.config.runDir, this.config.keyFile]) {
+    for (const privatePath of [this.config.stateDir, this.config.runDir, this.config.socketDir, this.config.keyFile].filter((value): value is string => Boolean(value))) {
       const protectedPath = await realpath(privatePath).catch(() => resolve(privatePath));
       if (inside(protectedPath, file)) throw new DesktopError("private-path", "Host control files are unavailable", 403);
     }

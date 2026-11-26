@@ -71,6 +71,40 @@ test("a refused since is refused before the list is built", async () => {
   assert.equal(built, 1, "an accepted since builds it once");
 });
 
+test("sendSessionList canonicalizes cmux row order without mutating caller arrays or reordering native rows", async () => {
+  const nativeFirst = { id: "ffff-native", backend: "infinite", status: "running" };
+  const nativeSecond = { id: "0000-native", backend: "infinite", status: "exited" };
+  const cmuxA = { id: "00000000-0000-4000-8000-000000000000", backend: "cmux", status: "running" };
+  const cmuxB = { id: "88888888-8888-4888-8888-888888888888", backend: "cmux", status: "exited" };
+  const cmuxC = { id: "ffffffff-ffff-4fff-8fff-ffffffffffff", backend: "cmux", status: "running" };
+
+  const invoke = async (since: string | undefined, rows: unknown[]) => {
+    let payload: unknown;
+    let raw: string | undefined;
+    const res = { json: (body: unknown) => { payload = body; }, type: () => res, send: (body: string) => { raw = body; } };
+    await sendSessionList({ query: since === undefined ? {} : { since } } as unknown as express.Request, res as unknown as express.Response, async () => rows);
+    return (payload ?? JSON.parse(raw!)) as { version?: string; unchanged?: true; sessions?: { id: string }[] };
+  };
+
+  const firstInput = [nativeFirst, nativeSecond, cmuxC, cmuxA, cmuxB];
+  const secondInput = [nativeFirst, nativeSecond, cmuxB, cmuxC, cmuxA];
+  const expectedOrder = [nativeFirst, nativeSecond, cmuxA, cmuxB, cmuxC];
+
+  const plain = await invoke(undefined, firstInput);
+  assert.deepEqual(plain.sessions, expectedOrder);
+  assert.deepEqual(firstInput.map(row => row.id), [nativeFirst.id, nativeSecond.id, cmuxC.id, cmuxA.id, cmuxB.id]);
+
+  const versionedA = await invoke("", firstInput);
+  const versionedB = await invoke("", secondInput);
+  assert.equal(versionedA.version, versionedB.version);
+  assert.deepEqual(versionedA.sessions, expectedOrder);
+  assert.deepEqual(versionedB.sessions, expectedOrder);
+  assert.deepEqual(secondInput.map(row => row.id), [nativeFirst.id, nativeSecond.id, cmuxB.id, cmuxC.id, cmuxA.id]);
+
+  const unchanged = await invoke(versionedA.version, secondInput);
+  assert.deepEqual(unchanged, { version: versionedA.version, unchanged: true });
+});
+
 test("an exited session reads the same on every poll, and the live list sends it once", { timeout: 60_000 }, async () => {
   const host = await inProcessHost();
   try {

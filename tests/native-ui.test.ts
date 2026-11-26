@@ -42,7 +42,7 @@ async function connect(url: URL, headers: Record<string, string>) {
 }
 
 test("native Codex attachment fences device control, pins its conversation, and survives API and client loss", { timeout: 35000 }, async () => {
-  const host = await startHost({ agents: { codex: { command: process.execPath, args: [resolve("tests/fixtures/native-codex.mjs")] } } });
+  const host = await startHost({ agents: { codex: { command: process.execPath, args: [resolve("tests/fixtures/native-codex.mjs")] } }, config: { browserSessions: false } });
   const clients: WebSocket[] = [];
   const id = randomUUID();
   const path = `/sessions/${id}`;
@@ -60,6 +60,7 @@ test("native Codex attachment fences device control, pins its conversation, and 
     const url = nativeUrl(host, id, controller);
     for (const headers of [{}, { Authorization: `Bearer ${host.tokens.viewer}` }, { Authorization: `Bearer ${host.tokens.controller}` }, { ...bearer, Origin: host.origin }])
       await assert.rejects(connect(url, headers), /403/);
+    await assert.rejects(connect(url, { Cookie: "infinite=foreign-session" }), /403/);
     assert.equal((await host.fetchApi(`${path}/native`, "viewer")).status, 403);
     assert.equal((await host.fetchApi(`${path}/native`, "controller")).status, 403);
     const first = await connect(url, bearer); clients.push(first.ws);

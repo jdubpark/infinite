@@ -8,36 +8,26 @@ import { CONFIRM_TASKS_MIN, TRIAL_TASKS_SQL, type TrialTaskRow } from "./eval-se
 import { configRef, TRIAL_HARNESS_VERSION, trialProfileKey, trialPromptVersion } from "./eval-trial-rules.js";
 import { insertCopy, REUSE_DAYS, reusable, type ReuseSource } from "./eval-trial-store.js";
 import {
-  PROMPT_ORIGINS, type ComparisonJobRequest, type ComparisonPin, type EvalRefusal, type TrialConfiguration,
+  evalConfigurationSchema, evalTaskIdSchema, evalWindowSchema, PROMPT_ORIGINS,
+  type ComparisonJobRequest, type ComparisonPin, type EvalRefusal, type TrialConfiguration,
 } from "./eval-types.js";
+import { ID_RE } from "./schema-primitives.js";
 
 export const COMPARE_TASKS_MIN = 2, COMPARISON_TASKS_DEFAULT = 20;
 
 const COMPARISON_TASKS_MAX = 200, TRIALS_PER_TASK_DEFAULT = 3, TRIALS_PER_TASK_MAX = 5, MAX_TRIALS_MAX = 1_000;
 const SELECTION_PAGES_MAX = 100, EXCLUDED_GROUPS_MAX = 200, GROUP_ID_MAX = 64;
 const DAY_MS = 86_400_000;
-const TASK_ID_PATTERN = /^(captured|mined):[A-Za-z0-9:._-]{1,200}$/;
-const AREA_PATTERN = /^[a-z][a-z0-9-]{0,39}$/;
-
-const configurationSchema = z.object({
-  profile: z.object({ provider: z.enum(["claude", "codex", "grok", "opencode", "demo"]) }).passthrough(),
-  guidance: z.literal("as-of-base"),
-  knowledge: z.literal("none"),
-}).strict();
-const windowSchema = z.object({
-  startHourUtc: z.number().int().min(0).max(23),
-  endHourUtc: z.number().int().min(1).max(24),
-}).strict().refine(window => window.endHourUtc !== window.startHourUtc, "a window must not be empty");
 
 const distinct = (list: unknown[]) => new Set(list.map(item => configRef(item as TrialConfiguration))).size === list.length;
 
 const comparisonShape = z.object({
   kind: z.enum(["compare", "confirm"]),
-  configurations: z.array(configurationSchema).min(2).max(4).refine(distinct, "Two configurations name one configRef"),
+  configurations: z.array(evalConfigurationSchema).min(2).max(4).refine(distinct, "Two configurations name one configRef"),
   taskFilter: z.object({
-    taskIds: z.array(z.string().regex(TASK_ID_PATTERN)).max(COMPARISON_TASKS_MAX).optional(),
+    taskIds: z.array(evalTaskIdSchema).max(COMPARISON_TASKS_MAX).optional(),
     origins: z.array(z.enum(["captured", "mined"])).max(2).optional(),
-    areas: z.array(z.string().regex(AREA_PATTERN)).max(32).optional(),
+    areas: z.array(z.string().regex(ID_RE)).max(32).optional(),
     promptOrigins: z.array(z.enum(PROMPT_ORIGINS)).max(PROMPT_ORIGINS.length).optional(),
     excludeGroups: z.array(z.string().min(1).max(GROUP_ID_MAX)).max(EXCLUDED_GROUPS_MAX).optional(),
     maxTasks: z.number().int().min(1).max(COMPARISON_TASKS_MAX).optional(),
@@ -47,7 +37,7 @@ const comparisonShape = z.object({
     maxTrials: z.number().int().min(1).max(MAX_TRIALS_MAX),
     maxWallMinutes: z.number().int().min(10).max(43_200),
   }).strict(),
-  windows: z.array(windowSchema).min(1).max(4).optional(),
+  windows: z.array(evalWindowSchema).min(1).max(4).optional(),
   expiresAt: z.iso.datetime().optional(),
 }).strict();
 

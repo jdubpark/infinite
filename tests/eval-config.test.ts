@@ -1,8 +1,22 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { captureSettings, evalCommandPrefix, evalHostSchema, evalProjectSchema, mineSettings, trialSettings, validationSettings } from "../packages/host/src/eval-config.js";
+import {
+  EVAL_AGENT_ARGS_MAX,
+  EVAL_AGENT_TEXT_MAX,
+  EVAL_REPOSITORY_PREFIX_MAX,
+  captureSettings,
+  evalAgentSchema,
+  evalCommandPrefix,
+  evalHostSchema,
+  evalProjectSchema,
+  mineSettings,
+  trialSettings,
+  validationSettings,
+  type EvalMemberConfig,
+} from "../packages/host/src/eval-config.js";
+import { OWNED_PATH_MAX_CHARS, ownedPathSchema } from "../packages/host/src/schema-primitives.js";
 import { teamProjectSchema } from "../packages/host/src/team-types.js";
-import { learningPurpose } from "../packages/host/src/types.js";
+import { agentProfileSchema, learningPurpose, type AgentProfile } from "../packages/host/src/types.js";
 
 const base = { checks: [], establishChecks: true } as const;
 
@@ -97,7 +111,7 @@ test("the trial settings parse with their limits", () => {
   const project = (eval_: Record<string, unknown>) => teamProjectSchema.safeParse({ ...base, eval: eval_ });
   const accepted = (eval_: Record<string, unknown>) => assert.equal(project(eval_).success, true, JSON.stringify(eval_));
   const refused = (eval_: Record<string, unknown>) => assert.equal(project(eval_).success, false, JSON.stringify(eval_));
-  const profile = (id: string) => ({ id, label: "Trial", provider: "claude", model: "model", effort: "high", tier: "strong" });
+  const profile = (id: string) => ({ id, label: "Trial", provider: "claude" as const, model: "model", effort: "high" as const, tier: "strong" as const });
 
   accepted({ trialsPerDay: 1, trialMinutes: 10 });
   accepted({ trialsPerDay: 50, trialMinutes: 240 });
@@ -145,4 +159,65 @@ test("the trial settings parse with their limits", () => {
   assert.equal(learningPurpose("duel"), true);
   assert.equal(learningPurpose("work"), false);
   assert.equal(learningPurpose(undefined), false);
+});
+
+type AssertExact<A, B> = [A] extends [B] ? ([B] extends [A] ? true : never) : never;
+
+test("evalAgentSchema stays aligned with AgentProfile and enforces eval bounds", () => {
+  const exactEvalAgentType: AssertExact<ReturnType<typeof evalAgentSchema.parse>, AgentProfile> = true;
+  const exactMemberAgentType: AssertExact<NonNullable<EvalMemberConfig["agents"]["claude"]>, AgentProfile> = true;
+  assert.equal(exactEvalAgentType, true);
+  assert.equal(exactMemberAgentType, true);
+
+  const acceptAgent = (_profile: NonNullable<EvalMemberConfig["agents"]["claude"]>) => {};
+  acceptAgent({ command: "claude", args: ["--print"], appServerCommand: "codex", appServerArgs: ["app-server"], workspaceDir: "/srv/workspaces", sharedWorkspace: true });
+  // @ts-expect-error unknown launch field must fail AgentProfile / evalAgentSchema parity
+  acceptAgent({ command: "claude", args: [], unknownLaunchField: true });
+  // @ts-expect-error required args field cannot be omitted
+  acceptAgent({ command: "claude" });
+
+  assert.deepEqual(Object.keys(evalAgentSchema.shape).sort(), Object.keys(agentProfileSchema.shape).sort());
+
+  const fullProfile: AgentProfile = {
+    command: "/usr/bin/claude",
+    args: ["--print", "--output-format", "json"],
+    appServerCommand: "/usr/bin/codex",
+    appServerArgs: ["app-server", "--stdio"],
+    workspaceDir: "/var/lib/infinite-eval/workspaces",
+    sharedWorkspace: false,
+  };
+  assert.deepEqual(evalAgentSchema.parse(fullProfile), agentProfileSchema.parse(fullProfile));
+  assert.equal(agentProfileSchema.safeParse({ ...fullProfile, workspaceDir: "relative/dir" }).success, false);
+  assert.equal(evalAgentSchema.safeParse({ ...fullProfile, workspaceDir: "relative/dir" }).success, false);
+
+  const overText = "x".repeat(EVAL_AGENT_TEXT_MAX + 1);
+  const overArgs = Array.from({ length: EVAL_AGENT_ARGS_MAX + 1 }, () => "-x");
+  const refused: unknown[] = [
+    { ...fullProfile, command: "" },
+    { ...fullProfile, command: overText },
+    { ...fullProfile, args: [overText] },
+    { ...fullProfile, args: overArgs },
+    { ...fullProfile, appServerCommand: "" },
+    { ...fullProfile, appServerCommand: overText },
+    { ...fullProfile, appServerArgs: [overText] },
+    { ...fullProfile, appServerArgs: overArgs },
+    { ...fullProfile, workspaceDir: `/${"a".repeat(EVAL_AGENT_TEXT_MAX)}` },
+    { ...fullProfile, unknownKey: 1 },
+  ];
+  for (const candidate of refused) assert.equal(evalAgentSchema.safeParse(candidate).success, false, JSON.stringify(candidate).slice(0, 120));
+});
+
+test("repositoryPrefix shares ownedPath safety rules with its 200-char ceiling", () => {
+  assert.equal(ownedPathSchema.safeParse("a".repeat(OWNED_PATH_MAX_CHARS)).success, true);
+  assert.equal(ownedPathSchema.safeParse("a".repeat(OWNED_PATH_MAX_CHARS + 1)).success, false);
+  assert.equal(evalProjectSchema.safeParse({ gradingPaths: ["a".repeat(EVAL_REPOSITORY_PREFIX_MAX)] }).success, true);
+  assert.equal(evalProjectSchema.safeParse({ gradingPaths: ["a".repeat(EVAL_REPOSITORY_PREFIX_MAX + 1)] }).success, false);
+  assert.equal(evalProjectSchema.safeParse({ testPaths: { prefixes: ["a".repeat(EVAL_REPOSITORY_PREFIX_MAX)], suffixes: [] } }).success, true);
+  assert.equal(evalProjectSchema.safeParse({ testPaths: { prefixes: ["a".repeat(EVAL_REPOSITORY_PREFIX_MAX + 1)], suffixes: [] } }).success, false);
+
+  const unsafe = ["/abs", "a\\b", "a\0b", ".", "..", "a/../b", "a/./b", ".git/config", "a//b", "a/", "src/*.ts", "a?b", "a[0]", "a:b"];
+  for (const path of unsafe) {
+    assert.equal(ownedPathSchema.safeParse(path).success, false, `ownedPath rejects ${JSON.stringify(path)}`);
+    assert.equal(evalProjectSchema.safeParse({ gradingPaths: [path] }).success, false, `gradingPaths rejects ${JSON.stringify(path)}`);
+  }
 });

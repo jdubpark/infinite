@@ -7,7 +7,7 @@ import { join, relative, sep } from "node:path";
 import type { Prompt } from "@infinite/attention";
 import { claimControl, waitFor } from "./helpers.js";
 import { fixture, git, limitLineup } from "./team-fixture.js";
-import { DEFAULT_PERMISSION_LIMIT, DEFAULT_PERMISSION_SCOPE, LEGACY_DEFAULT_PERMISSION_SCOPES, currentPermissions, type TeamLineup } from "../packages/host/src/team-types.js";
+import { DEFAULT_PERMISSION_LIMIT, DEFAULT_PERMISSION_SCOPE, LEGACY_DEFAULT_PERMISSION_SCOPES, currentPermissions, type TeamLineup, type TeamPermissionDecision } from "../packages/host/src/team-types.js";
 import { isCollapsedPermissionPrompt, permissionEvidenceHash, refusedBeforeSend } from "../packages/host/src/team-permissions.js";
 import { permissionEvidenceDigest } from "../packages/host/src/team-permission-evidence.js";
 import { ContentError } from "../packages/host/src/session-content.js";
@@ -931,4 +931,70 @@ test(`a ${action} with an unresolved verification operation stays in force after
     assert.equal(recovered.recovery, undefined);
     assert.equal((await f.host.fetchApi("/teams")).body.teams.find((team: { id: string }) => team.id === checking.id).status, recovered.status);
   } finally { await f.close(); }
+});
+
+test("answerTeamPermission delivers explicit sourceCoordinatorMemberId while observing live mutations on reused decisions", { timeout: 20_000 }, async () => {
+  mkdirSync(".local", { recursive: true, mode: 0o700 });
+  const root = mkdtempSync(join(".local", "ta-"));
+  const stateDir = join(root, "state"), runDir = join(root, "r"), sessionId = randomUUID();
+  mkdirSync(runDir);
+  const key = Buffer.alloc(32, 23);
+  const team = { runId: randomUUID(), memberId: randomUUID(), revision: 1, role: "implementer" as const, taskId: "task-reuse" };
+  const cwd = realpathSync(root), runtime = { id: randomUUID(), location: "cloud" as const, transport: "pty" as const };
+  const session = { id: sessionId, team, provider: "codex" as const, title: "Reuse", projectId: "fixture", cwd, createdAt: new Date().toISOString(), status: "running" as const, contextVersion: 0, context: "", initialPrompt: "", runtime } as Session;
+  const config = { stateDir, runDir, enableDemo: true, agents: { codex: { command: process.execPath, args: [] } } } as Config;
+  const prompt: Prompt = { id: 4, kind: "permission", source: "screen", hash: "b".repeat(64), pinned: true, acceptsText: false, title: "Would you like to run the following command?", detail: "Environment: local\n$ npm run check", options: [{ index: 0, label: "Yes, proceed (y)", role: "accept" }, { index: 1, label: "No (esc)", role: "reject" }] };
+  const liveState = { status: "running", seq: 11, screen: "", runtime, control: null, attention: { state: "needs-you", prompt } } as WorkerState;
+  mkdirSync(join(stateDir, "sessions", sessionId), { recursive: true });
+  writeSealed(join(stateDir, "sessions", sessionId, "meta.sealed"), key, `${sessionId}:meta`, { session, fingerprint: "fixture" });
+  let control: ControlLease | null = null, onClaim: (() => void) | undefined;
+  const delivered: Extract<WorkerRequest, { op: "team-answer" }>[] = [];
+  const server = createServer(socket => {
+    let data = "";
+    socket.on("data", chunk => {
+      data += chunk.toString();
+      const end = data.indexOf("\n");
+      if (end < 0) return;
+      const request = JSON.parse(data.slice(0, end)) as WorkerRequest;
+      if (request.op === "state") socket.end(JSON.stringify({ result: { ...liveState, control } }) + "\n");
+      else if (request.op === "control" && request.action === "claim") { control = { id: randomUUID(), label: request.actor.label, expiresAt: Date.now() + 60_000 }; onClaim?.(); socket.end(JSON.stringify({ result: control }) + "\n"); }
+      else if (request.op === "control" && request.action === "release") { control = null; socket.end(JSON.stringify({ result: null }) + "\n"); }
+      else if (request.op === "team-answer") { delivered.push(request); socket.end(JSON.stringify({ result: { requestId: request.requestId, state: "delivered", result: "closed", seq: 12 } }) + "\n"); }
+      else socket.end(JSON.stringify({ error: "unexpected request" }) + "\n");
+    });
+  });
+  await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(socketPath(runDir, sessionId), resolve); });
+  try {
+    const manager = new Manager(config, key), sourceCoordinatorId = randomUUID();
+    const makeDecision = (overrides: Partial<TeamPermissionDecision> = {}): TeamPermissionDecision => ({
+      id: randomUUID(), revision: 1, policyHash: "a".repeat(64), targetMemberId: team.memberId, targetSessionId: sessionId, targetCwd: cwd,
+      promptId: prompt.id, promptHash: prompt.hash!, evidenceHash: permissionEvidenceHash(prompt), prompt, option: 0,
+      expiresAt: new Date(Date.now() + 60_000).toISOString(), answerRequestId: randomUUID(), status: "answering", ...overrides,
+    });
+    const reused = makeDecision({ reusedFromDecisionId: randomUUID() });
+    const receipt = await manager.answerTeamPermission(sessionId, reused.answerRequestId, team, reused, () => true, sourceCoordinatorId);
+    assert.equal(receipt.state, "delivered");
+    assert.equal(receipt.result, "closed");
+    assert.equal(delivered.length, 1);
+    assert.equal(delivered[0]?.coordinatorMemberId, sourceCoordinatorId);
+    assert.equal(reused.coordinatorMemberId, undefined);
+    assert.equal(control, null);
+
+    const invalidated = makeDecision({ reusedFromDecisionId: randomUUID() });
+    onClaim = () => { invalidated.status = "uncertain"; };
+    await assert.rejects(manager.answerTeamPermission(sessionId, invalidated.answerRequestId, team, invalidated, () => true, sourceCoordinatorId), /invalidated before the answer/);
+    onClaim = undefined;
+    assert.equal(delivered.length, 1);
+    assert.equal(control, null);
+
+    const unattributed = makeDecision();
+    await assert.rejects(manager.answerTeamPermission(sessionId, unattributed.answerRequestId, team, unattributed, () => true, sourceCoordinatorId), /incomplete, expired, or not a one-shot approval/);
+    const missingSource = makeDecision({ reusedFromDecisionId: randomUUID() });
+    await assert.rejects(manager.answerTeamPermission(sessionId, missingSource.answerRequestId, team, missingSource, () => true), /incomplete, expired, or not a one-shot approval/);
+    const conflicting = makeDecision({ coordinatorMemberId: randomUUID() });
+    await assert.rejects(manager.answerTeamPermission(sessionId, conflicting.answerRequestId, team, conflicting, () => true, sourceCoordinatorId), /incomplete, expired, or not a one-shot approval/);
+  } finally {
+    if (server.listening) await new Promise<void>(resolve => server.close(() => resolve()));
+    rmSync(root, { recursive: true, force: true });
+  }
 });

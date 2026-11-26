@@ -278,4 +278,16 @@ test("describeTeamWaitReasons handles spinner-only, stalled, blocked gating, and
   for (const status of ["paused", "ready-for-review", "merged", "no-change", "cancelled"] as const) {
     assert.deepEqual(describeTeamWaitReasons(baseRun({ status, members: [spinnerMember] }), [], NOW_MS), []);
   }
+
+  const deferredRun = baseRun({
+    parallelism: 1,
+    tasks: [
+      task("task-deferred", { status: "running", memberId: "m-cap" }),
+      task("task-ready", { status: "pending", dependsOn: [] }),
+    ],
+    members: [member({ memberId: "m-cap", taskId: "task-deferred", status: "queued", pendingCapacity: true })],
+  });
+  const deferredReasons = describeTeamWaitReasons(deferredRun, [], NOW_MS);
+  assert.equal(deferredReasons.filter((r) => r.kind === "worker-slot").length, 1);
+  assert.equal(deferredReasons[0]?.memberId, "m-cap");
 });

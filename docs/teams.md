@@ -433,10 +433,18 @@ uses the normal `cancelledMinutes` retention. The outcome ledger keeps the run
 as blocked: the close writes no second settled event. A blocked run that
 still holds an unresolved operation keeps its workspaces unless the host looks
 and finds no process of that operation. The host records each command an
-operation starts, as the leader of its own session and process group, and while
-the operation runs it samples the process table for descendants that moved to
-other sessions or groups. The saved intent says that this record may be
-incomplete from before a command starts until a save holds it. While such a run
+operation starts, as the leader of its own session and process group, in the
+step that starts it, and while the operation runs it samples the process table
+for descendants that moved to other sessions or groups. The saved intent says
+that this record may be incomplete from before a command starts until a save
+holds it. When an operation fails, the host ends the operation's commands that
+are still running, as a halt does, and refuses the commands that have not
+started: one that the operation asks for later, and one that was still waiting
+for its turn to start. Such a command is refused at its turn or, when its turn
+came before the failure, just before its start, because its stop came first.
+The saved failure holds every command that has started, so it marks
+the record incomplete only while a command is still starting, not while the host
+still reads a command's start time. While such a run
 is blocked or paused with no command of its own running, the host looks at most
 every ten minutes for processes that match the record, and for any process of
 the host account or of the account that runs team commands that uses the run
@@ -450,7 +458,14 @@ run keeps its workspaces and stays blocked: when a look finds a process; when it
 cannot finish; when a process of those accounts refuses inspection; when the
 record overflowed; or when an earlier API process stopped while the record was
 marked incomplete and the host has not rebooted since. In the last four cases
-the host says it cannot tell. The host never signals or stops a process it
+the host says it cannot tell. Earlier versions also marked a failure's record
+incomplete while the host still read a command's start time. A run that such a
+version left marked this way is held as above until the host boots again: only
+a reboot lets the retention policy close it. Its events say that the host cannot
+tell whether the interrupted operation left processes, because "the host stopped
+while the operation was starting a command, so its record of the operation's
+processes may be incomplete".
+The host never signals or stops a process it
 finds. The look has stated limits: it does not inspect other accounts or a
 process that left its recorded session and group and no longer uses the run
 directory, and it is evidence about left-over processes, not a defense against
@@ -595,7 +610,7 @@ Eval capture keeps each implementer task of a finished team run as an eval task.
 
 Capture is off by default. Only a project in `github` source mode captures. A laptop project writes nothing and reads nothing.
 
-**Turn capture on only after the owner has admitted the patch form and the capture name list in the launcher** (see [Git forms](#git-forms)). Until then every task ends `capture-failed`. While the base check form is refused, every task ends `base-not-proven`.
+**Turn capture on only after the owner has admitted the patch form, the capture name list, and the tree check form in the launcher** (see [Git forms](#git-forms)). Until then every task ends `capture-failed` (or equal-tree base deltas end `capture-failed` if only the tree check is missing). While the base check form is refused, every task ends `base-not-proven`.
 
 Capture never changes a run. A failed, stalled, or slow capture never delays a run, takes an enrichment slot, or reaches a member.
 
@@ -655,7 +670,7 @@ Material codes. The task is `rejected` after the reads.
 
 | Code | Meaning |
 |---|---|
-| `capture-failed` | The reference's name read failed or threw. |
+| `capture-failed` | The reference's name read or a patch read failed, threw, or produced an empty reference diff. |
 | `reference-too-wide` | The reference lists more than 500 files, or its list was cut. |
 | `excluded-area` | A reference file is in an excluded area. |
 | `no-hidden-tests` | The reference has no test file, or only test files. |
@@ -672,7 +687,7 @@ Promotion codes. The ledger's decision rule runs first, then the facts, in this 
 | `same-model-review` | The approving review ran on the same model as the work. |
 | `not-accepted` | The ledger counts the attempt as not accepted. |
 | `acceptance-unknown` | The ledger cannot tell whether the attempt was accepted. |
-| `patch-missing` | A patch could not be read, or the patch form is refused. |
+| `patch-missing` | A patch commit/ref is missing (pre-upgrade partial rows created before empty/failed patch reads were split can also settle here; newly read failures record `capture-failed`). |
 | `reference-unknown` | The approval read is missing, or the later-change list was too wide. |
 | `reference-ambiguous` | A later commit of the run changed a reference file. |
 | `base-not-proven` | Form 3 did not prove that the anchor is on the mirror's branch. |
@@ -681,7 +696,7 @@ Promotion codes. The ledger's decision rule runs first, then the facts, in this 
 
 An unfrozen ledger row waits. A ledger row that does not open leaves its task as it is, and the pass counts it as `unreadable`.
 
-A missing fact stays missing. A refused patch is never stored as empty. A truncated list is never read as complete. An unknown acceptance is never a refusal or an acceptance. An empty reference patch counts as missing, because a captured task has at least two files, so an empty read means the read failed without saying so. An empty base delta is kept, because two different commits may have equal trees.
+A missing fact stays missing. A refused or failed patch read is never stored as empty or coerced to missing: it rejects the capture as `capture-failed`. A truncated list is never read as complete. An unknown acceptance is never a refusal or an acceptance. An empty reference patch also rejects as `capture-failed`, because a captured task has at least two files, so an empty read indicates a read failure rather than a missing ref. An empty base delta is kept only after Form 4 proves both commits have equal tree OIDs, because two different commits may have equal trees while a silent launcher could also exit zero with empty output.
 
 ### Deletion and retention
 
@@ -724,11 +739,12 @@ Each capture read runs through the team Git prefix, with the six `-c` settings. 
 
 | Form | Command | Limit | If refused |
 |---|---|---|---|
-| 1. Patch (new) | `git diff --no-ext-diff --no-textconv --no-color --binary --default-prefix --no-renames --submodule=short --ignore-submodules=none --unified=3 --inter-hunk-context=0 FROM TO --`, in the run's integration checkout | 1,048,576 bytes; Git 2.41 or later | The patch is `missing`, and the task ends `patch-missing`. |
+| 1. Patch (new) | `git diff --no-ext-diff --no-textconv --no-color --binary --default-prefix --no-renames --submodule=short --ignore-submodules=none --unified=3 --inter-hunk-context=0 FROM TO --`, in the run's integration checkout | 1,048,576 bytes; Git 2.41 or later | A missing ref leaves the patch `missing` (`patch-missing`); a refused/failed read or empty reference diff rejects as `capture-failed`. |
 | 2. Name list of capture (new) | `git diff --no-ext-diff --no-textconv --name-only --no-renames --ignore-submodules=none -z FROM TO --`, in the same checkout | 500 names for a reference; 2,000 for later changes; 64 KiB of output | Every capture ends `capture-failed`; a later-change list leaves the approval unknown. |
 | 3. Base check (reused, form 1 of the base scan) | `git merge-base --is-ancestor ANCHOR HEAD`, in the source mirror, where `HEAD` is the mirror's head | 30 seconds | Every task ends `base-not-proven`. |
+| 4. Tree check (new, same shape as form 4 of the base scan) | `git log --no-walk=unsorted --no-show-signature --format=%H %T %P FROM TO --`, in the run's integration checkout | 30 seconds; 4,096 bytes | An empty base delta rejects as `capture-failed`; non-empty base deltas do not run this form. |
 
-Form 3 is in a launcher audit that is pending with the outcome-ledger release. Forms 1 and 2 need the owner's launcher approval before capture is turned on. The launcher must also end each of the three reads by itself after 35 seconds: the host may not signal a command that the launcher runs as another account, and a read that hangs there holds one of four places until it ends.
+Form 3 is in a launcher audit that is pending with the outcome-ledger release. Forms 1, 2, and 4 need the owner's launcher approval before capture is turned on. The launcher must also end each of the four reads by itself after 35 seconds: the host may not signal a command that the launcher runs as another account, and a read that hangs there holds one of four places until it ends.
 
 ## Eval mining and validation
 
@@ -1791,20 +1807,28 @@ applies to every such steer, whether or not review feedback (below) is switched 
 - When the delivery of a continued revision fails, the run blocks for the owner
   without automatic delivery recovery.
 - A pull request recorded before the host kept its branch has no recorded branch,
-  and the host does not infer one. A new steer on that run is refused with
-  `delivery-branch-unknown`. A run that was already continued from such a record
-  blocks at delivery with the same code instead of delivering. Only review
-  feedback's read of GitHub records the branch, and only while the run waits for
-  review at its delivered revision. With review feedback off, such a run refuses
-  every new steer and never gets its branch recorded; start a new run instead.
+  and the host does not infer one locally. On steer or continued delivery, the
+  host performs an on-demand read-only `gh pr view` against the pinned delivery
+  repository, validates the head branch against `gitBranchSchema` and the run's
+  owned delivery branch, persists it on `pullRequest.branch`, and continues.
+  If the lookup fails or GitHub reports a closed, merged, fork, retargeted, or
+  unmatched branch, the steer fails or delivery blocks with
+  `delivery-branch-unknown` without mutating the run. Review feedback's read of
+  GitHub also backfills `pullRequest.branch` when switched on.
 
 With `github.reviewFeedback` switched on, the owner's changes-requested review of
 that pull request steers the run the same way, once per review. Only the review
 summary is read, never inline comments. A review by another login, an approval, a
 comment, a review of an older head, and a review submitted before the switch was
 last turned on start nothing. A run accepts at most three reviews. Runs of goals,
-handoffs, replays and missions are not watched; routines start goals, so their
-runs are not watched either. Removing the run's workspace ends intake.
+handoffs and replays are not watched; routines start goals, so their runs are not
+watched either. A mission's subteam run is watched, but the owner's review does
+not steer it: the review goes to the mission's coordinator as owner direction,
+and the run continues only when the coordinator forwards it with `steer-subtask`.
+The run shows the review as applied once the mission recorded it, and records no
+steering of its own until that forward. See
+[missions](missions.md#owner-review-of-a-subtasks-pull-request). Removing the
+run's workspace ends intake.
 
 ## Project context and explicit relationships
 
@@ -2905,7 +2929,9 @@ Every command that the host's team command runner starts for a team (setup,
 checks, member setup, the Git commands it runs and, under a command prefix,
 workspace removal) ends with the process that the host started for it.
 While that process runs, a stop (the time limit, a pause, a cancel, a block or a
-host stop) kills its process group. Once that process has exited, the host sends
+host stop) kills its process group. A command whose stop comes before its start,
+for example while it waits for its turn to start, is never started: it returns
+as interrupted, with no output. Once that process has exited, the host sends
 no signal to anything the command started: the group may be empty by then, and
 its id may already belong to an unrelated process. The host reads output that is
 still open for at most one second. It then reads what the pipes already hold:
@@ -3719,12 +3745,14 @@ Limits of this first slice, stated in full:
 - A project that lets the team establish its own checks has none configured and cannot use this.
 - The result of a head that main has already left can still be announced, with the commit it was measured at.
 - Tests cannot prove that a deployed launcher admits the forms the check uses. Audit the launcher before the setting is turned on in any project.
-- If the host's API process stops in the short window while a command of the check is starting, the run directory is not removed until the host boots again, and no main check on the host starts until then: that project waits on `processes` and the others on `another-check`.
+- If the host's API process ends before it has recorded the end of the check, for example when it crashes or is killed, in the short window while a command of the check is starting, the run directory is not removed until the host boots again, and no main check on the host starts until then: that project waits on `processes` and the others on `another-check`. An orderly stop records the end of a running check first. Once the end is recorded, the record holds the process id of every command the check started, even while the host still reads a command's start time, and the copy is removed once a census finds nothing of the run, without a reboot. Earlier versions also held the copy until the next boot when the host stopped after recording the end, while it still read a command's start time. A copy held that way at the upgrade still waits for the host to boot again. The record does not say whether the end of the check or a host start after a crash marked such a copy, and only a host start can leave a command's process id out of the record.
 - Preparing the copy has no time limit of its own. It ends by the Git helpers' own limits, a halt, or a host stop.
 - Two different heads observed with the same stamp are ordered by their results' order in the record. Fetches of one mirror are serial, so their stamps differ in practice.
 - The host may not signal a command that the command prefix runs as another account. A halt, a time limit or a host stop then cannot end the command. The check is recorded as an error ten seconds later, the command runs on, and no main check on the host starts until the command has ended: that project waits on `processes` and the others on `another-check`. A team's checks have the same limit.
 - The host learns that a command's process has exited when its event loop next runs. A stop that the host handles before it has learned of the exit is a stop of a running command, and it kills the command's process group.
-- A process of the host's account, or of the account that runs commands, that the census cannot inspect keeps a copy from being removed for as long as that process runs, whether or not a check started it. No main check on the host starts meanwhile: that project waits on `processes` and the others on `another-check`. On Linux a login session has such processes (its service manager and its SSH processes), so a host that runs under a login account removes no copy while a login session of that account lasts. Run the host under an account of its own, as the Ubuntu deployment does. A process that the account only started and that runs as another account, such as a `sudo` process, is not one of them.
+- The census cannot inspect some processes of the host's account and of the account that runs commands; on Linux a login session has such processes (its service manager and its SSH processes). When it admits a check, the host takes a census of a path under the team root that no copy uses (`main-check-gate`), and records each process that census cannot inspect by its id and start time, at most 256 of them, in a sealed anchor of that copy (`main-check-anchors/` in the host state directory). A process that names the team root in its arguments is recorded like any other. If `main-check-gate` under the team root is a symbolic link or another project's folder, a process the census cannot inspect that names that folder in its arguments is not recorded and holds the copy until it ends; this can delay a removal, never cause an early one. When it retires the copy, it disregards a process it cannot inspect only if the copy's anchor names the same id with the same start time, on the boot the check started in. Every other process it cannot inspect keeps the copy from being removed for as long as that process runs, whether or not a check started it: one that started after the admission, one past the first 256, one that received the id of an anchored process, and all of them when the anchor is missing or cannot be read. No main check on the host starts meanwhile: that project waits on `processes` and the others on `another-check`. A host that runs under a login account therefore also waits on a login session that starts while a copy waits; run the host under an account of its own, as the Ubuntu deployment does. A process that the account only started and that runs as another account, such as a `sudo` process, is not one of them. The anchor is deleted after the record no longer names the copy; after a host start, once every main-check record can be read, the host deletes every anchor that no record names.
+- An anchor is not an inspection. A process of the account that runs commands that was alive and could not be inspected before the admission enters the anchor without any tampering, for example a process that a team run's checks left behind, and the census never examines it while it stays that way: if it uses the copy, the copy is removed while it runs. A process that cannot be inspected and starts after the admission holds the copy until it ends, at every pass, so such processes that keep arriving during the wait extend it. On a machine where other login sessions of the account start at any time, such as a shared test runner, a copy can therefore wait for as long as each new session lasts.
+- Nothing of a run survives a reboot. On Linux, the host disregards every process it cannot inspect when it retires a copy recorded in an earlier boot. On macOS the boot id can change when the clock is set, so a changed boot id there keeps such a copy waiting on those processes, as before.
 - A process that a check left behind is found by the process, group and session ids that the host recorded during the check, and by its use of the copy. A process that left its group and session before the host sampled it, and that does not use the copy, is not found, and the copy is then removed while that process runs. The same holds for such a process that uses the copy and runs as another account than the two the census inspects, such as a set-uid program: the census does not inspect it. The process census has the same limit for team runs.
 
 Before turning the setting on, run the project's checks by hand at main's head, and confirm that the team's command prefix runs them as the agent account on this host. A host whose configuration sets `push.events` itself must add `main-check` to that list, or the result is recorded and no push is sent. Then audit the launcher: a deployed launcher must recognise the main-check run directories and the `infinite/team-main-check-*` branch names that the copy uses, as it recognises a team run's.

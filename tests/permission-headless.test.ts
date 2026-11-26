@@ -12,8 +12,9 @@ import {
 import {
   claudeTurnSignals, DEFERRAL_RETENTION_MS, HeadlessChannelWorker, OPEN_CALL_KEYS, OWNER_DENIED, PENDING_NOTICE, type ChannelWorkerHost,
 } from "../packages/host/src/permission-headless-worker.js";
-import { hookOutput } from "../packages/host/src/permission-hook.js";
+import { ask, hookOutput, type ChannelPost } from "../packages/host/src/permission-hook.js";
 import { requesterNotice } from "../packages/host/src/permission-policy.js";
+import { Journal, writeSealed } from "../packages/host/src/vault.js";
 import type { PermissionAgentServices, PermissionOutcome, PermissionPipeline, PermissionRequest } from "../packages/host/src/permission-agent-types.js";
 import type { Config, Event, Session } from "../packages/host/src/types.js";
 import { stopSessionWorkers, waitFor } from "./helpers.js";
@@ -230,14 +231,14 @@ test("a session the pipeline does not serve launches exactly as before", { timeo
   } finally { await r.stop(); }
 });
 
-function workerRig(replies: Array<ChannelReply | Error>) {
+function workerRig(replies: Array<ChannelReply | Error | Promise<ChannelReply>>) {
   const records: Array<Record<string, unknown>> = [];
   const requests: unknown[] = [];
   const prompts: number[] = [];
   const closed: Array<[number, string]> = [];
   let now = Date.parse("2026-11-14T10:00:00.000Z");
   let ended = 0, resumed = 0, resumeFails = false;
-  let resumeReply: ChannelReply | Error = { result: "ok" };
+  let resumeReply: ChannelReply | Error | Promise<ChannelReply> = { result: "ok" };
   const host: ChannelWorkerHost = {
     sessionId: randomUUID(), token: "0".repeat(64), socket: "/nonexistent",
     record: data => { records.push(data); return records.length; },
@@ -257,13 +258,15 @@ function workerRig(replies: Array<ChannelReply | Error>) {
     now: () => now,
   };
   const channel = new HeadlessChannelWorker(host);
-  const pre = (command: string, id: string, extra: Record<string, unknown> = {}) =>
-    channel.check({ hook_event_name: "PreToolUse", session_id: "native-1", tool_name: "Bash", tool_input: { command }, tool_use_id: id, ...extra });
+  const check = (body: unknown, run = String(channel.run)) => channel.check(body, run);
+  const request = (body: unknown, run = String(channel.run)) => channel.request(body, run);
+  const pre = (command: string, id: string, extra: Record<string, unknown> = {}, run = String(channel.run)) =>
+    check({ hook_event_name: "PreToolUse", session_id: "native-1", tool_name: "Bash", tool_input: { command }, tool_use_id: id, ...extra }, run);
   return {
-    channel, records, requests, prompts, closed, pre,
+    channel, records, requests, prompts, closed, check, request, pre,
     get ended() { return ended; }, get resumed() { return resumed; },
     failResume() { resumeFails = true; }, advance(ms: number) { now += ms; },
-    answerResume(reply: ChannelReply | Error) { resumeReply = reply; },
+    answerResume(reply: ChannelReply | Error | Promise<ChannelReply>) { resumeReply = reply; },
   };
 }
 const owner: ChannelReply = { result: "owner", interruptClass: "production-or-staging", rule: "production-deploy", sessionRoot: "/workspace", decisionId: randomUUID(), deliveryKey: "d".repeat(64) };
@@ -274,11 +277,11 @@ const claudeModeHooks = (name: string) => readFileSync(new URL(`./fixtures/claud
 test("Code Mode deferred Write resumes the same captured call id", async () => {
   const rows = claudeModeHooks("defer-hooks.jsonl");
   const w = workerRig([{ result: "none" }, { ...owner, rule: "write-owner" }]);
-  const launchArgs = headlessChannelArgs("/repo/hook-relay.js", true);
+  const launchArgs = headlessChannelArgs("/repo/hook-relay.js", 1, true);
   const settings: { hooks: Record<string, Array<{ hooks: Array<{ command: string }> }>> } = JSON.parse(launchArgs[launchArgs.indexOf("--settings") + 1]!);
-  const routes = (event: string) => settings.hooks[event]?.[0]?.hooks.map(({ command }) => command.split(" ").slice(-2).join(" ")) ?? [];
-  assert.deepEqual(routes("PreToolUse"), ["/repo/hook-relay.js claude", "/repo/permission-hook.js check"]);
-  assert.deepEqual(routes("PermissionRequest"), ["/repo/permission-hook.js request"]);
+  const routes = (event: string) => settings.hooks[event]?.[0]?.hooks.map(({ command }) => command.slice(process.execPath.length + 1)) ?? [];
+  assert.deepEqual(routes("PreToolUse"), ["/repo/hook-relay.js claude", "/repo/permission-hook.js check 1"]);
+  assert.deepEqual(routes("PermissionRequest"), ["/repo/permission-hook.js request 1"]);
   assert.deepEqual(routes("PostToolUse"), ["/repo/hook-relay.js claude"]);
   assert.deepEqual(routes("UserPromptSubmit"), ["/repo/hook-relay.js claude"]);
   const bash = rows.find(row => row.hook_event_name === "PreToolUse" && row.tool_name === "Bash")!;
@@ -288,14 +291,14 @@ test("Code Mode deferred Write resumes the same captured call id", async () => {
   assert.equal(typeof callId, "string");
   assert.equal(resumed.tool_use_id, callId);
 
-  assert.deepEqual(await w.channel.check(bash), { decision: "none" });
-  assert.deepEqual(await w.channel.check(original), { decision: "defer", reason: "This call waits for the owner's answer. The session resumes with that answer." });
+  assert.deepEqual(await w.check(bash), { decision: "none" });
+  assert.deepEqual(await w.check(original), { decision: "defer", reason: "This call waits for the owner's answer. The session resumes with that answer." });
   const deferred = w.records.find(record => record.event === "deferred");
   assert.equal(deferred?.callId, callId);
   assert.equal(deferred?.rule, "write-owner");
   assert.equal(w.channel.exited(0), true);
   w.channel.answer({ requestId: "fixture-owner-answer", promptId: w.prompts[0]!, option: 0 });
-  assert.deepEqual(await w.channel.check(resumed), { decision: "allow" });
+  assert.deepEqual(await w.check(resumed), { decision: "allow" });
   assert.equal(w.records.find(record => record.event === "delivered")?.callId, callId);
   assert.equal(w.channel.waiting(), false);
 });
@@ -304,12 +307,12 @@ test("Code Mode PermissionRequest without an id inherits its nested call id", as
   const rows = claudeModeHooks("hooks.jsonl");
   const w = workerRig([{ result: "none" }, { result: "none" }, { result: "deny", code: "unsafe", notice: "ignored" }]);
   const check = rows.find(row => row.hook_event_name === "PreToolUse" && row.tool_name === "Bash")!;
-  await w.channel.check(check);
+  await w.check(check);
   const write = rows.find(row => row.hook_event_name === "PreToolUse" && row.tool_name === "Write")!;
-  await w.channel.check(write);
+  await w.check(write);
   const permission = rows.find(row => row.hook_event_name === "PermissionRequest")!;
   assert.equal("tool_use_id" in permission, false);
-  await w.channel.request(permission);
+  await w.request(permission);
   const decide = w.requests.find(request => (request as { op?: string }).op === "decide") as { call: { toolUseId?: string } };
   assert.equal(decide.call.toolUseId, write.tool_use_id);
 });
@@ -317,7 +320,7 @@ test("Code Mode PermissionRequest without an id inherits its nested call id", as
 test("while a call waits, every other call of the session is denied as pending", async () => {
   const w = workerRig([owner]);
   assert.equal((await w.pre("deploy production", "toolu_1")).decision, "defer");
-  for (const answer of [await w.pre("ls", "toolu_2"), await w.channel.request({ tool_name: "Bash", tool_input: { command: "ls" } })])
+  for (const answer of [await w.pre("ls", "toolu_2"), await w.request({ tool_name: "Bash", tool_input: { command: "ls" } })])
     assert.deepEqual(answer, { decision: "deny", reason: PENDING_NOTICE });
   assert.deepEqual(w.requests.map(request => (request as { op: string }).op).filter(op => op !== "delivery"), ["class"]);
 });
@@ -398,6 +401,8 @@ test("a waiting call is retired at the retention limit and the session ends", as
   assert.equal(w.ended, 1);
   assert.deepEqual([w.records.at(-1)?.event, w.records.at(-1)?.reason], ["retired", "expired"]);
   assert.equal(w.channel.waiting(), false);
+  const sent = w.requests.at(-1) as Record<string, unknown>;
+  assert.deepEqual([sent.op, sent.kind, sent.detail], ["delivery", "refusal", "Headless: the deferred call was retired unanswered (expired)."]);
 });
 
 test("a provider that fails after deferring, or a resume that fails, retires the call", async () => {
@@ -418,13 +423,13 @@ test("a host that cannot be reached denies the call as unavailable; a call the h
   const w = workerRig([new Error("ECONNREFUSED"), { result: "not-served" }, new Error("timeout")]);
   assert.deepEqual(await w.pre("deploy production", "toolu_1"), { decision: "deny", reason: requesterNotice("unavailable") });
   assert.deepEqual(await w.pre("ls", "toolu_2"), { decision: "none" });
-  assert.deepEqual(await w.channel.request({ tool_name: "Bash", tool_input: { command: "ls" } }), { decision: "deny", reason: requesterNotice("unavailable") });
+  assert.deepEqual(await w.request({ tool_name: "Bash", tool_input: { command: "ls" } }), { decision: "deny", reason: requesterNotice("unavailable") });
 });
 
 test("a PermissionRequest carries the call id of its PreToolUse and only host text back", async () => {
   const w = workerRig([{ result: "none" }, { result: "deny", code: "unsafe", notice: "MODEL TEXT" }]);
   await w.pre("rm -rf scratch", "toolu_7");
-  assert.deepEqual(await w.channel.request({ tool_name: "Bash", tool_input: { command: "rm -rf scratch" } }), { decision: "deny", reason: requesterNotice("unsafe") });
+  assert.deepEqual(await w.request({ tool_name: "Bash", tool_input: { command: "rm -rf scratch" } }), { decision: "deny", reason: requesterNotice("unsafe") });
   const decide = w.requests[1] as { requestId: string; call: { toolUseId?: string } };
   assert.equal(decide.call.toolUseId, "toolu_7");
   assert.match(decide.requestId, /:toolu_7$/);
@@ -432,8 +437,8 @@ test("a PermissionRequest carries the call id of its PreToolUse and only host te
 
 const decides = (w: ReturnType<typeof workerRig>) =>
   w.requests.filter(request => (request as { op?: string }).op === "decide") as Array<{ requestId: string; call: { toolUseId?: string } }>;
-const raise = (w: ReturnType<typeof workerRig>, command: string, extra: Record<string, unknown> = {}) =>
-  w.channel.request({ hook_event_name: "PermissionRequest", tool_name: "Bash", tool_input: { command }, ...extra });
+const raise = (w: ReturnType<typeof workerRig>, command: string, extra: Record<string, unknown> = {}, run?: string) =>
+  w.request({ hook_event_name: "PermissionRequest", tool_name: "Bash", tool_input: { command }, ...extra }, run);
 const ownOrNone = (id: string | undefined, own: string) => assert.ok(id === undefined || id === own, `the request took ${id}, and its call is ${own}`);
 async function resumeAfterDeferral(w: ReturnType<typeof workerRig>) {
   assert.equal((await w.pre("deploy production", "toolu_owner")).decision, "defer");
@@ -526,7 +531,7 @@ test("a PermissionRequest that names a call takes the held call off only when it
 
 test("a call without an id is counted as open too, so its request never takes an identical call's id", async () => {
   const w = workerRig([]);
-  const bare = (command: string) => w.channel.check({ hook_event_name: "PreToolUse", session_id: "native-1", tool_name: "Bash", tool_input: { command } });
+  const bare = (command: string) => w.check({ hook_event_name: "PreToolUse", session_id: "native-1", tool_name: "Bash", tool_input: { command } });
   await w.pre("git status", "toolu_a");
   await bare("git status");
   await raise(w, "git status");
@@ -563,25 +568,144 @@ test("past its bound the worker no longer trusts what it holds: an identical cal
   ownOrNone(ids[2], "toolu_c");
 });
 
-test("a late PermissionRequest of a provider that exited does not take the id of the next provider's identical call", async () => {
-  const w = workerRig([{ result: "none" }, owner]);
-  await w.pre("git status", "toolu_a");
-  await resumeAfterDeferral(w);
-  await w.pre("git status", "toolu_b");
-  await raise(w, "git status");
-  await raise(w, "git status");
-  const ids = decides(w).map(decide => decide.call.toolUseId);
-  ownOrNone(ids[0], "toolu_a");
-  ownOrNone(ids[1], "toolu_b");
+test("a hook of a provider run that exited is refused and changes nothing, and the next run's request takes its own call's id", async () => {
+  const w = workerRig([{ result: "none" }, owner, { result: "none" }, { result: "allow" }]);
+  const refused = { decision: "deny", reason: requesterNotice("unavailable") };
+  const state = () => [w.records.length, w.requests.length, w.channel.view(), w.channel.waiting()];
+  const first = String(w.channel.run);
+  assert.deepEqual(await w.pre("git status", "toolu_a", {}, first), { decision: "none" });
+  assert.equal((await w.pre("deploy production", "toolu_owner", {}, first)).decision, "defer");
+  assert.equal(w.channel.exited(0), true);
+  const waiting = state();
+  assert.deepEqual(await raise(w, "git status", {}, first), refused);
+  assert.deepEqual(state(), waiting);
+  w.channel.answer({ requestId: "a1", promptId: w.prompts[0]!, option: 0 });
+  const second = String(w.channel.run);
+  assert.deepEqual(await w.pre("deploy production", "toolu_owner", {}, first), refused);
+  assert.deepEqual(await w.pre("deploy production", "toolu_owner", {}, second), { decision: "allow" });
+  assert.deepEqual(await w.pre("git status", "toolu_b", {}, second), { decision: "none" });
+  const resumed = state();
+  assert.deepEqual(await raise(w, "git status", {}, first), refused);
+  assert.deepEqual(await w.pre("deploy production", "toolu_late", {}, first), refused);
+  assert.deepEqual(await w.channel.request({ tool_name: "Bash", tool_input: { command: "git status" } }, undefined), refused);
+  assert.deepEqual(state(), resumed);
+  assert.deepEqual(await raise(w, "git status", {}, second), { decision: "allow" });
+  assert.deepEqual(decides(w).map(decide => decide.call.toolUseId), ["toolu_b"]);
+  assert.match(decides(w)[0]!.requestId, /:toolu_b$/);
 });
 
-test("a call left open by a provider that exited gives its id to no request of the next provider", async () => {
-  const w = workerRig([{ result: "none" }, owner]);
-  await w.pre("git status", "toolu_a");
+function held() {
+  let release!: (reply: ChannelReply) => void;
+  const reply = new Promise<ChannelReply>(done => { release = done; });
+  return { reply, release };
+}
+
+test("a call admitted before the provider exited changes nothing when its host reply arrives after the exit", async () => {
+  const refused = { decision: "deny", reason: requesterNotice("unavailable") };
+  const open = held();
+  const w = workerRig([open.reply, owner, { result: "none" }, { result: "allow" }]);
+  const inFlight = w.pre("git status", "toolu_a");
+  assert.equal((await w.pre("deploy production", "toolu_owner")).decision, "defer");
+  assert.equal(w.channel.exited(0), true);
+  const waiting = [w.records.length, w.requests.length];
+  open.release({ result: "none" });
+  assert.deepEqual(await inFlight, refused);
+  assert.deepEqual([w.records.length, w.requests.length], waiting);
+  w.channel.answer({ requestId: "a1", promptId: w.prompts[0]!, option: 0 });
+  assert.deepEqual(await w.pre("deploy production", "toolu_owner"), { decision: "allow" });
+  await w.pre("git status", "toolu_b");
+  assert.deepEqual(await raise(w, "git status"), { decision: "allow" });
+  assert.deepEqual(decides(w).map(decide => decide.call.toolUseId), ["toolu_b"]);
+
+  const classReply = held(), decideReply = held();
+  const ended = workerRig([classReply.reply, decideReply.reply]);
+  const check = ended.pre("deploy production", "toolu_1");
+  const request = raise(ended, "deploy staging");
+  assert.equal(ended.channel.exited(0), false);
+  classReply.release(owner);
+  decideReply.release({ result: "deny", code: "needs-owner", notice: "MODEL TEXT", interruptClass: "production-or-staging", decisionId: randomUUID() });
+  assert.deepEqual([await check, await request], [refused, refused]);
+  assert.deepEqual([ended.records, ended.channel.view().notice, ended.requests.length], [[], undefined, 3]);
+  const late = ended.requests.at(-1) as Record<string, unknown>;
+  assert.deepEqual([late.op, late.decisionId, late.deliveryKey, late.kind], ["delivery", (owner as { decisionId: string }).decisionId, "d".repeat(64), "refusal"]);
+});
+
+test("an owner's allow whose resume check returns after the resumed provider exited is denied, and the deferral stays open to block an ordinary resume", async () => {
+  const confirm = held();
+  const w = workerRig([owner]);
+  w.answerResume(confirm.reply);
+  await w.pre("deploy production", "toolu_1");
+  w.channel.exited(0);
+  w.channel.answer({ requestId: "a1", promptId: w.prompts[0]!, option: 0 });
+  const returning = w.pre("deploy production", "toolu_1");
+  assert.equal(w.channel.exited(0), false);
+  confirm.release({ result: "ok" });
+  assert.deepEqual(await returning, { decision: "deny", reason: requesterNotice("unavailable") });
+  assert.deepEqual([w.records.at(-1)?.event, w.records.at(-1)?.reason], ["retired", "resume-ended"]);
+  const r = await rig();
+  try {
+    const id = randomUUID(), dir = join(r.config.stateDir, "sessions", id);
+    mkdirSync(dir, { recursive: true });
+    writeSealed(join(dir, "meta.sealed"), r.key, `${id}:meta`, { session: { id, provider: "claude", projectId: "rehearsal", title: "Headless", cwd: r.workspace, headless: { channel: true } } });
+    const journal = new Journal(join(dir, "events"), r.key, id);
+    for (const data of w.records) journal.append("lifecycle", { permissionChannel: data });
+    assert.equal(deferredCallOpen((after, limit) => r.manager.events(id, after, limit)), true);
+    await assert.rejects(r.manager.resume(id, randomUUID()), /waited for the owner's answer/);
+  } finally { await r.stop(); }
+});
+
+test("a call retired at the resume is recorded as answered by the owner, and a newer waiting call stays open", async () => {
+  const text = "Headless: the deferred call was retired before the owner's answer reached it (resume-ended).";
+  const lastDelivery = (w: ReturnType<typeof workerRig>) => {
+    const sent = w.requests.filter(request => (request as { op: string }).op === "delivery").at(-1) as { kind?: string; detail?: string } | undefined;
+    return [sent?.kind, sent?.detail];
+  };
+  const early = workerRig([owner]);
+  await early.pre("deploy production", "toolu_1");
+  early.channel.exited(0);
+  early.channel.answer({ requestId: "a1", promptId: early.prompts[0]!, option: 0 });
+  assert.equal(early.channel.exited(0), false);
+  assert.deepEqual([early.records.at(-1)?.reason, ...lastDelivery(early)], ["resume-ended", "refusal", text]);
+
+  const confirm = held();
+  const late = workerRig([owner, owner]);
+  late.answerResume(confirm.reply);
+  await late.pre("deploy production", "toolu_1");
+  late.channel.exited(0);
+  late.channel.answer({ requestId: "a1", promptId: late.prompts[0]!, option: 0 });
+  const returning = late.pre("deploy production", "toolu_1");
+  assert.equal((await late.pre("deploy staging", "toolu_2")).decision, "defer");
+  assert.equal(late.channel.exited(0), true);
+  confirm.release({ result: "ok" });
+  assert.deepEqual(await returning, { decision: "deny", reason: requesterNotice("unavailable") });
+  assert.deepEqual([late.records.at(-1)?.callId, late.records.at(-1)?.reason, ...lastDelivery(late)], ["toolu_1", "resume-ended", "refusal", text]);
+  assert.equal(late.channel.waiting(), true);
+  assert.deepEqual(late.closed.map(([id]) => id), [late.prompts[0]]);
+});
+
+test("a verdict that arrives after its provider exited is recorded as never returned, and the call is denied", async () => {
+  const text = "Headless: the provider run that made the call ended while the call was decided; the verdict never reached the call, which was denied as unavailable.";
+  for (const verdict of [{ result: "allow" }, { result: "deny", code: "needs-owner", notice: "MODEL TEXT" }]) {
+    const decided = held();
+    const w = workerRig([decided.reply]);
+    const decisionId = randomUUID(), deliveryKey = "e".repeat(64);
+    const asked = raise(w, "git push");
+    assert.equal(w.channel.exited(0), false);
+    decided.release({ ...verdict, decisionId, deliveryKey } as ChannelReply);
+    assert.deepEqual(await asked, { decision: "deny", reason: requesterNotice("unavailable") });
+    const sent = w.requests.at(-1) as Record<string, unknown>;
+    assert.deepEqual([sent.op, sent.decisionId, sent.deliveryKey, sent.kind, sent.detail], ["delivery", decisionId, deliveryKey, "refusal", text]);
+    assert.deepEqual(w.records, []);
+  }
+});
+
+test("a run that passed its bound leaves the next run's call ids intact after a resume", async () => {
+  const w = workerRig([...Array<ChannelReply>(OPEN_CALL_KEYS + 1).fill({ result: "none" }), owner]);
+  for (let other = 0; other <= OPEN_CALL_KEYS; other++) await w.pre(`echo ${other}`, `toolu_other_${other}`);
   await resumeAfterDeferral(w);
   await w.pre("git status", "toolu_b");
   await raise(w, "git status");
-  ownOrNone(decides(w)[0]!.call.toolUseId, "toolu_b");
+  assert.deepEqual(decides(w).map(decide => decide.call.toolUseId), ["toolu_b"]);
 });
 
 function hostRig(pipeline: PermissionPipeline, headless: Session["headless"] = { channel: true },
@@ -820,6 +944,14 @@ test("the channel hook prints a provider decision only for a decision", () => {
   assert.equal(hookOutput("check", { decision: "none" }), "");
   assert.deepEqual(JSON.parse(hookOutput("check", { decision: "defer", reason: "wait" })), { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "defer", permissionDecisionReason: "wait" } });
   assert.deepEqual(JSON.parse(hookOutput("request", { decision: "defer" })).hookSpecificOutput.decision, { behavior: "deny", message: requesterNotice("unavailable") });
+});
+
+test("the channel hook posts its run number in the path, and without one posts the unnumbered path for the worker to judge", async () => {
+  const posted: string[] = [];
+  const post: ChannelPost = async url => { posted.push(url); return { status: 200, text: JSON.stringify({ decision: "none" }) }; };
+  assert.deepEqual(await ask("check", "{}", { url: "http://127.0.0.1:9/hook", token: "t", run: "2", post }), { decision: "none" });
+  assert.deepEqual(await ask("request", "{}", { url: "http://127.0.0.1:9/hook", token: "t", run: undefined, post }), { decision: "none" });
+  assert.deepEqual(posted, ["http://127.0.0.1:9/hook/permission-check/2", "http://127.0.0.1:9/hook/permission-request"]);
 });
 
 test("each resume the worker performed owes one continue: the first prompt after it is marked, and nothing else", async () => {

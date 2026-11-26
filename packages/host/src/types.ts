@@ -1,3 +1,4 @@
+import { isAbsolute } from "node:path";
 import type { Attention } from "@infinite/attention";
 import { z } from "zod";
 export type Role = "owner" | "controller" | "viewer";
@@ -16,6 +17,15 @@ export interface ControlLease {
   id: string;
   label: string;
   expiresAt: number;
+}
+export interface TerminalSize {
+  cols: number;
+  rows: number;
+}
+export interface TerminalOpen {
+  cursor: number;
+  cols?: number;
+  rows?: number;
 }
 export interface TerminalSnapshot {
   ansi: string;
@@ -237,14 +247,15 @@ export interface Project {
   source?: import("./team-types.js").ProjectSource;
   autonomy?: import("./autonomy.js").AutonomyMode;
 }
-export interface AgentProfile {
-  command: string;
-  args: string[];
-  appServerCommand?: string;
-  appServerArgs?: string[];
-  workspaceDir?: string;
-  sharedWorkspace?: boolean;
-}
+export const agentProfileSchema = z.object({
+  command: z.string(),
+  args: z.array(z.string()),
+  appServerCommand: z.string().optional(),
+  appServerArgs: z.array(z.string()).optional(),
+  workspaceDir: z.string().refine(isAbsolute, "Workspace directory must be absolute").optional(),
+  sharedWorkspace: z.boolean().optional(),
+});
+export type AgentProfile = z.infer<typeof agentProfileSchema>;
 export interface Config {
   linear?: { apiKeyFile: string; endpoint?: string; reportName?: string };
   hostLoad?: { minAvailableMemoryGiB: number; maxLoadPerCpu: number };
@@ -282,8 +293,10 @@ export interface Config {
   repositoryGraphs?: { command: string; args: string[]; graphifyCommand: string; cacheDir: string; projectIds?: string[]; timeoutMs: number; debounceMs: number; intervalMs: number };
   port: number;
   origin: string;
+  browserSessions?: boolean;
   stateDir: string;
   runDir: string;
+  socketDir?: string;
   keyFile: string;
   tokens: { id: string; label: string; role: Role; hash: string }[];
   projects: Project[];
@@ -314,6 +327,8 @@ export interface WorkerState {
   status: Status;
   pid?: number;
   workerPid?: number;
+  socketPath?: string;
+  permissionSocketPath?: string;
   exitCode?: number;
   seq: number;
   screen: string;
@@ -321,6 +336,8 @@ export interface WorkerState {
   capabilities?: { terminalSnapshot?: 1; inputControl?: 1; nativeUi?: "codex" | "opencode"; transcript?: 1 };
   control?: ControlLease | null;
   runtime?: SessionRuntime;
+  terminalSize?: TerminalSize;
+  sizeIndexCoveredSeq?: number;
   nativeSession?: { id: string; source: "hook" | "protocol" };
   execution?: ExecutionState;
   permissionChannel?: PermissionChannelView;
@@ -566,6 +583,7 @@ export interface Bootstrap {
   profile: AgentProfile;
   stateDir: string;
   runDir: string;
+  socketDir?: string;
   key: string;
   prompt: string;
   codeMode: boolean;

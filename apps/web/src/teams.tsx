@@ -14,7 +14,7 @@ import { Decision } from "./team-decision";
 type TeamStatus = "planning" | "discovering" | "implementing" | "integrating" | "verifying" | "reviewing" | "delivering" | "merged" | "needs-input" | "paused" | "blocked" | "ready-for-review" | "no-change" | "cancelled";
 type TeamRole = "project-manager" | "intent-checker" | "scout" | "implementer" | "integrator" | "reviewer" | "delivery" | "evaluator";
 type TeamCommand = { command: string; args: string[] };
-export type TeamTask = { id: string; title: string; instructions: string; paths: string[]; dependsOn: string[]; status: "pending" | "running" | "waiting" | "integrated" | "blocked"; memberId?: string; commit?: string; summary?: string; agentProfileId?: string; escalation?: { fromProfileId?: string; toProfileId: string; reason: string; memberId: string; at: string }; limitSwitches?: LimitSwitch[]; usage?: TaskUsage; ownerRating?: OwnerRating; rubric?: Rubric };
+export type TeamTask = { id: string; title: string; instructions: string; paths: string[]; dependsOn: string[]; status: "pending" | "running" | "waiting" | "integrated" | "blocked"; memberId?: string; commit?: string; summary?: string; limitations?: string[]; agentProfileId?: string; escalation?: { fromProfileId?: string; toProfileId: string; reason: string; memberId: string; at: string }; limitSwitches?: LimitSwitch[]; usage?: TaskUsage; ownerRating?: OwnerRating; rubric?: Rubric };
 type TeamContinuation = { revision: number; requestId: string; at: string; reason: string; headCommit: string; tasks: TeamTask[]; review?: TeamView["review"]; brief?: TeamBrief };
 type TeamScout = { id: string; title: string; instructions: string; agentProfileId: string; status: "pending" | "running" | "waiting" | "complete"; memberId?: string; summary?: string; evidence?: TeamEvidence[] };
 type TeamMember = { memberId: string; sessionId: string; role: TeamRole; revision: number; title: string; status: string; taskId?: string; cwd: string; baseCommit: string; provider?: string; modelProfile?: TeamModelProfile; usage?: UsageTotals; stoppedReason?: string };
@@ -27,7 +27,7 @@ export function directionSourceLabel(source: { kind: string; name: string } | st
 type TeamDecision = { id: string; memberId: string; revision: number; question: string; options: string[]; answerMode?: "approval" | "single" | "multiple"; createdAt: string; answer?: string; answeredAt?: string; answeredBy?: "owner" | "coordinator" | "connector"; source?: { kind: "connector"; id: string; name: string }; recommendation?: { answers: string[]; reason: string; outcome?: "matched" | "different" | "other" } };
 export type TeamView = {
   id: string; projectId: string; provider: string; title: string; objective: string; parallelism: number;
-  revision: number; status: TeamStatus; createdAt: string; updatedAt: string; workspace: string;
+  revision: number; status: TeamStatus; createdAt: string; updatedAt: string; lastActivityAt?: string; workspace: string;
   branch: string; baseCommit: string; headCommit?: string; tasks: TeamTask[]; members: TeamMember[];
   decisions: TeamDecision[]; checks: { command: TeamCommand; status: "running" | "passed" | "failed" | "interrupted"; startedAt: string; finishedAt?: string; exitCode?: number | null; output: string; revision: number }[];
   steering: { text: string; revision: number; at: string; source?: { kind: "connector" | "github-review"; id: string; name: string } | "coordinator" | "slack" }[]; events: { at: string; text: string }[];
@@ -49,7 +49,7 @@ export type TeamView = {
   continuations?: TeamContinuation[];
   workers?: { limit: number; max: number; running: number; ready: number };
 };
-export type TeamListItem = Pick<TeamView, "id" | "projectId" | "provider" | "title" | "parallelism" | "revision" | "status" | "createdAt" | "updatedAt"
+export type TeamListItem = Pick<TeamView, "id" | "projectId" | "provider" | "title" | "parallelism" | "revision" | "status" | "createdAt" | "updatedAt" | "lastActivityAt"
   | "workspace" | "branch" | "baseCommit" | "headCommit" | "decisions" | "events" | "reason" | "missionId" | "resumable" | "continuable" | "workers"> & {
   members: (Omit<TeamMember, "cwd" | "baseCommit" | "modelProfile" | "usage"> & { startedAt?: string; reportedAt?: string; lastActivityAt?: string; pendingLimit?: boolean; stalledAt?: string;
     modelProfile?: Pick<TeamModelProfile, "label" | "provider" | "tier">; usage?: Pick<UsageTotals, "cost"> })[];

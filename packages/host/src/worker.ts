@@ -161,13 +161,8 @@ const persist = () => {
 function append(type: Event["type"], data: Event["data"]): Event {
   return appendAll(type, [data])[0];
 }
-function appendAll(type: Event["type"], items: Event["data"][]): Event[] {
-  try {
-    return journal.appendAll(type, items);
-  } catch (error) {
-    recordingFailure();
-    throw error;
-  }
+function appendAll(type: Event["type"], items: readonly Event["data"][]): Event[] {
+  try { return journal.appendAll(type, items); } catch (error) { recordingFailure(); throw error; }
 }
 function flush() {
   clearTimeout(flushTimer);
@@ -316,8 +311,9 @@ const transcriptWatch = new TranscriptWatch({
   onUsage: record => { append("usage", { ...record }); },
 });
 const MESSAGE_FIELDS = new Set(["id", "role", "text", "toolName", "ts"]);
-function recordMessage(message: TranscriptMessage) {
-  append("message", Object.fromEntries(Object.entries(message).filter(([key, value]) => MESSAGE_FIELDS.has(key) && value !== undefined)));
+function recordMessages(messages: readonly TranscriptMessage[]) {
+  if (!messages.length) return;
+  appendAll("message", messages.map(message => Object.fromEntries(Object.entries(message).filter(([key, value]) => MESSAGE_FIELDS.has(key) && value !== undefined))));
   if (state.capabilities?.transcript !== 1) {
     state = { ...state, capabilities: { ...state.capabilities, transcript: 1 } };
     persist();
@@ -326,7 +322,7 @@ function recordMessage(message: TranscriptMessage) {
 function onTranscript(body: unknown): HookReply | void {
   const reply = transcriptWatch.post(body);
   if (!reply) return;
-  for (const message of reply.messages) recordMessage(message);
+  recordMessages(reply.messages);
   return reply.secondaries ? { after: reply.after, secondaries: reply.secondaries } : { after: reply.after };
 }
 let handoffReceipt: string | undefined;
@@ -1569,7 +1565,7 @@ server.listen(workerSocket, async () => {
         onSignal: (signal) => {
           if (signal.kind === "provider-limit") { limitWatch = undefined; recordLimit(signal, "protocol"); } else record(signal, "protocol");
         },
-        onMessage: (message) => { recordMessage(message); },
+        onMessage: (message) => { recordMessages([message]); },
         record: (method) => { append("input-intent", { op: "native", method }); },
       });
       hybrid?.providerReady(native.supportsExecutionSelection);

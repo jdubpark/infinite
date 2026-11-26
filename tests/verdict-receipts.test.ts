@@ -98,7 +98,7 @@ test("a changed delivery fact composes one new verdict and a repeat composes non
   assert.equal(stateOf(f, "c4"), "not-met");
 });
 
-test("a restart at either save of a late verdict writes nothing twice", () => {
+test("a restart at any save of a late verdict writes nothing twice", () => {
   const counts = (f: Fixture, total: number): string[] => {
     const handles = recorded(f).map(entry => entry.handle!);
     assert.equal(recorded(f).length, total, "entries in the log");
@@ -130,18 +130,20 @@ test("a restart at either save of a late verdict writes nothing twice", () => {
   counts(b2, 2);
   assert.equal(b2.host.deliveryReads, 0, "the saved fact is composed without a read");
 
-  const c = delivered({ goal: true });
-  c.host.deliveryFact = "landed";
-  c.host.failSaveAt = 2;
-  assert.throws(() => c.verdicts.settleReceipt(c.holder));
-  assert.equal(recorded(c).length, 2, "the goal's record holds the entry already");
-  const c2 = reopen(c);
-  assert.equal(c2.holder.outbox.length, 1, "no row reached the saved holder");
-  assert.equal(c2.verdicts.settleReceipt(c2.holder), true);
-  assert.equal(recorded(c2).length, 2, "no second entry");
-  assert.equal(recorded(c2).at(-1)!.handle, `verdict:${c2.holder.verdict!.verdictId}`);
-  assert.equal(c2.holder.outbox.length, 2);
-  assert.equal(c2.holder.run.assessment?.verdictId, c2.holder.verdict!.verdictId);
+  for (const failing of [2, 3]) {
+    const c = delivered({ goal: true });
+    c.host.deliveryFact = "landed";
+    c.host.failSaveAt = failing;
+    assert.throws(() => c.verdicts.settleReceipt(c.holder));
+    assert.equal(recorded(c).length, failing === 3 ? 2 : 1, failing === 3 ? "the goal's record holds the entry already" : "nothing is written before the pending verdict is saved");
+    const c2 = reopen(c);
+    assert.equal(c2.holder.outbox.length, 1, "no row reached the saved holder");
+    assert.equal(c2.verdicts.settleReceipt(c2.holder), true);
+    assert.equal(recorded(c2).length, 2, "no second entry");
+    assert.equal(recorded(c2).at(-1)!.handle, `verdict:${c2.holder.verdict!.verdictId}`);
+    assert.equal(c2.holder.outbox.length, 2);
+    assert.equal(c2.holder.run.assessment?.verdictId, c2.holder.verdict!.verdictId);
+  }
 
   const d = delivered();
   d.host.deliveryFact = "landed";

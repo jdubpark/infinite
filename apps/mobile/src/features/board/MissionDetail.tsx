@@ -17,6 +17,7 @@ import { useRunRequest } from "../teams/useRunRequest";
 import { attemptLabel, attemptsOf, findBoardItem, missionControls, missionExtendChoices, missionShowsReason, missionStatusLabel, missionStopLine, missionStoppedAtLimit, missionSubtaskLabel, missionTimeLeftMs, openMissionDecisions } from "./model";
 import { DecisionOptions, OutcomeNote, RecommendationBlock, type DecisionRecommendation } from "../teams/Recommendation";
 import { Attempts } from "./Attempts";
+import { MissionProgressSection } from "./MissionProgressSection";
 
 export function MissionDetail({ connection, id }: { connection: Connection; id: string }) {
   const router = useRouter();
@@ -95,6 +96,14 @@ export function MissionDetail({ connection, id }: { connection: Connection; id: 
       </Section> : null}
 
       {attempts.length ? <Attempts attempts={attempts} current={id} machine={machine} now={now} /> : null}
+
+      <MissionProgressSection
+        connection={connection}
+        missionId={id}
+        repoName={repoName}
+        onOpenTeam={teamId => router.push({ pathname: "/team/[id]", params: { id: teamId, machine } })}
+        onOpenSession={sessionId => router.push({ pathname: "/session/[id]", params: { id: sessionId, machine } })}
+      />
 
       <Section title="Subtasks" count={mission.subtasks.length}>
         {mission.subtasks.length ? mission.subtasks.map(subtask => {

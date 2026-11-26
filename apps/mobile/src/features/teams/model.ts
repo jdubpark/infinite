@@ -9,13 +9,56 @@ export type TeamLineup = { coordinator: ModelProfile; integrator: ModelProfile; 
 export type LinearTracking = { status: "pending" | "synced" | "blocked" | "error"; reason?: string; checkedAt?: string; issue?: { identifier: string; url: string; title: string; state: { name: string } } };
 export type TeamEvidence = { source: string; observation: string };
 export type TeamBrief = { title: string; problem: string; evidence: TeamEvidence[]; dataShape: string; acceptance: string[]; expectedOutcome: string; uiChanges: boolean };
-export type TeamTask = { id: string; title: string; instructions: string; paths: string[]; dependsOn: string[]; status: "pending" | "running" | "waiting" | "integrated" | "blocked"; memberId?: string; commit?: string; summary?: string; agentProfileId?: string; escalation?: { toProfileId: string; reason: string }; usage?: TaskUsage; ownerRating?: OwnerRating; rubric?: Rubric };
-export type TeamContinuation = { revision: number; requestId: string; at: string; reason: string; headCommit: string; tasks: TeamTask[]; review?: { verdict: "approved" | "changes-requested"; summary: string; revision: number; uiEvidence?: string }; brief?: TeamBrief };
-export type TeamMember = { memberId: string; sessionId: string; role: TeamRole; revision: number; title: string; status: string; taskId?: string; provider?: string; modelProfile?: ModelProfile; stoppedReason?: string };
+export type TeamCriterion = {
+  id: string;
+  statement: string;
+  check: string;
+  producer: "host" | "evaluator" | "owner";
+  derived?: true;
+};
+export type TeamRecordDigest = {
+  version: number;
+  criteria: TeamCriterion[];
+};
+export type TeamTaskCriterionRefs = {
+  objectiveVersion: number;
+  criteria: string[];
+};
+export type TeamAcceptanceEvidence = {
+  criterion: number;
+  verdict: "verified" | "not-verified" | "inconclusive";
+  evidence: string;
+};
+export type TeamRunAssessment = {
+  verdictId: string;
+  revision: number;
+  head: string;
+  kind: "reviewed" | "no-change";
+  result: "met" | "not-met" | "inconclusive";
+  evaluatorResult?: "met" | "not-met" | "inconclusive";
+  reason?: "no-independent-evaluator" | "evaluator-unavailable" | "record-unavailable" | "context-too-large";
+  counts: { met: number; notMet: number; inconclusive: number; pendingOwner: number };
+  criteria: { id: string; state: "met" | "not-met" | "inconclusive" | "pending-owner" }[];
+  at: string;
+};
+export type TeamTask = {
+  id: string; title: string; instructions: string; paths: string[]; dependsOn: string[];
+  status: "pending" | "running" | "waiting" | "integrated" | "blocked";
+  memberId?: string; commit?: string; summary?: string; agentProfileId?: string;
+  criterionRefs?: TeamTaskCriterionRefs;
+  escalation?: { toProfileId: string; reason: string };
+  usage?: TaskUsage; ownerRating?: OwnerRating; rubric?: Rubric;
+};
+export type TeamContinuation = { revision: number; requestId: string; at: string; reason: string; headCommit: string; tasks: TeamTask[]; review?: { verdict: "approved" | "changes-requested"; summary: string; revision: number; uiEvidence?: string; acceptance?: TeamAcceptanceEvidence[] }; brief?: TeamBrief };
+export type TeamMember = {
+  memberId: string; sessionId: string; role: TeamRole; revision: number; title: string; status: string;
+  taskId?: string; provider?: string; modelProfile?: ModelProfile; stoppedReason?: string;
+  startedAt?: string; reportedAt?: string; lastActivityAt?: string; stalledAt?: string;
+};
 export type TeamDecision = { id: string; memberId: string; revision: number; question: string; options: string[]; createdAt: string; answer?: string; answeredAt?: string; answeredBy?: "owner" | "coordinator" | "connector"; source?: { kind: "connector"; id: string; name: string }; recommendation?: { answers: string[]; reason: string; outcome?: "matched" | "different" | "other" } };
 export type TeamWorkers = { limit: number; max: number; running: number; ready: number };
 export type PermissionDecision = { id: string; revision: number; targetMemberId: string; targetSessionId: string; promptId: number; expiresAt: string; status: "pending" | "reviewing" | "approved" | "answering" | "answered" | "escalated" | "stale" | "uncertain"; reason?: string };
-export type TeamCheck = { command: TeamCommand; phase?: "setup"; status: "running" | "passed" | "failed" | "interrupted"; startedAt: string; finishedAt?: string; exitCode?: number | null; output: string; revision: number };
+export type TeamCheck = { command: TeamCommand; phase?: "setup"; headCommit?: string; round?: number; status: "running" | "passed" | "failed" | "interrupted"; startedAt: string; finishedAt?: string; exitCode?: number | null; output: string; revision: number };
 export type TeamView = {
   id: string; projectId: string; provider: string; title: string; objective: string; parallelism: number;
   workers?: TeamWorkers;
@@ -23,11 +66,12 @@ export type TeamView = {
   branch: string; baseCommit: string; headCommit?: string; tasks: TeamTask[]; members: TeamMember[];
   decisions: TeamDecision[]; checks: TeamCheck[]; steering: { text: string; revision: number; at: string; source?: { kind: "connector" | "github-review"; id: string; name: string } | "coordinator" | "slack" }[];
   events: { at: string; text: string }[]; reason?: string; round: number;
-  review?: { verdict: "approved" | "changes-requested"; summary: string; revision: number; uiEvidence?: string };
+  review?: { verdict: "approved" | "changes-requested"; summary: string; revision: number; uiEvidence?: string; acceptance?: TeamAcceptanceEvidence[] };
+  assessment?: TeamRunAssessment;
   deliveryReceipt?: { revision: number; headCommit: string; pullRequestUrl: string; mergeCommit: string; summary: string; reportedAt: string };
   pullRequest?: { revision: number; headCommit: string; pullRequestUrl: string; summary: string; reportedAt: string };
   lineup?: TeamLineup; linear?: LinearTracking; brief?: TeamBrief;
-  goal?: { id: string; revision: number; cycle: number };
+  goal?: { id: string; revision: number; cycle: number; successCriteria?: string; record?: TeamRecordDigest };
   missionId?: string;
   noChange?: { summary: string; evidence: TeamEvidence[] };
   resumable?: boolean;

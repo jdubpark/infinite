@@ -559,6 +559,7 @@ test("remote router round-trips valid percent-encoded path segments to Express a
     { id: "café", encoded: "caf%C3%A9", planUsd: 44 },
     { id: "100%", encoded: "100%25", planUsd: 55 },
     { id: "a%b", encoded: "a%25b", planUsd: 66 },
+    { id: "a".repeat(201), encoded: "a".repeat(201), planUsd: 77 },
   ];
   const host = await inProcessHost({
     configure: config => {
@@ -629,7 +630,7 @@ test("remote router round-trips valid percent-encoded path segments to Express a
       ["PUT", "/usage/accounts/%25252e%25252e/plan"],
       ["PUT", "/usage/accounts/a%2520b/plan"],
       ["PUT", "/usage/accounts//plan"],
-      ["PUT", `/usage/accounts/${"a".repeat(201)}/plan`],
+      ["PUT", `/usage/accounts/${"a".repeat(8200)}/plan`],
       ["PUT", "/usage/%61ccounts/claude/plan"],
       ["PUT", "/usage/accounts/claude/%70lan"],
       ["GET", "/%6de"],

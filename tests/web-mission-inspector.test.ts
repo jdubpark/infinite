@@ -8,6 +8,11 @@ import {
   CHILD_TEAM_1,
   DECISION_ID,
   ENTRY_IDS,
+  GEN_1,
+  GEN_2,
+  INST_1,
+  INST_2,
+  makeProgressCursor,
   MISSION_ID,
 } from "./fixtures/web-mission-inspector-data";
 
@@ -17,10 +22,13 @@ const harness = fileURLToPath(new URL("./fixtures/web-mission-inspector-harness.
 const ORIGIN = "http://127.0.0.1/mission-inspector";
 
 type InspectorWindow = {
-  missionInspector: {
+  __missionInspector: {
     requests: { path: string; body?: unknown }[];
     mutations: { path: string; body: Record<string, unknown> }[];
     openedTeams: string[];
+    progressCursors: (string | null)[];
+    setResyncStage: (stage: number) => void;
+    advanceResyncStage: () => number;
   };
 };
 
@@ -49,7 +57,9 @@ describe("web mission inspector Playwright E2E", { skip: skipBrowser }, () => {
 
   async function open(query = ""): Promise<Page> {
     const page = await browser.newPage({ viewport: { width: 1360, height: 900 } });
-    await page.route(`${ORIGIN}*`, route => route.fulfill({ contentType: "text/html", body: '<div id="root"></div>' }));
+    await page.route(`${ORIGIN}*`, route =>
+      route.fulfill({ contentType: "text/html", body: '<!doctype html><div id="root"></div>' }),
+    );
     await page.goto(`${ORIGIN}${query}#/missions/${MISSION_ID}`);
     await page.addStyleTag({ content: `html,body{margin:0;height:100%}${styles}` });
     await page.addScriptTag({ content: script });
@@ -79,7 +89,7 @@ describe("web mission inspector Playwright E2E", { skip: skipBrowser }, () => {
         () => (document.querySelector(".team-detail-body")?.textContent ?? "").includes("Hold release until integration checks confirm commit B."),
       );
 
-      const mutations = await page.evaluate(() => (window as unknown as InspectorWindow).missionInspector.mutations);
+      const mutations = await page.evaluate(() => (window as unknown as InspectorWindow).__missionInspector.mutations);
       assert.equal(mutations.length, 2);
       assert.equal(mutations[0]!.path, `/missions/${MISSION_ID}/answer/${DECISION_ID}`);
       assert.match(String(mutations[0]!.body.requestId), /^[0-9a-f-]{36}$/);
@@ -104,16 +114,25 @@ describe("web mission inspector Playwright E2E", { skip: skipBrowser }, () => {
     const page = await open("?scenario=resync");
     try {
       await page.waitForFunction(
+        expected => (document.querySelector(".mission-cursor-line")?.textContent ?? "").includes(expected),
+        makeProgressCursor(GEN_1, INST_1, 1),
+      );
+      assert.equal(await page.locator(".mission-resync-notice").count(), 0);
+
+      await page.getByRole("button", { name: "Refresh mission" }).click();
+      await page.waitForFunction(
         () => (document.querySelector(".mission-observation-list")?.textContent ?? "").includes("Progress sequence #3"),
       );
       assert.equal(await page.locator(".mission-resync-notice").count(), 0);
 
+      await page.evaluate(() => (window as unknown as InspectorWindow).__missionInspector.setResyncStage(1));
       await page.getByRole("button", { name: "Refresh mission" }).click();
       await page.waitForSelector(".mission-resync-notice");
       const bannerText = await page.locator(".mission-resync-notice").textContent();
       assert.match(bannerText ?? "", /Progress resynced \(host-restarted\)/);
       assert.match(bannerText ?? "", /Host restarted since your last progress cursor/);
 
+      await page.evaluate(() => (window as unknown as InspectorWindow).__missionInspector.setResyncStage(2));
       await page.getByRole("button", { name: "Refresh mission" }).click();
       await page.waitForFunction(() => {
         const text = document.querySelector(".mission-observation-list")?.textContent ?? "";
@@ -123,15 +142,35 @@ describe("web mission inspector Playwright E2E", { skip: skipBrowser }, () => {
       const obsText = await page.locator(".mission-observation-list").textContent();
       assert.match(obsText ?? "", /Progress sequence #3.*ready-for-review · revision 6/);
       assert.match(obsText ?? "", /Progress sequence #2.*working · revision 5/);
+
+      const cursors = await page.evaluate(() => (window as unknown as InspectorWindow).__missionInspector.progressCursors);
+      assert.ok(cursors.includes(null));
+      assert.ok(cursors.includes(makeProgressCursor(GEN_1, INST_1, 1)));
+      assert.ok(cursors.includes(makeProgressCursor(GEN_1, INST_1, 3)));
+      assert.ok(cursors.includes(makeProgressCursor(GEN_2, INST_2, 1)));
     } finally {
       await page.close();
     }
   });
 
-  test("compacts finished assignments, drills into child blackboard entries, opens team, and satisfies 44px control floor", async () => {
+  test("compacts finished assignments, drills into child blackboard entries, opens team, handles not-created subtask, and satisfies 44px floor", async () => {
     const page = await open();
     try {
       await page.waitForSelector(".mission-assignment-list");
+
+      const gridLayout = await page.evaluate(() => {
+        const listRect = document.querySelector(".mission-subtask-list")!.getBoundingClientRect();
+        const detailRect = document.querySelector(".mission-subtask-detail")!.getBoundingClientRect();
+        return {
+          listRight: Math.round(listRect.right),
+          detailLeft: Math.round(detailRect.left),
+          listTop: Math.round(listRect.top),
+          detailTop: Math.round(detailRect.top),
+        };
+      });
+      assert.ok(gridLayout.listRight <= gridLayout.detailLeft, `expected side-by-side desktop layout, got ${JSON.stringify(gridLayout)}`);
+      assert.equal(gridLayout.listTop, gridLayout.detailTop);
+
       const activeText = await page.locator(".mission-assignment-list").first().textContent();
       assert.match(activeText ?? "", /Integrator · t-api/);
       assert.match(activeText ?? "", /Earlier attempt \(stopped · r1/);
@@ -187,7 +226,7 @@ describe("web mission inspector Playwright E2E", { skip: skipBrowser }, () => {
       assert.match(detailText ?? "", /blackboard #102/);
       assert.match(detailText ?? "", /Updated generation check/);
 
-      const requests = await page.evaluate(() => (window as unknown as InspectorWindow).missionInspector.requests.map(r => r.path));
+      const requests = await page.evaluate(() => (window as unknown as InspectorWindow).__missionInspector.requests.map(r => r.path));
       assert.ok(requests.includes(`/teams/${CHILD_TEAM_1}/entries/${ENTRY_IDS.handoff}`));
 
       await page.locator(".mission-entries-controls select").selectOption("check");
@@ -195,8 +234,17 @@ describe("web mission inspector Playwright E2E", { skip: skipBrowser }, () => {
       assert.match((await page.locator(".mission-entry-list").textContent()) ?? "", /blackboard #101/);
 
       await page.getByRole("button", { name: "Open team" }).click();
-      const openedTeams = await page.evaluate(() => (window as unknown as InspectorWindow).missionInspector.openedTeams);
+      const openedTeams = await page.evaluate(() => (window as unknown as InspectorWindow).__missionInspector.openedTeams);
       assert.deepEqual(openedTeams, [CHILD_TEAM_1]);
+
+      await page.getByRole("option", { name: /Web inspector layout/ }).click();
+      await page.waitForFunction(() =>
+        (document.querySelector(".mission-subtask-detail")?.textContent ?? "").includes(
+          "No subteam run has been created for this subtask yet.",
+        ),
+      );
+      assert.equal(await page.getByRole("tab", { name: "Blackboard entries" }).count(), 0);
+      assert.equal(await page.getByRole("button", { name: "Open team" }).count(), 0);
     } finally {
       await page.close();
     }

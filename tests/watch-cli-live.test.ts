@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
+import type { Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -308,53 +309,39 @@ function seedBlackboard(blackboard: Blackboard, team1: TeamRun, team2: TeamRun):
   return { supersededFindingId: firstId, latestFindingId: secondId };
 }
 
+function overrideProp(target: object, key: string, value: unknown): () => void {
+  const saved = Object.getOwnPropertyDescriptor(target, key);
+  Object.defineProperty(target, key, { value, configurable: true, writable: true });
+  return () => {
+    if (saved) Object.defineProperty(target, key, saved);
+    else delete (target as Record<string, unknown>)[key];
+  };
+}
+
 function withInteractiveStreams(options: { ttyOut: boolean; onOut?: (chunk: string) => void }): () => void {
-  const stdout = process.stdout as NodeJS.WriteStream & Record<string, unknown>;
-  const stdin = process.stdin as NodeJS.ReadStream & Record<string, unknown>;
-
-  const savedStdoutIsTty = Object.getOwnPropertyDescriptor(stdout, "isTTY");
-  const savedStdoutRows = Object.getOwnPropertyDescriptor(stdout, "rows");
-  const savedStdoutCols = Object.getOwnPropertyDescriptor(stdout, "columns");
-  const savedStdoutWrite = stdout.write;
-
-  const savedStdinIsTty = Object.getOwnPropertyDescriptor(stdin, "isTTY");
-  const savedStdinRaw = Object.getOwnPropertyDescriptor(stdin, "setRawMode");
-  const savedStdinEncoding = stdin.setEncoding;
-  const savedStdinResume = stdin.resume;
-  const savedStdinPause = stdin.pause;
-
-  Object.defineProperty(stdout, "isTTY", { value: options.ttyOut, configurable: true });
-  Object.defineProperty(stdout, "rows", { value: 60, configurable: true });
-  Object.defineProperty(stdout, "columns", { value: 120, configurable: true });
-  if (options.onOut) {
-    stdout.write = ((chunk: string | Uint8Array) => {
-      options.onOut!(String(chunk));
-      return true;
-    }) as typeof process.stdout.write;
-  }
-
-  Object.defineProperty(stdin, "isTTY", { value: true, configurable: true });
-  Object.defineProperty(stdin, "setRawMode", { value: () => stdin, configurable: true });
-  stdin.setEncoding = (() => stdin) as typeof process.stdin.setEncoding;
-  stdin.resume = (() => stdin) as typeof process.stdin.resume;
-  stdin.pause = (() => stdin) as typeof process.stdin.pause;
+  const stdout = process.stdout;
+  const stdin = process.stdin;
+  const restorers = [
+    overrideProp(stdout, "isTTY", options.ttyOut),
+    overrideProp(stdout, "rows", 60),
+    overrideProp(stdout, "columns", 120),
+    ...(options.onOut
+      ? [
+          overrideProp(stdout, "write", ((chunk: string | Uint8Array) => {
+            options.onOut!(String(chunk));
+            return true;
+          }) as typeof process.stdout.write),
+        ]
+      : []),
+    overrideProp(stdin, "isTTY", true),
+    overrideProp(stdin, "setRawMode", () => stdin),
+    overrideProp(stdin, "setEncoding", () => stdin),
+    overrideProp(stdin, "resume", () => stdin),
+    overrideProp(stdin, "pause", () => stdin),
+  ];
 
   return () => {
-    if (savedStdoutIsTty) Object.defineProperty(stdout, "isTTY", savedStdoutIsTty);
-    else delete stdout.isTTY;
-    if (savedStdoutRows) Object.defineProperty(stdout, "rows", savedStdoutRows);
-    else delete stdout.rows;
-    if (savedStdoutCols) Object.defineProperty(stdout, "columns", savedStdoutCols);
-    else delete stdout.columns;
-    stdout.write = savedStdoutWrite;
-
-    if (savedStdinIsTty) Object.defineProperty(stdin, "isTTY", savedStdinIsTty);
-    else delete stdin.isTTY;
-    if (savedStdinRaw) Object.defineProperty(stdin, "setRawMode", savedStdinRaw);
-    else delete stdin.setRawMode;
-    stdin.setEncoding = savedStdinEncoding;
-    stdin.resume = savedStdinResume;
-    stdin.pause = savedStdinPause;
+    for (const restore of restorers.reverse()) restore();
   };
 }
 
@@ -575,31 +562,40 @@ function createWatchServer(blackboard: Blackboard, team1: TeamRun, team2: TeamRu
 }
 
 test("runTeamWatch --board drives real HTTP Blackboard, supersedes, filters, member jump, summary/logs/board modes, and exits cleanly", async () => {
-  const root = mkdtempSync(join(tmpdir(), "inf-live-team-watch-"));
-  const key = randomBytes(32);
-  const store = new EvidenceStore({ databasePath: evidenceDatabasePath(root), vaultKey: key });
-  const blackboard = new Blackboard(store);
-  const team1 = makeTeam1Run();
-  const team2 = makeTeam2Run();
-  const { supersededFindingId } = seedBlackboard(blackboard, team1, team2);
-  const controller = createWatchServer(blackboard, team1, team2);
-  const server = controller.app.listen(0, "127.0.0.1");
-  await new Promise<void>(resolve => server.once("listening", resolve));
-  const { port } = server.address() as AddressInfo;
-  const api = createClientApi({ origin: `http://127.0.0.1:${port}`, token: TOKEN });
-
-  const frames: string[] = [];
-  const restoreStreams = withInteractiveStreams({
-    ttyOut: true,
-    onOut: chunk => frames.push(stripAnsi(chunk)),
-  });
+  let root: string | null = null;
+  let store: EvidenceStore | null = null;
+  let server: Server | null = null;
+  let restoreStreams: (() => void) | null = null;
+  let watchDone: Promise<boolean> | null = null;
+  let watchSettled = false;
 
   try {
-    const watchDone = runTeamWatch({
+    root = mkdtempSync(join(tmpdir(), "inf-live-team-watch-"));
+    const key = randomBytes(32);
+    store = new EvidenceStore({ databasePath: evidenceDatabasePath(root), vaultKey: key });
+    const blackboard = new Blackboard(store);
+    const team1 = makeTeam1Run();
+    const team2 = makeTeam2Run();
+    const { supersededFindingId } = seedBlackboard(blackboard, team1, team2);
+    const controller = createWatchServer(blackboard, team1, team2);
+    server = controller.app.listen(0, "127.0.0.1");
+    await new Promise<void>(resolve => server!.once("listening", resolve));
+    const { port } = server.address() as AddressInfo;
+    const api = createClientApi({ origin: `http://127.0.0.1:${port}`, token: TOKEN });
+
+    const frames: string[] = [];
+    restoreStreams = withInteractiveStreams({
+      ttyOut: true,
+      onOut: chunk => frames.push(stripAnsi(chunk)),
+    });
+
+    watchDone = runTeamWatch({
       subcommand: "watch",
       id: TEAM_1,
       options: { json: false, logs: false, board: true },
       api,
+    }).finally(() => {
+      watchSettled = true;
     });
 
     const latestScreen = () => frames[frames.length - 1] ?? "";
@@ -678,35 +674,50 @@ test("runTeamWatch --board drives real HTTP Blackboard, supersedes, filters, mem
     const result = await watchDone;
     assert.equal(result, true);
   } finally {
-    restoreStreams();
-    await new Promise<void>(resolve => server.close(() => resolve()));
-    store.close();
-    rmSync(root, { recursive: true, force: true });
+    if (watchDone) {
+      if (!watchSettled) process.stdin.emit("data", "q");
+      await watchDone.catch(() => {});
+    }
+    restoreStreams?.();
+    if (server) {
+      server.closeAllConnections?.();
+      await new Promise<void>(resolve => server!.close(() => resolve()));
+    }
+    store?.close();
+    if (root) rmSync(root, { recursive: true, force: true });
   }
 });
 
 test("runMissionWatch drives real MissionProgressService cursor advance, restart resync, subtask switch, and Enter detail with follow off", async () => {
-  const root = mkdtempSync(join(tmpdir(), "inf-live-mission-watch-"));
-  const key = randomBytes(32);
-  const store = new EvidenceStore({ databasePath: evidenceDatabasePath(root), vaultKey: key });
-  const blackboard = new Blackboard(store);
-  const team1 = makeTeam1Run();
-  const team2 = makeTeam2Run();
-  seedBlackboard(blackboard, team1, team2);
-  const controller = createWatchServer(blackboard, team1, team2);
-  const server = controller.app.listen(0, "127.0.0.1");
-  await new Promise<void>(resolve => server.once("listening", resolve));
-  const { port } = server.address() as AddressInfo;
-  const api = createClientApi({ origin: `http://127.0.0.1:${port}`, token: TOKEN });
-
-  const frames: string[] = [];
-  const restoreStreams = withInteractiveStreams({ ttyOut: false });
+  let root: string | null = null;
+  let store: EvidenceStore | null = null;
+  let server: Server | null = null;
+  let restoreStreams: (() => void) | null = null;
+  const watchAbort = new AbortController();
+  let watchDone: Promise<void> | null = null;
 
   try {
-    const watchDone = runMissionWatch(api, MISSION_ID, {
+    root = mkdtempSync(join(tmpdir(), "inf-live-mission-watch-"));
+    const key = randomBytes(32);
+    store = new EvidenceStore({ databasePath: evidenceDatabasePath(root), vaultKey: key });
+    const blackboard = new Blackboard(store);
+    const team1 = makeTeam1Run();
+    const team2 = makeTeam2Run();
+    seedBlackboard(blackboard, team1, team2);
+    const controller = createWatchServer(blackboard, team1, team2);
+    server = controller.app.listen(0, "127.0.0.1");
+    await new Promise<void>(resolve => server!.once("listening", resolve));
+    const { port } = server.address() as AddressInfo;
+    const api = createClientApi({ origin: `http://127.0.0.1:${port}`, token: TOKEN });
+
+    const frames: string[] = [];
+    restoreStreams = withInteractiveStreams({ ttyOut: false });
+
+    watchDone = runMissionWatch(api, MISSION_ID, {
       tty: false,
       interactive: true,
       pollIntervalMs: 25,
+      signal: watchAbort.signal,
       onFrame: frame => frames.push(stripAnsi(frame)),
     });
 
@@ -773,9 +784,14 @@ test("runMissionWatch drives real MissionProgressService cursor advance, restart
     process.stdin.emit("data", "q");
     await watchDone;
   } finally {
-    restoreStreams();
-    await new Promise<void>(resolve => server.close(() => resolve()));
-    store.close();
-    rmSync(root, { recursive: true, force: true });
+    watchAbort.abort();
+    if (watchDone) await watchDone.catch(() => {});
+    restoreStreams?.();
+    if (server) {
+      server.closeAllConnections?.();
+      await new Promise<void>(resolve => server!.close(() => resolve()));
+    }
+    store?.close();
+    if (root) rmSync(root, { recursive: true, force: true });
   }
 });

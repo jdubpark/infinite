@@ -4,30 +4,79 @@ import { ApiContext, type Api } from "../../apps/web/src/api";
 import { MachineProvider } from "../../apps/web/src/machines";
 import { MissionPage } from "../../apps/web/src/missions";
 import {
-  buildResyncPolls,
+  buildResyncStageResponses,
   CHILD_TEAM_1,
   createFixtureMission,
   createProgressSnapshot,
   fixtureChildEntries,
   fixtureMe,
   GEN_1,
+  GEN_2,
   INST_1,
+  INST_2,
+  makeProgressCursor,
   MISSION_ID,
 } from "./web-mission-inspector-data";
 
 const params = new URLSearchParams(window.location.search);
 const scenario = params.get("scenario") ?? "inspector";
-const resyncPolls = buildResyncPolls();
+const resyncStages = buildResyncStageResponses();
 
 let mission = createFixtureMission();
-let progressPollIndex = 0;
+let resyncStage = 0;
+let stage0InitialSent = false;
+let stage0BatchSent = false;
+let stage1RestartSent = false;
+let stage2BatchSent = false;
 
 const control = {
   requests: [] as { path: string; body?: unknown }[],
   mutations: [] as { path: string; body: unknown }[],
   openedTeams: [] as string[],
+  progressCursors: [] as (string | null)[],
+  setResyncStage(stage: number) {
+    resyncStage = stage;
+  },
+  advanceResyncStage() {
+    resyncStage += 1;
+    return resyncStage;
+  },
 };
-Object.assign(window, { missionInspector: control });
+Object.assign(window, { missionInspector: control, __missionInspector: control });
+
+function nextResyncPage(cursor: string | null) {
+  control.progressCursors.push(cursor);
+  if (resyncStage === 0) {
+    if (!stage0InitialSent) {
+      if (cursor !== null) throw new Error(`Stage 0 initial expected null cursor, got ${cursor}`);
+      stage0InitialSent = true;
+      return structuredClone(resyncStages.stage0Initial);
+    }
+    if (!stage0BatchSent) {
+      const expected = makeProgressCursor(GEN_1, INST_1, 1);
+      if (cursor !== expected) throw new Error(`Stage 0 batch expected cursor ${expected}, got ${cursor}`);
+      stage0BatchSent = true;
+      return structuredClone(resyncStages.stage0Batch);
+    }
+    return structuredClone(resyncStages.stage0Idle);
+  }
+  if (resyncStage === 1) {
+    if (!stage1RestartSent) {
+      const expected = makeProgressCursor(GEN_1, INST_1, 3);
+      if (cursor !== expected) throw new Error(`Stage 1 restart expected cursor ${expected}, got ${cursor}`);
+      stage1RestartSent = true;
+      return structuredClone(resyncStages.stage1Restart);
+    }
+    return structuredClone(resyncStages.stage1Idle);
+  }
+  if (!stage2BatchSent) {
+    const expected = makeProgressCursor(GEN_2, INST_2, 1);
+    if (cursor !== expected) throw new Error(`Stage 2 batch expected cursor ${expected}, got ${cursor}`);
+    stage2BatchSent = true;
+    return structuredClone(resyncStages.stage2Batch);
+  }
+  return structuredClone(resyncStages.stage2Idle);
+}
 
 const host = (async (path: string, body?: unknown) => {
   control.requests.push({ path, ...(body === undefined ? {} : { body }) });
@@ -78,19 +127,14 @@ const host = (async (path: string, body?: unknown) => {
 
   if (path.startsWith(`/missions/${MISSION_ID}/progress`)) {
     if (scenario === "resync") {
-      const idx = Math.min(progressPollIndex, resyncPolls.length - 1);
-      progressPollIndex += 1;
-      if (progressPollIndex > resyncPolls.length) {
-        const last = resyncPolls[resyncPolls.length - 1]!;
-        return { ...last, observations: [] };
-      }
-      return structuredClone(resyncPolls[idx]!);
+      const url = new URL(path, "http://127.0.0.1");
+      return nextResyncPage(url.searchParams.get("cursor"));
     }
     const hasCursor = path.includes("cursor=");
     return {
       missionId: MISSION_ID,
       generation: GEN_1,
-      cursor: `mp1.${GEN_1}.${MISSION_ID}.${INST_1}.1`,
+      cursor: makeProgressCursor(GEN_1, INST_1, 1),
       observedAt: "2026-11-26T01:10:00.000Z",
       resync: hasCursor ? { required: false } : { required: true, reason: "initial" },
       observations: [],

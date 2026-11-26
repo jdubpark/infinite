@@ -223,7 +223,7 @@ export function createProgressSnapshot(
   };
 }
 
-function makeCursor(generation: string, instance: string, sequence: number): string {
+export function makeProgressCursor(generation: string, instance: string, sequence: number): string {
   return `mp1.${generation}.${MISSION_ID}.${instance}.${sequence}`;
 }
 
@@ -235,51 +235,98 @@ function makeObservation(
   status: MissionProgressSnapshot["mission"]["status"],
 ): MissionProgressObservation {
   return {
-    cursor: makeCursor(generation, instance, sequence),
+    cursor: makeProgressCursor(generation, instance, sequence),
     sequence,
     observedAt: `2026-11-26T01:1${sequence}:00.000Z`,
     snapshot: createProgressSnapshot(revision, status, "running"),
   };
 }
 
-export function buildResyncPolls(): MissionProgressPage[] {
-  const poll1Obs = [
+export function buildResyncStageResponses(): {
+  stage0Initial: MissionProgressPage;
+  stage0Batch: MissionProgressPage;
+  stage0Idle: MissionProgressPage;
+  stage1Restart: MissionProgressPage;
+  stage1Idle: MissionProgressPage;
+  stage2Batch: MissionProgressPage;
+  stage2Idle: MissionProgressPage;
+} {
+  const gen1Obs = [
     makeObservation(GEN_1, INST_1, 2, 4, "working"),
     makeObservation(GEN_1, INST_1, 3, 4, "needs-input"),
   ];
-  const poll3Obs = [
+  const gen2Obs = [
     makeObservation(GEN_2, INST_2, 2, 5, "working"),
     makeObservation(GEN_2, INST_2, 3, 6, "ready-for-review"),
   ];
-  return [
-    {
+  const gen1Start = createProgressSnapshot(4, "planning", "running");
+  const gen2Start = createProgressSnapshot(5, "working", "unavailable");
+
+  return {
+    stage0Initial: {
       missionId: MISSION_ID,
       generation: GEN_1,
-      cursor: makeCursor(GEN_1, INST_1, 3),
-      observedAt: "2026-11-26T01:13:00.000Z",
+      cursor: makeProgressCursor(GEN_1, INST_1, 1),
+      observedAt: "2026-11-26T01:11:00.000Z",
       resync: { required: true, reason: "initial" },
-      observations: poll1Obs,
-      snapshot: poll1Obs[1]!.snapshot,
+      observations: [],
+      snapshot: gen1Start,
     },
-    {
+    stage0Batch: {
+      missionId: MISSION_ID,
+      generation: GEN_1,
+      cursor: makeProgressCursor(GEN_1, INST_1, 3),
+      observedAt: "2026-11-26T01:13:00.000Z",
+      resync: { required: false },
+      observations: gen1Obs,
+      snapshot: gen1Obs[1]!.snapshot,
+    },
+    stage0Idle: {
+      missionId: MISSION_ID,
+      generation: GEN_1,
+      cursor: makeProgressCursor(GEN_1, INST_1, 3),
+      observedAt: "2026-11-26T01:13:30.000Z",
+      resync: { required: false },
+      observations: [],
+      snapshot: gen1Obs[1]!.snapshot,
+    },
+    stage1Restart: {
       missionId: MISSION_ID,
       generation: GEN_2,
-      cursor: makeCursor(GEN_2, INST_2, 1),
+      cursor: makeProgressCursor(GEN_2, INST_2, 1),
       observedAt: "2026-11-26T01:14:00.000Z",
       resync: { required: true, reason: "host-restarted" },
       observations: [],
-      snapshot: createProgressSnapshot(5, "working", "unavailable"),
+      snapshot: gen2Start,
     },
-    {
+    stage1Idle: {
       missionId: MISSION_ID,
       generation: GEN_2,
-      cursor: makeCursor(GEN_2, INST_2, 3),
+      cursor: makeProgressCursor(GEN_2, INST_2, 1),
+      observedAt: "2026-11-26T01:14:30.000Z",
+      resync: { required: false },
+      observations: [],
+      snapshot: gen2Start,
+    },
+    stage2Batch: {
+      missionId: MISSION_ID,
+      generation: GEN_2,
+      cursor: makeProgressCursor(GEN_2, INST_2, 3),
       observedAt: "2026-11-26T01:16:00.000Z",
       resync: { required: false },
-      observations: poll3Obs,
-      snapshot: poll3Obs[1]!.snapshot,
+      observations: gen2Obs,
+      snapshot: gen2Obs[1]!.snapshot,
     },
-  ];
+    stage2Idle: {
+      missionId: MISSION_ID,
+      generation: GEN_2,
+      cursor: makeProgressCursor(GEN_2, INST_2, 3),
+      observedAt: "2026-11-26T01:16:30.000Z",
+      resync: { required: false },
+      observations: [],
+      snapshot: gen2Obs[1]!.snapshot,
+    },
+  };
 }
 
 export const fixtureChildEntries: { head: EntryHeadView; body: unknown }[] = [

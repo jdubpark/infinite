@@ -33,7 +33,7 @@ function allowedPath(method: RemoteMethod, path: string): boolean {
   if (method === "GET" && /^\/api\/permissions\/decisions\/[A-Za-z0-9_.:-]{1,200}$/.test(url.pathname)) return true;
   if (method === "POST" && url.pathname === "/api/permissions/marks") return true;
   if (method === "GET" && url.pathname === "/api/halt") return true;
-  if (method === "GET" && ["/api/usage", "/api/usage/daily", "/api/usage/models", "/api/usage/projects"].includes(url.pathname)) return true;
+  if (method === "GET" && ["/api/usage", "/api/usage/daily", "/api/usage/models", "/api/usage/projects", "/api/usage/repair-loops"].includes(url.pathname)) return true;
   if (method === "GET" && /^\/api\/usage\/projects\/[a-z0-9-]{1,80}$/.test(url.pathname)) return true;
   if (method === "POST" && url.pathname === "/api/usage/balances/refresh") return true;
   if (method === "PUT" && /^\/api\/usage\/accounts\/[A-Za-z0-9_.-]+\/plan$/.test(url.pathname)) return true;

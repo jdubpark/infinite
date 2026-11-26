@@ -1,10 +1,12 @@
 import ctypes
 import os
 import pathlib
+import re
 import secrets
 import select
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tarfile
@@ -12,8 +14,29 @@ import tempfile
 import time
 
 os.umask(0o022)
-allowed = {"worker.py", "toolchain.json", "snapshot.json", "source.pack", "working-tree.tar"}
+allowed = {"worker.py", "project.py", "toolchain.json", "snapshot.json", "source.pack", "working-tree.tar"}
 interrupted = 0
+def admit_workspace():
+    if len(sys.argv) != 2:
+        raise RuntimeError("missing workspace selection")
+    expected = sys.argv[1]
+    if expected != "-" and not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}", expected):
+        raise RuntimeError("invalid workspace selection")
+    try:
+        descriptor = os.open("/etc/infinite-check-workspace", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        if expected != "-":
+            raise RuntimeError("runner has no workspace binding")
+    else:
+        with os.fdopen(descriptor, "rb") as marker:
+            info = os.fstat(marker.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+                raise RuntimeError("runner workspace binding is not administrator-owned")
+            label = expected.encode("ascii")
+            if expected == "-" or marker.read(66) not in (label, label + b"\n"):
+                raise RuntimeError("runner does not belong to the selected workspace")
+    print("INFINITE-CHECK-READY-v2", flush=True)
+
 def on_signal(number, _frame):
     global interrupted
     interrupted = number
@@ -149,6 +172,7 @@ def launch_systemd(base, env, token, systemd):
         time.sleep(0.1)
     return child.returncode, False
 try:
+    admit_workspace()
     header = sys.stdin.buffer.read(8)
     if len(header) != 8:
         raise EOFError("missing verification frame")
@@ -185,6 +209,7 @@ try:
         token = secrets.token_hex(16)
         run_id = "iv-" + token
         env["INFINITE_CHECK_RUN_ID"] = run_id
+        env["INFINITE_CHECK_WORKSPACE"] = sys.argv[1]
         env["INFINITE_CHECK_HOME"] = private_home
         systemd = systemd_probe(token, base, env)
         try:

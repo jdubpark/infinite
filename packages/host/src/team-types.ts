@@ -134,6 +134,7 @@ export interface TeamPermissionDecision {
   requestedPaths?: string[];
   status: "pending" | "reviewing" | "approved" | "answering" | "answered" | "escalated" | "stale" | "uncertain";
   reason?: string;
+  promptClosedAt?: string;
   receipt?: Receipt & { result?: AnswerResult };
 }
 export interface TeamPermissionRecoveryStep {

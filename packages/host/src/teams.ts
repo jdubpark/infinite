@@ -11,7 +11,7 @@ import { bootId, extendWitness, hostProcesses, newWitness, recordCommand, type C
 import type { WorkerError } from "./ipc.js";
 import { writeSealed, unseal } from "./vault.js";
 import { accountSettingPrompt, PROVIDER_NAMES, recoveryTurnEnd, type AttentionState, type Prompt, type SignalData } from "@infinite/attention";
-import { evaluateStallRecovery, MEMBER_STALL_REASON } from "./stall-recovery.js";
+import { activeStageForRole, evaluateStallRecovery, MEMBER_STALL_REASON, syncObservedMemberState, type LivePromptRef } from "./stall-recovery.js";
 import { describeTeamWaitReasons, PERMISSION_AGENT_REASON, PERMISSION_REVIEW_REASON, PROVIDER_INPUT_REASON, SESSION_SLOT_REASON } from "./team-wait-reasons.js";
 import { autonomyOf, type AutonomyMode } from "./autonomy.js";
 import { buildTeamPendingOperation, createTeamSchema, decisionAnswerLabel, inputSourceLabel, lineupProfiles, resolveLimitFallback, teamActionSchema, teamGoalContextSchema, teamLineupSchema, teamMutationSchema, teamMemberRetireSchema, teamParallelismSchema, recordedTeamReportEnvelopeSchema, type CreateTeam, type SteeringSource, type TeamContinue, type TeamGoalContext, type TeamLineup, type TeamMember, type TeamMemberRetire, type TeamModelProfile, type TeamParallelism, type TeamPermissionDecision, type TeamPermissionRecoveryView, type TeamReport, type TeamRun, type TeamScout, type TeamTask, type TeamView, type TeamVerificationReconcile, type TeamDeliveryReconcile, currentPermissions, DEFAULT_STORAGE_FLOOR, hostClosedBlockedReason, autoPinned, coversPoint, escalationPool, hostProfilesFor, memberLimit, switchFallback } from "./team-types.js";
@@ -1668,15 +1668,15 @@ export class TeamService {
   private stallWindowFor(member: TeamMember) {
     return member.role === "reviewer" ? Math.min(this.stallWindow(), REVIEW_QUIET_WINDOW_MS) : this.stallWindow();
   }
-  private evalStall(stored: Stored, member: TeamMember, attentionState: AttentionState, journalDrained: boolean, phase: "detect" | "replace") {
+  private evalStall(stored: Stored, member: TeamMember, attentionState: AttentionState, journalDrained: boolean, phase: "detect" | "replace", activePrompt?: LivePromptRef | null) {
     const nowMs = this.currentDate().getTime();
-    return evaluateStallRecovery({ run: stored.run, member, attentionState, quietForMs: nowMs - Date.parse(member.lastActivityAt ?? member.startedAt ?? timestamp()), stallWindowMs: this.stallWindowFor(member), journalDrained, hasDeliveryAttempt: Boolean(stored.deliveryAttempt), nowMs, phase });
+    return evaluateStallRecovery({ run: stored.run, member, attentionState, ...(activePrompt !== undefined ? { activePrompt } : {}), quietForMs: nowMs - Date.parse(member.lastActivityAt ?? member.startedAt ?? timestamp()), stallWindowMs: this.stallWindowFor(member), journalDrained, hasDeliveryAttempt: Boolean(stored.deliveryAttempt), nowMs, phase });
   }
-  private async detectStall(stored: Stored, member: TeamMember, attentionState: AttentionState, journalDrained: boolean, exited = false) {
-    const stall = this.evalStall(stored, member, attentionState, journalDrained, "detect");
+  private async detectStall(stored: Stored, member: TeamMember, attentionState: AttentionState, journalDrained: boolean, exited = false, activePrompt?: LivePromptRef | null) {
+    const stall = this.evalStall(stored, member, attentionState, journalDrained, "detect", activePrompt);
     if (stall.action === "suppress-duplicate" || (exited && stall.action === "none" && stall.guard === "current-assignment" && stall.reason !== "inactive-run-status")) { member.status = "stopped"; this.save(stored); return false; }
     if (stall.action !== "initiate-stop" && stall.action !== "end-replay") return false;
-    await this.replaceStalledMember(stored, member, attentionState);
+    await this.replaceStalledMember(stored, member, attentionState, activePrompt);
     return Boolean(stored.pending || stored.run.status === "blocked");
   }
   private extendDeadline(run: TeamRun, budget: TeamGoalContext | TeamHandoffContext) {
@@ -1979,13 +1979,14 @@ export class TeamService {
       let continuedAfterExpansion = false;
       const awaitingExpandedPrompt = Boolean(recovery?.expansion && ["expanded", "uncertain"].includes(recovery.expansion.status) &&
         recovery.expansion.observedPromptId === undefined && livePermissionRecoveryStatuses.has(recovery.status));
-      let obsolete = terminal || !decision || decision.status !== "reviewing" || !target || !activeMember(target);
+      let obsolete = terminal || !decision || decision.status !== "reviewing" || !target || !activeMember(target), promptClosed = !target || !activeMember(target);
       if (!obsolete && decision && target) {
         try {
           const state = await this.manager.state(target.sessionId, true), prompt = state.attention.prompt;
           obsolete = state.status !== "running" || state.attention.state !== "needs-you" || !prompt ||
             prompt.id !== decision.promptId || prompt.hash !== decision.promptHash ||
             permissionEvidenceHash(prompt) !== decision.evidenceHash;
+          promptClosed = obsolete && (state.status === "running" || state.status === "exited");
           if (obsolete && state.status === "running" && state.attention.state === "needs-you" &&
               (!state.control || state.control.expiresAt <= Date.now()) && prompt && recovery)
             continuedAfterExpansion = this.advanceExpandedPermissionPrompt(stored, recovery, target, prompt);
@@ -1994,7 +1995,7 @@ export class TeamService {
       if (!obsolete) continue;
       const decisionChanged = decision?.status === "reviewing";
       if (decision && decisionChanged) {
-        decision.status = "escalated";
+        decision.status = "escalated"; if (promptClosed) decision.promptClosedAt ??= timestamp();
         decision.reason = "The target request or team stage changed while the read-only permission review was running.";
         if (!continuedAfterExpansion && !awaitingExpandedPrompt) this.finishLinkedPermissionRecovery(stored, decision, decision.reason, "target-prompt-changed", "stop-stale-review",
           "No provider answer was sent; the current prompt requires a fresh review or owner attention.");
@@ -2049,8 +2050,7 @@ export class TeamService {
         for (const member of run.members.filter(item => item.revision === run.revision && item.status === "running" && !item.report)) {
           const state = await this.manager.state(member.sessionId);
           if (state.status !== "running") member.status = "unavailable";
-          if (!["unavailable", "recording-error"].includes(state.status)) { member.lastActivityAt = state.attention.lastActivityAt; member.spinnerOnlySince = state.attention.spinnerOnlySince; } else member.spinnerOnlySince = undefined;
-          member.pendingLimit = Boolean(state.attention.limit);
+          syncObservedMemberState(run, member, state, timestamp());
         }
         this.save(stored);
       }
@@ -2154,8 +2154,7 @@ export class TeamService {
           }
           if (!member.report) {
             const state = await this.manager.state(member.sessionId);
-            if (!["unavailable", "recording-error"].includes(state.status)) { member.lastActivityAt = state.attention.lastActivityAt; member.spinnerOnlySince = state.attention.spinnerOnlySince; } else member.spinnerOnlySince = undefined;
-            member.pendingLimit = Boolean(state.attention.limit);
+            syncObservedMemberState(run, member, state, timestamp());
             const journalDrained = !page.more && member.cursor >= state.seq;
             if (state.status === "exited" && (page.more || member.cursor < state.seq)) { this.save(stored); continue; }
             if (member.role === "permission-coordinator" && resumeFailed(state, member.continuation) &&
@@ -2189,7 +2188,7 @@ export class TeamService {
               continue;
             }
             if (state.status === "exited") {
-              if (member.stalledAt && journalDrained) { if (await this.detectStall(stored, member, state.attention.state, journalDrained, true)) return; continue; }
+              if (member.stalledAt && journalDrained) { if (await this.detectStall(stored, member, state.attention.state, journalDrained, true, null)) return; continue; }
               if (member.role === "permission-coordinator") {
                 const decision = permissionCoordinatorDecision(run, member);
                 member.status = "waiting";
@@ -2226,7 +2225,7 @@ export class TeamService {
             else if (member.status !== "unavailable" || member.role !== "permission-coordinator" ||
               permissionCoordinatorDecision(run, member)?.status === "reviewing") member.status = "running";
             this.save(stored);
-            if (state.status === "running" && member.role !== "permission-coordinator" && await this.detectStall(stored, member, state.attention.state, journalDrained)) return;
+            if (state.status === "running" && member.role !== "permission-coordinator" && await this.detectStall(stored, member, state.attention.state, journalDrained, false, state.attention.state === "needs-you" && state.attention.prompt ? { id: state.attention.prompt.id, ...(state.attention.prompt.hash ? { hash: state.attention.prompt.hash } : {}) } : null)) return;
             continue;
           }
           this.save(stored);
@@ -2258,6 +2257,7 @@ export class TeamService {
           stored.deliveryAttempt.memberId = next.memberId;
         const task = prior.role === "scout" ? run.discovery?.tasks.find(item => item.id === prior.taskId) : run.tasks.find(item => item.id === prior.taskId);
         if (task) { task.memberId = next.memberId; task.status = "running"; }
+        if (run.status === "needs-input" && !run.decisions.some(item => item.revision === run.revision && !item.answer) && !run.members.some(item => item.revision === run.revision && item.status === "waiting" && item.role !== "permission-coordinator")) run.status = activeStageForRole(next.role);
         this.save(stored);
       }
       if (run.discovery && !run.discovery.completedAt && run.discovery.revision === run.revision) {
@@ -2453,10 +2453,10 @@ export class TeamService {
     } while (!singlePage && !member.report && (exited || limit) && page.more);
     return { page, limit };
   }
-  private async replaceStalledMember(stored: Stored, member: TeamMember, attentionState: AttentionState = "working") {
+  private async replaceStalledMember(stored: Stored, member: TeamMember, attentionState: AttentionState = "working", activePrompt?: LivePromptRef | null) {
     if (stored.run.replay) return void this.replays.end(stored, "stalled");
     const run = stored.run, minutes = this.stallWindowFor(member) / 60000;
-    const pre = this.evalStall(stored, member, attentionState, true, "detect");
+    const pre = this.evalStall(stored, member, attentionState, true, "detect", activePrompt);
     if (pre.action === "suppress-duplicate") { member.status = "stopped"; this.save(stored); return; }
     if (pre.action !== "initiate-stop") return;
     const earlierStop = Boolean(member.stalledAt);
@@ -2479,7 +2479,7 @@ export class TeamService {
     if (limit) { member.stalledAt = undefined; if (member.stoppedReason?.startsWith("No activity for ")) member.stoppedReason = undefined; await this.switchLimitedMember(stored, member, limit); return; }
     this.memberStopped(stored, member, "stall");
     if (this.intentChecks.failed(stored, member) || this.verdicts.failed(stored, member)) return;
-    const decision = this.evalStall(stored, member, attentionState, true, "replace");
+    const decision = this.evalStall(stored, member, attentionState, true, "replace", activePrompt);
     if (decision.action === "block") { if (decision.code === "goal-deadline" && (run.goal || run.handoff)) run.stopReason = "deadline"; if (decision.code === "team-attempt-limit" && (run.goal || run.handoff)) run.stopReason = "member-limit"; return this.block(stored, new TeamError(409, decision.code, decision.message)); }
     if (decision.action !== "replace") { if (decision.action !== "wait") this.save(stored); return; }
     const task = member.role === "implementer" ? run.tasks.find(item => item.id === member.taskId && item.memberId === member.memberId) : undefined;
@@ -2569,7 +2569,7 @@ export class TeamService {
       member.prompt = teamPrompt(run, role, task, feedback, member.provider ?? run.provider, member.modelProfile,
         this.config.projects.find(project => project.id === run.projectId)?.team, this.permissionRecoveryHistory(run), this.publishHeadsEnabled());
     }
-    if (role !== "permission-coordinator") run.status = role === "project-manager" || role === "intent-checker" ? "planning" : role === "scout" ? "discovering" : role === "reviewer" || role === "evaluator" || role === "judge" ? "reviewing" : role === "delivery" ? "delivering" : role === "integrator" ? "integrating" : "implementing";
+    if (role !== "permission-coordinator") run.status = activeStageForRole(role);
     let failure: string | undefined;
     this.operation(stored, "member", async signal => {
       this.assertRunPath(stored, run.workspace);

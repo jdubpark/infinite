@@ -662,3 +662,15 @@ test("a Codex status row is corroborated only after it persists, once per episod
     await host.stop();
   }
 });
+
+test("repeated identical Codex usage-limited repaints still reach corroboration", { timeout: 60000 }, async () => {
+  const host = await limitHost("codex-limit-agent.mjs", "codex", ["--repaint"]);
+  try {
+    const id = await startLimitSession(host, "codex", "repaint");
+    const rows = await waitFor(() => limitsOf(host, id), (r) => r.some((e) => e.data.confidence === "corroborated"), 20000);
+    assert.deepEqual(rows.map((e) => [e.data.confidence, e.data.source]), [["single-source", "screen"], ["corroborated", "screen"]]);
+    assert.equal((await host.fetchApi(`/sessions/${id}`)).body.attention.limit?.confidence, "corroborated");
+  } finally {
+    await host.stop();
+  }
+});

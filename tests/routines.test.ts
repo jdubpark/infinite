@@ -47,7 +47,7 @@ function setup(overrides: { busy?: (id: string) => Promise<boolean>; launch?: (r
   return { root, config, key, goals, launched, createService, create };
 }
 const action = (revision: number) => ({ requestId: randomUUID(), revision });
-const wait = (ms: number) => mock.timers.tick(ms);
+const advance = (ms: number) => mock.timers.tick(ms);
 beforeEach(() => mock.timers.enable({ apis: ["Date"], now: Date.now() }));
 afterEach(() => mock.timers.reset());
 
@@ -60,7 +60,7 @@ test("routine launch intent survives restart and replays the same goal request a
       startGoal: async (request, admit) => { ids.push(request.requestId); admit(); if (firstCall) { firstCall = false; throw new Error("ack lost"); } return ({ id: request.requestId, status: "running", cycles: [], ...request } as unknown as ProductGoal); },
     });
     const created = await first.create(f.create());
-    await wait(30); await first.tick();
+    advance(30); await first.tick();
     assert.equal(first.get(created.id).status, "blocked");
     first.close();
     const restarted = new RoutineService(f.config, f.key, { get: id => { const goal = f.goals.get(id); if (!goal) throw new TeamError(404, "goal-not-found", "missing"); return goal; } } as never, {
@@ -92,7 +92,7 @@ test("changed project authority blocks launch and resume does not renew the appr
 test("outcome settings stay out of the routine approval digest", async () => {
   const f = setup(); const service = f.createService();
   try {
-    await service.create(f.create()); await wait(30); await service.tick();
+    await service.create(f.create()); advance(30); await service.tick();
     f.config.teams!.outcomes = { holdDays: 14, retentionDays: 365 };
     await service.tick();
     const active = service.list()[0]!;
@@ -106,7 +106,7 @@ test("outcome settings stay out of the routine approval digest", async () => {
 test("blackboard switches change the routine approval digest", async () => {
   const f = setup(); const service = f.createService();
   try {
-    await service.create(f.create()); await wait(30); await service.tick();
+    await service.create(f.create()); advance(30); await service.tick();
     f.config.teams!.blackboard = { tools: true };
     await service.tick();
     assert.equal(service.list()[0]!.status, "blocked");
@@ -116,7 +116,7 @@ test("blackboard switches change the routine approval digest", async () => {
 test("eval settings stay out of the routine approval digest", async () => {
   const f = setup(); const service = f.createService();
   try {
-    await service.create(f.create()); await wait(30); await service.tick();
+    await service.create(f.create()); advance(30); await service.tick();
     f.config.projects[0]!.team!.eval = { capture: true, retentionDays: 90, mine: true, focusedTest: { command: "node", args: ["{files}", "--test-reporter-destination={report}"] }, reportFormat: "junit", gradingPaths: ["package.json"] };
     f.config.eval = { grader: { prefix: { command: "sudo", args: ["-n", "-u", "infinite-grader", "--", "/usr/local/libexec/infinite/grader-command"] }, root: "/var/lib/infinite-grader" } };
     await service.tick();
@@ -130,7 +130,7 @@ test("eval settings stay out of the routine approval digest", async () => {
 test("the main check setting stays out of the routine approval digest", async () => {
   const f = setup(); const service = f.createService();
   try {
-    await service.create(f.create()); await wait(30); await service.tick();
+    await service.create(f.create()); advance(30); await service.tick();
     f.config.projects[0]!.team!.mainCheck = { minutes: 20 };
     await service.tick();
     assert.equal(service.list()[0]!.status, "running", "turning the main check on does not block the routine");
@@ -140,7 +140,7 @@ test("the main check setting stays out of the routine approval digest", async ()
 test("trial settings leave the routine digest alone", async () => {
   const f = setup(); const service = f.createService();
   try {
-    await service.create(f.create()); await wait(30); await service.tick();
+    await service.create(f.create()); advance(30); await service.tick();
     const profile = { id: "trial-a", label: "Trial A", provider: "claude" as const, model: "model", effort: "high" as const, tier: "strong" as const };
     f.config.projects[0]!.team!.eval = { trialsPerDay: 4, trialMinutes: 60, candidateProfiles: [profile], capture: true, reportFormat: "junit", focusedTest: { command: "node", args: ["{files}", "--test-reporter-destination={report}"] } };
     f.config.eval = { member: { prefix: { command: "sudo", args: ["-n", "-u", "infinite-eval", "--", "/usr/local/libexec/infinite/eval-command"] }, root: "/var/lib/infinite-eval", agents: { claude: { command: "claude", args: [] } } } };
@@ -155,7 +155,7 @@ test("trial settings leave the routine digest alone", async () => {
 test("routing settings change the approval digest, and their absence keeps it", async () => {
   const f = setup(); const service = f.createService();
   try {
-    await service.create(f.create()); await wait(30); await service.tick();
+    await service.create(f.create()); advance(30); await service.tick();
     assert.equal(service.list()[0]!.status, "running");
     f.config.projects[0]!.team!.routing = undefined;
     await service.tick();
@@ -172,7 +172,7 @@ test("the objective switch is inside the routine approval digest", async () => {
     const team = teamProjectSchema.parse(f.config.projects[0]!.team);
     assert.equal(Object.hasOwn(team, "objective"), false, "the schema adds no objective key by default");
     f.config.projects[0]!.team = team;
-    await service.create(f.create()); await wait(30); await service.tick();
+    await service.create(f.create()); advance(30); await service.tick();
     assert.equal(service.list()[0]!.status, "running");
     service.close(); service = f.createService(); await service.tick();
     assert.equal(service.list()[0]!.status, "running");
@@ -185,14 +185,14 @@ test("the objective switch is inside the routine approval digest", async () => {
 test("the intent check settings are inside the routine approval digest", async () => {
   const f = setup(); let service = f.createService();
   try {
-    await service.create(f.create()); await wait(30); await service.tick();
+    await service.create(f.create()); advance(30); await service.tick();
     assert.equal(service.list()[0]!.status, "running");
     service.close(); service = f.createService(); await service.tick();
     assert.equal(service.list()[0]!.status, "running", "a reload keeps the stored authority with both keys absent");
     f.config.projects[0]!.team = { ...f.config.projects[0]!.team!, objective: { intentCheck: "off" } };
     await service.tick();
     assert.equal(service.list()[0]!.status, "blocked");
-    const second = await service.create(f.create()); await wait(30); await service.tick();
+    const second = await service.create(f.create()); advance(30); await service.tick();
     assert.equal(service.get(second.id).status, "running", "a second routine starts under the current authority");
     f.config.teams!.lineup = { ...f.config.teams!.lineup!, evaluators: [{ id: "astra", label: "Astra", provider: "codex", model: "astra", effort: "high", tier: "strong" }] } as never;
     await service.tick();
@@ -203,7 +203,7 @@ test("the intent check settings are inside the routine approval digest", async (
 test("member trace settings are outside the routine approval digest", async () => {
   const f = setup(); const service = f.createService();
   try {
-    await service.create(f.create()); await wait(30); await service.tick();
+    await service.create(f.create()); advance(30); await service.tick();
     assert.equal(service.list()[0]!.status, "running");
     f.config.teams!.memberTraces = { enabled: true, memberBytes: 1000, runBytes: 5000 };
     await service.tick();
@@ -217,7 +217,7 @@ test("member trace settings are outside the routine approval digest", async () =
 test("the register setting is inside the routine approval digest", async () => {
   const f = setup(); let service = f.createService();
   try {
-    await service.create(f.create()); await wait(30); await service.tick();
+    await service.create(f.create()); advance(30); await service.tick();
     assert.equal(service.list()[0]!.status, "running");
     service.close(); service = f.createService(); await service.tick();
     assert.equal(service.list()[0]!.status, "running", "a reload keeps the stored authority with the key absent");
@@ -230,7 +230,7 @@ test("the register setting is inside the routine approval digest", async () => {
 test("the evaluator setting is inside the routine approval digest", async () => {
   const f = setup(); let service = f.createService();
   try {
-    await service.create(f.create()); await wait(30); await service.tick();
+    await service.create(f.create()); advance(30); await service.tick();
     assert.equal(service.list()[0]!.status, "running");
     service.close(); service = f.createService(); await service.tick();
     assert.equal(service.list()[0]!.status, "running", "a reload keeps the stored authority with the key absent");
@@ -243,21 +243,62 @@ test("the evaluator setting is inside the routine approval digest", async () => 
 test("a pending project run prevents overlap and launch is skipped when the approved budget cannot fit", async () => {
   const f = setup({ busy: async () => true }); const service = f.createService();
   try {
-    const created = await service.create(f.create()); await wait(30); await service.tick();
+    const created = await service.create(f.create()); advance(30); await service.tick();
     assert.equal(f.launched.length, 0); assert.match(service.get(created.id).reason!, /active work/);
   } finally { service.close(); rmSync(f.root, { recursive: true, force: true }); }
   const second = setup(); const service2 = second.createService();
   try {
     const req = second.create({ expiresAt: new Date(Date.now() + 1000).toISOString(), startsAt: new Date(Date.now() + 10).toISOString() });
-    const created = await service2.create(req); await wait(30); await service2.tick();
+    const created = await service2.create(req); advance(30); await service2.tick();
     assert.equal(service2.get(created.id).status, "expired"); assert.equal(second.launched.length, 0);
   } finally { service2.close(); rmSync(second.root, { recursive: true, force: true }); }
+});
+
+test("a routine may start now but not a millisecond earlier", async () => {
+  const f = setup(); const service = f.createService();
+  try {
+    const at = Date.now();
+    await assert.rejects(service.create(f.create({ startsAt: new Date(at - 1).toISOString() })),
+      { status: 400, code: "invalid-routine-window", message: "Routine start time cannot be in the past." });
+    assert.equal(service.list().length, 0, "a refused routine is not stored");
+    const created = await service.create(f.create({ startsAt: new Date(at).toISOString() }));
+    assert.equal(created.status, "scheduled");
+    assert.equal(created.nextRunAt, new Date(at).toISOString());
+  } finally { service.close(); rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("a routine starts at its start time and not a millisecond before", async () => {
+  const f = setup(); const service = f.createService();
+  try {
+    const created = await service.create(f.create({ startsAt: new Date(Date.now() + 60_000).toISOString() }));
+    advance(59_999); await service.tick();
+    assert.equal(f.launched.length, 0, "nothing starts a millisecond before the start time");
+    assert.deepEqual(service.get(created.id), created);
+    advance(1); await service.tick();
+    assert.equal(f.launched.length, 1, "the start time itself is due");
+    assert.equal(service.get(created.id).status, "running");
+  } finally { service.close(); rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("a waiting signal does not start a routine before its start time", async () => {
+  const f = setup(); const service = f.createService(); const signals = inbox();
+  service.useSignals(signals.reader, () => []);
+  try {
+    const created = await service.create(f.create({ startsAt: new Date(Date.now() + 60_000).toISOString(), wakeOn: ["owner"] }));
+    const early = signals.add("owner");
+    advance(59_999); await service.tick();
+    assert.equal(f.launched.length, 0, "a wake waits for the start time");
+    assert.deepEqual(service.get(created.id).pendingWake?.signals.map(signal => signal.id), [early.id]);
+    advance(1); await service.tick();
+    assert.equal(f.launched.length, 1, "the wake starts the routine at its start time");
+    assert.deepEqual(service.get(created.id).occurrences[0]!.wake, { signalIds: [early.id], dropped: 0 });
+  } finally { service.close(); rmSync(f.root, { recursive: true, force: true }); }
 });
 
 test("pause and cancel stop future triggers while preserving the active goal reference", async () => {
   const f = setup(); const service = f.createService();
   try {
-    const created = await service.create(f.create()); await wait(30); await service.tick();
+    const created = await service.create(f.create()); advance(30); await service.tick();
     const active = service.get(created.id); assert.equal(active.status, "running"); assert.ok(active.activeGoalId);
     const paused = await service.pause(created.id, action(active.revision));
     assert.match(paused.reason!, /active goal retains/); assert.equal(paused.activeGoalId, active.activeGoalId);
@@ -280,7 +321,7 @@ test("owner actions are idempotent and stale revisions are rejected", async () =
 test("needs-input and failed goals block progression while retaining the child for owner review", async () => {
   const f = setup(); const service = f.createService();
   try {
-    const created = await service.create(f.create()); await wait(30); await service.tick();
+    const created = await service.create(f.create()); advance(30); await service.tick();
     const active = service.get(created.id); const goal = f.goals.get(active.activeGoalId!)!;
     f.goals.set(goal.id, { ...goal, status: "needs-input", reason: "owner input required" });
     await service.tick();
@@ -300,7 +341,7 @@ test("needs-input and failed goals block progression while retaining the child f
 test("an achieved child with unmerged cycles cannot unlock another routine occurrence", async () => {
   const f = setup(); const service = f.createService();
   try {
-    const created = await service.create(f.create()); await wait(30); await service.tick();
+    const created = await service.create(f.create()); advance(30); await service.tick();
     const routine = service.get(created.id), child = f.goals.get(routine.activeGoalId!)!;
     f.goals.set(child.id, { ...child, status: "achieved", cycles: [{ teamId: randomUUID(), cycle: 1, goalRevision: 1, status: "ready-for-review", startedAt: new Date().toISOString(), memberCount: 1 }] });
     await service.tick();
@@ -324,7 +365,7 @@ test("a cancelled routine reconciles an accepted uncertain launch after restart 
     },
   });
   try {
-    const created = await service.create(f.create()); await wait(30); await service.tick();
+    const created = await service.create(f.create()); advance(30); await service.tick();
     const blocked = service.get(created.id);
     const cancelled = await service.cancel(created.id, action(blocked.revision));
     assert.equal(cancelled.status, "cancelled");
@@ -356,7 +397,7 @@ test("a confirmed launch is reconciled after approval expiry without creating a 
   const realNow = Date.now;
   try {
     const created = await service.create(f.create({ expiresAt: new Date(Date.now() + 10 * 60_000).toISOString() }));
-    await wait(30); await service.tick(); service.close();
+    advance(30); await service.tick(); service.close();
     Date.now = () => realNow() + 11 * 60_000;
     const restarted = new RoutineService(f.config, f.key, { get: id => { const goal = f.goals.get(id); if (!goal) throw new TeamError(404, "goal-not-found", "missing"); return goal; } } as never, {
       isProjectBusy: async () => false,
@@ -377,7 +418,7 @@ test("a settled no-opportunity recurs on cadence and completes at the approved o
   const f = setup(); const service = f.createService(); const realNow = Date.now;
   try {
     const created = await service.create(f.create({ maxOccurrences: 2 }));
-    await wait(30); Date.now = () => realNow() + 60_000; await service.tick();
+    advance(30); Date.now = () => realNow() + 60_000; await service.tick();
     let routine = service.get(created.id), first = f.goals.get(routine.activeGoalId!)!;
     f.goals.set(first.id, { ...first, status: "no-opportunity", cycles: [] });
     await service.tick();

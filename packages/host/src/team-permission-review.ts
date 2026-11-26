@@ -518,10 +518,14 @@ export class TeamPermissionReview extends TeamPermissionRecovery {
       if (!("state" in before)) return { status: "interrupted" as const, reason: before.reason ?? "The target state could not be confirmed before evidence collection." };
       let changedPaths: string[], evidence: ReturnType<typeof collectPermissionEvidence>;
       try {
-        changedPaths = await memberChangedPaths(request.targetCwd, target.baseCommit, this.host.config.teams?.commandPrefix);
+        changedPaths = await memberChangedPaths(request.targetCwd, target.baseCommit, this.host.config.teams?.commandPrefix, signal);
         evidence = collectPermissionEvidence({ prompt: before.prompt, cwd: request.targetCwd, changedPaths, requestedPaths,
           approvedScratchRoots: target.scratchDirectory ? [target.scratchDirectory] : [] });
-      } catch (error) { return { status: "exhausted" as const, reason: error instanceof Error ? error.message : "Requested evidence could not be collected safely." }; }
+      } catch (error) {
+        if (signal.aborted) return { status: "interrupted" as const,
+          reason: this.permissionRecoveryPromptInvalidReason(stored, request, target) ?? "The team stopped while requested evidence was being collected." };
+        return { status: "exhausted" as const, reason: error instanceof Error ? error.message : "Requested evidence could not be collected safely." };
+      }
       const after = await this.inspectPermissionRecoveryPrompt(stored, request, target);
       if (!("state" in after)) return { status: "interrupted" as const, reason: after.reason ?? "The target state could not be confirmed after evidence collection." };
       if (after.prompt.hash !== before.prompt.hash || permissionEvidenceHash(after.prompt) !== permissionEvidenceHash(before.prompt))

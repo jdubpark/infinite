@@ -1668,14 +1668,14 @@ server.listen(workerSocket, async () => {
         try { await runFinalDrain(launch, drainEnv); } finally { drainOpen = false; }
       } catch {}
     };
-    const exited = (exitCode: number) => {
+    const exited = (exitCode: number, forced = false) => {
       if (permissionChannel?.exited(exitCode)) return;
       native?.stop();
       void hybrid?.close().catch(() => {}); executor?.close();
       try {
         flush();
         controller = null;
-        const tail = tails.marker();
+        const tail = tails.marker(forced ? child : undefined);
         state = { ...state, status: "exited", exitCode, control: null, ...tail };
         publish(applyLifecycle(attention, "exited", new Date().toISOString()));
         append("lifecycle", { status: "exited", exitCode, ...tail });
@@ -1715,7 +1715,7 @@ server.listen(workerSocket, async () => {
       tails.track(pty);
       pty.onExit(onExit);
     };
-    endSession = () => terminalBarrier.dispatch(() => exited(0));
+    endSession = () => terminalBarrier.dispatch(() => exited(0, true));
   } catch (error) {
     state = { ...state, status: "exited", exitCode: 1 };
     publish(applyLifecycle(attention, "exited", new Date().toISOString()));

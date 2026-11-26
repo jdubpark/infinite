@@ -35,9 +35,9 @@ export function trackPtyTail(pty: IPty, deliver: (data: string) => void): () => 
 }
 
 export function ptyTails(first: IPty, deliver: (data: string) => void) {
-  const incomplete = [trackPtyTail(first, deliver)];
+  const entries = [{ pty: first, incomplete: trackPtyTail(first, deliver) }];
   return {
-    track(pty: IPty) { incomplete.push(trackPtyTail(pty, deliver)); },
-    marker: (): { outputTailIncomplete?: true } => (incomplete.some(check => check()) ? { outputTailIncomplete: true } : {}),
+    track(pty: IPty) { entries.push({ pty, incomplete: trackPtyTail(pty, deliver) }); },
+    marker: (skip?: IPty): { outputTailIncomplete?: true } => (entries.some(entry => entry.pty !== skip && entry.incomplete()) ? { outputTailIncomplete: true } : {}),
   };
 }

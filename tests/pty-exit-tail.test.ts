@@ -7,10 +7,10 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { randomBytes, randomUUID } from "node:crypto";
-import { spawn as ptySpawn } from "node-pty";
+import { spawn as ptySpawn, type IPty } from "node-pty";
 import { workerCall } from "../packages/host/src/ipc.js";
 import { Manager } from "../packages/host/src/manager.js";
-import { drainDescriptor } from "../packages/host/src/pty-tail.js";
+import { drainDescriptor, ptyTails } from "../packages/host/src/pty-tail.js";
 import { terminalPages } from "../packages/host/src/terminal-stream.js";
 import { readEvents, writeSealed } from "../packages/host/src/vault.js";
 import { waitFor } from "./helpers.js";
@@ -177,4 +177,14 @@ test("node-pty keeps the terminal's read stream and a non-blocking descriptor wh
   } finally {
     pty.kill("SIGKILL");
   }
+});
+
+test("a session end that the permission channel forces carries no marker for the terminal that is still alive, and keeps an earlier terminal's incomplete tail", () => {
+  const first = {} as IPty;
+  const second = {} as IPty;
+  const tails = ptyTails(first, () => {});
+  assert.deepEqual(tails.marker(first), {}, "the only terminal is the one the end skips");
+  assert.deepEqual(tails.marker(), { outputTailIncomplete: true }, "a terminal whose end was never seen is marked at its own exit");
+  tails.track(second);
+  assert.deepEqual(tails.marker(second), { outputTailIncomplete: true }, "an earlier terminal's unconfirmed tail still marks the session");
 });

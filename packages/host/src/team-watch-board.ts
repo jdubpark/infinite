@@ -282,10 +282,37 @@ export function teamBoardText(
     else lines.push("  Loading entry detail...");
   }
   const footer = interactive
-    ? `↑↓ entry · enter detail · p filter (${kindLabel}) · f follow (${synced.state.follow ? "on" : "off"}) · o logs · s summary · l logs · q quit`
+    ? `↑↓ entry · enter detail · p filter (${kindLabel}) · f follow (${synced.state.follow ? "on" : "off"}) · o member logs · l logs · s summary · q quit`
     : `Summary: infinite team status ${clean(team?.id)} · Logs: infinite team status ${clean(team?.id)} --logs`;
   lines.push("", checkedAt ? `${clean(checkedAt)} · ${footer}` : footer);
   return lines.join("\n");
+}
+
+export function boardFocusOffset(
+  text: string,
+  rows: number,
+  columns: number,
+  currentOffset: number,
+  detailOpen: boolean,
+): number {
+  const all = text.split("\n");
+  all.pop();
+  while (all.length && !all[all.length - 1]!.trim()) all.pop();
+  const width = Math.max(1, columns || 80);
+  const wrapped = wrapText(all.join("\n"), width);
+  const visible = Math.max(1, Math.max(3, rows || 24) - 3);
+  const selectedIdx = wrapped.findIndex(line => line.startsWith("> seq "));
+  const detailIdx = detailOpen ? wrapped.findIndex(line => line.startsWith("ENTRY DETAIL ")) : -1;
+  const focusStart = detailOpen && detailIdx >= 0 ? detailIdx : selectedIdx;
+  if (focusStart < 0) return currentOffset;
+  const focusEnd = detailOpen && detailIdx >= 0
+    ? wrapped.length - 1
+    : Math.min(wrapped.length - 1, focusStart + 1);
+  if (focusStart < currentOffset) return focusStart;
+  if (focusEnd >= currentOffset + visible) {
+    return Math.min(focusStart, Math.max(0, focusEnd - visible + 1));
+  }
+  return currentOffset;
 }
 
 function eventLine(event: { type?: string; data?: Record<string, unknown> }) {
@@ -409,6 +436,8 @@ export async function runTeamWatch({
   let memberId = "";
   let previous: string | null = null;
   let pending: ReturnType<typeof teamWatchCommand> = null;
+  let pendingMemberId = "";
+  let keepBoardFocus = board;
   let wake = new AbortController();
   let card = "";
   let notice = "";
@@ -443,6 +472,9 @@ export async function runTeamWatch({
     } else {
       const key = `${mode}/${mode === "logs" ? memberId : ""}`;
       if (key !== view) { view = key; offset = 0; }
+      if (mode === "board" && keepBoardFocus) {
+        offset = boardFocusOffset(text, process.stdout.rows || 24, process.stdout.columns || 80, offset, boardState.detailOpen);
+      }
       card = text;
       notice = "";
       status = fixedStatus;
@@ -458,18 +490,24 @@ export async function runTeamWatch({
       const result = applyBoardCommand(boardState, command, boardEntries);
       boardState = result.state;
       if (result.jumpToMemberId) {
-        mode = "logs";
-        memberId = result.jumpToMemberId;
+        pending = "openMember";
+        pendingMemberId = result.jumpToMemberId;
         wake.abort();
         return;
       }
+      keepBoardFocus = true;
       const selected = boardState.selectedEntryId ? detailCache.get(boardState.selectedEntryId) ?? null : null;
       show(teamBoardText(lastTeam, boardEntries, boardState, selected, clock(), interactive, process.stdout.columns || 80));
       if (result.needDetail && !detailCache.has(result.needDetail)) wake.abort();
       return;
     }
     const scroll = scrolls[command];
-    if (scroll) { offset = scroll(); paint(); return; }
+    if (scroll) {
+      keepBoardFocus = false;
+      offset = scroll();
+      paint();
+      return;
+    }
     pending = command;
     wake.abort();
   };
@@ -502,8 +540,14 @@ export async function runTeamWatch({
           pending = null;
           if (action === "logs") mode = "logs";
           else if (action === "summary") mode = "summary";
-          else if (action === "board") mode = "board";
-          else if (action === "next" || action === "prev") {
+          else if (action === "board") {
+            mode = "board";
+            keepBoardFocus = true;
+          } else if (action === "openMember") {
+            mode = "logs";
+            if (pendingMemberId) memberId = pendingMemberId;
+            pendingMemberId = "";
+          } else if (action === "next" || action === "prev") {
             mode = "logs";
             const ordered = orderedTeamMembers(team).filter(member => member?.sessionId);
             const known = ordered.some(member => member?.memberId === memberId);
@@ -512,8 +556,10 @@ export async function runTeamWatch({
           if (subcommand === "status" && logs) await printTeamLogs(api, team, abort.signal);
           else if (mode === "board") {
             boardEntries = await fetchAllEntries(api, String(team.id), abort.signal);
+            if (pending) continue;
             const synced = syncBoardEntries(boardState, boardEntries);
             boardState = synced.state;
+            if (boardState.follow) keepBoardFocus = true;
             let detail: TeamBoardDetail | null = null;
             if (boardState.detailOpen && synced.selected) {
               detail = detailCache.get(synced.selected.entryId) ?? null;
@@ -522,14 +568,15 @@ export async function runTeamWatch({
                 detailCache.set(synced.selected.entryId, detail);
               }
             }
-            show(teamBoardText(team, boardEntries, boardState, detail, clock(), interactive, process.stdout.columns || 80));
+            if (!pending) show(teamBoardText(team, boardEntries, boardState, detail, clock(), interactive, process.stdout.columns || 80));
           } else if (mode === "logs") {
             const member = preferredMember(team, memberId, !interactive);
             if (member?.memberId) memberId = String(member.memberId);
-            if (!member) show(`${clean(team?.id)} · review logs\n\nNo agent session is available.\n\n${interactive ? "s summary · b board · q quit" : "Summary: infinite team status " + clean(team?.id)}`);
-            else {
+            if (!member) {
+              if (!pending) show(`${clean(team?.id)} · review logs\n\nNo agent session is available.\n\n${interactive ? "b board · s summary · q quit" : "Summary: infinite team status " + clean(team?.id)}`);
+            } else {
               const recorded = await memberLog(api, member, abort.signal);
-              show(teamLogsText(team, orderedTeamMembers(team).filter(item => item?.sessionId), member, recorded.screen, recorded.events, clock(), interactive, process.stdout.columns || 80));
+              if (!pending) show(teamLogsText(team, orderedTeamMembers(team).filter(item => item?.sessionId), member, recorded.screen, recorded.events, clock(), interactive, process.stdout.columns || 80));
             }
           } else {
             let rows = await teamBriefRows(api, team, abort.signal, briefRows);
@@ -541,7 +588,7 @@ export async function runTeamWatch({
             const hasBrief = Boolean(chosen?.status.summary?.repository?.brief?.summary || chosen?.status.summary?.text);
             const progress = briefInProgress ? hasBrief ? "Understanding is updating this Brief." : "Understanding is writing the Brief." : "";
             const failureStatus = failed ? `Summary refresh failed: ${failed.fetchError}` : "";
-            show(teamSummaryText(team, rows, clock(), interactive, interactive ? Date.now() : undefined, tty), failureStatus || (tty ? progress : ""));
+            if (!pending) show(teamSummaryText(team, rows, clock(), interactive, interactive ? Date.now() : undefined, tty), failureStatus || (tty ? progress : ""));
           }
         }
       } catch (error) {

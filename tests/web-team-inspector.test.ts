@@ -26,14 +26,28 @@ const skipBrowser = existsSync(executablePath) ? false : "Chromium for Playwrigh
 const harness = fileURLToPath(new URL("./fixtures/web-team-inspector-harness.tsx", import.meta.url));
 const ORIGIN = "http://127.0.0.1/team-inspector";
 
-test("TeamOverview renders criteria groups, separate provisional assessment, reviewer claims, and collapsed finished roster", () => {
+test("TeamOverview renders criteria groups, separate provisional assessment, reviewer claims, unassigned tasks, and collapsed finished roster", () => {
   const noop = () => {};
+  const teamWithOther = {
+    ...fixtureTeam,
+    tasks: [
+      ...fixtureTeam.tasks,
+      {
+        id: "task-extra",
+        title: "Extra unpinned work",
+        instructions: "Extra",
+        paths: ["src/extra.ts"],
+        dependsOn: [],
+        status: "running" as const,
+      },
+    ],
+  };
   const html = renderToStaticMarkup(
     createElement(
       ApiContext.Provider,
       { value: (async () => ({})) as unknown as Api },
       createElement(TeamOverview, {
-        team: fixtureTeam,
+        team: teamWithOther,
         sessions: fixtureSessions,
         onOpenSession: noop,
         onInspectMemberEntries: noop,
@@ -42,6 +56,8 @@ test("TeamOverview renders criteria groups, separate provisional assessment, rev
     ),
   );
   assert.ok(html.includes("1 of 1 tasks integrated"));
+  assert.ok(html.includes("Other tasks"));
+  assert.ok(html.includes("0 of 1 tasks integrated"));
   assert.ok(html.includes("Provisional assessment: Met"));
   assert.ok(html.includes("Reviewer acceptance claims"));
   assert.ok(html.includes("Verified (claim)"));
@@ -72,17 +88,17 @@ describe("web team inspector repair trace", { skip: skipBrowser }, () => {
 
   after(() => browser?.close());
 
-  async function open(hash = `#/teams/${TEAM_ID}`): Promise<Page> {
+  async function open(hash = `#/teams/${TEAM_ID}`, query = ""): Promise<Page> {
     const page = await browser.newPage({ viewport: { width: 1360, height: 900 } });
     await page.route(`${ORIGIN}*`, route => route.fulfill({ contentType: "text/html", body: '<div id="root"></div>' }));
-    await page.goto(`${ORIGIN}${hash}`);
+    await page.goto(`${ORIGIN}${query}${hash}`);
     await page.addStyleTag({ content: `html,body{margin:0;height:100%}${styles}` });
     await page.addScriptTag({ content: script });
     await page.waitForSelector(".team-detail-heading");
     return page;
   }
 
-  test("repair trace shows pinned decisions, replacement links, commit hashes, supersedes, and session links", async () => {
+  test("repair trace shows pinned decisions, replacement links, toolbar layout, 44px controls, commit hashes, supersedes, and session links", async () => {
     const page = await open();
     try {
       await page.waitForSelector(".team-decisions");
@@ -95,6 +111,23 @@ describe("web team inspector repair trace", { skip: skipBrowser }, () => {
 
       await page.getByRole("button", { name: "Board" }).click();
       await page.waitForSelector(".ti-entry-row");
+
+      const layout = await page.evaluate(() => {
+        const toolbar = document.querySelector(".ti-board-toolbar")!.getBoundingClientRect();
+        const selects = [...document.querySelectorAll(".ti-board-toolbar select")].map(el => el.getBoundingClientRect());
+        const controls = [
+          ...document.querySelectorAll(".ti-finished-toggle, .ti-follow-btn, .ti-board-toolbar select, .ti-board-toolbar input, .ti-link-btn"),
+        ].map(el => ({ tag: el.tagName, height: Math.round(el.getBoundingClientRect().height) }));
+        return {
+          toolbarWidth: Math.round(toolbar.width),
+          selects: selects.map(r => ({ width: Math.round(r.width), top: Math.round(r.top) })),
+          controls,
+        };
+      });
+      assert.equal(layout.selects.length, 4);
+      assert.ok(layout.selects.every(s => s.width < layout.toolbarWidth * 0.5), `expected side-by-side selects, got ${JSON.stringify(layout)}`);
+      assert.ok(layout.controls.every(c => c.height >= 44), `expected >= 44px controls, got ${JSON.stringify(layout.controls)}`);
+
       const listText = await page.locator(".ti-entry-list").textContent();
       assert.match(listText ?? "", /seq 101/);
       assert.match(listText ?? "", /Host receipt/);
@@ -128,15 +161,43 @@ describe("web team inspector repair trace", { skip: skipBrowser }, () => {
     }
   });
 
-  test("deep link #/teams/:id/entries/:entryId opens Board directly to that entry", async () => {
+  test("deep link #/teams/:id/entries/:entryId opens Board directly, survives follow, and clears on hashchange back to team", async () => {
     const page = await open(`#/teams/${TEAM_ID}/entries/${ENTRY_IDS.checkPass}`);
     try {
       await page.waitForSelector(".ti-entry-detail");
       const boardPressed = await page.getByRole("button", { name: "Board" }).getAttribute("aria-pressed");
       assert.equal(boardPressed, "true");
-      const detailText = await page.locator(".ti-entry-detail").textContent();
+      let detailText = await page.locator(".ti-entry-detail").textContent();
       assert.match(detailText ?? "", /seq 104/);
       assert.match(detailText ?? "", /PASS src\/gate\.test\.ts on commit B/);
+
+      await page.evaluate(hash => { window.location.hash = hash; }, `#/teams/${TEAM_ID}/entries/${ENTRY_IDS.checkFail}`);
+      await page.waitForFunction(() => (document.querySelector(".ti-entry-detail")?.textContent ?? "").includes("seq 101"));
+      detailText = await page.locator(".ti-entry-detail").textContent();
+      assert.match(detailText ?? "", /seq 101/);
+
+      await page.evaluate(hash => { window.location.hash = hash; }, `#/teams/${TEAM_ID}`);
+      await page.waitForFunction(() => (document.querySelector(".ti-entry-detail")?.textContent ?? "").includes("Select an entry"));
+    } finally {
+      await page.close();
+    }
+  });
+
+  test("pagination Load more advances cursor and subsequent polls use since=55 without regressing", async () => {
+    const firstEntry = "99999999-9999-4999-8999-000000000001";
+    const page = await open(`#/teams/${TEAM_ID}/entries/${firstEntry}`, "?paged=1");
+    try {
+      const loadMoreBtn = page.getByRole("button", { name: "Load more" });
+      await loadMoreBtn.waitFor();
+      await loadMoreBtn.click();
+      await page.waitForFunction(() => document.querySelectorAll(".ti-entry-row").length === 55);
+      assert.equal(await loadMoreBtn.count(), 0);
+
+      await page.waitForTimeout(2300);
+      const requests = await page.evaluate(() => (window as unknown as { inspector: { requests: string[] } }).inspector.requests.slice());
+      const entryPolls = requests.filter(path => path.includes("/entries?"));
+      assert.ok(entryPolls.some(path => path.includes("since=55")), `expected incremental poll since=55, got ${JSON.stringify(entryPolls)}`);
+      assert.equal(await loadMoreBtn.count(), 0);
     } finally {
       await page.close();
     }

@@ -196,7 +196,6 @@ export function TeamEvidenceBoard({
 }: TeamEvidenceBoardProps) {
   const api = useApi();
   const [entries, setEntries] = useState<TeamEntryHead[]>([]);
-  const [cursor, setCursor] = useState(0);
   const [more, setMore] = useState(false);
   const [listError, setListError] = useState("");
   const [loadingMore, setLoadingMore] = useState(false);
@@ -214,67 +213,82 @@ export function TeamEvidenceBoard({
   const cursorRef = useRef(0);
   const moreRef = useRef(false);
   const followRef = useRef(follow);
-  cursorRef.current = cursor;
-  moreRef.current = more;
+  const feedEpochRef = useRef(0);
+  const ownSelectionRef = useRef<string | null>(null);
+  const activeKeyRef = useRef({ teamId: team.id, entryId: selectedEntryId });
+  activeKeyRef.current = { teamId: team.id, entryId: selectedEntryId };
   followRef.current = follow;
 
   useEffect(() => {
+    feedEpochRef.current += 1;
+    cursorRef.current = 0;
+    moreRef.current = false;
+    ownSelectionRef.current = null;
     setEntries([]);
-    setCursor(0);
     setMore(false);
     setListError("");
     setDetail(null);
     setDetailError("");
+    setDetailLoading(false);
+    setWithdrawError("");
   }, [team.id]);
 
   const feed = useLiveRefresh(async current => {
+    const epoch = feedEpochRef.current;
+    const teamId = team.id;
+    const isCurrent = () => current() && feedEpochRef.current === epoch && activeKeyRef.current.teamId === teamId;
     try {
-      const page = await api<TeamEntryPage>(`/teams/${team.id}/entries?limit=50`);
-      if (!current()) return;
-      let latestCursor = page.cursor;
+      const startSince = cursorRef.current;
+      const firstPath = `/teams/${teamId}/entries?limit=50${startSince > 0 ? `&since=${startSince}` : ""}`;
+      const page = await api<TeamEntryPage>(firstPath);
+      if (!isCurrent()) return;
+      const accumulated = [page];
+      let nextCursor = Math.max(startSince, page.cursor);
       let hasMore = page.more;
-      let accumulated = [page];
       if (followRef.current) {
         let hops = 0;
-        while (hasMore && hops < 5) {
-          const next = await api<TeamEntryPage>(`/teams/${team.id}/entries?limit=50&since=${latestCursor}`);
-          if (!current()) return;
+        while (hasMore && hops < 25) {
+          const next = await api<TeamEntryPage>(`/teams/${teamId}/entries?limit=50&since=${nextCursor}`);
+          if (!isCurrent()) return;
           accumulated.push(next);
-          if (next.cursor <= latestCursor) { hasMore = false; break; }
-          latestCursor = next.cursor;
+          if (next.cursor <= nextCursor) { hasMore = false; break; }
+          nextCursor = next.cursor;
           hasMore = next.more;
           hops += 1;
         }
-      } else if (moreRef.current && cursorRef.current > page.cursor) {
-        const next = await api<TeamEntryPage>(`/teams/${team.id}/entries?limit=50&since=${cursorRef.current}`);
-        if (!current()) return;
-        accumulated.push(next);
-        latestCursor = next.cursor;
-        hasMore = next.more;
       }
+      cursorRef.current = Math.max(cursorRef.current, nextCursor);
+      moreRef.current = hasMore;
       setEntries(previous => accumulated.reduce((acc, nextPage) => mergeEntryPage(acc, nextPage), previous));
-      setCursor(latestCursor);
       setMore(hasMore);
       setListError("");
     } catch (error) {
-      if (current()) setListError((error as Error).message);
+      if (isCurrent()) setListError((error as Error).message);
       throw error;
     }
   }, 2000, team.id);
 
   async function loadMore() {
-    if (loadingMore || !more) return;
+    if (loadingMore || !moreRef.current) return;
+    const epoch = feedEpochRef.current;
+    const teamId = team.id;
+    const startSince = cursorRef.current;
     setLoadingMore(true);
     try {
-      const page = await api<TeamEntryPage>(`/teams/${team.id}/entries?limit=50&since=${cursor}`);
+      const page = await api<TeamEntryPage>(`/teams/${teamId}/entries?limit=50&since=${startSince}`);
+      if (feedEpochRef.current !== epoch || activeKeyRef.current.teamId !== teamId) return;
+      const nextCursor = Math.max(cursorRef.current, page.cursor);
+      cursorRef.current = nextCursor;
+      moreRef.current = page.more;
       setEntries(previous => mergeEntryPage(previous, page));
-      setCursor(page.cursor);
       setMore(page.more);
       setListError("");
     } catch (error) {
-      setListError((error as Error).message);
+      if (feedEpochRef.current === epoch && activeKeyRef.current.teamId === teamId) {
+        setListError((error as Error).message);
+      }
     } finally {
-      setLoadingMore(false);
+      if (feedEpochRef.current === epoch && activeKeyRef.current.teamId === teamId) setLoadingMore(false);
     }
   }
 
@@ -289,33 +303,42 @@ export function TeamEvidenceBoard({
   const supersessionIndex = useMemo(() => buildSupersessionIndex(entries), [entries]);
 
   useEffect(() => {
-    if (!filteredEntries.length) return;
-    if (follow) {
-      const latest = filteredEntries[filteredEntries.length - 1]!;
-      if (selectedEntryId !== latest.entryId) onSelectEntry(latest.entryId);
-      if (listRef.current) listRef.current.scrollTop = listRef.current.scrollHeight;
-    } else if (!selectedEntryId) {
-      onSelectEntry(filteredEntries[filteredEntries.length - 1]!.entryId);
+    if (!filteredEntries.length || !follow) return;
+    const latest = filteredEntries[filteredEntries.length - 1]!;
+    if (selectedEntryId !== latest.entryId) {
+      ownSelectionRef.current = latest.entryId;
+      onSelectEntry(latest.entryId);
     }
+    if (listRef.current) listRef.current.scrollTop = listRef.current.scrollHeight;
   }, [filteredEntries, follow, selectedEntryId, onSelectEntry]);
 
   useEffect(() => {
+    setWithdrawError("");
     if (!selectedEntryId) {
       setDetail(null);
       setDetailError("");
+      setDetailLoading(false);
       return;
     }
+    if (selectedEntryId !== ownSelectionRef.current) {
+      setFollow(false);
+      followRef.current = false;
+    }
+    ownSelectionRef.current = null;
     let active = true;
+    const targetTeamId = team.id;
     setDetailLoading(true);
     setDetailError("");
-    api<TeamEntryDetail>(`/teams/${team.id}/entries/${selectedEntryId}`)
+    api<TeamEntryDetail>(`/teams/${targetTeamId}/entries/${selectedEntryId}`)
       .then(result => {
-        if (!active) return;
+        if (!active || activeKeyRef.current.teamId !== targetTeamId || activeKeyRef.current.entryId !== selectedEntryId) return;
         setDetail(result);
         setEntries(previous => mergeEntryPage(previous, { entries: [result.head], cursor: result.head.seq, more: false }));
       })
       .catch(error => {
-        if (active) setDetailError((error as Error).message);
+        if (active && activeKeyRef.current.teamId === targetTeamId && activeKeyRef.current.entryId === selectedEntryId) {
+          setDetailError((error as Error).message);
+        }
       })
       .finally(() => {
         if (active) setDetailLoading(false);
@@ -346,19 +369,25 @@ export function TeamEvidenceBoard({
   async function withdrawSelected() {
     if (!selectedHead || withdrawing || me.role !== "owner" || !fresh || selectedHead.state === "withdrawn") return;
     if (!window.confirm("Withdraw this blackboard entry? Its history remains visible as withdrawn.")) return;
+    const targetTeamId = team.id;
+    const targetEntryId = selectedHead.entryId;
+    const targetEpoch = feedEpochRef.current;
     setWithdrawing(true);
     setWithdrawError("");
     try {
       await api<{ entryId: string; state: string; changed: boolean }>(
-        `/teams/${team.id}/entries/${selectedHead.entryId}/withdraw`,
+        `/teams/${targetTeamId}/entries/${targetEntryId}/withdraw`,
         { requestId: crypto.randomUUID() },
       );
-      const updated = await api<TeamEntryDetail>(`/teams/${team.id}/entries/${selectedHead.entryId}`);
-      setDetail(updated);
+      const updated = await api<TeamEntryDetail>(`/teams/${targetTeamId}/entries/${targetEntryId}`);
+      if (feedEpochRef.current !== targetEpoch || activeKeyRef.current.teamId !== targetTeamId) return;
       setEntries(previous => mergeEntryPage(previous, { entries: [updated.head], cursor: updated.head.seq, more: false }));
+      if (activeKeyRef.current.entryId === targetEntryId) setDetail(updated);
       feed.refresh();
     } catch (error) {
-      setWithdrawError((error as Error).message);
+      if (feedEpochRef.current === targetEpoch && activeKeyRef.current.teamId === targetTeamId && activeKeyRef.current.entryId === targetEntryId) {
+        setWithdrawError((error as Error).message);
+      }
     } finally {
       setWithdrawing(false);
     }
@@ -440,7 +469,9 @@ export function TeamEvidenceBoard({
                 aria-selected={entry.entryId === selectedEntryId}
                 className={`ti-entry-row${entry.state === "withdrawn" ? " is-withdrawn" : ""}`}
                 onClick={() => {
+                  ownSelectionRef.current = entry.entryId;
                   setFollow(false);
+                  followRef.current = false;
                   onSelectEntry(entry.entryId);
                 }}
               >
@@ -521,7 +552,9 @@ export function TeamEvidenceBoard({
                       type="button"
                       className="ti-link-btn"
                       onClick={() => {
+                        ownSelectionRef.current = selectedHead.supersedes!;
                         setFollow(false);
+                        followRef.current = false;
                         onSelectEntry(selectedHead.supersedes!);
                       }}
                     >
@@ -534,7 +567,9 @@ export function TeamEvidenceBoard({
                       key={newer.entryId}
                       className="ti-link-btn"
                       onClick={() => {
+                        ownSelectionRef.current = newer.entryId;
                         setFollow(false);
+                        followRef.current = false;
                         onSelectEntry(newer.entryId);
                       }}
                     >

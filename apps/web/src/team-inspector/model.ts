@@ -343,7 +343,7 @@ export function parseTeamEntryHash(hash: string, teamId?: string): TeamEntryHash
   const machine = match[1] ? decodeURIComponent(match[1]) : "direct";
   const matchedTeamId = decodeURIComponent(match[2]!);
   const entryId = match[3] ? decodeURIComponent(match[3]) : null;
-  if (teamId && matchedTeamId !== teamId) return null;
+  if (teamId && matchedTeamId.toLowerCase() !== teamId.toLowerCase()) return null;
   return { machine, teamId: matchedTeamId, entryId };
 }
 

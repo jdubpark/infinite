@@ -221,7 +221,7 @@ export function teamSummaryText(team: any, rows: { sessionId: string; status: Te
     section(lines, "GAPS AND UNKNOWNS", brief?.unknowns ?? []);
     lines.push("", "Generated reading of recorded activity and the repository. It is not completion or approval.");
   }
-  const keys = ["l logs", ...(canAskForBrief(team, rows) ? ["a refresh Brief"] : []), "q quit"].join(" · ");
+  const keys = ["b board", "l logs", ...(canAskForBrief(team, rows) ? ["a refresh Brief"] : []), "q quit"].join(" · ");
   const tail = interactive ? keys : `Review logs: infinite team status ${clean(team?.id)} --logs`;
   lines.push("", checkedAt ? `${clean(checkedAt)} · ${tail}` : tail);
   return lines.join("\n");
@@ -286,7 +286,7 @@ export function teamLogsText(team: any, agents: any[], member: any, screen: unkn
   lines.push("", "RECENT EVENTS");
   if (recent.length) for (const event of recent) lines.push(`  ${clock(event.at)}  ${short(event.text, 300)}`);
   else lines.push("  No recent control events.");
-  const keys = `${agents.length > 1 ? "←→ agent · " : ""}s summary · q quit`;
+  const keys = `${agents.length > 1 ? "←→ agent · " : ""}b board · s summary · q quit`;
   const tail = interactive ? keys : `Summary: infinite team status ${clean(team?.id)}`;
   lines.push("", checkedAt ? `${clean(checkedAt)} · ${tail}` : tail);
   return lines.join("\n");

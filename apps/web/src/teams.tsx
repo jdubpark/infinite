@@ -14,7 +14,6 @@ import { TeamOverview } from "./team-inspector/TeamOverview";
 import { TeamEvidenceBoard } from "./team-inspector/TeamEvidenceBoard";
 import { buildTeamEntryHash, parseTeamEntryHash } from "./team-inspector/model";
 import type { TeamAcceptanceEvidence, TeamCriterionRefs, TeamGoalRecord, TeamRunAssessment } from "./team-inspector/types";
-import "./team-inspector/team-inspector.css";
 
 type TeamStatus = "planning" | "discovering" | "implementing" | "integrating" | "verifying" | "reviewing" | "delivering" | "merged" | "needs-input" | "paused" | "blocked" | "ready-for-review" | "no-change" | "cancelled";
 type TeamRole = "project-manager" | "intent-checker" | "scout" | "implementer" | "integrator" | "reviewer" | "delivery" | "evaluator";
@@ -416,6 +415,8 @@ export function TeamDetail({ id, me, connected, sessions, refreshTeams, openSess
       if (next?.entryId) {
         setMode("board");
         setSelectedEntryId(next.entryId);
+      } else if (next && !next.entryId) {
+        setSelectedEntryId(null);
       }
     };
     window.addEventListener("hashchange", onHashChange);
@@ -424,6 +425,7 @@ export function TeamDetail({ id, me, connected, sessions, refreshTeams, openSess
   function selectMode(next: "summary" | "board" | "logs") {
     setMode(next);
     if (next !== "board") {
+      setSelectedEntryId(null);
       const current = parseTeamEntryHash(window.location.hash, id);
       if (current?.entryId) history.replaceState(null, "", buildTeamEntryHash(machine, id));
     }
@@ -519,7 +521,7 @@ export function TeamDetail({ id, me, connected, sessions, refreshTeams, openSess
       {openDecisions.length > 0 && <section className="team-section team-decisions"><h2>{missionManaged ? "Open decisions" : "Decisions for you"} <span className="quiet">{openDecisions.length}</span></h2>{openDecisions.map(decision => <Decision key={decision.id} decision={decision} disabled={!canSteer || team.status === "paused" || busy || Boolean(pending)} from={askedBy(team, decision)} answer={text => void mutate("/teams/" + id + "/decisions/" + decision.id + "/answer", "Answer", text)} readOnly={missionManaged} />)}</section>}
       {attention.length > 0 && <section className="team-section team-decisions"><h2>Agent sessions need you</h2><p className="quiet">The host answers ordinary prompts in a member’s own workspace. These sessions still wait on a provider prompt; respond in the session.</p>{attention.map(session => <button className="team-session-link" key={session.id} onClick={() => openSession(session.id)}><span><strong>{session.title}</strong><small>{session.attention?.now ?? "Open the session to respond."}</small></span><ArrowUpRight size={18} /></button>)}</section>}
       <ProviderLimitNotice limits={team.providerLimits} />
-      <TeamOverview team={team} sessions={sessions} onOpenSession={openSession} onInspectMemberEntries={memberId => { setBoardMemberFilter(memberId); selectMode("board"); }} onViewMemberLogs={memberId => { setAgentId(memberId); selectMode("logs"); }} />
+      <TeamOverview team={team} sessions={sessions} onOpenSession={openSession} onInspectMemberEntries={memberId => { setSelectedEntryId(null); setBoardMemberFilter(memberId); selectMode("board"); }} onViewMemberLogs={memberId => { setAgentId(memberId); selectMode("logs"); }} />
       <section className="team-section"><h2>Your request</h2><p className="team-prose">{team.objective}</p></section>
       {mode === "logs" ? <>
         <div className="team-agent-switch" role="tablist" aria-label="Agents">{orderedMembers.map(member => <button type="button" role="tab" key={member.memberId} aria-selected={member.memberId === agentId} onClick={() => setAgentId(member.memberId)}><strong><span className={"team-agent-dot" + (["running", "waiting"].includes(member.status) ? " live" : "")} />{roles[member.role].name}</strong><span>{member.status}{member.revision === team.revision ? "" : ` · revision ${member.revision}`}</span></button>)}</div>

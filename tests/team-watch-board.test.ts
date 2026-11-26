@@ -4,6 +4,7 @@ import { parseClientArgs } from "../packages/host/src/client.js";
 import type { EntryHead } from "../packages/host/src/evidence/entry-types.js";
 import {
   applyBoardCommand,
+  boardFocusOffset,
   boardKindFilter,
   createTeamBoardState,
   teamBoardText,
@@ -127,6 +128,42 @@ test("applyBoardCommand navigates entries, cycles kind filter on p, toggles foll
   const followed = applyBoardCommand(state, "follow", entries);
   state = followed.state;
   assert.equal(state.follow, true);
+});
+
+test("boardFocusOffset scrolls selected entry and expanded detail into a 24-row viewport", () => {
+  const many: EntryHead[] = Array.from({ length: 20 }, (_, index) => ({
+    entryId: `e-${index + 1}`,
+    seq: index + 1,
+    scope: "run",
+    runId: team.id,
+    revision: 2,
+    at: "2026-11-26T01:00:00.000Z",
+    kind: "check",
+    author: "host",
+    authority: "receipt",
+    paths: [],
+    summary: `entry summary ${index + 1}`,
+    bodyBytes: 100,
+    state: "active",
+  }));
+  const state = createTeamBoardState();
+  const card = teamBoardText(team, many, state, null, "12:00:00", true, 100);
+  assert.match(card.split("\n").at(-1)!, /o member logs · l logs/);
+  const offset = boardFocusOffset(card, 24, 100, 0, false);
+  assert.ok(offset > 0, `expected non-zero scroll offset for bottom entry in 24-row viewport, got ${offset}`);
+
+  const opened = applyBoardCommand(state, "enter", many).state;
+  const withDetail = teamBoardText(
+    team,
+    many,
+    opened,
+    { head: many[many.length - 1]!, body: { status: "passed", output: "line 1\nline 2\nline 3" } },
+    "12:00:00",
+    true,
+    100,
+  );
+  const detailOffset = boardFocusOffset(withDetail, 24, 100, 0, true);
+  assert.ok(detailOffset >= offset, `expected detail offset ${detailOffset} >= ${offset}`);
 });
 
 test("parseClientArgs supports --board on team watch and rejects invalid combinations", () => {

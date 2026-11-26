@@ -152,6 +152,33 @@ export function TeamOverview({
               </article>
             );
           })}
+          {overview.unassignedTasks.length > 0 && (() => {
+            const integrated = overview.unassignedTasks.filter(task => task.status === "integrated").length;
+            const total = overview.unassignedTasks.length;
+            const pct = Math.round((integrated / total) * 100);
+            return (
+              <article className="ti-criterion-card" key="other-tasks">
+                <div className="ti-criterion-top">
+                  <span className="ti-criterion-id">other</span>
+                  <span className="ti-pill">Tasks</span>
+                </div>
+                <p className="ti-criterion-label">Other tasks</p>
+                <div className="ti-progress-row">
+                  <span>{integrated} of {total} tasks integrated</span>
+                </div>
+                <div className="ti-progress-track" aria-hidden="true">
+                  <div className="ti-progress-fill" style={{ width: `${pct}%` }} />
+                </div>
+                <div className="ti-task-chips">
+                  {overview.unassignedTasks.map(task => (
+                    <span className="ti-task-chip" key={task.id} title={`${task.title} (${task.status})`}>
+                      {task.id}: {task.status}
+                    </span>
+                  ))}
+                </div>
+              </article>
+            );
+          })()}
         </div>
       ) : (
         <div className="ti-summary-box">

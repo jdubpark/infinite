@@ -93,7 +93,7 @@ test("the summary card reads the coordinator brief and the log card returns to i
   assert.deepEqual([...order].sort((a, b) => a - b), order);
   assert.ok(!order.includes(-1));
   assert.match(summary, /1\. \[high\] alarm gate\n\s+It decides when the alarm stops\n\s+Ask: Does rolling over count\?/);
-  assert.match(summary.split("\n").at(-1)!, /^l logs · q quit$/);
+  assert.match(summary.split("\n").at(-1)!, /^b board · l logs · q quit$/);
   assert.match(teamSummaryText(detailed, [{ sessionId: "s-pm", status: ready }]).split("\n").at(-1)!, /infinite team status team-1 --logs/);
   const empty = teamSummaryText(detailed, [{ sessionId: "s-pm", status: { state: "empty" } }], "", true);
   assert.match(empty, /Press a to refresh the Brief/);
@@ -121,7 +121,7 @@ test("the summary card reads the coordinator brief and the log card returns to i
   assert.match(logs, /Implementer waiting/);
   assert.match(logs, /Coordinator stopped r1/);
   assert.match(logs, /planning the stop/);
-  assert.match(logs.split("\n").at(-1)!, /^←→ agent · s summary · q quit$/);
+  assert.match(logs.split("\n").at(-1)!, /^←→ agent · b board · s summary · q quit$/);
 });
 
 test("watch keys switch views and agents, scroll, and detach", () => {

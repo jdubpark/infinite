@@ -36,14 +36,14 @@
 .ti-roster-card-top strong { font-size: 13px; }
 .ti-roster-sub { font-size: 11px; color: var(--muted); overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
 .ti-roster-links { display: flex; flex-wrap: wrap; gap: 6px 10px; margin-top: 2px; }
-.ti-link-btn { padding: 4px 8px; min-height: 28px; border: 1px solid var(--rule); border-radius: 6px; background: #fff; color: var(--green); font-size: 11px; font-weight: 500; display: inline-flex; align-items: center; gap: 4px; }
+.ti-link-btn { padding: 8px 12px; min-height: 44px; border: 1px solid var(--rule); border-radius: 6px; background: #fff; color: var(--green); font-size: 12px; font-weight: 500; display: inline-flex; align-items: center; gap: 4px; }
 .ti-link-btn:hover:not(:disabled) { background: #eef1e9; }
-.ti-finished-toggle { align-self: flex-start; min-height: 36px; padding: 6px 12px; border: 1px solid var(--rule); border-radius: 8px; background: #fff; color: var(--ink); font-size: 12px; font-weight: 500; display: inline-flex; align-items: center; gap: 6px; }
+.ti-finished-toggle { align-self: flex-start; min-height: 44px; padding: 8px 14px; border: 1px solid var(--rule); border-radius: 8px; background: #fff; color: var(--ink); font-size: 12px; font-weight: 500; display: inline-flex; align-items: center; gap: 6px; }
 .ti-board { display: flex; flex-direction: column; gap: 14px; padding: 20px 0 24px; border-bottom: 1px solid var(--rule); }
 .ti-board-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 10px; }
-.ti-board-toolbar select, .ti-board-toolbar input { min-height: 36px; padding: 6px 10px; border: 1px solid var(--rule); border-radius: 8px; background: #fff; font-size: 12px; }
+.ti-board-toolbar select, .ti-board-toolbar input { width: auto; min-height: 44px; padding: 8px 12px; border: 1px solid var(--rule); border-radius: 8px; background: #fff; font-size: 12px; }
 .ti-board-toolbar input { flex: 1 1 180px; min-width: 140px; }
-.ti-follow-btn { min-height: 36px; padding: 6px 12px; border: 1px solid var(--rule); border-radius: 8px; background: #fff; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.ti-follow-btn { min-height: 44px; padding: 8px 14px; border: 1px solid var(--rule); border-radius: 8px; background: #fff; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
 .ti-follow-btn[aria-pressed="true"] { border-color: var(--green); background: #eef4ec; color: var(--green); font-weight: 600; }
 .ti-board-split { display: grid; grid-template-columns: minmax(280px, 1fr) minmax(320px, 1.15fr); gap: 16px; align-items: start; }
 .ti-entry-list { display: flex; flex-direction: column; border: 1px solid var(--rule); border-radius: 10px; background: var(--paper); overflow: hidden; max-height: 620px; overflow-y: auto; }
@@ -60,7 +60,7 @@
 .ti-detail-title-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
 .ti-detail-title-row h3 { margin: 0; font-size: 15px; }
 .ti-detail-actions { display: flex; flex-wrap: wrap; gap: 8px; }
-.ti-danger-btn { min-height: 32px; padding: 5px 10px; border: 1px solid #dfb9b3; border-radius: 6px; background: #fff; color: #9d382a; font-size: 12px; font-weight: 500; }
+.ti-danger-btn { min-height: 44px; padding: 8px 12px; border: 1px solid #dfb9b3; border-radius: 6px; background: #fff; color: #9d382a; font-size: 12px; font-weight: 500; }
 .ti-kv { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 8px 14px; margin: 0; font-size: 12px; }
 .ti-kv dt { color: var(--muted); }
 .ti-kv dd { margin: 0; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }

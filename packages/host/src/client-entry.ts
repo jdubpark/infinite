@@ -57,7 +57,7 @@ infinite understand create COLLECTION|update COLLECTION ID|archive COLLECTION ID
   Mutations require --revision N --request-id UUID; create/update/policy also require --file JSON
 infinite team status [ID] [--json] [--logs] | team watch ID [--logs | --board] | team pull TEAM_ID [--json]
   status ID prints open decisions and the Brief. Watch keeps it full screen.
-  l review logs · s summary · ←→ or n/p agent · ↑↓ j/k space scroll · a refresh Brief · q quit
+  b board · l review logs · s summary · ←→ or n/p agent · ↑↓ j/k space scroll · a refresh Brief · q quit
   --logs starts in the review log. --json prints the team record.
 infinite team steer ID TEXT | team answer ID QUESTION_ID TEXT
 infinite team continue ID [TEXT] [--json] [--request-id UUID]

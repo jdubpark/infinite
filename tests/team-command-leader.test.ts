@@ -217,7 +217,7 @@ test("a command whose stop comes before its start never starts, whether it was a
     open();
     const results = [asked, await queued];
     assert.deepEqual(heard, [undefined, undefined], "the scope heard of a started process");
-    for (const result of results) assert.deepEqual(result, { exitCode: null, output: "", stdout: "", interrupted: true, truncated: false, leftover: false });
+    for (const result of results) assert.deepEqual(result, { exitCode: null, output: "", stdout: "", interrupted: true, notStarted: true, truncated: false, leftover: false });
     assert.deepEqual([existsSync(stopped.leaderFile), existsSync(waiting.leaderFile)], [false, false], "a command ran");
   } finally {
     open();

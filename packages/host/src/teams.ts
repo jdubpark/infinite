@@ -1,5 +1,5 @@
 import type { ConnectorSource } from "./mcp-types.js";
-import { inputSourceLabel, decisionAnswerLabel, type SteeringSource } from "./team-types.js";
+import { runMayOverlapWindow, snapshotRepairRun, type RepairMetricsRun, type RepairRunFilter } from "./repair-metrics.js";
 import { withoutMainCheck, type HandoffPolicy, type TeamHandoffContext } from "./handoff-types.js";
 import { randomUUID } from "node:crypto";
 import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync } from "node:fs";
@@ -14,7 +14,7 @@ import { accountSettingPrompt, PROVIDER_NAMES, recoveryTurnEnd, type AttentionSt
 import { evaluateStallRecovery, MEMBER_STALL_REASON } from "./stall-recovery.js";
 import { describeTeamWaitReasons, PERMISSION_AGENT_REASON, PERMISSION_REVIEW_REASON, PROVIDER_INPUT_REASON, SESSION_SLOT_REASON } from "./team-wait-reasons.js";
 import { autonomyOf, type AutonomyMode } from "./autonomy.js";
-import { buildTeamPendingOperation, createTeamSchema, lineupProfiles, resolveLimitFallback, teamActionSchema, teamGoalContextSchema, teamLineupSchema, teamMutationSchema, teamMemberRetireSchema, teamParallelismSchema, recordedTeamReportEnvelopeSchema, type CreateTeam, type TeamContinue, type TeamGoalContext, type TeamLineup, type TeamMember, type TeamMemberRetire, type TeamModelProfile, type TeamParallelism, type TeamPermissionDecision, type TeamPermissionRecoveryView, type TeamReport, type TeamRun, type TeamScout, type TeamTask, type TeamView, type TeamVerificationReconcile, type TeamDeliveryReconcile, currentPermissions, DEFAULT_STORAGE_FLOOR, hostClosedBlockedReason, autoPinned, coversPoint, escalationPool, hostProfilesFor, memberLimit, switchFallback } from "./team-types.js";
+import { buildTeamPendingOperation, createTeamSchema, decisionAnswerLabel, inputSourceLabel, lineupProfiles, resolveLimitFallback, teamActionSchema, teamGoalContextSchema, teamLineupSchema, teamMutationSchema, teamMemberRetireSchema, teamParallelismSchema, recordedTeamReportEnvelopeSchema, type CreateTeam, type SteeringSource, type TeamContinue, type TeamGoalContext, type TeamLineup, type TeamMember, type TeamMemberRetire, type TeamModelProfile, type TeamParallelism, type TeamPermissionDecision, type TeamPermissionRecoveryView, type TeamReport, type TeamRun, type TeamScout, type TeamTask, type TeamView, type TeamVerificationReconcile, type TeamDeliveryReconcile, currentPermissions, DEFAULT_STORAGE_FLOOR, hostClosedBlockedReason, autoPinned, coversPoint, escalationPool, hostProfilesFor, memberLimit, switchFallback } from "./team-types.js";
 import { memberConfiguration, type MemberConfiguration } from "./config-identity.js";
 import { deliveryPromptStale, pullRequestBranch, refreshReportingInstructions, retargetPrompt, TEAM_PROMPT_LIMIT_BYTES, teamContext, teamDeliveryBranch, teamPrompt } from "./team-prompts.js";
 import { reviewEvidenceProblems } from "./team-acceptance.js";
@@ -755,6 +755,7 @@ export class TeamService {
   list(): TeamView[] { return [...this.records.values()].filter(stored => !stored.run.replay).map(record => this.view(record)).sort((a, b) => b.createdAt.localeCompare(a.createdAt)); }
   listItems(): TeamListItem[] { return this.list().map(teamListItem); }
   understandingRecords() { return [...this.records.values()].filter(stored => !stored.run.replay).map(stored => structuredClone(stored.run)); }
+  repairMetricsRuns(filter?: RepairRunFilter): RepairMetricsRun[] { return [...this.records.values()].flatMap(stored => runMayOverlapWindow(stored.run, filter) ? [snapshotRepairRun(stored.run)] : []); }
   pendingOperation(runId: string): boolean { return Boolean(this.records.get(runId)?.pending); }
   understandingOwnsSession(runId: string, memberId: string, sessionId: string, projectId: string): boolean {
     const stored = this.records.get(runId);

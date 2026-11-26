@@ -636,3 +636,99 @@ test("stored reader: malformed, corrupt, over-bound, or unrecognized payloads fa
     assert.equal(built.readStoredCrossingDigest(payload), undefined, `readStoredCrossingDigest accepted ${label}`);
   }
 });
+
+test("stored reader: near-limit legacy digests enforce the receipt reserve so withClaims(loaded, {}) is a lossless no-op", () => {
+  const reserveMeasure = (digest: CrossingDigest) => measure({ ...digest, outcome: "complete", omitted: counts(OMITTED_MAX) });
+  const buildNearReserve = (pad: number, includeClaim: boolean): CrossingDigest => ({
+    v: 1,
+    outcome: "failed",
+    touched: [
+      ...Array.from({ length: 5 }, (_, index) => ({ path: `r${index}/${"p".repeat(260)}`, op: "changed" as const, by: "receipt" as const })),
+      { path: `tail/${"v".repeat(pad)}`, op: "read", by: "receipt" },
+    ],
+    decisions: [],
+    failures: [{ signal: `exit ${char(0x7f)}`, where: "npm test", class: "check", by: "receipt" }],
+    forSiblings: [],
+    open: includeClaim ? ["legacy open note"] : [],
+    omitted: counts(0),
+  });
+  const textOnly = (digest: CrossingDigest): CrossingDigest => ({
+    ...digest,
+    failures: digest.failures.map(row => ({ ...row, signal: `exit ${escapeOf(0x7f)}` })),
+  });
+
+  for (const includeClaim of [false, true]) {
+    let target: CrossingDigest | undefined;
+    for (let pad = 1; pad <= 280; pad += 1) {
+      const candidate = buildNearReserve(pad, includeClaim);
+      const afterText = textOnly(candidate);
+      if (measure(candidate) <= DIGEST_LIMIT_BYTES && measure(afterText) <= DIGEST_LIMIT_BYTES && reserveMeasure(afterText) > DIGEST_LIMIT_BYTES) {
+        target = candidate;
+        break;
+      }
+    }
+    assert.ok(target, `failed to build near-reserve legacy fixture (includeClaim=${includeClaim})`);
+    assert.equal(crossingDigestSchema.safeParse(target).success, false);
+    const loaded = valid(built.readStoredCrossingDigest(target));
+    assert.ok(reserveMeasure(loaded) <= DIGEST_LIMIT_BYTES, `loaded digest exceeded reserved budget (${reserveMeasure(loaded)} bytes)`);
+    if (includeClaim) {
+      assert.equal(loaded.touched.length, target.touched.length);
+      assert.equal(loaded.open.length, 0);
+      assert.equal(loaded.omitted.open, 1);
+    } else {
+      assert.equal(loaded.touched.length, target.touched.length - 1);
+      assert.equal(loaded.omitted.touched, 1);
+    }
+    const afterEmptyClaims = valid(built.withClaims(loaded, {}));
+    assert.deepEqual(afterEmptyClaims, loaded, `withClaims(loaded, {}) modified loaded digest (includeClaim=${includeClaim})`);
+    assert.equal(JSON.stringify(afterEmptyClaims), JSON.stringify(loaded));
+    assert.deepEqual(valid(built.readStoredCrossingDigest(loaded)), loaded);
+  }
+});
+
+test("stored reader: failure keys that collide after normalization fold receipt over claim independently of byte fitting", () => {
+  const empty = valid(built.emptyDigest("failed"));
+  const receiptFirst: CrossingDigest = {
+    ...empty,
+    failures: [
+      { signal: "exit\r", where: "npm test", class: "check", by: "receipt" },
+      { signal: "exit\n", where: "npm test", class: "claim", by: "claim" },
+    ],
+  };
+  const claimFirst: CrossingDigest = {
+    ...empty,
+    failures: [
+      { signal: "exit\n", where: "npm test", class: "claim", by: "claim" },
+      { signal: "exit\r", where: "npm test", class: "check", by: "receipt" },
+    ],
+  };
+  const noWhere: CrossingDigest = {
+    ...empty,
+    failures: [
+      { signal: "exit\r\n", class: "stop", by: "receipt" },
+      { signal: "exit\n", class: "claim", by: "claim" },
+    ],
+  };
+  const sameAuthority: CrossingDigest = {
+    ...empty,
+    failures: [
+      { signal: "exit\r", where: "npm test", class: "stop", by: "receipt" },
+      { signal: "exit\n", where: "npm test", class: "check", by: "receipt" },
+    ],
+  };
+
+  for (const [label, raw, expected] of [
+    ["receipt then claim", receiptFirst, [{ signal: "exit\n", where: "npm test", class: "check", by: "receipt" }]],
+    ["claim then receipt", claimFirst, [{ signal: "exit\n", where: "npm test", class: "check", by: "receipt" }]],
+    ["matching undefined where", noWhere, [{ signal: "exit\n", class: "stop", by: "receipt" }]],
+    ["same authority keeps newest", sameAuthority, [{ signal: "exit\n", where: "npm test", class: "stop", by: "receipt" }]],
+  ] as const) {
+    assert.ok(measure(raw) < DIGEST_LIMIT_BYTES / 2, `${label} fixture should stay well under 2 KiB`);
+    assert.equal(crossingDigestSchema.safeParse(raw).success, false, `strict schema accepted raw ${label}`);
+    const loaded = valid(built.readStoredCrossingDigest(raw));
+    assert.deepEqual(loaded.failures, expected, label);
+    assert.equal(loaded.omitted.failures, 0, `${label}: folded failure should not bump omitted`);
+    assert.deepEqual(valid(built.withClaims(loaded, {})), loaded, `${label}: withClaims changed folded digest`);
+    assert.deepEqual(valid(built.readStoredCrossingDigest(loaded)), loaded, `${label}: not idempotent`);
+  }
+});

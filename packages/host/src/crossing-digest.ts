@@ -85,6 +85,20 @@ function digestObjectSchema<T extends z.ZodType<string>, S extends z.ZodType<str
 
 export const crossingDigestSchema = digestObjectSchema(text, shortText);
 export type CrossingDigest = z.infer<typeof crossingDigestSchema>;
+type Touched = CrossingDigest["touched"][number];
+type Failure = CrossingDigest["failures"][number];
+type Decision = CrossingDigest["decisions"][number];
+type Sibling = CrossingDigest["forSiblings"][number];
+type Omitted = CrossingDigest["omitted"];
+type Counts = Required<Omitted>;
+type Outcome = CrossingDigest["outcome"];
+
+const WIDEST_COUNTS: Counts = { touched: OMITTED_MAX, decisions: OMITTED_MAX, failures: OMITTED_MAX, forSiblings: OMITTED_MAX, open: OMITTED_MAX };
+const WIDEST_OUTCOME: Outcome = OUTCOMES.reduce((wide, next) => (next.length > wide.length ? next : wide));
+
+function reservedBytes(digest: CrossingDigest): number {
+  return digestBytes({ ...digest, outcome: WIDEST_OUTCOME, omitted: WIDEST_COUNTS });
+}
 
 function isPlainTree(value: unknown, depth = 0): boolean {
   if (value === null || typeof value !== "object") return true;
@@ -100,6 +114,11 @@ function isPlainTree(value: unknown, depth = 0): boolean {
   return keys.every(key => isPlainTree((value as Row)[key], depth + 1));
 }
 
+function foldFailures(rows: Failure[]): Failure[] {
+  const [receipts, claims] = tiers(rows, list => unique(list, failureKey), failureKey);
+  return [...receipts, ...claims];
+}
+
 function normalizeDigestText(digest: CrossingDigest): CrossingDigest {
   return {
     v: digest.v,
@@ -110,21 +129,21 @@ function normalizeDigestText(digest: CrossingDigest): CrossingDigest {
       by: row.by,
       ...(row.ids === undefined ? {} : { ids: row.ids.map(id => cleanText(id, SHORT_BYTES)) }),
     })),
-    decisions: digest.decisions.map(row => ({
-      what: cleanText(row.what),
-      why: cleanText(row.why),
-    })),
-    failures: digest.failures.map(row => ({
+    decisions: unique(
+      digest.decisions.map(row => ({ what: cleanText(row.what), why: cleanText(row.why) })),
+      item => JSON.stringify([item.what, item.why]),
+    ),
+    failures: foldFailures(digest.failures.map(row => ({
       signal: cleanText(row.signal),
       ...(row.where === undefined ? {} : { where: cleanText(row.where) }),
       class: row.class,
       by: row.by,
-    })),
-    forSiblings: digest.forSiblings.map(row => ({
+    }))),
+    forSiblings: mergeSiblings(digest.forSiblings.map(row => ({
       note: cleanText(row.note),
       ...(row.paths === undefined ? {} : { paths: [...row.paths] }),
-    })),
-    open: digest.open.map(item => cleanText(item)),
+    }))),
+    open: unique(digest.open.map(item => cleanText(item)), item => item),
     omitted: {
       touched: digest.omitted.touched,
       decisions: digest.omitted.decisions,
@@ -137,7 +156,7 @@ function normalizeDigestText(digest: CrossingDigest): CrossingDigest {
 
 function normalizeStoredDigest(digest: CrossingDigest): CrossingDigest {
   const normalized = normalizeDigestText(digest);
-  const bounded = digestBytes(normalized) <= DIGEST_LIMIT_BYTES
+  const bounded = reservedBytes(normalized) <= DIGEST_LIMIT_BYTES
     ? normalized
     : combine(normalized.outcome, [normalized]);
   return checked("storedCrossingDigestSchema", bounded);
@@ -153,16 +172,6 @@ export function readStoredCrossingDigest(value: unknown): CrossingDigest | undef
   const parsed = storedCrossingDigestSchema.safeParse(value);
   return parsed.success ? parsed.data : undefined;
 }
-type Touched = CrossingDigest["touched"][number];
-type Failure = CrossingDigest["failures"][number];
-type Decision = CrossingDigest["decisions"][number];
-type Sibling = CrossingDigest["forSiblings"][number];
-type Omitted = CrossingDigest["omitted"];
-type Counts = Required<Omitted>;
-type Outcome = CrossingDigest["outcome"];
-
-const WIDEST_COUNTS: Counts = { touched: OMITTED_MAX, decisions: OMITTED_MAX, failures: OMITTED_MAX, forSiblings: OMITTED_MAX, open: OMITTED_MAX };
-const WIDEST_OUTCOME: Outcome = OUTCOMES.reduce((wide, next) => (next.length > wide.length ? next : wide));
 
 export type HostInput = {
   outcome: Outcome;
@@ -426,10 +435,9 @@ function cut(items: unknown[], max: number): number {
 }
 
 function fit(digest: CrossingDigest, order: readonly (keyof Counts)[], droppable: (row: unknown) => boolean): void {
-  const reserved = () => digestBytes({ ...digest, outcome: WIDEST_OUTCOME, omitted: WIDEST_COUNTS });
   for (const key of order) {
     const items: unknown[] = digest[key];
-    for (let index = items.length - 1; index >= 0 && reserved() > DIGEST_LIMIT_BYTES; index -= 1) {
+    for (let index = items.length - 1; index >= 0 && reservedBytes(digest) > DIGEST_LIMIT_BYTES; index -= 1) {
       if (!droppable(items[index])) continue;
       items.splice(index, 1);
       bump(digest.omitted, key);

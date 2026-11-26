@@ -1,12 +1,13 @@
 import { bootId, hostProcesses, type CensusResult, type ProcessWitness } from "./process-census.js";
 import { teamRunDirectory, type TeamKernel } from "./team-kernel.js";
-import { COMMAND_STOP_UNCONFIRMED_REASON, TeamError } from "./team-workspace.js";
+import { COMMAND_STOP_UNCONFIRMED_REASON, STOP_GRACE_MS, TeamError } from "./team-workspace.js";
 import { CENSUS_TTL_MS, censusCounts, countsKey, leftoverCensusEvent, leftoverStatementEvent, type StoredLeftover } from "./team-leftover.js";
 import type { PendingOperation, Stored, TeamServiceOptions } from "./teams.js";
 
 export const COMMAND_STOP_STATEMENT_REASON = "The host stopped a configured team command but cannot confirm that it ended, and its process census cannot tell whether that command's processes still run. While the census cannot tell, the owner's statement is the only way out: after checking the host, run `infinite team processes-ended RUN_ID` (POST /api/teams/RUN_ID/processes-ended); Resume is accepted after that.";
 export const commandStopReasons = new Set([COMMAND_STOP_UNCONFIRMED_REASON, COMMAND_STOP_STATEMENT_REASON]);
 export const HALT_CENSUS_MS = 30_000;
+const ANCHOR_SETTLE_MS = STOP_GRACE_MS + 500;
 
 export type OwnerStatement = { requestId: string; at: string; detail: string };
 export type TakenCensus = { at: string; operation?: { pendingId: string; result: CensusResult }; leftover?: { record: StoredLeftover; result: CensusResult } };
@@ -145,7 +146,8 @@ export class CommandFence {
   }
   watch(stored: Stored) {
     if (!stopFenced(stored)) return;
-    void this.take(stored.run.id).then(taken => taken && this.host.enqueue(stored.run.id, () => this.apply(stored, taken))).catch(() => {});
+    const settled = this.host.config.teams?.commandPrefix ? new Promise<void>(resolve => setTimeout(resolve, ANCHOR_SETTLE_MS).unref()) : Promise.resolve();
+    void settled.then(() => this.take(stored.run.id)).then(taken => taken && this.host.enqueue(stored.run.id, () => this.apply(stored, taken))).catch(() => {});
   }
   recent(id: string, reuseMs: number): Promise<TakenCensus | undefined> {
     const stored = this.host.records.get(id), census = stored?.census;

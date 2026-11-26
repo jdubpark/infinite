@@ -18,6 +18,29 @@ export const GROUP_ANCHOR = [
   "exit \"$c\"",
 ].join("\n");
 
+export const TEAM_ANCHOR = [
+  "g=$1; s=; shift",
+  "exec 3>&2 2>/dev/null 4<&0",
+  "if env --default-signal=INT,QUIT true >/dev/null 2>&1; then set -- env --default-signal=INT,QUIT \"$@\"; fi",
+  "trap 'if [ -z \"$s\" ]; then s=1; kill -s TERM 0; { command -p sleep \"$g\"; kill -s KILL 0; } </dev/null >/dev/null 2>&1 3>&- 4<&- & fi' TERM",
+  "\"$@\" <&4 2>&3 3>&- 4<&- &",
+  "p=$!",
+  "exec 4<&-",
+  "while :; do",
+  "  wait \"$p\"; c=$?",
+  "  kill -0 \"$p\" 2>/dev/null || break",
+  "done",
+  "trap - TERM",
+  "if [ \"$c\" -gt 128 ] && n=$(kill -l \"$c\"); then",
+  "  case $n in STOP|TSTP|TTIN|TTOU) ;; *) ulimit -c 0; kill -s \"$n\" $$ ;; esac",
+  "fi",
+  "exit \"$c\"",
+].join("\n");
+
+export function teamAnchored(command: { command: string; args: string[] }, graceMs: number): { command: string; args: string[] } {
+  return { command: "sh", args: ["-c", TEAM_ANCHOR, "sh", String(Math.ceil(graceMs / 1000)), command.command, ...command.args] };
+}
+
 export const GROUP_SUPERVISOR = `
   const {spawn}=require('node:child_process');
   const child=spawn(process.argv[1],process.argv.slice(2),{detached:true,stdio:['ignore','pipe','pipe']});

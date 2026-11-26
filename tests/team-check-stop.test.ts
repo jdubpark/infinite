@@ -160,10 +160,29 @@ test("a check stopped at its time limit whose child keeps the output open blocks
   await stoppedCheckIsFenced(false, "holds-output");
 });
 
-test("under a sudo prefix, a check stopped at its time limit whose first process ends while its child runs on blocks its run; nothing starts in the workspace and Resume waits for a census that finds none of its processes", {
+test("under a sudo prefix, a check stopped at its time limit whose first process ends while its child, outside the check's group, runs on blocks its run; nothing starts in the workspace and Resume waits for a census that finds none of its processes", {
   timeout: 150_000, skip: sudoUnavailable,
 }, async () => {
-  await stoppedCheckIsFenced(true, "leaves-child");
+  await stoppedCheckIsFenced(true, "holds-output");
+});
+
+test("under a sudo prefix, a check stopped at its time limit whose child stays in its group has that child ended by the anchor, and Resume passes without a release", {
+  timeout: 150_000, skip: sudoUnavailable,
+}, async () => {
+  const h = harness(true);
+  const { f, id } = await teamWithCheck(h, "leaves-child");
+  try {
+    await entry(h.checkLog, "start");
+    const child = await entry(h.checkLog, "child", undefined, 10_000);
+    const blocked = await waitFor(() => f.get(id), run => run.status === "blocked", 3_000 + STOP_SETTLE_MS + 20_000);
+    assert.equal(blocked.pendingOperation?.failureCode, "command-stop-unconfirmed");
+    await waitFor(async () => !alive(child.pid), Boolean, 10_000);
+    await resumedOnceEnded(f, id);
+  } finally {
+    for (const pid of pidsIn(h.checkLog)) if (alive(pid)) h.end(pid);
+    await f.close();
+    rmSync(h.shared, { recursive: true, force: true });
+  }
 });
 
 test("under a sudo prefix, after the host ends in the middle of a stop, removal of the cancelled run is refused while the check runs and accepted after it ended", {
@@ -183,8 +202,7 @@ test("under a sudo prefix, after the host ends in the middle of a stop, removal 
     const refused = await f.host.fetchApi(`/teams/${id}`, "owner", undefined, {}, "DELETE");
     assert.equal(refused.body?.code, "team-operation-running", JSON.stringify(refused.body));
     assert.equal(existsSync(h.checkLog) && entries(h.checkLog).some(item => item.text === `term ${first.pid}`), true, "the relayed SIGTERM reached the check before the host ended");
-    writeFileSync(h.release, "done");
-    await entry(h.checkLog, "end", first.pid, 10_000);
+    await waitFor(async () => !alive(first.pid), Boolean, 10_000);
     let last: { status: number; body?: { code?: string } } | undefined;
     await waitFor(async () => (last = await f.host.fetchApi(`/teams/${id}`, "owner", undefined, {}, "DELETE")).status, status => status === 200, 30_000).catch(() => {});
     assert.equal(last?.status, 200, `removal is accepted once the check ended: ${JSON.stringify(last?.body)}`);

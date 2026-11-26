@@ -8,7 +8,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import type { Manager } from "../packages/host/src/manager.js";
 import { newWitness, type CensusResult, type HostProcesses, type ProcessWitness } from "../packages/host/src/process-census.js";
 import { handleTeamClientCommand } from "../packages/host/src/team-cli.js";
-import { COMMAND_STOP_UNCONFIRMED_REASON } from "../packages/host/src/team-workspace.js";
+import { COMMAND_STOP_UNCONFIRMED_REASON, STOP_GRACE_MS } from "../packages/host/src/team-workspace.js";
 import { TeamError, TeamService } from "../packages/host/src/teams.js";
 import { schedulerFixture } from "./fixtures/team-scheduler.js";
 
@@ -178,5 +178,25 @@ test("team processes-ended CLI posts only a request ID to the statement endpoint
     console.log = log;
     process.stderr.write = write;
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("under a prefix the watch of a stopped command takes its census after the anchor's grace, and without a prefix at once", async () => {
+  for (const prefixed of [true, false]) {
+    const f = schedulerFixture();
+    fencedRun(f, "blocked");
+    if (prefixed) f.config.teams!.commandPrefix = { command: "env", args: [] };
+    const seen = { count: 0 };
+    const teams = openTeam(f, () => ENDED, seen);
+    try {
+      const internals = teams as unknown as { fence: { watch(stored: unknown): void }; records: Map<string, unknown> };
+      internals.fence.watch(internals.records.get(f.run.id));
+      await delay(prefixed ? STOP_GRACE_MS - 1_000 : 500);
+      assert.equal(seen.count, prefixed ? 0 : 1, prefixed ? "no census before the grace ended" : "a census at once");
+      if (prefixed) {
+        await delay(2_000);
+        assert.equal(seen.count, 1, "the census follows the grace");
+      }
+    } finally { await close(f, teams); }
   }
 });

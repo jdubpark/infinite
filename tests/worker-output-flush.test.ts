@@ -108,7 +108,8 @@ test("a 4 MiB output burst on a slow journal disk is synced in bounded flushes w
     const chunks = worker.output();
     assert.ok(chunks.join("").length > BURST, "the whole burst is recorded");
     assert.ok(chunks.every(text => text.length <= 8192), "output events keep their 8192-character chunks");
-    assert.ok(worker.synced().largest <= 40, `one sync holds at most 256 KiB of output plus one read, not ${worker.synced().largest} events`);
+    assert.ok(worker.synced().largest > 1, "a flush syncs its output events together, not one at a time");
+    assert.ok(worker.synced().largest <= 40, `one sync holds at most 256 Ki characters of output plus one read, not ${worker.synced().largest} events`);
   } finally {
     await worker.stop();
   }

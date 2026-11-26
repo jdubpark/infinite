@@ -273,7 +273,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
     },
   });
   outbox.registerProjector(outcomeProjector(evidence, { prices: config.usage?.prices }));
-  const evalHost: EvalHost = new EvalHost({ config, store: evidence, source: projectSource, hostLoad: manager.hostLoad, halt: () => halt, runs: () => teams.understandingRecords(), teams: () => teams, sessions: manager, cost: sessionId => sessionCostOf(usage.session(sessionId)) });
+  const evalHost: EvalHost = new EvalHost({ config, store: evidence, source: projectSource, hostLoad: manager.hostLoad, halt: () => halt, runs: () => teams.understandingRecords(), teams: () => teams, sessions: manager, cost: sessionId => sessionCostOf(usage.session(sessionId)), usage: () => usage, fuse: () => gate });
   const fuse = new FuseService({ config, key, store: evidence, sessionExists: id => {
     try { manager.meta(id); return true; } catch (error) { return (error as NodeJS.ErrnoException).code !== "ENOENT"; }
   } });
@@ -282,7 +282,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
     source: projectSource,
     graphs: repositoryGraphs,
     events: outbox,
-    capture: evalHost.capture,
+    capture: evalHost.capture, replayLaunchGate: input => evalHost.replayLaunchWait(input),
     entries: blackboard, ...(options.processCensus ? { processes: options.processCensus } : {}),
     delivery: deliveryPort(evidence),
     onMerged: id => {

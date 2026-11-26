@@ -668,7 +668,7 @@ export interface TeamScout extends TeamScoutPlan {
   summary?: string;
   evidence?: TeamEvidence[];
 }
-export type ReplayLink = { jobId: string; trialId: string; purpose: "replay" | "gate" | "duel"; ending?: TrialEnding | JudgeEnding; resultCommit?: string; resetsAt?: string; judgement?: Judgement; judgeMinutes?: number };
+export type ReplayLink = { jobId: string; trialId: string; purpose: "replay" | "gate" | "duel"; ending?: TrialEnding | JudgeEnding; resultCommit?: string; resetsAt?: string; judgement?: Judgement; judgeMinutes?: number; pairedProviders?: Provider[]; launchWait?: string };
 export interface TeamRun {
   blackboard?: { tools: true };
   routing?: TeamRunRouting;

@@ -3,13 +3,18 @@ import assert from "node:assert/strict";
 import {
   EVAL_AGENT_ARGS_MAX,
   EVAL_AGENT_TEXT_MAX,
+  EVAL_BUDGET_USD_MAX,
   EVAL_REPOSITORY_PREFIX_MAX,
   captureSettings,
   evalAgentSchema,
   evalCommandPrefix,
   evalHostSchema,
   evalProjectSchema,
+  evalProviderBudgetSchema,
+  evalProviderBudgetsSchema,
+  hasTrialBudgetFor,
   mineSettings,
+  providerBudgetConstraints,
   trialSettings,
   validationSettings,
   type EvalMemberConfig,
@@ -124,6 +129,14 @@ test("the trial settings parse with their limits", () => {
 
   accepted({ trialsPerDay: 1, trialMinutes: 10 });
   accepted({ trialsPerDay: 50, trialMinutes: 240 });
+  accepted({ providerBudgets: { opencode: { usd: 5 } } });
+  accepted({ providerBudgets: { opencode: { usd: 0, period: "day" }, claude: { usd: 25, period: "week" }, codex: { usd: EVAL_BUDGET_USD_MAX, period: "month" } } });
+  refused({ providerBudgets: {} });
+  refused({ providerBudgets: { opencode: { usd: -0.01 } } });
+  refused({ providerBudgets: { opencode: { usd: EVAL_BUDGET_USD_MAX + 1 } } });
+  refused({ providerBudgets: { opencode: { usd: 5, period: "year" } } });
+  refused({ providerBudgets: { grok: { usd: 5 } } });
+  refused({ providerBudgets: { opencode: { usd: 5, extra: 1 } } });
   refused({ trialsPerDay: 0 });
   refused({ trialsPerDay: 51 });
   refused({ trialMinutes: 9 });
@@ -131,6 +144,9 @@ test("the trial settings parse with their limits", () => {
   accepted({ candidateProfiles: Array.from({ length: 8 }, (_, i) => profile(`p${i}`)) });
   refused({ candidateProfiles: Array.from({ length: 9 }, (_, i) => profile(`p${i}`)) });
   refused({ trialsPerDay: 4, unknownKey: 1 });
+
+  assert.deepEqual(evalProviderBudgetSchema.parse({ usd: 12.5 }), { usd: 12.5, period: "day" });
+  assert.deepEqual(evalProviderBudgetsSchema.parse({ opencode: { usd: 3 } }), { opencode: { usd: 3, period: "day" } });
 
   const member = { prefix: { command: "sudo", args: ["-n", "-u", "infinite-eval", "--", "/usr/local/libexec/infinite/eval-command"] }, root: "/var/lib/infinite-eval", agents: { claude: { command: "claude", args: [] } } };
   assert.equal(evalHostSchema.safeParse({ member }).success, true);
@@ -146,16 +162,31 @@ test("the trial settings parse with their limits", () => {
   const checks = [{ command: "node", args: ["check.js"] }];
   const focusedTest = { command: "node", args: ["--import", "tsx", "--test", "{files}", "--test-reporter-destination={report}"] };
   const complete = { focusedTest, reportFormat: "junit" as const };
-  assert.deepEqual(trialSettings({ source: github, team: { checks, eval: complete } }), { missing: "trialsPerDay" });
+  assert.deepEqual(trialSettings({ source: github, team: { checks, eval: complete } }), { missing: "budget" });
   assert.deepEqual(trialSettings({ source: github, team: { checks, eval: { reportFormat: "junit" as const } } }), { missing: "focusedTest" });
   assert.deepEqual(trialSettings({ source: { mode: "laptop" }, team: { checks, eval: { ...complete, trialsPerDay: 4 } } }), { missing: "source" });
   const settings = trialSettings({ source: github, team: { checks, eval: { ...complete, trialsPerDay: 4 } } });
   assert.deepEqual(settings, {
-    settings: { focusedTest, reportFormat: "junit", gradingPaths: [], guardChecks: checks, trialsPerDay: 4, trialMinutes: 45, candidateProfiles: [] },
+    settings: { focusedTest, reportFormat: "junit", gradingPaths: [], guardChecks: checks, trialsPerDay: 4, providerBudgets: {}, trialMinutes: 45, candidateProfiles: [] },
   });
+  const budgetOnly = trialSettings({ source: github, team: { checks, eval: { ...complete, providerBudgets: { opencode: { usd: 5, period: "day" } } } } });
+  assert.deepEqual(budgetOnly, {
+    settings: { focusedTest, reportFormat: "junit", gradingPaths: [], guardChecks: checks, trialsPerDay: null, providerBudgets: { opencode: { usd: 5, period: "day" } }, trialMinutes: 45, candidateProfiles: [] },
+  });
+  const hostOnly = trialSettings({ source: github, team: { checks, eval: complete } }, { opencode: { usd: 20, period: "month" } });
+  assert.deepEqual(hostOnly, {
+    settings: { focusedTest, reportFormat: "junit", gradingPaths: [], guardChecks: checks, trialsPerDay: null, providerBudgets: {}, trialMinutes: 45, candidateProfiles: [] },
+  });
+  assert.deepEqual(
+    providerBudgetConstraints("opencode", { opencode: { usd: 5, period: "day" } }, { opencode: { usd: 20, period: "month" } }),
+    [{ source: "project", usd: 5, period: "day" }, { source: "host", usd: 20, period: "month" }],
+  );
+  assert.equal(hasTrialBudgetFor("opencode", { trialsPerDay: null, providerBudgets: { opencode: { usd: 5, period: "day" } } }, undefined), true);
+  assert.equal(hasTrialBudgetFor("claude", { trialsPerDay: null, providerBudgets: { opencode: { usd: 5, period: "day" } } }, undefined), false);
+  assert.equal(hasTrialBudgetFor("claude", { trialsPerDay: 2, providerBudgets: { opencode: { usd: 5, period: "day" } } }, undefined), true);
   const withProfiles = trialSettings({ source: github, team: { checks, eval: { ...complete, trialsPerDay: 2, trialMinutes: 60, candidateProfiles: [profile("a")] } } });
   assert.deepEqual(withProfiles, {
-    settings: { focusedTest, reportFormat: "junit", gradingPaths: [], guardChecks: checks, trialsPerDay: 2, trialMinutes: 60, candidateProfiles: [profile("a")] },
+    settings: { focusedTest, reportFormat: "junit", gradingPaths: [], guardChecks: checks, trialsPerDay: 2, providerBudgets: {}, trialMinutes: 60, candidateProfiles: [profile("a")] },
   });
 
   const parsed = evalHostSchema.parse({ member }).member;

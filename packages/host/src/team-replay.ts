@@ -3,10 +3,12 @@ import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { evalCommandPrefix } from "./eval-config.js";
 import { evalProxyUrl } from "./egress.js";
 import { planDigest } from "./run-events.js";
-import type { Capsule, EvalFeatures, TrialEnding } from "./eval-types.js";
+import type { Capsule, EvalFeatures, EvalJobWait, TrialEnding } from "./eval-types.js";
 import { JUDGE_PACKAGE_DIR, type Judgement, type JudgeEnding } from "./judge-types.js";
+import type { CalibrationWait } from "./judge-store.js";
 import { judgePrompt } from "./judge-prompt.js";
-import type { Config, ExecutionIdentity, SessionPurpose } from "./types.js";
+import type { ProviderLimit } from "./provider-limits.js";
+import type { Config, ExecutionIdentity, Provider, SessionPurpose } from "./types.js";
 import type { TeamCommand, TeamMember, TeamModelProfile, TeamReport, TeamRun } from "./team-types.js";
 import { assertMemberReadOnly, assertSecureAncestors, TeamError } from "./team-workspace.js";
 
@@ -17,10 +19,16 @@ export function replayWorkspace(root: string, path: string): string {
   catch { throw new TeamError(409, "invalid-workspace", "The trials root cannot be read."); }
 }
 
+export type ReplayLaunchWait = EvalJobWait | CalibrationWait | "configuration-changed";
+export type ReplayLaunchInput = {
+  projectId: string; jobId: string; trialId: string; purpose: "replay" | "gate" | "duel";
+  provider: Provider; profile: TeamModelProfile; pairedProviders?: readonly Provider[]; limited: ReadonlySet<Provider>;
+};
+export type ReplayLaunchGate = (input: ReplayLaunchInput) => ReplayLaunchWait | undefined;
 export type ReplayCreate = {
   trialId: string; jobId: string; purpose: "replay" | "gate"; projectId: string;
   profile: TeamModelProfile; capsule: Capsule; features: EvalFeatures;
-  baseCommit: string; workspace: string;
+  baseCommit: string; workspace: string; pairedProviders?: Provider[];
 };
 export type JudgeCreate = {
   purpose: "duel"; trialId: string; jobId: string; projectId: string; profile: TeamModelProfile;
@@ -34,6 +42,7 @@ export type JudgeContext = {
 export type ReplayState = {
   phase: "running" | "ended";
   ending?: TrialEnding | JudgeEnding | "settled";
+  launchWait?: ReplayLaunchWait;
   judgement?: Judgement;
   resultCommit?: string;
   resetsAt?: string;
@@ -87,7 +96,7 @@ export class TeamReplay {
       steering: capsule.steering.map(text => ({ text, revision: 1, at, source: "coordinator" as const })),
       autonomy: "supervised", linearTracking: false,
       ...(capsule.brief ? { brief: structuredClone(capsule.brief) } : {}),
-      replay: { jobId: input.jobId, trialId: input.trialId, purpose: input.purpose },
+      replay: { jobId: input.jobId, trialId: input.trialId, purpose: input.purpose, ...(input.pairedProviders?.length ? { pairedProviders: [...input.pairedProviders] } : {}) },
     } as TeamRun;
   }
 
@@ -212,6 +221,39 @@ export class TeamReplay {
     return this.end(holder, endingOfBlock(error, holder.run.replay?.purpose === "duel"));
   }
 
+  launchBlocked(holder: ReplayHolder, member: TeamMember, activeLimits: readonly ProviderLimit[], gate?: ReplayLaunchGate): boolean {
+    const { run } = holder, replay = run.replay;
+    if (!replay) return false;
+    const provider = member.provider ?? run.provider;
+    const limit = activeLimits.find(item => item.provider === provider);
+    if (limit) {
+      this.end(holder, "void-limit", limit.resetsAt ?? limit.expiresAt);
+      return true;
+    }
+    if (!gate) return false;
+    const profile = member.modelProfile ?? run.lineup?.coordinator ?? { id: provider, label: provider, provider, tier: "light" } as TeamModelProfile;
+    let wait: ReplayLaunchWait | undefined;
+    try {
+      wait = gate({
+        projectId: run.projectId,
+        jobId: replay.jobId,
+        trialId: replay.trialId,
+        purpose: replay.purpose,
+        provider,
+        profile,
+        ...(replay.pairedProviders?.length ? { pairedProviders: replay.pairedProviders } : {}),
+        limited: new Set(activeLimits.map(item => item.provider)),
+      });
+    } catch {
+      wait = "budget-unmeasurable";
+    }
+    if (wait === undefined) return false;
+    replay.launchWait = wait;
+    run.reason = `Eval launch refused before session start: ${wait}.`;
+    this.end(holder, "void-host");
+    return true;
+  }
+
   async state(holder: ReplayHolder | undefined): Promise<ReplayState | undefined> {
     if (!holder?.run.replay) return undefined;
     const { run } = holder, replay = run.replay!;
@@ -221,7 +263,7 @@ export class TeamReplay {
       sessionExited: !member || status === undefined || !["starting", "running"].includes(status),
       ...(member ? { memberId: member.memberId, sessionId: member.sessionId, ...(member.startedAt ? { memberStartedAt: member.startedAt } : {}) } : {}),
     };
-    if (replay.ending) return { phase: "ended", ending: replay.ending, ...(replay.resetsAt ? { resetsAt: replay.resetsAt } : {}), ...(replay.resultCommit ? { resultCommit: replay.resultCommit } : {}), ...(replay.judgement ? { judgement: replay.judgement } : {}), ...base };
+    if (replay.ending) return { phase: "ended", ending: replay.ending, ...(replay.launchWait ? { launchWait: replay.launchWait as ReplayLaunchWait } : {}), ...(replay.resetsAt ? { resetsAt: replay.resetsAt } : {}), ...(replay.resultCommit ? { resultCommit: replay.resultCommit } : {}), ...(replay.judgement ? { judgement: replay.judgement } : {}), ...base };
     if (run.status === "ready-for-review") return { phase: "ended", ending: "settled", ...(replay.resultCommit ? { resultCommit: replay.resultCommit } : {}), ...base };
     if (run.status === "paused" || run.status === "cancelled") return { phase: "ended", ending: "void-owner", ...base };
     if (run.status === "blocked") return { phase: "ended", ending: "void-host", ...base };

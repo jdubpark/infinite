@@ -2,7 +2,7 @@
 
 This runbook installs the eval account, which runs the member of a replay trial. The member is a model session that works on one task of a project, with its own provider logins and no production credential. Each step is a root step unless it says otherwise, and each one says how to undo it and how to check it.
 
-Nothing in this runbook starts a trial. A trial starts only when all of these hold: steps 1 to 10 are done, the grader runs launcher version 2 (step 9), and a project sets `trialsPerDay`. Until then the summary shows `eval identity not-configured` when no `eval.member` is set, and `eval identity unavailable` when the launcher is missing or fails. A baseline job waits `eval-identity` in both cases. A grader that still runs version 1 makes the summary show `grader ready (version 1: no trials)`, and a baseline job waits `grader`. Each check below says what it shows.
+Nothing in this runbook starts a trial. A trial starts only when all of these hold: steps 1 to 10 are done, the grader runs launcher version 2 (step 9), and a project sets `providerBudgets` (or host `usage.budgets`) or the optional `trialsPerDay` cap. Until then the summary shows `eval identity not-configured` when no `eval.member` is set, and `eval identity unavailable` when the launcher is missing or fails. A baseline job waits `eval-identity` in both cases. A grader that still runs version 1 makes the summary show `grader ready (version 1: no trials)`, and a baseline job waits `grader`. Each check below says what it shows.
 
 The design is in [eval trials](../../docs/teams.md#eval-trials), and the boundary is in [the eval member account](../../docs/security.md#eval-member-account). The grader is set up in [the eval grader account](grader.md), and the egress lists are in [egress](egress.md).
 
@@ -124,7 +124,7 @@ The last drop-in makes `infinite.service` require the firewall unit: the API doe
 
 The first command checks the file and that the `infinite-eval` account exists. The rule is in the `inet` family, so it rejects IPv4 and IPv6 alike, and each load replaces only the table `infinite_eval`, in one transaction. After a change to the file, reload the unit, never restart it: a restart removes the table first. The probe does not check the provider route, and it reports `network-open` only while the cloud metadata address answers, so `systemctl is-active infinite-eval-firewall.service` is what shows that the rule loaded.
 
-Undo: stop trials first (write each project's team block without `trialsPerDay`). Then `sudo systemctl disable --now infinite-eval-firewall.service`, which deletes the table; remove `/etc/systemd/system/infinite.service.d/eval-firewall.conf` first, so that the API no longer requires the unit; remove `/etc/systemd/system/infinite-eval-firewall.service`, `/etc/systemd/system/nftables.service.d/infinite-eval.conf`, and `/etc/infinite/eval.nft`; and run `sudo systemctl daemon-reload`.
+Undo: stop all eval trials and judge calibrations first. Cancel active eval jobs (`infinite eval cancel JOB`) and any running judge calibration, remove `trialsPerDay` and `providerBudgets` from every project's `eval` block, remove any eval-enabling provider entries from host `usage.budgets` (or remove `eval.member` from host config and restart `infinite.service`), and verify no active or schedulable eval launches remain (`infinite eval status PROJECT_ID` shows `trials off` and no active jobs). Then `sudo systemctl disable --now infinite-eval-firewall.service`, which deletes the table; remove `/etc/systemd/system/infinite.service.d/eval-firewall.conf` first, so that the API no longer requires the unit; remove `/etc/systemd/system/infinite-eval-firewall.service`, `/etc/systemd/system/nftables.service.d/infinite-eval.conf`, and `/etc/infinite/eval.nft`; and run `sudo systemctl daemon-reload`.
 
 Check:
 
@@ -240,9 +240,9 @@ Put in `canaries` the secret paths of [GitHub App renewal](github-app.md), [the 
 
 Grader canaries. Add the three login paths of step 7 under the eval home to `eval.grader.canaries`: `/var/lib/infinite-eval/home/.claude/.credentials.json`, `/var/lib/infinite-eval/home/.codex/auth.json`, and `/var/lib/infinite-eval/home/.local/share/opencode/auth.json`. The grader runs untrusted tests, and these files are what it must never read. The reset keeps them, and the probe only checks whether the grader can read each path, never its content. A separate canary file in the eval home would not work: the reset of step 8 removes every file there that is not a login, and the eval probe counts it as a leftover until then.
 
-Project configuration. A project needs its validation settings, which [the grader install](grader.md#6-configuration) and [teams](../../docs/teams.md#eval-mining-and-validation) describe, and `trialsPerDay`. Without `trialsPerDay`, no trial starts. Set it as the owner through `PUT /api/projects/PROJECT_ID/team`, with the body `{ "team": { "eval": { "trialsPerDay": 6 } } }`. The default is off. The recommended first value is 6. `candidateProfiles` in the same block adds up to 8 profiles that the lineup does not have. No prompt shows them, and they serve only baseline jobs.
+Project configuration. A project needs its validation settings, which [the grader install](grader.md#6-configuration) and [teams](../../docs/teams.md#eval-mining-and-validation) describe, and either `providerBudgets` (or host `usage.budgets` covering the requested providers) or the optional `trialsPerDay` safety cap. Without a budget covering the requested providers and without `trialsPerDay`, no trial starts. Set project eval settings as the owner through `PUT /api/projects/PROJECT_ID/team`, for example `{ "team": { "eval": { "providerBudgets": { "opencode": { "usd": 10, "period": "day" } }, "trialsPerDay": 6 } } }`. The default is off. `candidateProfiles` in the same block adds up to 8 profiles that the lineup does not have. No prompt shows them, and they serve only baseline jobs.
 
-Undo: remove the `member` block and restart `infinite.service`. To stop trials for one project, write its team block again without `trialsPerDay`. `infinite eval status PROJECT_ID` then shows `trials off`.
+Undo: remove the `member` block and restart `infinite.service`. To stop trials for one project, remove `providerBudgets` and `trialsPerDay` from its `eval` block and ensure host `usage.budgets` has no active provider budget for it. `infinite eval status PROJECT_ID` then shows `trials off`.
 
 ## 11. The checks
 
@@ -302,8 +302,8 @@ infinite eval status PROJECT_ID          # eval identity ready
 
 The probe line has `"trials":0` and `"leftovers":0`. `infinite eval status` then prints `eval identity ready`. Any other state names the failed check, and the states are those of [the eval member account](../../docs/security.md#eval-member-account).
 
-The account is ready once every check above passed. A trial still starts only when `trialsPerDay` is set on a project.
+The account is ready once every check above passed. A trial still starts only when a project has `providerBudgets` (or host `usage.budgets`) or optional `trialsPerDay` configured.
 
 ## Stopping trials
 
-Cancel a baseline job with `infinite eval cancel JOB`, which voids its live trial as `void-owner`. Remove `trialsPerDay` from the project, so that no job starts another trial. Remove `eval.member` and restart `infinite.service`, so that no eval identity is configured.
+Cancel active jobs with `infinite eval cancel JOB` (and cancel any active judge calibration), which voids any live run as `void-owner`. Remove `providerBudgets` and `trialsPerDay` from every project and remove any eval-enabling provider entries from host `usage.budgets`, so that no job starts another trial (`infinite eval status PROJECT_ID` shows `trials off`). Remove `eval.member` and restart `infinite.service`, so that no eval identity is configured, before disabling or removing the eval firewall.

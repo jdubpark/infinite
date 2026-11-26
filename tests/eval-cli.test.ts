@@ -63,6 +63,22 @@ test("status prints the eval identity and trials", () => {
   assert.ok(off.includes("trials off"));
   assert.ok(!off.some(line => line.startsWith("trials today")));
 
+  const budgeted = evalStatusLines({
+    ...withTrials,
+    trials: {
+      today: 3,
+      dailyCap: null,
+      budgets: [
+        { provider: "opencode", source: "project", period: "day", limitUsd: 5, spentUsd: 1.25, state: "admitted" },
+        { provider: "claude", source: "host", period: "month", limitUsd: 20, spentUsd: null, state: "unmeasurable", reason: "provider-unmeasured" },
+      ],
+    },
+  });
+  assert.ok(budgeted.includes("trials today 3"));
+  assert.ok(budgeted.includes("budget opencode (project/day): $1.25 of $5.00 · admitted"));
+  assert.ok(budgeted.includes("budget claude (host/month): unknown of $20.00 · unmeasurable (provider-unmeasured)"));
+  assert.ok(!budgeted.includes("trials off"));
+
   const version1 = evalStatusLines({ ...withTrials, grader: { state: "ready", version: 1 } });
   assert.ok(version1.includes("grader ready (version 1: no trials)"));
   assert.ok(!version1.includes("grader ready"));

@@ -1027,13 +1027,13 @@ The Git commands that validation runs inside the grader's root are grader comman
 
 A baseline job runs replay trials. A trial gives one implementer one task of the project's `valid` set, under one configuration, in a workspace that holds only the task's base. The grader then grades the result against the hidden tests. A trial spends model tokens on one member launch, which runs as the eval account. Read [the eval member account install](../deploy/ubuntu/eval.md) and [the eval member account](security.md#eval-member-account) before you turn trials on.
 
-Trials are off in every project until the owner sets `trialsPerDay`. A project with no `trialsPerDay` runs no trial, and its baseline job is refused `409` `eval-config-incomplete`.
+Trials are off in every project until the owner configures a provider budget (`providerBudgets` in the project's `eval` block, or host `usage.budgets` for the job's providers) or sets the optional `trialsPerDay` safety cap. A project without a budget covering the requested providers and without `trialsPerDay` runs no trial, and its job is refused `409` `eval-config-incomplete`. Before removing eval firewall isolation, cancel active eval jobs and judge calibrations, remove `trialsPerDay` and `providerBudgets` from every project and any eval-enabling provider entries from host `usage.budgets` (or remove `eval.member`), and confirm no active or schedulable eval launches remain.
 
 #### Turn it on
 
 1. Set up validation: steps 1 to 4 and 6 of [the grader install](../deploy/ubuntu/grader.md), and launcher version 2 of its section 2.2.
 2. Set up the eval member account: steps 1 to 10 of [the eval member account install](../deploy/ubuntu/eval.md).
-3. In the project's `eval` block, set `focusedTest`, `reportFormat`, and `trialsPerDay`.
+3. In the project's `eval` block, set `focusedTest`, `reportFormat`, and `providerBudgets` (or host `usage.budgets`, with optional `trialsPerDay` as a secondary safety cap).
 4. Create a baseline job with `infinite eval run PROJECT --file job.json --request-id UUID`, with `"kind": "baseline"` in the file.
 
 No trial starts before step 4. The code installs nothing: the launchers, the sudo rules, the network rules, the template, and the configuration are the owner's steps.
@@ -1044,7 +1044,8 @@ The project's `eval` block takes these fields. They are read only for a `github`
 
 | Field | Limit | Default | Meaning |
 |---|---|---|---|
-| `trialsPerDay` | 1 to 50 | off | Trials a day, counted by UTC day, for a baseline job. It is the stand-in for a learning budget, see below. |
+| `providerBudgets` | `claude`, `codex`, `opencode`: `{ usd: 0..100000, period: "day" \| "week" \| "month" }` | off (`period` defaults to `"day"`) | Per-provider USD spend caps enforced fail-closed from `UsageService` alongside host `usage.budgets`. |
+| `trialsPerDay` | 1 to 50 | off | Optional secondary safety cap on trials per UTC day, kept for backwards compatibility and providers without USD metering. |
 | `trialMinutes` | 10 to 240 | 45 | Minutes a trial's member may run before it ends `timeout`. |
 | `candidateProfiles` | up to 8 model profiles | none | Profiles that the lineup does not have. A baseline job may use them, and no prompt shows them. |
 
@@ -1125,9 +1126,12 @@ One trial runs host-wide at a time. Validation and trials share the grader, one 
 | `halt` | The project is halted. |
 | `storage` | The grader has less than 10 GiB or 200,000 inodes free. |
 | `another-job` | A trial or a validation task of another job runs. |
+| `spend-fuse` | The host or project spend fuse is open or its baseline cannot be read. |
 | `provider-limit` | The configuration's provider has an active limit. |
+| `provider-budget` | A configured project or host USD budget for the configuration's provider is exhausted for the current period. |
+| `budget-unmeasurable` | A configured provider USD budget cannot be verified because spend is unavailable, unmeasured, partial, or unpriced. |
 | `session-slots` | Fewer than four host session slots are free. |
-| `daily-cap` | `trialsPerDay` trials have started today. |
+| `daily-cap` | The optional secondary `trialsPerDay` cap has been reached today. |
 | `mirror` | The project has no mirror head or no base branch. |
 | `grader-failed` | A step of the trial's source in the grader failed. |
 | `eval-failed` | A step of the trial's source in the eval account failed. |
@@ -1137,7 +1141,7 @@ A trial whose source cannot be built keeps its attempt and is tried again, and t
 
 The reasons that stop a job are `trial-voids` (three voids in a row), `eval-processes-alive` (a process of the eval account survived `stop`, and the job is blocked until the owner resumes it), and `configuration-changed`, with the validate job's reasons.
 
-`trialsPerDay` is the stand-in for the learning budget. It bounds the count of trials and nothing else. It has no USD limits, no reservation, no estimate, and no learning floor, and no duel gate exists yet. The delegated adoption design's standing budget (delivery step 4, "The standing budget") replaces it, and removes the field.
+Provider USD budgets (`providerBudgets` and host `usage.budgets`) enforce measured provider spend fail-closed across UTC day, week, and month periods, together with the spend fuse (`FuseService`) and provider quota limits (`ProviderLimits`). Creating a new trial job while the spend fuse is open, a provider USD budget is exhausted, or a configured USD budget is unmeasurable refuses with `409` (`spend-fuse-open`, `provider-budget-exceeded`, or `provider-budget-unmeasurable`). `trialsPerDay` remains optional as a secondary daily trial-count safety cap. The delegated adoption design's standing learning budget (delivery step 4) adds reservations, estimates, and weekly purpose shares on top of this enforcement.
 
 #### Missing while a launcher refuses
 

@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { initialAttention } from "@infinite/attention";
 import { GoalService } from "../packages/host/src/goals.js";
@@ -342,6 +342,48 @@ test("a run at its attempt limit settles without an evaluator", { timeout: 12000
     assert.equal(view.members.length, 60, "no member was added");
     assert.equal(view.assessment?.result, "inconclusive");
     assert.equal(view.assessment?.reason, "evaluator-unavailable");
+  } finally { f.close(); }
+});
+
+test("an evaluator whose working copy cannot be prepared settles the run without it", { timeout: 120000 }, async () => {
+  const f = schedulerFixture();
+  try {
+    activeSessions(f);
+    seedReviewed(f, { rank: "passed" });
+    const config = join(f.run.workspace, ".git", "config");
+    const kept = readFileSync(config, "utf8");
+    writeFileSync(config, `${kept}\n[broken\n`);
+    const teams = f.openTeam();
+    teams.start();
+    const cause = (view: { events: { text: string }[] }) => view.events.filter(event => /working copy could not be prepared \([a-z-]+\)/.test(event.text));
+    await waitFor(() => Promise.resolve(teams.get(f.run.id)), current => cause(current).length > 0 || TERMINAL.includes(current.status), 60000);
+    writeFileSync(config, kept);
+    const view = await waitFor(() => Promise.resolve(teams.get(f.run.id)), current => TERMINAL.includes(current.status), 60000);
+    teams.close();
+    assert.equal(view.status, "ready-for-review", JSON.stringify(view.events.slice(-5)));
+    assert.equal(view.assessment?.result, "inconclusive");
+    assert.equal(view.assessment?.reason, "evaluator-unavailable");
+    assert.equal(evaluators(view).length, 0, "no evaluator was added");
+    assert.equal(storedOf(teams, f.run.id).pending, undefined, "no failed operation stays on the run");
+    assert.equal(cause(view).length, 1, "the run's events name the cause once");
+  } finally { f.close(); }
+});
+
+test("a members directory the host refuses still blocks the run at the evaluator", { timeout: 120000 }, async () => {
+  const f = schedulerFixture();
+  const members = join(f.run.workspace, "..", "members");
+  try {
+    activeSessions(f);
+    seedReviewed(f, { rank: "passed" });
+    rmSync(members, { recursive: true, force: true });
+    symlinkSync(join(f.run.workspace, ".."), members);
+    const teams = f.openTeam();
+    teams.start();
+    const view = await waitFor(() => Promise.resolve(teams.get(f.run.id)), current => TERMINAL.includes(current.status), 60000);
+    teams.close();
+    assert.equal(view.status, "blocked", JSON.stringify(view.events.slice(-5)));
+    assert.equal(view.blockCode, "team-root-unsafe");
+    assert.equal(view.assessment, undefined, "no assessment is written for a blocked run");
   } finally { f.close(); }
 });
 

@@ -50,7 +50,7 @@ export type VerdictHolder = { run: TeamRun; verdict?: VerdictState; objectiveRec
 
 export type VerdictHost = {
   holder(runId: string): VerdictHolder | undefined;
-  prepare(holder: VerdictHolder, onPrepared: (member: TeamMember) => void, prebuilt: { prompt: string; profile: TeamModelProfile }): void;
+  prepare(holder: VerdictHolder, onPrepared: (member: TeamMember) => void, prebuilt: { prompt: string; profile: TeamModelProfile }, onFailed: () => void): void;
   consume(holder: VerdictHolder, member: TeamMember): void;
   operation(holder: VerdictHolder, perform: (signal: AbortSignal) => Promise<boolean | undefined>, complete: (clean: boolean | undefined) => void, member: TeamMember): void;
   save(holder: VerdictHolder): void;
@@ -405,7 +405,11 @@ export class TeamVerdicts {
     this.host.prepare(holder, member => {
       const live = holder.verdict;
       if (live?.verdictId === verdictId && live.status === "evaluating") live.evaluatorMemberId = member.memberId;
-    }, { prompt: evaluatorPrompt(profile.provider, profile), profile });
+    }, { prompt: evaluatorPrompt(profile.provider, profile), profile }, () => {
+      const live = holder.verdict;
+      if (STOPPED.includes(holder.run.status) || holder.run.recovery?.status === "stopping") return;
+      if (live?.verdictId === verdictId && live.status === "evaluating" && live.evaluatorMemberId === undefined) this.finish(holder, live, undefined, "evaluator-unavailable");
+    });
     this.host.save(holder);
   }
 

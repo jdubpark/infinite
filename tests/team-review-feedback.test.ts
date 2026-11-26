@@ -262,7 +262,7 @@ test("a coordinator's forward of a mission run's review reads GitHub once more a
     const teams = f.openTeam(), review = connect(teams, stored), feedback = poller(teams);
     await feedback.start();
     await feedback.poll();
-    assert.deepEqual(stored.inbox.map(message => message.type), ["review-direction"]);
+    assert.deepEqual(stored.inbox.splice(0).map(message => message.type), ["review-direction"]);
     assert.deepEqual(review.queueForward(stored, subtask, forwarded, true), { kind: "queued" });
     const lost = structuredClone(stored), reads = gh.commands().length;
     await settle(review, stored);

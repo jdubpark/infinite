@@ -86,15 +86,18 @@ test("a review reopens a mission at ready-for-review with a new working window, 
   const h = scripted({ configure: config => {
     config.intake = { linear: { teamIds: ["team"], creatorId: "creator", label: "infinite", commentsMirrorToSlack: false, admitIssues: false },
       mission: { groupId: "shop", maxSubtasks: 8, maxMinutes: 30 }, maxActive: 3, requireSlackThread: false } as typeof config.intake;
+    config.github = { reviewFeedback: { enabled: true, ownerLogin: "example-owner", pollMinutes: 5 } };
   } });
   const store = new IntakeStore(h.config, randomBytes(32));
-  const intakeService = () => new IntakeService(h.config, store, h.missions, {} as IntakeLinear, { pollMs: 3600000, log: () => {} });
+  const intakeService = (config = h.config) => new IntakeService(config, store, h.missions, {} as IntakeLinear, { pollMs: 3600000, log: () => {} });
   const intake = intakeService();
   try {
     const { id, direction } = await delivered(h);
     const at = new Date().toISOString(), issueId = randomUUID();
-    store.create({ issueId, identifier: "ENG-1", url: "https://linear.example/ENG-1", title: "Add an endpoint", description: "", issueCreatedAt: at, issueUpdatedAt: at, state: "started", rule: "label",
-      missionId: id, comments: {}, messages: [{ key: "started", kind: "started", text: "Started.", createdAt: at, attempts: 1, status: "sent", ts: "1.000100" }], questions: [], inbound: [], createdAt: at, updatedAt: at });
+    const record = { issueId, identifier: "ENG-1", url: "https://linear.example/ENG-1", title: "Add an endpoint", description: "", issueCreatedAt: at, issueUpdatedAt: at, state: "started" as const, rule: "label" as const,
+      missionId: id, comments: {}, messages: [{ key: "started", kind: "started" as const, text: "Started.", createdAt: at, attempts: 1, status: "sent" as const, ts: "1.000100" }], questions: [], inbound: [], createdAt: at, updatedAt: at };
+    store.create(record);
+    store.create({ ...record, issueId: randomUUID(), identifier: "ENG-2", state: "finished", missionId: "finished-mission" });
     intake.start();
     await h.report(2, { kind: "result", summary: "Added the flag." });
     const finished = await until(() => h.get(id), mission => mission.status === "ready-for-review");
@@ -128,11 +131,28 @@ test("a review reopens a mission at ready-for-review with a new working window, 
     await pause(1000);
     assert.equal(store.get(issueId)!.state, "finished", "a stopped intake service does not see the reopen");
     assert.deepEqual(reviewStates(h, id), ["superseded", "open"], "a newer review of the same pull request replaces the open one");
+    const off = intakeService({ ...h.config, github: undefined });
+    off.start();
+    await off.poll();
+    off.close();
+    assert.equal(store.get(issueId)!.state, "finished", "with review feedback off, an intake pass does not look at finished records");
+    const peeks: string[] = [], peek = h.missions.peek.bind(h.missions), update = store.update.bind(store);
+    h.missions.peek = (missionId: string) => { peeks.push(missionId); return peek(missionId); };
+    let broken = true;
+    store.update = (changed: string, change: Parameters<typeof store.update>[1]) => {
+      if (broken && changed === issueId) { broken = false; throw new Error("The intake record could not be written."); }
+      return update(changed, change);
+    };
     const later = intakeService();
     try {
       later.start();
       await later.poll();
-      assert.equal(store.get(issueId)!.state, "started", "the next intake pass finds the reopened mission");
+      assert.equal(store.get(issueId)!.state, "finished", "a failed write leaves the record finished");
+      await later.poll();
+      assert.equal(store.get(issueId)!.state, "started", "the pass after a failed reopen looks at finished records again");
+      const looked = peeks.filter(item => item === "finished-mission").length;
+      await later.poll();
+      assert.deepEqual([looked, peeks.filter(item => item === "finished-mission").length], [2, 2], "later passes leave finished records alone");
       const quiet = store.get(issueId)!.updatedAt;
       await pause(5);
       assert.equal(await h.missions.reviewDirection(id, direction("PRR_3")), "applied");
@@ -281,6 +301,44 @@ test("a forward to a cancelled mission's subteam, or one whose steer fails unexp
       assert.deepEqual(h.steers, [], name);
     } finally { h.close(); }
   }
+});
+
+test("a forward held only by a paused run outside the mission names that run to the coordinator, and the coordinator cannot wait on it", { timeout: 60000 }, async () => {
+  const h = scripted();
+  try {
+    const { id, teamId, direction } = await delivered(h);
+    await h.missions.reviewDirection(id, direction());
+    await h.report(2, { kind: "wait", summary: "Reading the review." });
+    h.runs.set("paused-api", { id: "paused-api", projectId: "api", missionId: "", status: "paused", revision: 1, decisions: [], updatedAt: new Date().toISOString() });
+    await h.report(3, { kind: "steer-subtask", subtaskId: "a", text: forwarded });
+    const held = (await h.messages(4)).filter((message: MissionMessage) => message.type === "repository-held");
+    assert.deepEqual(held, [{ type: "repository-held", subtaskId: "a", repoProjectId: "api", teamId: "paused-api", teamStatus: "paused", reviewId: "PRR_1" }]);
+    assert.match((await h.attempt(4)).prompt, /A repository-held message with a reviewId means the forward of that review waits/);
+    await h.report(4, { kind: "wait", summary: "Waiting for the forward." });
+    await until(() => h.get(id), mission => events(mission).some(text => text.startsWith("The coordinator's wait report was refused: Nothing is running")));
+    assert.deepEqual([h.steers, h.githubChecks], [[], []]);
+    h.set("paused-api", { status: "cancelled" });
+    await until(() => h.get(id), received);
+    assert.deepEqual(h.steers, [{ teamId, text: forwarded }]);
+  } finally { h.close(); }
+});
+
+test("a steer-subtask from an attempt whose messages stopped before the review is not the forward", { timeout: 60000 }, async () => {
+  const h = scripted();
+  try {
+    const { id, teamId, direction } = await delivered(h);
+    const live = (h.missions as unknown as { records: Map<string, { inbox: MissionMessage[] }> }).records.get(id)!;
+    for (let n = 0; n < 30; n++) live.inbox.push({ type: "refused", kind: "wait", reason: `Earlier refusal ${n}.` });
+    await h.missions.reviewDirection(id, direction());
+    await h.report(2, { kind: "wait", summary: "Waiting." });
+    assert.deepEqual(reviewMessages(await h.messages(3)), [], "the review waits behind thirty earlier messages");
+    await h.report(3, { kind: "steer-subtask", subtaskId: "a", text: "Add a changelog entry." });
+    await until(() => h.get(id), mission => events(mission).some(text => text.startsWith("The coordinator's steer-subtask report for subtask a was not applied")));
+    assert.equal(reviewMessages(await h.messages(4)).length, 1);
+    await h.report(4, { kind: "steer-subtask", subtaskId: "a", text: forwarded });
+    await until(() => h.get(id), received);
+    assert.deepEqual(h.steers, [{ teamId, text: forwarded }]);
+  } finally { h.close(); }
 });
 
 test("a slow GitHub read holds neither its mission's queue nor the scheduler, and a hold that starts during the read stops the steer", { timeout: 60000 }, async () => {

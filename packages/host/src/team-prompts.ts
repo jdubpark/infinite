@@ -608,14 +608,14 @@ export type MissionMessage = (
   | { type: "owner-answer"; decisionId: string; question: string; answer: string; forwardedTo?: { subtaskId: string; childDecisionId: string } }
   | { type: "owner-direction"; text: string }
   | { type: "review-direction"; subtaskId: string; teamId: string; reviewId: string; pullRequestUrl: string; text: string }
-  | { type: "repository-held"; subtaskId: string; repoProjectId: string; teamId: string; teamStatus: string; reason?: string }
+  | { type: "repository-held"; subtaskId: string; repoProjectId: string; teamId: string; teamStatus: string; reason?: string; reviewId?: string }
   | { type: "resumed" }
   | { type: "follow-up"; followUpId: string; dueAt: string; reason: string; check: string }
   | { type: "refused"; kind: string; reason: string }
 ) & { truncated?: string };
 export const isDirectionMessage = (message: MissionMessage) => message.type === "owner-direction" || message.type === "connector-direction" || message.type === "review-direction";
-const reviewDirectionGuidance = (messages: MissionMessage[]) => messages.some(message => message.type === "review-direction")
-  ? "A review-direction message is the owner's own changes-requested review of a subtask's pull request, quoted unchanged; it is owner direction. A steer-subtask report on that subtask continues its subteam from the delivered commit and updates the same pull request. The host accepts it once per review, only while that subteam still waits for review at the reviewed head, and reads GitHub again before it steers. Decide as for any owner direction: forward it, ask the owner, or do something else in scope."
+const reviewDirectionGuidance = (messages: MissionMessage[]) => messages.some(message => message.type === "review-direction" || message.type === "repository-held" && message.reviewId)
+  ? "A review-direction message is the owner's own changes-requested review of a subtask's pull request, quoted unchanged; it is owner direction. A steer-subtask report on that subtask continues its subteam from the delivered commit and updates the same pull request. The host accepts it once per review, only while that subteam still waits for review at the reviewed head, and reads GitHub again before it steers. Decide as for any owner direction: forward it, ask the owner, or do something else in scope. A repository-held message with a reviewId means the forward of that review waits until those runs release the subtask's repository; until then a result is refused, so ask the owner, set a follow-up, or report blocked."
   : "";
 export type MissionCoordinatorNote = { at: string; text: string };
 export type MissionPromptRepo = { projectId: string; name: string; path: string; teamReady: boolean };

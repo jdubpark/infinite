@@ -50,6 +50,7 @@ type MissionReviewHost<S extends MissionReviewStored> = {
   event(stored: S, text: string): void;
   follow(subtask: MissionSubtask, team: TeamView): void;
   held(projectId: string): boolean;
+  reportHeld(stored: S, subtask: MissionSubtask, reviewId: string): void;
   steeringFull(mission: Mission, text: string): boolean;
 };
 
@@ -59,7 +60,7 @@ const fieldsOf = ({ requestId, runId, subtaskId, reviewId, pullRequestUrl, revis
   ({ requestId, runId, subtaskId, reviewId, pullRequestUrl, revision, headCommit, at });
 
 export class MissionReview<S extends MissionReviewStored> implements MissionReviewDestination {
-  private teams!: MissionReviewTeams;
+  private teams: MissionReviewTeams = { receipt: () => false, stillCurrent: async () => undefined };
   private readonly reads = new Map<string, ForwardRead>();
   constructor(private readonly host: MissionReviewHost<S>) {}
 
@@ -98,9 +99,9 @@ export class MissionReview<S extends MissionReviewStored> implements MissionRevi
   queueForward(stored: S, subtask: MissionSubtask, text: string, sawReview: boolean, source?: ConnectorSource): ForwardRequest {
     const review = subtask.status === "done" ? stored.reviews?.filter(item => item.subtaskId === subtask.id && item.state === "open").at(-1) : undefined;
     if (!review) return { kind: "none" };
-    if (!sawReview) {
-      this.host.event(stored, `The coordinator's steer-subtask report for subtask ${subtask.id} was not applied: the owner sent direction or a review after that attempt started. A new attempt will consider it.`);
-      stored.inbox.push({ type: "refused", kind: "steer-subtask", reason: `The owner sent direction or a review after your previous attempt started. Read it before you forward the owner's review of subtask ${subtask.id} with steer-subtask.` });
+    if (!sawReview || stored.inbox.some(message => message.type === "review-direction" && message.reviewId === review.reviewId)) {
+      this.host.event(stored, `The coordinator's steer-subtask report for subtask ${subtask.id} was not applied: that attempt had not received the owner's latest direction or review. A new attempt will consider it.`);
+      stored.inbox.push({ type: "refused", kind: "steer-subtask", reason: `Your previous attempt had not received the owner's latest direction or review. Read it before you forward the owner's review of subtask ${subtask.id} with steer-subtask.` });
       return { kind: "late" };
     }
     const moved = this.moved(review);
@@ -123,7 +124,10 @@ export class MissionReview<S extends MissionReviewStored> implements MissionRevi
     if (mission.status === "paused" || mission.status === "blocked" && mission.stopReason === "deadline") return true;
     if (!live.has(mission.status)) return this.end(stored, review, "refused", "The mission stopped before the forward reached the subteam.");
     const subtask = mission.subtasks.find(item => item.id === op.subtaskId);
-    if (subtask && this.host.held(subtask.repoProjectId)) return true;
+    if (subtask && this.host.held(subtask.repoProjectId)) {
+      this.host.reportHeld(stored, subtask, review.reviewId);
+      return true;
+    }
     if (!read) return this.read(op, review);
     if (!read.current) return this.end(stored, review, "superseded", "GitHub no longer shows it as the owner's newest request for changes on the delivered head, or review feedback was switched off.");
     const moved = this.moved(review);

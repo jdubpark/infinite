@@ -136,7 +136,8 @@ export class MissionService {
   private fuse?: FuseGate;
   private readonly review = new MissionReview<Stored>((service => ({ get records() { return service.records; }, get teams() { return service.teams; },
     enqueue: (id, task) => service.enqueue(id, task), save: stored => service.save(stored), event: (stored, text) => service.event(stored, text),
-    follow: (subtask, team) => Object.assign(subtask, { status: subtaskStatus(team.status), teamStatus: team.status }), held: projectId => service.held(projectId), steeringFull }))(this));
+    follow: (subtask, team) => Object.assign(subtask, { status: subtaskStatus(team.status), teamStatus: team.status }), held: projectId => service.held(projectId), steeringFull,
+    reportHeld: (stored, subtask, reviewId) => service.reportHeld(stored, subtask, reviewId) }))(this));
 
   constructor(private readonly config: Config, private readonly key: Buffer, private readonly manager: Manager, private readonly teams: TeamService, private readonly groups: ProjectGroupLookup) {
     this.directory = join(config.stateDir, "missions");
@@ -779,14 +780,14 @@ export class MissionService {
       this.save(stored);
     }
   }
-  private reportHeld(stored: Stored, subtask: Mission["subtasks"][number]) {
+  private reportHeld(stored: Stored, subtask: Mission["subtasks"][number], reviewId?: string) {
     if ((stored.attempts.at(-1)?.status ?? "stopped") !== "stopped") return;
     if (stored.mission.subtasks.some(item => item.repoProjectId === subtask.repoProjectId && (item.status === "running" || stored.launches[item.id]))) return;
     const holders = holdersOf(this.teams.list(), subtask.repoProjectId);
     if (!holders.length || holders.some(run => run.missionId === stored.mission.id || !waitsOnPerson(run.status))) return;
     for (const run of holders)
-      this.message(stored, `${subtask.id}:held:${run.id}:${run.status}`, { type: "repository-held", subtaskId: subtask.id, repoProjectId: subtask.repoProjectId,
-        teamId: run.id, teamStatus: run.status, ...(run.reason ? { reason: run.reason } : {}) });
+      this.message(stored, `${subtask.id}:held:${reviewId ? `${reviewId}:` : ""}${run.id}:${run.status}`, { type: "repository-held", subtaskId: subtask.id, repoProjectId: subtask.repoProjectId,
+        teamId: run.id, teamStatus: run.status, ...(run.reason ? { reason: run.reason } : {}), ...(reviewId ? { reviewId } : {}) });
   }
   private baseSubtask(mission: Mission, subtask: Mission["subtasks"][number]) {
     const byId = new Map(mission.subtasks.map(item => [item.id, item]));
@@ -1188,7 +1189,8 @@ export class MissionService {
     const mission = stored.mission;
     if (mission.decisions.some(item => !item.answer)) return true;
     if (openFollowUps(mission).length) return true;
-    if (stored.ops.some(op => op.kind === "review-forward")) return true;
+    const free = (projectId: string) => holdersOf(this.teams.list(), projectId).every(run => !waitsOnPerson(run.status));
+    if (stored.ops.some(op => op.kind === "review-forward" && mission.subtasks.some(item => item.id === op.subtaskId && free(item.repoProjectId)))) return true;
     const working = (teamId: string) => {
       if (stored.ops.some(op => op.kind === "resume" && op.teamId === teamId)) return true;
       try { return this.teams.get(teamId).status !== "paused"; } catch (error) { if (notFound(error)) return false; throw error; }
@@ -1198,9 +1200,7 @@ export class MissionService {
     const ready = mission.subtasks.filter(item => item.status === "queued" && !stalled.has(item.id) &&
       item.dependsOn.every(id => mission.subtasks.find(other => other.id === id)?.status === "done"));
     if (ready.some(item => stored.launches[item.id])) return true;
-    if (!ready.length) return false;
-    const runs = this.teams.list();
-    return ready.some(item => holdersOf(runs, item.repoProjectId).every(run => !waitsOnPerson(run.status)));
+    return ready.some(item => free(item.repoProjectId));
   }
   private refuse(stored: Stored, kind: string, reason: string, wake = true) {
     stored.refusals++;

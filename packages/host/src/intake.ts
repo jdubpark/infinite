@@ -222,6 +222,7 @@ export class IntakeService {
   private timer?: NodeJS.Timeout;
   private unsubscribe?: () => void;
   private closed = false;
+  private reopenScan = false;
   private inFlight?: Promise<void>;
   private lastError?: { at: string; step: string; message: string };
   private readonly log: (line: string, error: unknown) => void;
@@ -262,6 +263,7 @@ export class IntakeService {
 
   start(): void {
     if (!this.enabled() || this.timer || this.closed) return;
+    this.reopenScan = this.config.github?.reviewFeedback?.enabled === true;
     this.unsubscribe = this.missions.onChange(mission => this.observe(mission));
     this.timer = setInterval(() => void this.poll(), this.pollMs);
     this.timer.unref();
@@ -336,8 +338,10 @@ export class IntakeService {
     await this.attempt("route", () => this.route());
     await this.attempt("file", () => this.file());
     await this.attempt("start", () => this.startQueued());
+    const reopening = this.reopenScan;
+    this.reopenScan = false;
     for (const record of this.store.list())
-      if (record.state === "started" || record.state === "finished") {
+      if (record.state === "started" || reopening && record.state === "finished") {
         const mission = this.missions.peek(record.missionId);
         if (mission) this.observe(mission);
       }
@@ -669,9 +673,8 @@ export class IntakeService {
   private reopen(mission: Mission): void {
     const record = this.store.forMission(mission.id);
     if (record?.state !== "finished") return;
-    this.attemptSync("observe", () => this.store.update(record.issueId, next => {
-      next.state = "started";
-    }), record.identifier);
+    try { this.store.update(record.issueId, next => { next.state = "started"; }); }
+    catch (error) { this.reopenScan = true; this.fail("observe", error, record.identifier); }
   }
 
   private observeDeadline(record: IntakeRecord, mission: Mission): void {

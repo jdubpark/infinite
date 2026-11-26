@@ -198,6 +198,7 @@ export class TeamVerdicts {
     const run = holder.run;
     const state = holder.verdict;
     if (run.verdicts !== "on" || (run.status !== "merged" && run.status !== "ready-for-review")) return false;
+    if (state?.status === "recording") return this.recover(holder);
     if (state === undefined || state.status !== "done" || state.kind !== "reviewed" || !this.current(run, state) || state.since === undefined || state.reason === "record-unavailable") return false;
     const assessment = run.assessment;
     if (assessment === undefined || assessment.revision !== state.revision || assessment.head !== state.head) return false;

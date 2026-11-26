@@ -21,7 +21,7 @@ import { cadenceDue, classifyCycle, cycleWakeOf, defaultWakeMinGapMinutes, folde
 import { KEPT_PAUSED, LEFT_AS_IS, LEFT_PAUSED, STILL_HALTED, isHaltReason, pauseFailure, releaseRefusal, type HaltCovers, type HaltHeldBy, type HaltMark, type HaltOutcome } from "./halt/rules.js";
 import { correctionGate, digestEvent, correctGoalObjective, createGoalObjective, goalObjectiveNote, goalObjectiveView, goalRecordDigest, goalRecordPort, loadGoalObjective, ratingStamp, steerGoalObjective, type ObjectiveUnavailable } from "./objective-goals.js";
 import { objectivePromptsOn, objectiveRegisterOn } from "./objective-digest.js";
-import { answerProvisional, assertVerdictAnswer, continueGoal, criteriaRowsFor, cycleVerdict, deliveryHold, lateVerdict, owedStop, provisionalStop, verdictFailed, CONTINUE_EVENT, DELIVERY_HOLD_REASON, LATE_RECEIPT_EVENT, PROVISIONAL_EVENT, PROVISIONAL_REASON } from "./goal-verdicts.js";
+import { answerProvisional, applyLateVerdict, assertVerdictAnswer, continueGoal, criteriaRowsFor, cycleVerdict, deliveryHold, holdReasonChange, lateVerdict, markProvisional, owedStop, provisionalStop, verdictFailed, CONTINUE_EVENT, DELIVERY_HOLD_REASON, LATE_RECEIPT_EVENT, PROVISIONAL_EVENT, PROVISIONAL_REASON } from "./goal-verdicts.js";
 import { correctionSchema, type CriterionInput } from "./objective-input.js";
 import { objectiveError, recordView, type ObjectiveRecordView } from "./objective-record.js";
 import { goalMetricsRead, pruneMetrics, settleMetrics } from "./goal-metrics.js";
@@ -878,15 +878,12 @@ export class GoalService {
     stored.goal.reason = reason; this.save(stored);
   }
   private stopProvisional(stored: Stored) {
-    const goal = stored.goal;
-    goal.status = "ready-for-review"; goal.reason = PROVISIONAL_REASON; goal.stopReason = "provisional-met";
+    markProvisional(stored.goal);
     this.event(stored, PROVISIONAL_EVENT);
   }
   private lateReceipt(stored: Stored, cycle: GoalCycle | undefined): void {
     const team = cycle === undefined ? undefined : this.teams.assessmentOf?.(cycle.teamId);
-    const late = cycle === undefined || team === undefined ? undefined : lateVerdict(stored.goal, cycle, team);
-    if (cycle === undefined || late === undefined) return;
-    Object.assign(cycle, late);
+    if (cycle === undefined || team === undefined || !applyLateVerdict(stored.goal, cycle, team)) return;
     this.event(stored, LATE_RECEIPT_EVENT);
     this.save(stored);
   }
@@ -903,11 +900,9 @@ export class GoalService {
     const scanned = this.config.projects.find(item => item.id === goal.projectId)?.source?.mode === "github";
     const detail = cycle?.assessment === undefined ? undefined : this.teams.verdicts?.detail(cycle.teamId);
     const holds = deliveryHold(goal, { nowMs: Date.now(), scanned, detail });
-    if (holds && goal.reason !== DELIVERY_HOLD_REASON) {
-      goal.reason = DELIVERY_HOLD_REASON; this.event(stored, DELIVERY_HOLD_REASON); this.save(stored);
-    } else if (!holds && goal.reason === DELIVERY_HOLD_REASON) {
-      goal.reason = undefined; this.save(stored);
-    }
+    const change = holdReasonChange(goal, holds);
+    if (change === "hold") this.event(stored, DELIVERY_HOLD_REASON);
+    if (change !== undefined) this.save(stored);
     return holds;
   }
   private runCreated(requestId: string) { return this.teams.goalIdOf(requestId) !== undefined; }

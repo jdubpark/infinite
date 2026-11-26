@@ -46,6 +46,23 @@ export function lateVerdict(goal: Pick<ProductGoal, "cycles">, cycle: GoalCycle,
   return copy.assessment === undefined || copy.supersededVerdictIds === undefined ? undefined : { assessment: copy.assessment, supersededVerdictIds: copy.supersededVerdictIds };
 }
 
+export function markProvisional(goal: ProductGoal): void {
+  goal.status = "ready-for-review"; goal.reason = PROVISIONAL_REASON; goal.stopReason = "provisional-met";
+}
+
+export function applyLateVerdict(goal: ProductGoal, cycle: GoalCycle, team: Pick<TeamView, "assessment">): boolean {
+  const late = lateVerdict(goal, cycle, team);
+  if (late === undefined) return false;
+  Object.assign(cycle, late);
+  return true;
+}
+
+export function holdReasonChange(goal: ProductGoal, holds: boolean): "hold" | "release" | undefined {
+  if (holds && goal.reason !== DELIVERY_HOLD_REASON) { goal.reason = DELIVERY_HOLD_REASON; return "hold"; }
+  if (!holds && goal.reason === DELIVERY_HOLD_REASON) { goal.reason = undefined; return "release"; }
+  return undefined;
+}
+
 export function owedStop(goal: ProductGoal, busy: boolean): boolean {
   if (goal.status !== "running" || goal.activeTeamId !== undefined || busy) return false;
   if (autonomyOf(goal) !== "autonomous" || goal.standing !== undefined) return false;

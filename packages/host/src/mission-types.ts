@@ -1,6 +1,6 @@
 import type { ConnectorSource } from "./mcp-types.js";
 import { z } from "zod";
-import { blockerEvidenceSchema, storedUsageRollupSchema, type TeamLineup, type TeamStatus } from "./team-types.js";
+import { blockerEvidenceSchema, storedUsageRollupSchema, type GithubReviewSource, type TeamLineup, type TeamStatus } from "./team-types.js";
 import type { StoredRollup, UsageRollup } from "./team-usage.js";
 import { projectGroupIdSchema } from "./project-group-types.js";
 import { questionRecommendationSchema, refineQuestion, requiredQuestionRecommendationSchema, type DecisionRecommendation } from "./question-recommendation.js";
@@ -322,9 +322,10 @@ export interface Mission {
   dispatchSummary?: string;
   subtasks: MissionSubtask[];
   decisions: MissionDecision[];
-  steering: { text: string; revision: number; at: string; source?: MissionInputSource }[];
+  steering: { text: string; revision: number; at: string; source?: MissionInputSource | GithubReviewSource }[];
   events: { at: string; text: string }[];
   result?: { summary: string; revision: number; at: string };
+  earlierResults?: { summary: string; revision: number; at: string }[];
   followUps?: RecordedMissionFollowUp[];
   usage?: UsageRollup;
 }

@@ -122,6 +122,8 @@ test("worker snapshots restore a bounded rendered prefix and contiguous live del
     const events = worker.events();
     const deltas = events.filter(event => event.seq > snapshot.seq && event.type === "output");
     assert.ok(deltas.length > 0, "output continued after the snapshot fence");
+    const after = deltas.map(event => String(event.data.text)).join("");
+    assert.deepEqual([...after.matchAll(/LIVE (\d+)/g)].map(match => Number(match[1])), Array.from({ length: 140 }, (_, index) => index + 11), "every line streamed after the fence is recorded once, in order");
     assert.ok(events.filter(event => event.seq <= snapshot.seq && event.type === "output").map(event => String(event.data.text)).join("").includes("LIVE 10"));
     const replay = new headless.Terminal({ cols: snapshot.cols, rows: snapshot.rows, scrollback: 5000, allowProposedApi: true });
     const restored = new headless.Terminal({ cols: snapshot.cols, rows: snapshot.rows, scrollback: 5000, allowProposedApi: true });

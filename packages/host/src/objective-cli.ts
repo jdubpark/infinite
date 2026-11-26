@@ -62,7 +62,7 @@ function correctionFailure(error: unknown, retry: string): Error {
   if (state) return state;
   if (typeof code === "string" && Object.hasOwn(OBJECTIVE_ERRORS, code)) return new Error(OBJECTIVE_ERRORS[code as ObjectiveErrorCode].message);
   if (status === 404 && code === "goal-not-found") return new Error("No goal has this ID.");
-  if (status === 404 && code === undefined) return new Error("This host does not accept corrections. Upgrade the host.");
+  if (status === 404 && (code === undefined || code === "route-not-found")) return new Error("This host does not accept corrections. Upgrade the host.");
   return new Error("The host refused the correction.");
 }
 

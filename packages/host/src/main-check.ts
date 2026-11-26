@@ -12,6 +12,7 @@ import type { Config, Project } from "./types.js";
 
 export type { CheckSummary, MainCheckRecord, MainCheckResult, MainCheckView, MainCheckWaiting } from "./main-check-state.js";
 export type { MainCheckPorts } from "./main-check-ports.js";
+export type { HostProcesses } from "./process-census.js";
 
 export type MainCheckNotice = { projectId: string; label: string; notice: number; outcome: "passed" | "failed"; summary: CheckSummary };
 export type MainCheckOptions = {

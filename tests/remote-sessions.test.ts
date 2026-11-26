@@ -73,6 +73,19 @@ test("machine setup persists private device and relay registrations without disc
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test("host-local new directs owners to the paired native CLI without reading host config", () => {
+  let failure: unknown;
+  try {
+    execFileSync(process.execPath, ["--import", "tsx", "packages/host/src/cli.ts", "new", "--config", "/home/dev/missing-config.json",
+      "--provider", "codex", "--title", "Example task"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  } catch (error) { failure = error; }
+  assert.ok(failure, "host-local session creation must be retired");
+  const output = `${(failure as NodeJS.ErrnoException & { stdout?: string }).stdout ?? ""}\n${(failure as NodeJS.ErrnoException & { stderr?: string }).stderr ?? ""}`;
+  assert.match(output, /Host-local session creation is retired/);
+  assert.match(output, /infinite pair https:\/\/HOST --token-file FILE/);
+  assert.match(output, /infinite --project ID --title "Task" codex/);
+});
+
 test("two registered machines create and steer independently, with scoped file previews and recorded chat", async () => {
   const hosts = await Promise.all([startHost(), startHost()]);
   try {

@@ -9,12 +9,14 @@ import type { Signal } from "@infinite/attention";
 import type { AgentProfile, InputControl } from "./types.js";
 import { NATIVE_MAX_BUFFERED, NATIVE_MAX_MESSAGE } from "./native-transport.js";
 import {
+  CODEX_ENVIRONMENT_STATE_FILE,
   connectCodexEnvironments,
   type CodexEnvironmentClient,
   type CodexEnvironmentPersistenceOptions,
   type CodexEnvironmentStore,
   type CodexExecutor,
 } from "./codex-environment.js";
+export { CODEX_ENVIRONMENT_STATE_FILE };
 
 export function validateNativeCodexArgs(args: string[], initialPrompt = "", allowEmpty = false) {
   const values = new Set(["-m", "--model", "-c", "--config", "-a", "--ask-for-approval", "-s", "--sandbox"]);
@@ -72,6 +74,7 @@ export function nativeItemMessage(item: unknown): TranscriptMessage | undefined 
 export async function startNativeCodex(options: {
   profile: AgentProfile; cwd: string; env: Record<string, string>;
   execution?: Executor;
+  resumeThreadId?: string;
   environmentState?: CodexEnvironmentPersistenceOptions;
   environmentStore?: CodexEnvironmentStore;
   onExecutionUnavailable?: () => void;
@@ -86,11 +89,12 @@ export async function startNativeCodex(options: {
   const token = randomBytes(32).toString("hex");
   const observerToken = randomBytes(32).toString("hex");
   const attachments = new Map<string, Attachment>();
-  let threadId: string | undefined, ready = false, stopped = false;
+  let threadId: string | undefined = options.resumeThreadId, ready = false, stopped = false;
   let lastMessage: string | undefined;
   let execution = options.execution, selecting = false;
   let environments: CodexEnvironmentClient | undefined;
   let child: ChildProcess | undefined;
+  let restoredClean = true;
   const http = createServer((_req, res) => { res.writeHead(404); res.end(); });
   const sockets = new WebSocketServer({ noServer: true, maxPayload: NATIVE_MAX_MESSAGE, perMessageDeflate: false });
   const upstreams = new Set<WebSocket>();
@@ -138,6 +142,17 @@ export async function startNativeCodex(options: {
         ...(options.environmentStore ? { store: options.environmentStore } : {}),
       });
       await environments.register(execution);
+      if (options.resumeThreadId) {
+        try {
+          await environments.restoreThread(options.resumeThreadId);
+          ready = true;
+          options.onThread(options.resumeThreadId);
+        } catch {
+          ready = false;
+          restoredClean = false;
+          options.onExecutionUnavailable?.();
+        }
+      }
     }
     http.on("upgrade", (req, socket, head) => {
       socket.on("error", () => {});
@@ -153,18 +168,33 @@ export async function startNativeCodex(options: {
         upstreams.add(upstream);
         const queue: string[] = [];
         let bytes = 0, startRequest: number | string | undefined;
+        let endStartupDiscovery: (() => void) | undefined;
+        let holdingStart = false;
+        const heldUpstream: string[] = [];
         const checkpointRequest = `infinite-checkpoint-${randomBytes(16).toString("hex")}`;
         let checking = false;
         const pending = new Map<number | string, string>();
-        const close = () => { frontend.terminate(); upstream.terminate(); };
+        const releaseDiscovery = () => {
+          const end = endStartupDiscovery;
+          endStartupDiscovery = undefined;
+          end?.();
+        };
+        const close = () => { releaseDiscovery(); heldUpstream.length = 0; frontend.terminate(); upstream.terminate(); };
         const authority = () => { if (!observer) options.checkControl(attachment!.authority); };
         const timer = setInterval(() => { try { authority(); } catch { close(); } }, 1000);
         const send = (target: WebSocket, data: string) => {
           if (target.bufferedAmount + Buffer.byteLength(data) > NATIVE_MAX_BUFFERED) throw new Error("Native connection is too slow");
           target.send(data);
         };
-        frontend.on("close", () => { clearInterval(timer); upstream.close(); if (credential && !observer) attachments.delete(credential); });
-        upstream.on("close", () => { clearInterval(timer); upstreams.delete(upstream); frontend.close(); });
+        const deliverFrontend = (payload: string) => {
+          if (holdingStart) {
+            heldUpstream.push(payload);
+            return;
+          }
+          if (frontend.readyState === WebSocket.OPEN) send(frontend, payload);
+        };
+        frontend.on("close", () => { clearInterval(timer); releaseDiscovery(); upstream.close(); if (credential && !observer) attachments.delete(credential); });
+        upstream.on("close", () => { clearInterval(timer); releaseDiscovery(); upstreams.delete(upstream); frontend.close(); });
         frontend.on("error", close); upstream.on("error", close);
         frontend.on("message", (data, binary) => {
           try {
@@ -177,6 +207,14 @@ export async function startNativeCodex(options: {
             };
             if (method === "thread/start") {
               if (!observer || threadId || startRequest !== undefined || message.id === undefined) { refuse(); return; }
+              if (execution && environments) {
+                try {
+                  endStartupDiscovery = environments.beginStartupDiscovery(execution.environmentId);
+                } catch (error) {
+                  refuse(error instanceof Error ? error.message : "Execution environment startup is unavailable");
+                  return;
+                }
+              }
               message.params = { ...params, historyMode: "legacy" };
               startRequest = message.id;
             } else if (method === "thread/fork" || method === "thread/delete" || method === "thread/archive" || method === "thread/unarchive") { refuse(); return; }
@@ -234,22 +272,61 @@ export async function startNativeCodex(options: {
               checking = false;
               const thread = message.result?.thread;
               ready = !message.error && thread?.id === threadId;
-              if (ready && environments && execution && threadId && Array.isArray(thread?.environments)) {
-                try { environments.assertObservedEnvironments(threadId, thread.environments); } catch { ready = false; }
+              if (ready && environments && execution && threadId) {
+                if (!restoredClean || environments.placement(threadId).status !== "verified" || !Array.isArray(thread?.environments)) {
+                  ready = false;
+                } else {
+                  try { environments.assertObservedEnvironments(threadId, thread.environments); } catch { ready = false; }
+                }
               }
               return;
             }
-            if (observer && startRequest !== undefined && message.id === startRequest && typeof message.result?.thread?.id === "string" && message.result.thread.id) {
+            if (observer && startRequest !== undefined && message.id === startRequest) {
+              releaseDiscovery();
+              if (message.error || typeof message.result?.thread?.id !== "string" || !message.result.thread.id) {
+                startRequest = undefined;
+                deliverFrontend(JSON.stringify(message));
+                return;
+              }
               const startedThreadId: string = message.result.thread.id;
               if (threadId && threadId !== startedThreadId) throw new Error("Native conversation changed");
               threadId = startedThreadId;
               environments?.observe({ method: "thread/started", params: { thread: { id: startedThreadId } } });
               if (environments && execution) {
-                environments.confirmInitialPlacement({
+                const startPayload = JSON.stringify(message);
+                const startId = message.id;
+                holdingStart = true;
+                void environments.confirmInitialPlacement({
                   threadId: startedThreadId,
                   executor: execution,
                   reportedEnvironments: message.result.thread.environments,
-                });
+                }).then(
+                  () => {
+                    if (stopped || frontend.readyState !== WebSocket.OPEN) return;
+                    holdingStart = false;
+                    options.onThread(startedThreadId);
+                    send(frontend, startPayload);
+                    const buffered = heldUpstream.splice(0, heldUpstream.length);
+                    for (const frame of buffered) {
+                      if (frontend.readyState === WebSocket.OPEN) send(frontend, frame);
+                    }
+                  },
+                  error => {
+                    holdingStart = false;
+                    heldUpstream.length = 0;
+                    ready = false;
+                    if (!stopped && frontend.readyState === WebSocket.OPEN) {
+                      try {
+                        send(frontend, JSON.stringify({
+                          id: startId,
+                          error: { code: -32000, message: error instanceof Error ? error.message : "Initial execution placement verification failed" },
+                        }));
+                      } catch {}
+                    }
+                    close();
+                  },
+                );
+                return;
               }
               options.onThread(startedThreadId);
             }
@@ -271,14 +348,14 @@ export async function startNativeCodex(options: {
             if (message.id !== undefined && !message.method) pending.delete(message.id);
             if (!selecting && environments && threadId && (method === "thread/read" || method === "thread/resume") &&
                 Array.isArray(message.result?.thread?.environments) && environments.placement(threadId).status === "verified") {
-              try { environments.assertObservedEnvironments(threadId, message.result.thread.environments); } catch {}
+              try { environments.assertObservedEnvironments(threadId, message.result.thread.environments); } catch { ready = false; }
             }
             if (method === "thread/list" && Array.isArray(message.result?.data)) {
               message.result.data = message.result.data.filter((thread: { id: string }) => thread.id === threadId);
               message.result.nextCursor = null;
             }
             if (method === "thread/loaded/list" && Array.isArray(message.result?.data)) message.result.data = message.result.data.filter((id: string) => id === threadId);
-            if (frontend.readyState === WebSocket.OPEN) send(frontend, JSON.stringify(message));
+            deliverFrontend(JSON.stringify(message));
           } catch { close(); }
         });
       });
@@ -297,7 +374,7 @@ export async function startNativeCodex(options: {
         attachments.set(credential, { authority, used: false });
         return { url, token: credential, sessionId: threadId };
       },
-      supportsExecutionSelection: environments?.supportsSelection ?? false,
+      supportsExecutionSelection: (environments?.supportsSelection ?? false) && restoredClean,
       async selectExecution(next: Executor, release: () => void) {
         if (!environments || !threadId || selecting || stopped) throw new Error("Execution selection is unavailable");
         selecting = true;

@@ -8,7 +8,7 @@ const MAX_QUEUED_BYTES = 256 * 1024;
 const MAX_QUEUED_FRAMES = 128;
 
 export type FenceDecision =
-  | { allowed: true }
+  | { allowed: true; generation: number; bootstrap?: boolean }
   | { allowed: false; code: string; reason: string };
 
 export interface FencedDispatchEvent {
@@ -28,8 +28,11 @@ interface RegisteredEndpoint {
 interface QueuedFrame {
   text: string;
   method?: string;
+  params?: Record<string, unknown>;
   id?: string | number;
   probe: boolean;
+  authorizedGeneration: number;
+  bootstrap: boolean;
 }
 
 interface ActiveChannel {
@@ -48,8 +51,7 @@ function isRpcId(value: unknown): value is string | number {
   return typeof value === "string" || typeof value === "number";
 }
 
-function parseObject(text: string): Record<string, unknown> | undefined {
-  const value: unknown = JSON.parse(text);
+function parseObject(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value)
     ? value as Record<string, unknown>
     : undefined;
@@ -57,13 +59,14 @@ function parseObject(text: string): Record<string, unknown> | undefined {
 
 export interface CodexToolFence {
   add(target: { environmentId: string; url: string; token: string }): { url: string; token: string };
+  remove(environmentId: string, reason: string): void;
   revoke(environmentId: string, reason: string): void;
   revokeAll(reason: string): void;
   close(): void;
 }
 
 export async function createCodexToolFence(options: {
-  authorize: (environmentId: string, method?: string) => FenceDecision;
+  authorize: (environmentId: string, method?: string, params?: Record<string, unknown>) => FenceDecision;
   onFenced?: (event: FencedDispatchEvent) => void;
 }): Promise<CodexToolFence> {
   const endpoints = new Map<string, RegisteredEndpoint>();
@@ -110,6 +113,11 @@ export async function createCodexToolFence(options: {
         frontend.terminate();
         upstream?.terminate();
       };
+      const closeSocket = (sock: WebSocket | undefined) => {
+        if (!sock) return;
+        if (sock.readyState === WebSocket.OPEN) sock.close();
+        else if (sock.readyState === WebSocket.CONNECTING) sock.terminate();
+      };
       const sendError = (id: string | number | undefined, reason: string) => {
         if (id === undefined || frontend.readyState !== WebSocket.OPEN) return;
         sendSafe(frontend, JSON.stringify({
@@ -134,11 +142,6 @@ export async function createCodexToolFence(options: {
         queued.push(...retained);
         queuedBytes = retainedBytes;
       };
-      const closeSocket = (sock: WebSocket | undefined) => {
-        if (!sock) return;
-        if (sock.readyState === WebSocket.OPEN) sock.close();
-        else if (sock.readyState === WebSocket.CONNECTING) sock.terminate();
-      };
       const ensureUpstream = (): WebSocket => {
         if (upstream) return upstream;
         const next = new WebSocket(endpoint.upstreamUrl, {
@@ -156,10 +159,16 @@ export async function createCodexToolFence(options: {
           queuedBytes = 0;
           for (const frame of pending) {
             if (!frame.probe) {
-              const decision = options.authorize(endpoint.environmentId, frame.method);
+              const decision = options.authorize(endpoint.environmentId, frame.method, frame.params);
               if (!decision.allowed) {
                 options.onFenced?.({ environmentId: endpoint.environmentId, method: frame.method, code: decision.code, reason: decision.reason });
                 sendError(frame.id, decision.reason);
+                continue;
+              }
+              if (decision.generation !== frame.authorizedGeneration || Boolean(decision.bootstrap) !== frame.bootstrap) {
+                const reason = "Execution environment placement generation changed while the request was queued";
+                options.onFenced?.({ environmentId: endpoint.environmentId, method: frame.method, code: "conflict", reason });
+                sendError(frame.id, reason);
                 continue;
               }
             }
@@ -187,18 +196,23 @@ export async function createCodexToolFence(options: {
         if (binary || closed) { teardown(); return; }
         try {
           const text = data.toString();
-          const message = parseObject(text);
+          const message = parseObject(JSON.parse(text));
           if (!message) { teardown(); return; }
           const method = typeof message.method === "string" ? message.method : undefined;
+          const params = parseObject(message.params);
           const id = isRpcId(message.id) ? message.id : undefined;
           const probe = method !== undefined && PROBE_METHODS.has(method);
+          let authorizedGeneration = 0;
+          let bootstrap = false;
           if (!probe) {
-            const decision = options.authorize(endpoint.environmentId, method);
+            const decision = options.authorize(endpoint.environmentId, method, params);
             if (!decision.allowed) {
               options.onFenced?.({ environmentId: endpoint.environmentId, method, code: decision.code, reason: decision.reason });
               sendError(id, decision.reason);
               return;
             }
+            authorizedGeneration = decision.generation;
+            bootstrap = Boolean(decision.bootstrap);
           }
           const target = ensureUpstream();
           if (target.readyState === WebSocket.OPEN) {
@@ -209,7 +223,7 @@ export async function createCodexToolFence(options: {
               teardown();
               return;
             }
-            queued.push({ text, method, id, probe });
+            queued.push({ text, method, params, id, probe, authorizedGeneration, bootstrap });
             queuedBytes += bytes;
           } else {
             teardown();
@@ -247,7 +261,7 @@ export async function createCodexToolFence(options: {
     add(target) {
       if (closed) throw new Error("Tool dispatch fence is closed");
       const existing = endpoints.get(target.environmentId);
-      if (existing) {
+      if (existing && existing.upstreamUrl === target.url && existing.upstreamToken === target.token) {
         return {
           url: `${base}/env/${encodeURIComponent(existing.environmentId)}`,
           token: existing.proxyToken,
@@ -264,6 +278,15 @@ export async function createCodexToolFence(options: {
         url: `${base}/env/${encodeURIComponent(target.environmentId)}`,
         token: proxyToken,
       };
+    },
+    remove(environmentId, reason) {
+      endpoints.delete(environmentId);
+      for (const channel of [...channels]) {
+        if (channel.environmentId === environmentId) {
+          channel.rejectQueuedToolFrames(reason);
+          channel.close();
+        }
+      }
     },
     revoke(environmentId, reason) {
       for (const channel of channels) {

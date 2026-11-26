@@ -1,16 +1,18 @@
-import { isAbsolute, normalize, relative, sep } from "node:path";
+import { isAbsolute, normalize, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { WebSocket } from "ws";
 import { replyDeadline } from "./deadline.js";
 import { NATIVE_MAX_BUFFERED, NATIVE_MAX_MESSAGE } from "./native-transport.js";
 import {
   CODEX_ENVIRONMENT_STATE_FILE,
+  MAX_CODEX_ENVIRONMENT_STATE_BYTES,
   activeSelectionOf,
   clonePlacement,
   cloneSelection,
   generationOf,
   hydrateThreadPlacements,
   openCodexEnvironmentStore,
+  pathWithinRoots,
   revisionOf,
   serializeThreadPlacements,
   usedOf,
@@ -26,6 +28,7 @@ import { createCodexToolFence, type CodexToolFence, type FenceDecision, type Fen
 
 export {
   CODEX_ENVIRONMENT_STATE_FILE,
+  MAX_CODEX_ENVIRONMENT_STATE_BYTES,
   openCodexEnvironmentStore,
   type CodexEnvironmentPersistenceOptions,
   type CodexEnvironmentStore,
@@ -92,6 +95,8 @@ export class CodexEnvironmentError extends Error {
 type RecordValue = Record<string, unknown>;
 type StoreHealth = { ok: true } | { ok: false; reason: string };
 
+const STARTUP_DISCOVERY_METHODS = new Set(["fs/getMetadata", "fs/readFile"]);
+
 const object = (value: unknown): RecordValue | undefined =>
   value !== null && typeof value === "object" && !Array.isArray(value) ? value as RecordValue : undefined;
 
@@ -100,6 +105,18 @@ const nativePath = (value: unknown): string => {
   const path = value.startsWith("file:") ? fileURLToPath(value) : value;
   if (!isAbsolute(path)) throw new CodexEnvironmentError("rejected", "The provider returned a relative workspace path");
   return normalize(path);
+};
+
+const discoveryPathWithinRoots = (params: RecordValue | undefined, cwd: string, roots: string[]): boolean => {
+  const raw = params?.path;
+  if (typeof raw !== "string" || !raw || raw.includes("\0")) return false;
+  try {
+    const converted = raw.startsWith("file:") ? fileURLToPath(raw) : raw;
+    const target = isAbsolute(converted) ? normalize(converted) : normalize(resolve(cwd, converted));
+    return pathWithinRoots(target, roots);
+  } catch {
+    return false;
+  }
 };
 
 const authenticatedUrl = (value: string): string => {
@@ -158,10 +175,7 @@ const normalizeExecutor = (executor: CodexExecutor): CodexExecutor => {
     cwd: nativePath(executor.cwd),
     roots: [...new Set(executor.roots.map(nativePath))],
   };
-  if (!validated.roots.some(root => {
-    const path = relative(root, validated.cwd);
-    return !path || (path !== ".." && !path.startsWith(`..${sep}`) && !isAbsolute(path));
-  })) {
+  if (!pathWithinRoots(validated.cwd, validated.roots)) {
     throw new CodexEnvironmentError("rejected", "The execution directory is outside its selected roots");
   }
   return validated;
@@ -190,8 +204,10 @@ export async function connectCodexEnvironments(options: {
     perMessageDeflate: false, handshakeTimeout: 10000,
   });
   const pending = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> }>();
-  const registered = new Map<string, CodexExecutor>();
+  const reserved = new Map<string, CodexExecutor>();
+  const validatedExecutors = new Map<string, CodexExecutor>();
   const registering = new Map<string, Promise<void>>();
+  const bootstrapDiscovery = new Map<string, { cwd: string; roots: string[]; count: number }>();
   const turns = new Map<string, { turnId?: string; revision: number }>();
   const threadQueues = new Map<string, Promise<unknown>>();
   let fence: CodexToolFence | undefined;
@@ -207,6 +223,10 @@ export async function connectCodexEnvironments(options: {
     }
   };
 
+  const clearDiscovery = (environmentId: string, reason: string) => {
+    if (bootstrapDiscovery.delete(environmentId)) fence?.revoke(environmentId, reason);
+  };
+
   const findThreadByEnvironment = (environmentId: string): string | undefined => {
     for (const [threadId, state] of placements) {
       if (state.kind === "verified" && state.placement.environmentId === environmentId) return threadId;
@@ -218,17 +238,27 @@ export async function connectCodexEnvironments(options: {
     return undefined;
   };
 
-  const checkEnvironmentDispatch = (environmentId: string): FenceDecision => {
+  const checkEnvironmentDispatch = (environmentId: string, method?: string, params?: RecordValue): FenceDecision => {
     if (closed) return { allowed: false, code: "unavailable", reason: "The internal provider connection is unavailable" };
     if (!storeHealth.ok) return { allowed: false, code: "uncertain", reason: storeHealth.reason };
+    const reg = validatedExecutors.get(environmentId);
+    if (!reg) {
+      return { allowed: false, code: "conflict", reason: "Executor has not completed validated registration on this provider connection" };
+    }
     for (const state of placements.values()) {
       if (state.kind === "verified" && state.placement.environmentId === environmentId) {
-        const reg = registered.get(environmentId);
-        if (reg && !sameSelectionValues(state.placement, { environmentId: reg.environmentId, cwd: reg.cwd, runtimeWorkspaceRoots: reg.roots })) {
+        if (!sameSelectionValues(state.placement, { environmentId: reg.environmentId, cwd: reg.cwd, runtimeWorkspaceRoots: reg.roots })) {
           return { allowed: false, code: "conflict", reason: "Registered executor does not match verified placement" };
         }
-        return { allowed: true };
+        return { allowed: true, generation: state.placement.generation };
       }
+    }
+    const discovery = bootstrapDiscovery.get(environmentId);
+    if (discovery && method && STARTUP_DISCOVERY_METHODS.has(method)) {
+      if (discoveryPathWithinRoots(params, discovery.cwd, discovery.roots)) {
+        return { allowed: true, generation: 0, bootstrap: true };
+      }
+      return { allowed: false, code: "conflict", reason: "Startup discovery path is outside the registered workspace roots" };
     }
     for (const state of placements.values()) {
       if (state.kind === "selecting" && (state.target.environmentId === environmentId || state.previous?.environmentId === environmentId)) {
@@ -267,6 +297,7 @@ export async function connectCodexEnvironments(options: {
   function lost() {
     if (closed) return;
     closed = true;
+    bootstrapDiscovery.clear();
     fence?.revokeAll("The internal provider connection closed; tool dispatch is fenced");
     fence?.close();
     for (const entry of pending.values()) {
@@ -291,14 +322,14 @@ export async function connectCodexEnvironments(options: {
       else entry.resolve(message.result);
     } catch { socket.terminate(); lost(); }
   });
-  const call = (method: string, params: unknown): Promise<unknown> => new Promise((resolve, reject) => {
-    if (closed || socket.readyState !== WebSocket.OPEN) { reject(new CodexEnvironmentError("unavailable", "The internal provider connection is unavailable")); return; }
+  const call = (method: string, params: unknown): Promise<unknown> => new Promise((resolveCall, rejectCall) => {
+    if (closed || socket.readyState !== WebSocket.OPEN) { rejectCall(new CodexEnvironmentError("unavailable", "The internal provider connection is unavailable")); return; }
     const id = ++nextId;
     const timer = replyDeadline(15000, () => {
       if (!pending.delete(id)) return;
-      reject(new CodexEnvironmentError("uncertain", "The provider acknowledgement timed out; keep execution held and reconcile before continuing"));
+      rejectCall(new CodexEnvironmentError("uncertain", "The provider acknowledgement timed out; keep execution held and reconcile before continuing"));
     });
-    pending.set(id, { resolve, reject, timer });
+    pending.set(id, { resolve: resolveCall, reject: rejectCall, timer });
     const text = JSON.stringify({ id, method, params });
     if (socket.bufferedAmount + Buffer.byteLength(text) > NATIVE_MAX_BUFFERED) { socket.terminate(); lost(); return; }
     socket.send(text, error => { if (error) { socket.terminate(); lost(); } });
@@ -317,27 +348,37 @@ export async function connectCodexEnvironments(options: {
 
   async function register(executor: CodexExecutor): Promise<void> {
     const validated = normalizeExecutor(executor);
-    const existing = registered.get(validated.environmentId);
+    const existing = reserved.get(validated.environmentId);
     if (existing && JSON.stringify(existing) !== JSON.stringify(validated)) {
       throw new CodexEnvironmentError("conflict", "An environment ID cannot be rebound; use a fresh placement ID");
     }
     const inflight = registering.get(validated.environmentId);
     if (inflight) return inflight;
-    const needsAdd = !existing;
-    if (needsAdd) registered.set(validated.environmentId, validated);
+    if (!existing) reserved.set(validated.environmentId, validated);
+    const needsAdd = !validatedExecutors.has(validated.environmentId);
     const promise = (async () => {
-      if (needsAdd) {
-        if (!fence) throw new CodexEnvironmentError("unavailable", "The tool dispatch fence is unavailable");
-        const proxy = fence.add({ environmentId: validated.environmentId, url: validated.url, token: validated.token });
-        await call("environment/add", {
-          environmentId: validated.environmentId,
-          execServerUrl: proxy.url,
-          authBearerToken: proxy.token,
-          connectTimeoutMs: 10000,
-        });
+      try {
+        if (needsAdd) {
+          if (!fence) throw new CodexEnvironmentError("unavailable", "The tool dispatch fence is unavailable");
+          const proxy = fence.add({ environmentId: validated.environmentId, url: validated.url, token: validated.token });
+          await call("environment/add", {
+            environmentId: validated.environmentId,
+            execServerUrl: proxy.url,
+            authBearerToken: proxy.token,
+            connectTimeoutMs: 10000,
+          });
+        }
+        const info = object(await call("environment/info", { environmentId: validated.environmentId }));
+        if (nativePath(info?.cwd) !== validated.cwd) {
+          throw new CodexEnvironmentError("rejected", "The executor reported a different working directory");
+        }
+        validatedExecutors.set(validated.environmentId, validated);
+      } catch (error) {
+        validatedExecutors.delete(validated.environmentId);
+        bootstrapDiscovery.delete(validated.environmentId);
+        fence?.remove(validated.environmentId, "Executor registration failed validation");
+        throw error;
       }
-      const info = object(await call("environment/info", { environmentId: validated.environmentId }));
-      if (nativePath(info?.cwd) !== validated.cwd) throw new CodexEnvironmentError("rejected", "The executor reported a different working directory");
     })();
     registering.set(validated.environmentId, promise);
     try { await promise; } finally {
@@ -353,6 +394,43 @@ export async function connectCodexEnvironments(options: {
     }
     return { threadId, environments: parseEnvironments(thread.environments) };
   }
+
+  const beginStartupDiscovery = (environmentId: string): (() => void) => {
+    if (closed) throw new CodexEnvironmentError("unavailable", "The internal provider connection is unavailable");
+    if (!storeHealth.ok) throw new CodexEnvironmentError("uncertain", storeHealth.reason);
+    const reg = validatedExecutors.get(environmentId);
+    if (!reg) throw new CodexEnvironmentError("conflict", "Executor has not completed validated registration on this provider connection");
+    for (const state of placements.values()) {
+      if (state.kind === "selecting" && (state.target.environmentId === environmentId || state.previous?.environmentId === environmentId)) {
+        throw new CodexEnvironmentError("conflict", "Execution environment selection is in progress");
+      }
+      if (state.kind === "uncertain" && (state.expected?.environmentId === environmentId || state.used.has(environmentId))) {
+        throw new CodexEnvironmentError("uncertain", state.reason);
+      }
+      if (state.kind === "verified" && state.placement.environmentId !== environmentId && state.used.has(environmentId)) {
+        throw new CodexEnvironmentError("conflict", "Execution environment placement is stale and has been superseded");
+      }
+      if (state.kind === "pending-verification" && state.persisted.placement.environmentId !== environmentId &&
+          state.persisted.usedEnvironmentIds.includes(environmentId)) {
+        throw new CodexEnvironmentError("conflict", "Execution environment placement is stale and has been superseded");
+      }
+    }
+    const existing = bootstrapDiscovery.get(environmentId);
+    if (existing) existing.count += 1;
+    else bootstrapDiscovery.set(environmentId, { cwd: reg.cwd, roots: [...reg.roots], count: 1 });
+    let ended = false;
+    return () => {
+      if (ended) return;
+      ended = true;
+      const entry = bootstrapDiscovery.get(environmentId);
+      if (!entry) return;
+      entry.count -= 1;
+      if (entry.count <= 0) {
+        bootstrapDiscovery.delete(environmentId);
+        fence?.revoke(environmentId, "Startup discovery window closed");
+      }
+    };
+  };
 
   const assertNotOwnedByOtherThread = (threadId: string, environmentId: string) => {
     for (const [otherThreadId, state] of placements) {
@@ -376,7 +454,10 @@ export async function connectCodexEnvironments(options: {
       reason,
       updatedAt: new Date().toISOString(),
     });
-    for (const id of nextUsed) fence?.revoke(id, reason);
+    for (const id of nextUsed) {
+      bootstrapDiscovery.delete(id);
+      fence?.revoke(id, reason);
+    }
     if (store && storeHealth.ok) { try { persistStore(); } catch {} }
   };
 
@@ -384,20 +465,21 @@ export async function connectCodexEnvironments(options: {
     threadId: string;
     executor: CodexExecutor;
     reportedEnvironments?: unknown;
-  }): CodexPlacement => {
+  }): Promise<CodexPlacement> => serialThread(request.threadId, async () => {
     if (closed) throw new CodexEnvironmentError("unavailable", "The internal provider connection is unavailable");
     if (!storeHealth.ok) throw new CodexEnvironmentError("uncertain", storeHealth.reason);
     const validated = normalizeExecutor(request.executor);
-    const reg = registered.get(validated.environmentId);
-    if (reg && JSON.stringify(reg) !== JSON.stringify(validated)) {
-      throw new CodexEnvironmentError("conflict", "An environment ID cannot be rebound; use a fresh placement ID");
+    clearDiscovery(validated.environmentId, "Startup discovery window closed");
+    const reg = validatedExecutors.get(validated.environmentId);
+    if (!reg || JSON.stringify(reg) !== JSON.stringify(validated)) {
+      throw new CodexEnvironmentError("conflict", "Executor has not completed validated registration on this provider connection");
     }
     const requestedSelection: PersistedCodexSelection = {
       environmentId: validated.environmentId,
       cwd: validated.cwd,
       runtimeWorkspaceRoots: [...validated.roots],
     };
-    let reported: CodexEnvironmentSelection[] | undefined;
+    let reported: CodexEnvironmentSelection[];
     if (request.reportedEnvironments !== undefined) {
       try {
         reported = parseEnvironments(request.reportedEnvironments);
@@ -405,10 +487,17 @@ export async function connectCodexEnvironments(options: {
         markUncertain(request.threadId, "The provider returned an invalid initial thread environment", requestedSelection);
         throw new CodexEnvironmentError("uncertain", "The provider returned an invalid initial thread environment");
       }
-      if (!sameSelection(reported, validated)) {
-        markUncertain(request.threadId, "The provider's initial thread environment did not match the requested executor", requestedSelection);
-        throw new CodexEnvironmentError("uncertain", "The provider's initial thread environment did not match the requested executor");
+    } else {
+      try {
+        reported = (await read(request.threadId)).environments;
+      } catch {
+        markUncertain(request.threadId, "The provider did not confirm the initial thread environment via thread/read", requestedSelection);
+        throw new CodexEnvironmentError("uncertain", "The provider did not confirm the initial thread environment; tool dispatch remains fenced");
       }
+    }
+    if (!sameSelection(reported, validated)) {
+      markUncertain(request.threadId, "The provider's initial thread environment did not match the requested executor", requestedSelection);
+      throw new CodexEnvironmentError("uncertain", "The provider's initial thread environment did not match the requested executor");
     }
     assertNotOwnedByOtherThread(request.threadId, validated.environmentId);
     const existing = placements.get(request.threadId);
@@ -419,7 +508,7 @@ export async function connectCodexEnvironments(options: {
       }
       if (existing.kind === "pending-verification") {
         const expected = existing.persisted.placement;
-        if (reported && reported.length === 1 && sameSelectionValues(reported[0], expected) && sameSelectionValues(expected, requestedSelection)) {
+        if (sameSelectionValues(reported[0], expected) && sameSelectionValues(expected, requestedSelection)) {
           const placement: CodexPlacement = {
             threadId: request.threadId,
             ...cloneSelection(expected),
@@ -452,7 +541,7 @@ export async function connectCodexEnvironments(options: {
       }
     }
     return clonePlacement(placement);
-  };
+  });
 
   const assertObservedEnvironments = (threadId: string, rawEnvironments: unknown): CodexPlacement => {
     if (closed) throw new CodexEnvironmentError("unavailable", "The internal provider connection is unavailable");
@@ -471,7 +560,7 @@ export async function connectCodexEnvironments(options: {
     return clonePlacement(current.placement);
   };
 
-  const verify = (threadId: string): Promise<CodexPlacement> => serialThread(threadId, async () => {
+  const verifyUnlocked = async (threadId: string): Promise<CodexPlacement> => {
     if (closed) throw new CodexEnvironmentError("unavailable", "The internal provider connection is unavailable");
     if (!storeHealth.ok) throw new CodexEnvironmentError("uncertain", storeHealth.reason);
     const current = placements.get(threadId);
@@ -485,10 +574,10 @@ export async function connectCodexEnvironments(options: {
     const turnId = current.kind === "pending-verification" ? current.persisted.turnId : current.placement.turnId;
     const verifiedAt = current.kind === "pending-verification" ? current.persisted.verifiedAt : current.placement.verifiedAt;
     const updatedAt = current.kind === "pending-verification" ? current.persisted.updatedAt : current.updatedAt;
-    const reg = registered.get(expected.environmentId);
-    if (reg && !sameSelectionValues(expected, { environmentId: reg.environmentId, cwd: reg.cwd, runtimeWorkspaceRoots: reg.roots })) {
-      markUncertain(threadId, "Registered executor metadata drifted from persisted placement; reconcile before dispatching tools", expected, used);
-      throw new CodexEnvironmentError("conflict", "Registered executor does not match persisted placement");
+    const reg = validatedExecutors.get(expected.environmentId);
+    if (!reg || !sameSelectionValues(expected, { environmentId: reg.environmentId, cwd: reg.cwd, runtimeWorkspaceRoots: reg.roots })) {
+      markUncertain(threadId, "Executor has not completed validated registration matching persisted placement; reconcile before dispatching tools", expected, used);
+      throw new CodexEnvironmentError("conflict", "Executor has not completed validated registration matching persisted placement");
     }
     let live: { threadId: string; environments: CodexEnvironmentSelection[] };
     try { live = await read(threadId); } catch (error) {
@@ -504,6 +593,43 @@ export async function connectCodexEnvironments(options: {
     const placement: CodexPlacement = { threadId, ...cloneSelection(expected), generation, ...(turnId ? { turnId } : {}), verifiedAt };
     placements.set(threadId, { kind: "verified", placement, revision, used, updatedAt });
     return clonePlacement(placement);
+  };
+
+  const verify = (threadId: string): Promise<CodexPlacement> => serialThread(threadId, () => verifyUnlocked(threadId));
+
+  const restoreThread = (threadId: string): Promise<CodexPlacement> => serialThread(threadId, async () => {
+    if (closed) throw new CodexEnvironmentError("unavailable", "The internal provider connection is unavailable");
+    if (!storeHealth.ok) throw new CodexEnvironmentError("uncertain", storeHealth.reason);
+    const current = placements.get(threadId);
+    if (!current) throw new CodexEnvironmentError("conflict", "No persisted execution environment placement exists for this thread");
+    if (current.kind === "selecting") throw new CodexEnvironmentError("conflict", "Execution environment selection is in progress; wait for completion");
+    if (current.kind === "uncertain") throw new CodexEnvironmentError("uncertain", current.reason);
+    const expected = activeSelectionOf(current)!;
+    const endDiscovery = beginStartupDiscovery(expected.environmentId);
+    let resumed: RecordValue | undefined;
+    try {
+      resumed = object(await call("thread/resume", { threadId }));
+    } finally {
+      endDiscovery();
+    }
+    const thread = object(resumed?.thread);
+    if (thread?.id !== threadId) {
+      markUncertain(threadId, "Provider failed to resume the saved thread during restart recovery", expected);
+      throw new CodexEnvironmentError("unavailable", "Provider did not resume the requested thread");
+    }
+    if (thread.environments !== undefined) {
+      let reported: CodexEnvironmentSelection[];
+      try { reported = parseEnvironments(thread.environments); } catch {
+        markUncertain(threadId, "Provider returned an invalid environment selection during thread resume", expected);
+        throw new CodexEnvironmentError("conflict", "Provider returned an invalid environment selection during thread resume");
+      }
+      if (reported.length !== 1 || !sameSelectionValues(reported[0], expected)) {
+        markUncertain(threadId, "Resumed thread environment placement drifted from persisted state; reconcile before dispatching tools", expected);
+        throw new CodexEnvironmentError("conflict", "Resumed thread environment placement does not match persisted state");
+      }
+    }
+    observe({ method: "thread/started", params: { thread: { id: threadId } } });
+    return verifyUnlocked(threadId);
   });
 
   const checkDispatch = (request: CodexDispatchCheck): CodexDispatchDecision => {
@@ -514,6 +640,10 @@ export async function connectCodexEnvironments(options: {
     if (state.kind === "pending-verification") return { allowed: false, code: "uncertain", reason: "Persisted execution environment placement must be verified after restart before tool dispatch" };
     if (state.kind === "selecting") return { allowed: false, code: "conflict", reason: "Execution environment selection is in progress; tool dispatch is held" };
     if (state.kind === "uncertain") return { allowed: false, code: "uncertain", reason: state.reason };
+    const reg = validatedExecutors.get(state.placement.environmentId);
+    if (!reg || !sameSelectionValues(state.placement, { environmentId: reg.environmentId, cwd: reg.cwd, runtimeWorkspaceRoots: reg.roots })) {
+      return { allowed: false, code: "conflict", reason: "Executor has not completed validated registration on this provider connection" };
+    }
     if (request.environmentId !== undefined && request.environmentId !== state.placement.environmentId) {
       return { allowed: false, code: "conflict", reason: "Requested execution environment does not match the verified placement" };
     }
@@ -586,7 +716,8 @@ export async function connectCodexEnvironments(options: {
         }
       };
       await register(request.executor);
-      const executor = registered.get(request.executor.environmentId)!;
+      const executor = validatedExecutors.get(request.executor.environmentId);
+      if (!executor) throw new CodexEnvironmentError("conflict", "Executor has not completed validated registration on this provider connection");
       assertNotOwnedByOtherThread(threadId, executor.environmentId);
       const priorUsed = usedOf(current);
       const priorActive = activeSelectionOf(current);
@@ -606,6 +737,8 @@ export async function connectCodexEnvironments(options: {
       };
       const environments = [cloneSelection(nextSelection)];
 
+      clearDiscovery(executor.environmentId, "Execution environment selection is in progress; tool dispatch is held");
+      if (priorActive) clearDiscovery(priorActive.environmentId, "Execution environment selection is in progress; tool dispatch is held");
       placements.set(threadId, {
         kind: "selecting",
         generation: nextGeneration,
@@ -616,8 +749,11 @@ export async function connectCodexEnvironments(options: {
         ...(turnId ? { turnId } : {}),
         updatedAt: new Date().toISOString(),
       });
-      if (priorActive && priorActive.environmentId !== executor.environmentId) {
+      if (priorActive) {
         fence?.revoke(priorActive.environmentId, "Execution environment selection is in progress; tool dispatch is held");
+      }
+      if (!priorActive || priorActive.environmentId !== executor.environmentId) {
+        fence?.revoke(executor.environmentId, "Execution environment selection is in progress; tool dispatch is held");
       }
       try { persistStore(); } catch (error) {
         markUncertain(threadId, "Could not persist execution environment transition; tool dispatch remains fenced", nextSelection, nextUsed);
@@ -670,13 +806,13 @@ export async function connectCodexEnvironments(options: {
   let providerSupportsSelection = false;
   try {
     fence = await createCodexToolFence({
-      authorize: environmentId => checkEnvironmentDispatch(environmentId),
+      authorize: (environmentId, method, params) => checkEnvironmentDispatch(environmentId, method, params),
       onFenced: event => options.onDispatchFenced?.({ ...event, threadId: findThreadByEnvironment(event.environmentId) }),
     });
-    await new Promise<void>((resolve, reject) => {
-      socket.once("open", resolve);
-      socket.once("error", () => reject(new CodexEnvironmentError("unavailable", "Could not connect to the provider")));
-      socket.once("close", () => reject(new CodexEnvironmentError("unavailable", "Provider closed during initialization")));
+    await new Promise<void>((resolveOpen, rejectOpen) => {
+      socket.once("open", resolveOpen);
+      socket.once("error", () => rejectOpen(new CodexEnvironmentError("unavailable", "Could not connect to the provider")));
+      socket.once("close", () => rejectOpen(new CodexEnvironmentError("unavailable", "Provider closed during initialization")));
     });
     await call("initialize", { clientInfo: { name: "infinite_execution", version: "0.1.0" }, capabilities: { experimentalApi: true } });
     socket.send(JSON.stringify({ method: "initialized" }));
@@ -702,9 +838,11 @@ export async function connectCodexEnvironments(options: {
     },
     placement: placementView,
     read,
+    beginStartupDiscovery,
     confirmInitialPlacement,
     assertObservedEnvironments,
     verify,
+    restoreThread,
     checkDispatch,
     assertDispatchAllowed,
     dispatchTool,

@@ -59,8 +59,7 @@ import { TerminalSnapshots } from "./terminal-snapshot.js";
 import { DEFAULT_TERMINAL_SIZE, isPtyTerminalSize, TERMINAL_SIZE_INDEX_FILE, TerminalBarrier, TerminalSizeIndex } from "./terminal-size.js";
 import { ptyTails } from "./pty-tail.js";
 import { SignalIndex } from "./signal-index.js";
-import { CODEX_ENVIRONMENT_STATE_FILE } from "./codex-environment.js";
-import { startNativeCodex, validateNativeCodexArgs } from "./native-codex.js";
+import { CODEX_ENVIRONMENT_STATE_FILE, startNativeCodex, validateNativeCodexArgs } from "./native-codex.js";
 import { startNativeOpenCode, validateNativeOpenCodeArgs } from "./native-opencode.js";
 import { createExecutorTunnel, type ExecutorTunnel } from "./executor-tunnel.js";
 import { JsonLineAssembler, toolFromRunLine, usageFromRunLine } from "./opencode-usage.js";
@@ -1488,7 +1487,7 @@ server.listen(workerSocket, async () => {
       }
       native = await startNativeCodex({
         profile, cwd: session.cwd, env,
-        ...(executor && session.workspace ? { execution: { ...executor.environment, roots: session.workspace.roots }, environmentState: { file: join(dir, CODEX_ENVIRONMENT_STATE_FILE), key, scope: `${session.id}:codex-environments` } } : {}),
+        ...(executor && session.workspace ? { execution: { ...executor.environment, roots: session.workspace.roots }, environmentState: { file: join(dir, CODEX_ENVIRONMENT_STATE_FILE), key, scope: `${session.id}:codex-environments` }, ...(session.resumeNativeSession?.id ? { resumeThreadId: session.resumeNativeSession.id } : {}) } : {}),
         onExecutionUnavailable: () => hybrid?.providerReady(false),
         noAltScreen: (session.nativeArgs ?? []).includes("--no-alt-screen"),
         checkControl: (authority) => {

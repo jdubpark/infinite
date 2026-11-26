@@ -1,10 +1,11 @@
-import { lstatSync, readFileSync } from "node:fs";
-import { isAbsolute, normalize, relative, sep } from "node:path";
+import { randomBytes } from "node:crypto";
+import { closeSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeSync } from "node:fs";
+import { dirname, isAbsolute, normalize, relative, sep } from "node:path";
 import { z } from "zod";
-import { unseal, writeSealed } from "./vault.js";
+import { seal, unseal } from "./vault.js";
 
 export const CODEX_ENVIRONMENT_STATE_FILE = "codex-environments.sealed";
-const MAX_STATE_BYTES = 2 * 1024 * 1024;
+export const MAX_CODEX_ENVIRONMENT_STATE_BYTES = 2 * 1024 * 1024;
 const ENVIRONMENT_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/;
 
 export interface PersistedCodexSelection {
@@ -120,7 +121,7 @@ const isoTimestampSchema = z.string().min(1).max(64).refine(
 
 const positiveCounterSchema = z.number().int().min(1).max(Number.MAX_SAFE_INTEGER);
 
-const pathWithinRoots = (cwd: string, roots: string[]): boolean =>
+export const pathWithinRoots = (cwd: string, roots: string[]): boolean =>
   roots.some(root => {
     const rel = relative(root, cwd);
     return !rel || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
@@ -331,6 +332,28 @@ export function serializeThreadPlacements(
   return { version: 1, scope, threads };
 }
 
+function writeAtomicPayload(file: string, payload: string): void {
+  mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
+  const temporary = `${file}.${randomBytes(8).toString("hex")}.tmp`;
+  const fd = openSync(temporary, "wx", 0o600);
+  try {
+    try {
+      const bytes = Buffer.from(payload, "utf8");
+      let offset = 0;
+      while (offset < bytes.length) offset += writeSync(fd, bytes, offset);
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    renameSync(temporary, file);
+  } catch (error) {
+    try { rmSync(temporary, { force: true }); } catch {}
+    throw error;
+  }
+  const dir = openSync(dirname(file), "r");
+  try { fsyncSync(dir); } finally { closeSync(dir); }
+}
+
 export function openCodexEnvironmentStore(options: CodexEnvironmentPersistenceOptions): CodexEnvironmentStore {
   if (!options.scope || options.scope.length > 200) {
     throw new Error("Codex environment persistence scope must be a non-empty bounded string");
@@ -345,7 +368,7 @@ export function openCodexEnvironmentStore(options: CodexEnvironmentPersistenceOp
         if ((error as NodeJS.ErrnoException).code === "ENOENT") return { state: "missing" };
         return { state: "unreadable", reason: "Persisted execution environment state could not be inspected" };
       }
-      if (!info.isFile() || info.size > MAX_STATE_BYTES || (info.mode & 0o077) !== 0) {
+      if (!info.isFile() || info.size > MAX_CODEX_ENVIRONMENT_STATE_BYTES || (info.mode & 0o077) !== 0) {
         return { state: "unreadable", reason: "Persisted execution environment state failed file safety checks" };
       }
       let raw: string;
@@ -370,7 +393,11 @@ export function openCodexEnvironmentStore(options: CodexEnvironmentPersistenceOp
       if (!parsed.success || parsed.data.scope !== options.scope) {
         throw new Error("Refusing to persist invalid Codex execution environment state");
       }
-      writeSealed(options.file, options.key, options.scope, parsed.data);
+      const sealed = seal(options.key, options.scope, parsed.data);
+      if (Buffer.byteLength(sealed, "utf8") > MAX_CODEX_ENVIRONMENT_STATE_BYTES) {
+        throw new Error("Persisted execution environment state exceeds maximum size limit");
+      }
+      writeAtomicPayload(options.file, sealed);
     },
   };
 }

@@ -2,11 +2,14 @@ import test, { type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { randomBytes, randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import fs, { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type express from "express";
 import { spawn as ptySpawn } from "node-pty";
 import { CmuxSessions } from "../packages/host/src/cmux/index.js";
+import { sendSessionList } from "../packages/host/src/session-list.js";
 import { createApp } from "../packages/host/src/server.js";
 import { hashToken } from "../packages/host/src/config.js";
 import { captureWorkspace, readWorkspaceBlob } from "../packages/host/src/workspace-checkpoint.js";
@@ -536,4 +539,52 @@ test("a cmux session in the project holds a workspace sync, and cmux starts are 
   assert.equal(f.mutations().filter(row => row.method === "workspace.create").length, launches, "cmux was never asked to launch");
   answer(true);
   await assert.rejects(held, { code: "session-running" });
+});
+
+test("cmux session rows and sessionListVersion stay identical across creation order and differently ordered reloads", { timeout: 20000 }, async (t) => {
+  const f = await fixture(t);
+  const highId = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+  const midId = "88888888-8888-4888-8888-888888888888";
+  const lowId = "00000000-0000-4000-8000-000000000000";
+  for (const [id, title] of [[highId, "High"], [lowId, "Low"], [midId, "Mid"]] as const) {
+    await f.sessions.create({ requestId: id, provider: "claude", projectId: "project", title, prompt: "" });
+  }
+  const readVersion = async (since: string) => {
+    let payload: unknown;
+    let raw: string | undefined;
+    const res = { json: (value: unknown) => { payload = value; }, type: () => res, send: (value: string) => { raw = value; } };
+    await sendSessionList({ query: { since } } as unknown as express.Request, res as unknown as express.Response, () => f.sessions.list());
+    return (payload ?? JSON.parse(raw!)) as { version: string; unchanged?: true; sessions?: { id: string }[] };
+  };
+  const expectedIds = [f.id, highId, midId, lowId].sort((left, right) => (left < right ? -1 : left > right ? 1 : 0));
+  assert.deepEqual((await f.sessions.list()).map(row => row.id), expectedIds);
+  const before = await readVersion("");
+  assert.deepEqual(before.sessions?.map(row => row.id), expectedIds);
+
+  const cmuxDir = join(f.config.stateDir, "cmux");
+  const realReaddirSync = fs.readdirSync;
+  let reverseOrder = false;
+  fs.readdirSync = ((path: fs.PathLike, ...rest: unknown[]) => {
+    const entries = (realReaddirSync as (...args: unknown[]) => unknown[])(path, ...rest);
+    if (String(path) === cmuxDir && Array.isArray(entries)) {
+      const sorted = [...entries].sort((left, right) => (String(left) < String(right) ? -1 : String(left) > String(right) ? 1 : 0));
+      return reverseOrder ? sorted.reverse() : sorted;
+    }
+    return entries;
+  }) as typeof fs.readdirSync;
+  syncBuiltinESMExports();
+  t.after(() => {
+    fs.readdirSync = realReaddirSync;
+    syncBuiltinESMExports();
+  });
+
+  reverseOrder = false;
+  await f.restart();
+  assert.deepEqual((await f.sessions.list()).map(row => row.id), expectedIds);
+  assert.deepEqual(await readVersion(before.version), { version: before.version, unchanged: true });
+
+  reverseOrder = true;
+  await f.restart();
+  assert.deepEqual((await f.sessions.list()).map(row => row.id), expectedIds);
+  assert.deepEqual(await readVersion(before.version), { version: before.version, unchanged: true });
 });

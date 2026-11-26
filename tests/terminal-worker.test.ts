@@ -16,7 +16,7 @@ import { connectTerminals } from "../packages/host/src/terminal-stream.js";
 import { readEvents, unseal, writeSealed } from "../packages/host/src/vault.js";
 import { permissionEvidenceHash, oneShotPermissionOption } from "../packages/host/src/team-permissions.js";
 import { requesterNotice } from "../packages/host/src/permission-policy.js";
-import { waitFor } from "./helpers.js";
+import { moveWorkerClock, waitFor } from "./helpers.js";
 import type { Bootstrap, Config, ControlActor, ControlLease, Event, Receipt, TerminalSnapshot, WorkerRequest, WorkerState } from "../packages/host/src/types.js";
 import type { TeamAssignment } from "../packages/host/src/team-types.js";
 
@@ -152,7 +152,7 @@ async function fixture(provider: "demo" | "claude" | "codex" = "demo", initialPr
     runDir, stateDir, key: key.toString("base64"), prompt: initialPrompt,
     attention: { idleAfterMs: 60_000, hooks: { claude: true, codex: true } },
   };
-  const worker = spawn(process.execPath, ["--import", "tsx", resolve("packages/host/src/worker.ts")], { stdio: ["pipe", "ignore", "pipe"] });
+  const worker = spawn(process.execPath, ["--import", "tsx", "--import", resolve("tests/fixtures/worker-clock.mjs"), resolve("packages/host/src/worker.ts")], { stdio: ["pipe", "ignore", "pipe"], env: { ...process.env, INFINITE_TEST_CLOCK_FILE: join(root, "clock") } });
   let diagnostics = "";
   worker.stderr.on("data", data => { diagnostics += data; });
   worker.stdin.end(JSON.stringify(bootstrap));
@@ -187,7 +187,7 @@ async function fixture(provider: "demo" | "claude" | "codex" = "demo", initialPr
       catch (error) { if (worker.exitCode !== null) throw new Error(diagnostics || String(error)); return undefined; }
     }, state => Boolean(state?.screen.includes("READY")));
   } catch (error) { await stop(); throw error; }
-  return { id, root, stateDir, runDir, key, session: bootstrap.session, cwd: realpathSync(root), runtime, call, events, output, command, stop, persisted: () => unseal<WorkerState>(key, `${id}:status`, readFileSync(join(stateDir, "sessions", id, "status.sealed"), "utf8")) };
+  return { id, root, stateDir, runDir, key, session: bootstrap.session, cwd: realpathSync(root), runtime, call, events, output, command, moveClock: (ms: number) => moveWorkerClock(worker, join(root, "clock"), ms), stop, persisted: () => unseal<WorkerState>(key, `${id}:status`, readFileSync(join(stateDir, "sessions", id, "status.sealed"), "utf8")) };
 }
 
 async function fixtures(count: number, start: () => ReturnType<typeof fixture>) {
@@ -413,7 +413,7 @@ test("worker control fences input and resize, keeps retry receipts stable, and r
     assert.equal(observing.pid, before.pid);
     assert.deepEqual(observing.control, { id: lease.id, label: a.label, expiresAt: lease.expiresAt });
     assert.deepEqual(worker.persisted().runtime, worker.runtime);
-    await new Promise(resolve => setTimeout(resolve, lease.expiresAt - Date.now() + 60));
+    await worker.moveClock(lease.expiresAt - Date.now() + 60);
     assert.equal((await worker.call({ op: "state" })).control, null);
     await assert.rejects(worker.call({ op: "raw", requestId: randomUUID(), text: "expired\n", actor: a, leaseId: lease.id }), { code: "control-lost" });
     await worker.command("after expiry");

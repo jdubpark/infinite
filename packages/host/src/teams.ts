@@ -1517,7 +1517,7 @@ export class TeamService {
     run.reason = reason;
     if (line) this.event(stored, line);
     if (action === "cancel") this.intentChecks.release(stored, "cancelled");
-    await this.invalidatePermissionDecisions(stored, `The team was ${action} before the permission request could be answered.`);
+    await this.invalidatePermissionDecisions(stored, `The team was ${action === "pause" ? "paused" : "cancelled"} before the permission request could be answered.`);
     this.commands.get(run.id)?.abort();
   }
   private waitsWithNothingInFlight(stored: Stored) {

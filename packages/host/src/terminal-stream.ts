@@ -7,38 +7,95 @@ import { z } from "zod";
 import { workerCall, type WorkerError } from "./ipc.js";
 import { controlActor, type PairedDevice } from "./device-control.js";
 import type { Manager } from "./manager.js";
-import { normalizeControlRequest, type ControlActor, type Receipt, type TerminalSnapshot, type WorkerState } from "./types.js";
+import { normalizeControlRequest, type ControlActor, type Event, type Receipt, type TerminalSize, type TerminalSnapshot, type WorkerState } from "./types.js";
+import { resolveReplayTerminalSize, terminalSizeFromEvent, terminalSizeOf } from "./terminal-size.js";
 
-export async function* terminalPages(manager: Manager, sessionId: string, after: number, signal: AbortSignal, snapshot = false) {
+export async function* terminalPages(
+  manager: Manager,
+  sessionId: string,
+  after: number,
+  signal: AbortSignal,
+  snapshot = false,
+  initialState?: WorkerState,
+) {
   let cursor = after, changed = true, wake: (() => void) | undefined, lastState = 0;
+  let activeSize: TerminalSize | undefined;
+  const sizeFields = () => (activeSize ? { cols: activeSize.cols, rows: activeSize.rows } : {});
+  const observeEventSize = (event: Event) => {
+    const next = terminalSizeFromEvent(event);
+    if (next) activeSize = next;
+  };
   const notify = () => { changed = true; wake?.(); };
   const watcher = watch(join(manager.config.stateDir, "sessions", sessionId, "events"), notify);
   watcher.on("error", notify);
   signal.addEventListener("abort", notify);
   try {
-    if (snapshot && (await manager.state(sessionId)).capabilities?.terminalSnapshot === 1) {
-      try {
-        const screen = await workerCall<TerminalSnapshot>(manager.config.runDir, sessionId, { op: "snapshot" });
-        if (screen.seq >= cursor) {
-          cursor = screen.seq;
-          yield { snapshot: screen, cursor };
-        }
-      } catch {}
+    let opened = false;
+    let state = initialState;
+    let snapshotSize: TerminalSize | undefined;
+    if (snapshot) {
+      state ??= await manager.state(sessionId);
+      if (state.capabilities?.terminalSnapshot === 1) {
+        try {
+          const screen = await workerCall<TerminalSnapshot>(manager.config.runDir, sessionId, { op: "snapshot" });
+          snapshotSize = terminalSizeOf(screen);
+          if (screen.seq >= cursor) {
+            cursor = screen.seq;
+            activeSize = snapshotSize;
+            opened = true;
+            yield {
+              open: { cursor, ...sizeFields() },
+              snapshot: screen,
+              cursor,
+              ...sizeFields(),
+            };
+          }
+        } catch {}
+      }
+    }
+    if (!opened) {
+      activeSize = resolveReplayTerminalSize(
+        (from, limit, types) => manager.events(sessionId, from, limit, types),
+        cursor,
+        state?.terminalSize ?? snapshotSize,
+      );
+      if (!activeSize && !state) {
+        try {
+          state = await manager.state(sessionId);
+          activeSize = terminalSizeOf(state.terminalSize);
+        } catch {}
+      }
+      yield {
+        open: { cursor, ...sizeFields() },
+        cursor,
+        ...sizeFields(),
+      };
     }
     while (!signal.aborted) {
       changed = false;
       const page = manager.events(sessionId, cursor, 200, new Set(["output", "lifecycle"]));
-      for (const event of page.events) yield { events: [event], cursor: event.seq };
-      if (cursor !== page.cursor) yield { events: [], cursor: page.cursor, more: page.more };
+      for (const event of page.events) {
+        observeEventSize(event);
+        yield { events: [event], cursor: event.seq, ...sizeFields() };
+      }
+      if (cursor !== page.cursor) yield { events: [], cursor: page.cursor, more: page.more, ...sizeFields() };
       cursor = page.cursor;
       if (page.more) continue;
       if (Date.now() - lastState >= 1000) {
-        const { status, pid, exitCode, control, capabilities, runtime, nativeSession } = await manager.state(sessionId);
-        yield { state: { status, pid, exitCode, control, capabilities, runtime, nativeSession } };
+        const { status, pid, exitCode, control, capabilities, runtime, nativeSession, terminalSize } = await manager.state(sessionId);
+        const liveSize = terminalSizeOf(terminalSize);
+        if (!activeSize && liveSize) activeSize = liveSize;
+        yield { state: { status, pid, exitCode, control, capabilities, runtime, nativeSession, ...(liveSize ? { terminalSize: liveSize } : {}) } };
         lastState = Date.now();
         if (status === "exited" || status === "unavailable") {
           const final = manager.events(sessionId, cursor, 200, new Set(["output", "lifecycle"]));
-          yield final;
+          for (const event of final.events) {
+            observeEventSize(event);
+            yield { events: [event], cursor: event.seq, ...sizeFields() };
+          }
+          if (!final.events.length || cursor !== final.cursor) {
+            yield { events: [], cursor: final.cursor, more: final.more, ...sizeFields() };
+          }
           if (!final.more) return;
           cursor = final.cursor;
           continue;
@@ -237,9 +294,9 @@ export function connectTerminals(server: Server, manager: Manager, authenticate:
             clearTimeout(authTimeout);
             void (async () => {
               try {
-                await ready;
+                const initialState = await ready;
                 if (!active()) return;
-                for await (const page of terminalPages(manager, match[1], after, abort.signal, url.searchParams.get("snapshot") === "1")) await send(page);
+                for await (const page of terminalPages(manager, match[1], after, abort.signal, url.searchParams.get("snapshot") === "1", initialState)) await send(page);
                 if (!abort.signal.aborted) {
                   open = false;
                   abort.abort();

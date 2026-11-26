@@ -297,7 +297,7 @@ export class CmuxSessions {
           record.draft = Boolean(row && /^[\s│┃]*[>›❯]\s*\S/.test(row));
           if (record.screen !== screen.text) {
             record.screen = screen.text.slice(-512 * 1024);
-            this.append(record, "output", { text: `\u001b[2J\u001b[H${record.screen.replace(/\r?\n/g, "\r\n")}`, snapshot: true });
+            this.append(record, "output", { text: `\u001b[2J\u001b[H${record.screen.replace(/\r?\n/g, "\r\n")}`, snapshot: true, ...(record.columns && record.rows ? { cols: record.columns, rows: record.rows } : {}) });
           }
         } catch { unreadable = true; }
       }
@@ -392,6 +392,7 @@ export class CmuxSessions {
       attention: record.recordingError ? applyLifecycle(record.attention, "recording-error", record.attention.lastActivityAt) : record.attention,
       capabilities: { terminalSnapshot: 1, inputControl: 1 }, control: this.currentControl(record),
       runtime: record.session.runtime,
+      ...(record.columns && record.rows ? { terminalSize: { cols: record.columns, rows: record.rows } } : {}),
       ...(record.nativeId ? { nativeSession: { id: record.nativeId, source: "hook" as const } } : {}),
     };
   }

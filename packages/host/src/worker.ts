@@ -57,6 +57,7 @@ import { addClaudeCodeModeToLaunchEnv, addProjectIdToLaunchEnv } from "./worker-
 import { clearEgressEnvironment, workerEgressEnvironment } from "./egress.js";
 import { claudeConfigPath, recordClaudeTrustAsync } from "./workspace-trust.js";
 import { TerminalSnapshots } from "./terminal-snapshot.js";
+import { DEFAULT_TERMINAL_SIZE, isPtyTerminalSize } from "./terminal-size.js";
 import { startNativeCodex, validateNativeCodexArgs } from "./native-codex.js";
 import { startNativeOpenCode, validateNativeOpenCodeArgs } from "./native-opencode.js";
 import { createExecutorTunnel, type ExecutorTunnel } from "./executor-tunnel.js";
@@ -90,12 +91,7 @@ const dir = join(stateDir, "sessions", session.id);
 const journal = new Journal(join(dir, "events"), key, session.id);
 if (journal.seq !== 0)
   throw new Error("Refusing to start a second process for an existing session");
-const terminal = new headless.Terminal({
-  cols: 120,
-  rows: 32,
-  scrollback: 5000,
-  allowProposedApi: true,
-});
+const terminal = new headless.Terminal({ ...DEFAULT_TERMINAL_SIZE, scrollback: 5000, allowProposedApi: true });
 const snapshots = new TerminalSnapshots(terminal);
 type AnswerRequest = Extract<WorkerRequest, { op: "answer" }>;
 type TeamAnswerRequest = Extract<WorkerRequest, { op: "team-answer" }>;
@@ -117,6 +113,7 @@ let state: WorkerState = {
   status: "starting", seq: 0, screen: "", attention,
   capabilities: { terminalSnapshot: 1, inputControl: 1 },
   control: null,
+  terminalSize: { cols: terminal.cols, rows: terminal.rows },
   runtime: session.runtime ?? { id: randomUUID(), location: "local", transport: "pty" },
   ...(session.resumeNativeSession ? { nativeSession: session.resumeNativeSession } : {}),
   ...(session.workspace ? { execution: { location: "laptop", state: "connecting", cloudReady: false } as const } : {}),
@@ -1315,19 +1312,18 @@ const server = createServer((socket) => {
         }
         result = { invalidated: true };
       } else if (request.op === "resize") {
-        if (
-          !Number.isInteger(request.cols) ||
-          !Number.isInteger(request.rows) ||
-          request.cols < 20 ||
-          request.cols > 240 ||
-          request.rows < 5 ||
-          request.rows > 100
-        )
-          throw new Error("Invalid terminal size");
+        if (!isPtyTerminalSize(request.cols, request.rows)) throw new Error("Invalid terminal size");
         result = await serialize(() => {
           checkControl(request);
+          flush();
           child?.resize(request.cols, request.rows);
           terminal.resize(request.cols, request.rows);
+          const terminalSize = { cols: terminal.cols, rows: terminal.rows };
+          if (state.terminalSize?.cols !== terminalSize.cols || state.terminalSize?.rows !== terminalSize.rows) {
+            state = { ...state, terminalSize };
+            append("lifecycle", { event: "resize", cols: terminalSize.cols, rows: terminalSize.rows });
+            persist();
+          }
           refreshControl(request);
           return { ok: true };
         });
@@ -1606,13 +1602,13 @@ server.listen(socketPath(runDir, session.id), async () => {
     child = spawn(launch.command, launch.args, {
       cwd: session.cwd,
       env,
-      cols: 120,
-      rows: 32,
+      cols: terminal.cols,
+      rows: terminal.rows,
       name: "xterm-256color",
     });
-    state = { ...state, status: "running", pid: child.pid };
+    state = { ...state, status: "running", pid: child.pid, terminalSize: { cols: terminal.cols, rows: terminal.rows } };
     publish(attention);
-    journal.append("lifecycle", { status: "running", pid: child.pid });
+    journal.append("lifecycle", { status: "running", pid: child.pid, cols: terminal.cols, rows: terminal.rows });
     persist();
     const output = (data: string) => {
       pending += data;
@@ -1707,7 +1703,7 @@ server.listen(socketPath(runDir, session.id), async () => {
       const pty = spawn(next.command, next.args, { cwd: session.cwd, env, cols: terminal.cols, rows: terminal.rows, name: "xterm-256color" });
       child = pty;
       state = { ...state, status: "running", pid: pty.pid };
-      append("lifecycle", { status: "running", pid: pty.pid, permissionChannel: { event: "resumed" } });
+      append("lifecycle", { status: "running", pid: pty.pid, cols: terminal.cols, rows: terminal.rows, permissionChannel: { event: "resumed" } });
       persist();
       pty.onData(onData);
       pty.onExit(onExit);

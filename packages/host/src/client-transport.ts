@@ -1,9 +1,11 @@
 import { randomUUID } from "node:crypto";
-import type { ControlLease, Event, Receipt, TerminalSnapshot, WorkerState } from "./types.js";
+import type { ControlLease, Event, Receipt, TerminalOpen, TerminalSnapshot, WorkerState } from "./types.js";
 
 export type TerminalPage = {
+  open?: TerminalOpen;
   events?: Event[]; cursor?: number; more?: boolean;
-  state?: Pick<WorkerState, "status" | "exitCode" | "control" | "capabilities" | "runtime" | "nativeSession">;
+  cols?: number; rows?: number;
+  state?: Pick<WorkerState, "status" | "pid" | "exitCode" | "control" | "capabilities" | "runtime" | "nativeSession" | "terminalSize">;
   snapshot?: TerminalSnapshot; receipt?: Receipt; error?: string;
   requestId?: string; control?: ControlLease | null;
   refusal?: { requestId?: string; code: string; error?: string };

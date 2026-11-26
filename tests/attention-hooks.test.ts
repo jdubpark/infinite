@@ -140,6 +140,24 @@ test("truncateInput enforces the 16 KiB UTF-8 cap", () => {
   const hugeKey = truncateInput({ ["a".repeat(20_000)]: 1 });
   assert.ok(Buffer.byteLength(JSON.stringify(hugeKey), "utf8") <= 16_384);
   assert.equal(hasTruncatedEvidence(hugeKey), true);
+
+  const wideWithEmpties = truncateInput({
+    emptyObj: {},
+    emptyArr: [],
+    ...Object.fromEntries(Array.from({ length: 2000 }, (_, i) => [`k${String(i).padStart(4, "0")}`, 1])),
+  });
+  assert.ok(Buffer.byteLength(JSON.stringify(wideWithEmpties), "utf8") <= 16_384);
+  assert.deepEqual(wideWithEmpties.emptyObj, {});
+  assert.deepEqual(wideWithEmpties.emptyArr, []);
+  assert.equal(hasTruncatedEvidence(wideWithEmpties), true);
+
+  const wideWithUndefined = truncateInput({
+    missing: undefined,
+    ...Object.fromEntries(Array.from({ length: 2000 }, (_, i) => [`k${String(i).padStart(4, "0")}`, 1])),
+    tailMissing: undefined,
+  });
+  assert.ok(Buffer.byteLength(JSON.stringify(wideWithUndefined), "utf8") <= 16_384);
+  assert.equal(hasTruncatedEvidence(wideWithUndefined), true);
 });
 
 test("truncateInput annotates dropped array items without altering 50-item arrays", () => {

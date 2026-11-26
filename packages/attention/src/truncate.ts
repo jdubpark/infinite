@@ -90,9 +90,17 @@ export function truncateInput(input: Record<string, unknown>): Record<string, un
   if (size() <= CAP_BYTES) return out;
 
   const markerBytes = utf8Length(JSON.stringify("[truncated]"));
+  const serializedBytes = (value: unknown): number | undefined => {
+    const serialized = JSON.stringify(value);
+    return serialized === undefined ? undefined : utf8Length(serialized);
+  };
   const topObjects = Object.keys(out)
-    .filter(key => out[key] && typeof out[key] === "object")
-    .map(key => ({ key, bytes: utf8Length(JSON.stringify(out[key])) }))
+    .flatMap(key => {
+      const value = out[key];
+      if (!value || typeof value !== "object") return [];
+      const bytes = serializedBytes(value);
+      return bytes !== undefined && bytes > markerBytes ? [{ key, bytes }] : [];
+    })
     .sort((a, b) => b.bytes - a.bytes);
   let current = size();
   for (const entry of topObjects) {
@@ -103,8 +111,10 @@ export function truncateInput(input: Record<string, unknown>): Record<string, un
   if (size() <= CAP_BYTES) return out;
 
   const topValues = Object.keys(out)
-    .map(key => ({ key, bytes: utf8Length(JSON.stringify(out[key])) }))
-    .filter(entry => entry.bytes > markerBytes)
+    .flatMap(key => {
+      const bytes = serializedBytes(out[key]);
+      return bytes !== undefined && bytes > markerBytes ? [{ key, bytes }] : [];
+    })
     .sort((a, b) => b.bytes - a.bytes);
   current = size();
   for (const entry of topValues) {
@@ -120,9 +130,10 @@ export function truncateInput(input: Record<string, unknown>): Record<string, un
   for (let i = keys.length - 1; i >= 0 && current > CAP_BYTES; i--) {
     const key = keys[i]!;
     if (key === "[truncated]") continue;
-    const entryBytes = utf8Length(JSON.stringify(key)) + 1 + utf8Length(JSON.stringify(out[key])) + 1;
+    const valueBytes = serializedBytes(out[key]);
     delete out[key];
-    current -= entryBytes;
+    if (valueBytes === undefined) continue;
+    current -= utf8Length(JSON.stringify(key)) + 1 + valueBytes + 1;
   }
   if (size() > CAP_BYTES) return { "[truncated]": "[truncated]" };
   return out;

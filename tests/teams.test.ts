@@ -2306,7 +2306,7 @@ test(`a report written during a stall stop wins over replacement${limited ? " an
   try {
     const member = f.run.members[0];
     const report = { kind: "question", question: "Which scope should this assignment use?", options: ["Keep the current scope"] };
-    f.manager.events = (read => (id: string, after: number, _limit: number, types?: Set<string>) => read(id, after, 1, types))(f.manager.events);
+    f.manager.events = (read => (id: string, after: number, limit: number, types?: Set<string>) => read(id, after, after ? limit : 1, types))(f.manager.events);
     f.manager.stopTeamSession = async () => {
       if (f.state.status !== "exited") {
         if (limited) f.journal.append("signal", { kind: "provider-limit", limit: "usage", confidence: "corroborated", provider: "demo", source: "protocol", message: "Usage exhausted" });
@@ -2315,6 +2315,7 @@ test(`a report written during a stall stop wins over replacement${limited ? " an
         f.journal.append("team-report", { ...envelope, memberId: randomUUID() });
         f.journal.append("team-report", { ...envelope, revision: member.revision + 1 });
         f.journal.append("team-report", envelope);
+        f.journal.append("lifecycle", { status: "exited" });
         f.state.status = "exited";
       }
       return f.manager.state();

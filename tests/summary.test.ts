@@ -7,7 +7,7 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { responseText, Summarizer, transcriptText } from "../packages/host/src/summary.js";
-import { claimControl, startHost, waitFor } from "./helpers.js";
+import { claimControl, demoProfile, startHost, waitFor } from "./helpers.js";
 
 const attention = { idleAfterMs: 3000, hooks: { claude: true, codex: true } };
 
@@ -280,11 +280,13 @@ test("automatic brief uses the latest transcript after a delayed provider flush 
   const transcript = join(root, "provider-session.jsonl");
   const receipt = join(root, "calls.jsonl");
   const releaseLateTranscript = join(root, "release-late-transcript");
+  const releaseHeldBrief = join(root, "release-held-brief");
   const agent = join(process.cwd(), "tests/fixtures/briefing-transcript-agent.mjs");
   const cli = join(process.cwd(), "tests/fixtures/jevcode-brief.mjs");
-  const host = await startHost({ agents: { claude: { command: process.execPath, args: [agent, transcript, releaseLateTranscript] } }, config: { attention,
-    repositoryBriefings: { command: process.execPath, args: [cli, receipt], model: "gpt-6-luna", automatic: true, intervalMs: 100, cooldownMs: 0, timeoutMs: 10000 },
+  const host = await startHost({ agents: { claude: { command: process.execPath, args: [agent, transcript, releaseLateTranscript] }, demo: demoProfile() }, config: { attention,
+    repositoryBriefings: { command: process.execPath, args: [cli, receipt, "hold", releaseHeldBrief], model: "gpt-6-luna", automatic: true, intervalMs: 100, cooldownMs: 0, timeoutMs: 45000 },
   } });
+  let heldSummary: ReturnType<typeof host.fetchApi> | undefined;
   try {
     const project = host.config.projects[0].path;
     execFileSync("git", ["init", "-q"], { cwd: project });
@@ -294,12 +296,27 @@ test("automatic brief uses the latest transcript after a delayed provider flush 
     execFileSync("git", ["-C", project, "add", "README.md"]);
     execFileSync("git", ["-C", project, "commit", "-qm", "fixture"]);
 
+    const heldSessionId = randomUUID();
+    await host.fetchApi("/sessions", "owner", { requestId: heldSessionId, provider: "demo", projectId: "rehearsal", title: "Held briefing", prompt: "Hold the briefing writer while another transcript settles." });
+    heldSummary = host.fetchApi(`/sessions/${heldSessionId}/summary`, "viewer");
+    void heldSummary.catch(() => {});
+    await waitFor(async () => existsSync(receipt), Boolean, 20000);
+
     const id = randomUUID();
     await host.fetchApi("/sessions", "owner", { requestId: id, provider: "claude", projectId: "rehearsal", title: "Long transcript", prompt: "Inspect the recent work." });
     await waitFor(() => host.fetchApi(`/sessions/${id}`), r => r.body.status === "running" && r.body.capabilities?.transcript === 1, 20000);
     const queued = await waitFor(() => host.fetchApi(`/sessions/${id}/summary?status=1`), r => r.body.state === "pending", 20000);
     assert.equal(queued.body.state, "pending", "the Stop hook has been observed before the late transcript append");
     writeFileSync(releaseLateTranscript, "release");
+    let transcriptCursor = "0";
+    await waitFor(async () => {
+      const page = await host.fetchApi(`/sessions/${id}/messages?after=${transcriptCursor}`);
+      transcriptCursor = page.body.cursor;
+      return page.body.messages.some((message: { text: string }) => message.text.includes("FINAL_TRANSCRIPT_MARKER"));
+    }, Boolean, 20000);
+    assert.equal(readFileSync(receipt, "utf8").trim().split("\n").length, 1, "the other session keeps the single briefing writer occupied until the final transcript record is visible");
+    writeFileSync(releaseHeldBrief, "release");
+    assert.equal((await heldSummary).status, 200, "the held control refresh finishes successfully after the writer is released");
     const status = await waitFor(() => host.fetchApi(`/sessions/${id}/summary?status=1`), r => r.body.state === "ready" || r.body.state === "failed", 30000);
     assert.equal(status.body.state, "ready");
     assert.match(status.body.summary.text, /FINAL_TRANSCRIPT_MARKER/);
@@ -309,13 +326,17 @@ test("automatic brief uses the latest transcript after a delayed provider flush 
     assert.ok(status.body.summary.repository.coverage.some((line: string) => /Session activity: 200 of \d+ recorded messages included; activity outside the bounded message or page limits omitted/.test(line)), "the public coverage identifies the bounded activity window");
 
     const calls = readFileSync(receipt, "utf8").trim().split("\n").map(line => JSON.parse(line));
-    assert.equal(calls.length, 1, "the provider transcript should produce one automatic checkpoint");
-    assert.ok(calls[0].args.includes("--activity-stdin"));
-    const activity = calls[0].input.split("\n").filter(Boolean).map((line: string) => JSON.parse(line));
+    assert.equal(calls.length, 2, "one held control refresh and one automatic checkpoint should run");
+    assert.ok(calls[1].args.includes("--activity-stdin"));
+    assert.equal(calls[0].args[calls[0].args.indexOf("--session") + 1], heldSessionId);
+    assert.equal(calls[1].args[calls[1].args.indexOf("--session") + 1], id);
+    const activity = calls[1].input.split("\n").filter(Boolean).map((line: string) => JSON.parse(line));
     assert.equal(activity.length, 200, "only the bounded latest activity window is sent");
     assert.ok(activity.some((message: { text: string }) => message.text.includes("FINAL_TRANSCRIPT_MARKER")), "the delayed final transcript append must be in the collected snapshot");
     assert.ok(status.body.summary.repository.evidence.some((item: { source: string; text: string }) => item.source === "activity:1" && item.text.includes("FINAL_TRANSCRIPT_MARKER")), "the cited activity evidence survives into the public summary");
   } finally {
+    writeFileSync(releaseHeldBrief, "release");
+    await heldSummary?.catch(() => {});
     await host.stop();
     rmSync(root, { recursive: true, force: true });
   }

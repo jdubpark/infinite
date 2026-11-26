@@ -68,6 +68,7 @@ type AttentionBase = {
   now: string;
   lastMessage?: string;
   lastActivityAt: string;
+  spinnerOnlySince?: string;
   hooks: "active" | "none";
   hookErrors: number;
   limit?: { limit: "usage" | "credits"; confidence: "single-source" | "corroborated"; resetsAt?: string; since: string; message: string };

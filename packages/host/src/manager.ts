@@ -27,7 +27,7 @@ import type { FuseGate } from "./fuse/types.js";
 import { haltReason } from "./halt/rules.js";
 import { agentAcceptOption, isCollapsedPermissionPrompt, oneShotRejectOption, permissionEvidenceHash, oneShotPermissionOption } from "./team-permissions.js";
 import { nativeContinuationSchema, teamModelProfileSchema, type NativeContinuation, type TeamAssignment, type TeamModelProfile, type TeamPermissionDecision } from "./team-types.js";
-import { headlessLaunch, missionCoordinatorLaunch, permissionCoordinatorLaunch, sessionAgentProfile, teamModelLaunch, withoutSharedContext } from "./launch.js";
+import { hasHostLaunchFields, headlessLaunch, matchesSessionRequestFingerprint, missionCoordinatorLaunch, parseMissionCoordinatorProvider, permissionCoordinatorLaunch, sessionAgentProfile, sessionRequestFingerprint, stripHostLaunchFields, teamModelLaunch, withoutSharedContext } from "./launch.js";
 import { withNativeContinuation } from "./native-continuation.js";
 import { SESSION_PERMISSION_ACTOR_LABEL, isRequesterNotice, sessionPermissionRequestId, type SessionPermissionAnswer } from "./permission-session-requests.js";
 import { deferredCallOpen, type HeadlessPermissionChannel } from "./permission-headless.js";
@@ -36,20 +36,10 @@ import { TeamError } from "./team-workspace.js";
 import { prepareMemberTrace } from "./member-traces.js";
 import { projectGithubRepository, sessionGithubGrant, sessionGithubScopeFor, type GithubGrantScope, type SessionGithubOrigin } from "./github-grants.js";
 import {
-  learningPurpose, SESSION_PURPOSES,
-  type SessionPurpose,
-} from "./types.js";
-import type {
-  Config,
-  Provider,
-  Session,
-  WorkerState,
-  Bootstrap,
-  LaptopWorkspace,
-  WorkerRequest,
-  ControlLease,
-  Receipt,
-  TeamMemberAssignment, TeamPermissionExpansionExpectation,
+  isEvalSession, resolveLaunchExecutionIdentity, sessionExecutionIdentity,
+  type Bootstrap, type Config, type ControlLease, type ExecutionIdentity, type LaptopWorkspace, type Provider,
+  type Receipt, type Session, type SessionPurpose, type TeamMemberAssignment, type TeamPermissionExpansionExpectation,
+  type WorkerRequest, type WorkerState,
 } from "./types.js";
 
 export class TeamStopRefused extends ContentError {}
@@ -304,7 +294,7 @@ export class Manager {
   remove(id: string): Promise<void> {
     return this.serializeSession(id, async () => {
       const stored = this.meta(id);
-      if (stored.session.team && !learningPurpose(stored.session.purpose)) throw new ContentError("Team sessions cannot be removed", 409);
+      if (stored.session.team && !isEvalSession(stored.session)) throw new ContentError("Team sessions cannot be removed", 409);
 
       let workerStateReadFailed = false;
       try { await workerCall(this.socketTarget, id, { op: "state" }); } catch { workerStateReadFailed = true; }
@@ -384,15 +374,20 @@ export class Manager {
   create(request: CreateSession, startedBy?: "owner"): Promise<Session & WorkerState> {
     if (request.continuation !== undefined)
       throw new ContentError("Native continuation is only available for managed coordinator team sessions", 400);
+    if (hasHostLaunchFields(request))
+      throw new ContentError("Host-owned launch fields cannot be supplied when creating a session", 400);
     return this.serializeSession(request.requestId, () =>
-      this.createOnce(request, false, startedBy === "owner" ? "owner-started" : undefined),
+      this.createOnce(stripHostLaunchFields(request), false, startedBy === "owner" ? "owner-started" : undefined),
     );
   }
   createTeamSession(request: CreateSession, team: TeamAssignment, cwd: string, modelProfile?: TeamModelProfile, workspaceRoot?: string, workspaceTrusted = false,
-    header: { purpose?: SessionPurpose; configId?: string; haltScope?: readonly string[] } = {}, github?: GithubGrantScope): Promise<Session & WorkerState> {
+    header: { purpose?: SessionPurpose; executionIdentity?: ExecutionIdentity; configId?: string; haltScope?: readonly string[] } = {}, github?: GithubGrantScope): Promise<Session & WorkerState> {
     if (!this.config.teams || request.nativeArgs !== undefined || request.localUi || request.workspace || request.resumedFrom)
       throw new ContentError("Team sessions require a configured team workspace and managed launch", 400);
-    if (header.purpose !== undefined && !SESSION_PURPOSES.includes(header.purpose)) throw new ContentError("The session purpose is not recognized", 400);
+    if (hasHostLaunchFields(request))
+      throw new ContentError("Host-owned launch fields must be supplied through the team launch header", 400);
+    const resolvedIdentity = resolveLaunchExecutionIdentity(header);
+    if (!resolvedIdentity.ok) throw new ContentError(resolvedIdentity.message, 400);
     if (header.configId !== undefined && !/^[0-9a-f]{64}$/.test(header.configId)) throw new ContentError("The session config ID must be a lowercase SHA-256 digest", 400);
     let continuation: NativeContinuation | undefined;
     if (request.continuation !== undefined) {
@@ -410,8 +405,10 @@ export class Manager {
     const rel = relative(root, canonical);
     if (!rel || rel.startsWith("..") || isAbsolute(rel)) throw new ContentError("Invalid team working directory", 400);
     return this.serializeSession(request.requestId, () => this.createOnce({
-      ...request, ...(continuation ? { continuation } : {}), team, teamCwd: canonical, ...(selection ? { teamModelProfile: selection } : {}),
-      ...(header.purpose !== undefined ? { purpose: header.purpose } : {}), ...(header.configId !== undefined ? { configId: header.configId } : {}),
+      ...stripHostLaunchFields(request), ...(continuation ? { continuation } : {}), team, teamCwd: canonical, ...(selection ? { teamModelProfile: selection } : {}),
+      ...(header.purpose !== undefined ? { purpose: header.purpose } : {}),
+      ...(header.executionIdentity !== undefined ? { executionIdentity: header.executionIdentity } : {}),
+      ...(header.configId !== undefined ? { configId: header.configId } : {}),
     }, workspaceTrusted, { team: github }, header.haltScope));
   }
   async inspectTeamRuntime(sessionId: string, team: TeamAssignment): Promise<TeamRuntimeInspection> {
@@ -892,6 +889,7 @@ export class Manager {
       return result;
     };
     if (session.team) throw new ContentError("Resume this member from its team so its assignment stays consistent");
+    if (isEvalSession(session)) throw new ContentError("Eval sessions cannot be resumed", 409);
     const state = await this.state(sessionId);
     if (session.headless?.channel && deferredCallOpen((after, limit) => this.events(sessionId, after, limit, new Set(["lifecycle"]))))
       throw new ContentError("This session ended while a call waited for the owner's answer. Start a new session instead of resuming it.", 409);
@@ -934,14 +932,17 @@ export class Manager {
       return remember(await this.createOnce(request, false, github));
     });
   }
-  private async createOnce(request: ManagedCreateSession & { team?: TeamAssignment; teamCwd?: string; teamModelProfile?: TeamModelProfile; purpose?: SessionPurpose; configId?: string }, workspaceTrusted = false, github?: SessionGithubOrigin, haltScope?: readonly string[]) {
+  private async createOnce(request: ManagedCreateSession & { team?: TeamAssignment; teamCwd?: string; teamModelProfile?: TeamModelProfile; purpose?: SessionPurpose; executionIdentity?: ExecutionIdentity; configId?: string }, workspaceTrusted = false, github?: SessionGithubOrigin, haltScope?: readonly string[]) {
     try { return await this.createRecorded(request, workspaceTrusted, github, haltScope); }
     catch (error) {
       if (request.team) try { this.fuse?.release(request.requestId); } catch { }
       throw error;
     }
   }
-  private async createRecorded(request: ManagedCreateSession & { team?: TeamAssignment; teamCwd?: string; teamModelProfile?: TeamModelProfile; purpose?: SessionPurpose; configId?: string }, workspaceTrusted = false, github?: SessionGithubOrigin, haltScope?: readonly string[]) {
+  private async createRecorded(request: ManagedCreateSession & { team?: TeamAssignment; teamCwd?: string; teamModelProfile?: TeamModelProfile; purpose?: SessionPurpose; executionIdentity?: ExecutionIdentity; configId?: string }, workspaceTrusted = false, github?: SessionGithubOrigin, haltScope?: readonly string[]) {
+    const resolvedIdentity = resolveLaunchExecutionIdentity(request);
+    if (!resolvedIdentity.ok) throw new ContentError(resolvedIdentity.message, 400);
+    const executionIdentity = resolvedIdentity.identity;
     if (!request.resumedFrom && request.nativeArgs) assertFreshNativeContext(request.provider, request.nativeArgs);
     if (request.workspace && (request.provider !== "codex" || !request.localUi))
       throw new Error("Laptop execution requires the Codex native interface");
@@ -951,20 +952,19 @@ export class Manager {
       else validateNativeOpenCodeArgs(request.nativeArgs ?? [], request.nativeArgs === undefined ? request.prompt : "");
     }
     const id = request.requestId;
-    const fingerprintFor = (targetId: string) => createHash("sha256").update(JSON.stringify(targetId === id ? request : { ...request, requestId: targetId })).digest("hex");
-    const fingerprint = fingerprintFor(id);
+    const fingerprint = sessionRequestFingerprint(request, id);
     const dir = join(this.config.stateDir, "sessions", id);
     const deletedId = this.deletedReceiptEntry(id);
     if (deletedId !== undefined) {
       const deleted = unseal<DeletedSessionReceipt>(this.key, `deleted:${deletedId}`, readFileSync(this.deletedReceiptPath(deletedId), "utf8"));
       if (deleted.id !== deletedId) throw new Error("Invalid deleted session receipt");
-      if (deleted.fingerprint !== fingerprintFor(deletedId)) throw new Error("Request ID already belongs to a different session");
+      if (!matchesSessionRequestFingerprint(deleted.fingerprint, request, deletedId, executionIdentity)) throw new Error("Request ID already belongs to a different session");
       throw new ContentError("This session was deleted and cannot be started again", 410);
     }
     const existingId = this.sessionDirEntry(id);
     if (existingId !== undefined && existsSync(join(this.config.stateDir, "sessions", existingId, "meta.sealed"))) {
       const stored = this.meta(existingId);
-      if (stored.fingerprint !== fingerprintFor(existingId))
+      if (!matchesSessionRequestFingerprint(stored.fingerprint, request, existingId, executionIdentity) || sessionExecutionIdentity(stored.session) !== executionIdentity)
         throw new Error("Request ID already belongs to a different session");
       return { ...stored.session, ...(await this.state(existingId)) };
     }
@@ -990,18 +990,19 @@ export class Manager {
         if (!admission.ok) throw new TeamError(409, "fuse-open", fuseReason("open" in admission ? admission.open : "write-failed"));
       }
       if (!request.team && [...this.handoffProjects.values()].some(path => handoffPathsOverlap(path, realpathSync(project.path)))) throw new ContentError("This project is capturing an accepted team handoff");
-      const configuredProfile = sessionAgentProfile(this.config, request.provider, request.purpose);
+      const configuredProfile = sessionAgentProfile(this.config, request.provider, executionIdentity);
       if (!configuredProfile) throw new Error("Provider is not configured on this host");
       let profile = request.teamModelProfile ? teamModelLaunch(configuredProfile, request.teamModelProfile) : configuredProfile;
       if (request.team?.role === "permission-coordinator") profile = permissionCoordinatorLaunch(request.provider, profile);
-      if (request.team?.role === "mission-coordinator") profile = missionCoordinatorLaunch(request.provider, profile);
+      if (request.team?.role === "mission-coordinator") profile = missionCoordinatorLaunch(parseMissionCoordinatorProvider(request.provider), profile);
       if (request.continuation) profile = withNativeContinuation(profile, request.continuation);
-      const context = withoutSharedContext(new ProjectContexts(this.config, this.key).snapshot(request.projectId), request.purpose);
+      const context = withoutSharedContext(new ProjectContexts(this.config, this.key).snapshot(request.projectId), executionIdentity);
       const session: Session = {
         id,
         ...(request.team ? { team: request.team } : {}),
         ...(request.teamModelProfile ? { teamModelProfile: request.teamModelProfile } : {}),
         ...(request.purpose !== undefined ? { purpose: request.purpose } : {}),
+        executionIdentity,
         ...(request.configId !== undefined ? { configId: request.configId } : {}),
         ...(request.team && workspaceTrusted ? { workspaceTrusted: true as const } : {}),
         backend: "infinite",
@@ -1050,7 +1051,7 @@ export class Manager {
       const coordinator = request.team?.role === "permission-coordinator" || request.team?.role === "mission-coordinator";
       const facts = { headless: headlessLaunch(request.provider, launchProfile).headless, served: session.headless?.channel === true, excluded: coordinator };
       const recorded = request.recordedCodeMode ?? (request.resumedFrom === undefined ? undefined : false);
-      session.codeMode = codeModeEnabled(this.config.codeMode?.claude, request.provider, facts, recorded, request.purpose);
+      session.codeMode = codeModeEnabled(this.config.codeMode?.claude, request.provider, facts, recorded, executionIdentity);
       if (request.recordedCodeMode && !session.codeMode)
         throw new ContentError("The host asked for Code Mode when this conversation started. Claude Code resumes a Code Mode conversation only with Code Mode on, and a headless resume on this host cannot ask for it. Start a new session instead of resuming it.", 409);
       const prompt = request.nativeArgs !== undefined ? "" : [
@@ -1083,11 +1084,12 @@ export class Manager {
       });
       child.on("error", () => {});
       child.stdin.on("error", () => {});
-      const githubScope = sessionGithubScopeFor({ team: Boolean(request.team), origin: github, repository: projectGithubRepository(project) });
+      const githubScope = sessionGithubScopeFor({ team: Boolean(request.team), origin: github, repository: projectGithubRepository(project), executionIdentity });
       const githubGrant = sessionGithubGrant(this.config, githubScope, { sessionId: id, projectId: request.projectId }), codexTraceRoot = prepareMemberTrace(this.config, id, request.provider, request.team, launchProfile);
       child.stdin.end(
         JSON.stringify({
           session,
+          executionIdentity,
           profile: launchProfile,
           stateDir: this.config.stateDir,
           runDir: this.config.runDir, ...(this.socketDir !== this.config.runDir ? { socketDir: this.socketDir } : {}),

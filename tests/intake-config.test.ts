@@ -171,6 +171,27 @@ test("a loopback Slack endpoint is local-only", () => {
     assert.throws(() => validate({ slack: { ...slack, endpoint } }, { environment: "local" }), /official HTTPS endpoint/, endpoint);
 });
 test("the answer repository is a configured project", () => assert.throws(() => validate({ mission: { groupId: "work", answerProjectId: "missing" } }), /answerProjectId/));
+test("intake rejects non-Claude or non-strong mission coordinators at config parse time while allowing standalone Codex team lineups", () => {
+  const claudeStrong = { id: "lead", label: "Lead", provider: "claude", model: "claude-opus-5-5", effort: "xhigh", tier: "strong" };
+  const codexStrong = { id: "codex-lead", label: "Codex lead", provider: "codex", model: "gpt-6-astra", effort: "xhigh", tier: "strong" };
+  const opencodeStrong = { id: "oc-lead", label: "OpenCode lead", provider: "opencode", model: "vendor/strong", variant: "high", tier: "strong" };
+  const implementer = { id: "light", label: "Light", provider: "codex", model: "gpt-6-luna", effort: "high", tier: "light" };
+  const claudeLight = { ...claudeStrong, id: "lead-light", tier: "light" };
+  const teamsWith = (coordinator: Record<string, unknown>, reviewer: Record<string, unknown> = claudeStrong) => ({
+    workspaceDir: join(root, "teams"),
+    lineup: { coordinator, integrator: claudeStrong, reviewer, implementers: [implementer] },
+  });
+
+  assert.doesNotThrow(() => parsed({}, { teams: teamsWith(claudeStrong) }));
+  assert.throws(() => parsed({}, { teams: teamsWith(codexStrong) }), /Mission coordinators require Claude Code; Codex merges inherited MCP server tables/);
+  assert.throws(() => parsed({}, { teams: teamsWith(opencodeStrong) }), /Mission coordinators require Claude Code/);
+  assert.throws(() => parsed({}, { teams: teamsWith(claudeLight) }), /mission coordinator must be a strong profile/);
+  assert.throws(() => parsed({}, { teams: teamsWith(claudeStrong, claudeLight) }), /mission reviewer must be a strong profile/);
+
+  const standaloneFile = join(root, `config-${++counter}.json`);
+  writeFileSync(standaloneFile, JSON.stringify({ ...baseHost, teams: teamsWith(codexStrong) }));
+  assert.equal(readConfig(standaloneFile).config.teams?.lineup?.coordinator.provider, "codex");
+});
 test("hostLoad accepts the spec default and rejects a zero load ceiling", () => {
   assert.deepEqual(parsed({}, { hostLoad: { minAvailableMemoryGiB: 8, maxLoadPerCpu: 1.5 } }).hostLoad, { minAvailableMemoryGiB: 8, maxLoadPerCpu: 1.5 });
   assert.throws(() => parsed({}, { hostLoad: { minAvailableMemoryGiB: 8, maxLoadPerCpu: 0 } }));

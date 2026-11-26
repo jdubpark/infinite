@@ -1,6 +1,7 @@
 import { recommendationLine, type QuestionRecommendation } from "./question-recommendation.js";
+import { orderTeamWaitReasons } from "./team-wait-reasons.js";
 
-const clean = (value: unknown) => String(value ?? "").replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
+export const clean = (value: unknown) => String(value ?? "").replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
 
 export function openQuestionLines(question: { id: unknown; question: unknown; options?: unknown; recommendation?: QuestionRecommendation }): string[] {
   const options: unknown[] = Array.isArray(question.options) ? question.options : [];
@@ -8,11 +9,11 @@ export function openQuestionLines(question: { id: unknown; question: unknown; op
     ...(question.recommendation ? [`  ${clean(recommendationLine(question.recommendation))}`] : []),
     ...options.map((option, index) => `  ${index + 1}. ${clean(option)}`)];
 }
-const short = (value: unknown, max: number) => {
+export const short = (value: unknown, max: number) => {
   const text = clean(value).trim();
   return text.length > max ? `${text.slice(0, max - 3)}...` : text;
 };
-const roleNames: Record<string, string> = {
+export const roleNames: Record<string, string> = {
   "project-manager": "Coordinator",
   "intent-checker": "Intent checker",
   scout: "Scout",
@@ -32,6 +33,7 @@ export function teamMonitorText(team: any, checkedAt = "", detach = false): stri
   if (team.linear?.issue?.url) lines.push(`Linear ${clean(team.linear.issue.url)}`);
   else if (team.linear?.url) lines.push(`Linear ${clean(team.linear.url)}`);
   if (team.reason) lines.push(`Reason: ${short(team.reason, 240)}`);
+  waitReasonLines(lines, team);
   const members = Array.isArray(team.members) ? team.members : [];
   const current = members.filter((member: any) => member?.revision === team.revision);
   const shown = (current.length ? current : members).slice(0, 8);
@@ -40,8 +42,10 @@ export function teamMonitorText(team: any, checkedAt = "", detach = false): stri
     for (const member of shown) {
       const role = roleNames[member.role] ?? short(member.role, 24);
       const task = member.taskId ? ` · ${short(member.taskId, 40)}` : "";
+      const flags = [member.stalledAt ? "stalled" : "", member.spinnerOnlySince ? "spinner-only" : ""].filter(Boolean);
+      const flagText = flags.length ? ` · ${flags.join(" · ")}` : "";
       const stopped = member.stoppedReason ? ` · ${short(member.stoppedReason, 80)}` : "";
-      lines.push(`  ${role}  ${clean(member.status)}  ${short(member.title, 80)}${task}${stopped}`);
+      lines.push(`  ${role}  ${clean(member.status)}  ${short(member.title, 80)}${task}${flagText}${stopped}`);
     }
     const hidden = (current.length ? current.length : members.length) - shown.length;
     if (hidden > 0) lines.push(`  + ${hidden} more`);
@@ -166,7 +170,20 @@ function section(lines: string[], title: string, items: (string | string[])[], n
   if (shown.length > 8) lines.push(`  + ${shown.length - 8} more`);
 }
 
-function decisionLines(lines: string[], team: any) {
+export function waitReasonLines(lines: string[], team: any) {
+  const raw: { kind?: unknown; summary?: unknown }[] = Array.isArray(team?.waitReasons) ? team.waitReasons : [];
+  const reasons = orderTeamWaitReasons(raw);
+  if (!reasons.length) return;
+  lines.push("", `WAIT REASONS (${reasons.length})`);
+  for (const reason of reasons.slice(0, 6)) {
+    const kind = clean(reason?.kind || "wait");
+    const summary = short(reason?.summary ?? "", 240);
+    lines.push(`  • [${kind}] ${summary}`);
+  }
+  if (reasons.length > 6) lines.push(`  + ${reasons.length - 6} more`);
+}
+
+export function decisionLines(lines: string[], team: any) {
   const open = (team?.decisions ?? []).filter((question: any) => !question?.answer && question?.revision === team?.revision);
   if (!open.length) return;
   lines.push("", `DECISIONS FOR YOU (${open.length})`);
@@ -180,7 +197,7 @@ function decisionLines(lines: string[], team: any) {
   if (open.length > 3) lines.push(`  + ${open.length - 3} more`);
 }
 
-function teamHeading(team: any, view: string) {
+export function teamHeading(team: any, view: string) {
   const objective = clean(team?.objective).trim();
   return [`${clean(team?.id)} · ${clean(team?.status)} · revision ${clean(team?.revision)} · ${view}`, short(objective || team?.title, 500)];
 }
@@ -193,6 +210,7 @@ export function canAskForBrief(team: any, rows: { sessionId: string; status: Tea
 export function teamSummaryText(team: any, rows: { sessionId: string; status: TeamBriefStatus }[], checkedAt = "", interactive = false, now?: number, repainted = false): string {
   const lines = teamHeading(team, "summary");
   if (team?.reason) lines.push(`Reason: ${short(team.reason, 400)}`);
+  waitReasonLines(lines, team);
   decisionLines(lines, team);
   const coordinator = summaryMember(team);
   const chosen = chooseTeamBrief(rows, coordinator?.sessionId);
@@ -221,7 +239,7 @@ export function teamSummaryText(team: any, rows: { sessionId: string; status: Te
     section(lines, "GAPS AND UNKNOWNS", brief?.unknowns ?? []);
     lines.push("", "Generated reading of recorded activity and the repository. It is not completion or approval.");
   }
-  const keys = ["l logs", ...(canAskForBrief(team, rows) ? ["a refresh Brief"] : []), "q quit"].join(" · ");
+  const keys = ["b board", "l logs", ...(canAskForBrief(team, rows) ? ["a refresh Brief"] : []), "q quit"].join(" · ");
   const tail = interactive ? keys : `Review logs: infinite team status ${clean(team?.id)} --logs`;
   lines.push("", checkedAt ? `${clean(checkedAt)} · ${tail}` : tail);
   return lines.join("\n");
@@ -237,7 +255,7 @@ export function visibleScreen(value: unknown, maxLines = 24): string {
   return lines.some(line => line.trim()) ? lines.join("\n") : "No screen is recorded for this agent.";
 }
 
-export type TeamWatchCommand = "logs" | "summary" | "next" | "prev" | "ask" | "detach" | "up" | "down" | "pageUp" | "pageDown" | "top" | "bottom";
+export type TeamWatchCommand = "logs" | "summary" | "board" | "next" | "prev" | "ask" | "detach" | "up" | "down" | "pageUp" | "pageDown" | "top" | "bottom" | "enter" | "follow" | "openMember";
 
 const keySequences: [string, TeamWatchCommand][] = [
   ["\u001b[A", "up"], ["\u001bOA", "up"], ["\u001b[B", "down"], ["\u001bOB", "down"],
@@ -246,8 +264,9 @@ const keySequences: [string, TeamWatchCommand][] = [
   ["\u001b[H", "top"], ["\u001bOH", "top"], ["\u001b[1~", "top"], ["\u001b[F", "bottom"], ["\u001bOF", "bottom"], ["\u001b[4~", "bottom"],
 ];
 const keys: Record<string, TeamWatchCommand> = {
-  l: "logs", s: "summary", b: "summary", n: "next", p: "prev", a: "ask", q: "detach",
+  l: "logs", s: "summary", b: "board", n: "next", p: "prev", a: "ask", q: "detach",
   j: "down", k: "up", " ": "pageDown", g: "top", G: "bottom",
+  "\r": "enter", "\n": "enter", f: "follow", o: "openMember",
 };
 
 export function teamWatchCommand(chunk: string): TeamWatchCommand | null {
@@ -278,14 +297,15 @@ export function teamLogsText(team: any, agents: any[], member: any, screen: unkn
   if (agents.length > 8) strip.push(` +${agents.length - 8} more`);
   lines.push("", `  ${strip.join("  ")}`.slice(0, Math.max(1, width)));
   const role = roleNames[member?.role] ?? short(member?.role, 24);
-  lines.push("", `${role.toUpperCase()} · ${clean(member?.status)} · ${short(member?.title, 120)}${member?.taskId ? ` · ${short(member.taskId, 40)}` : ""}`);
+  const memberFlags = [member?.stalledAt ? "stalled" : "", member?.spinnerOnlySince ? "spinner-only" : ""].filter(Boolean);
+  lines.push("", `${role.toUpperCase()} · ${clean(member?.status)} · ${short(member?.title, 120)}${member?.taskId ? ` · ${short(member.taskId, 40)}` : ""}${memberFlags.length ? ` · ${memberFlags.join(" · ")}` : ""}`);
   if (member?.stoppedReason) lines.push(`Stopped: ${short(member.stoppedReason, 240)}`);
   lines.push("", "SCREEN", visibleScreen(screen));
   const recent = events.filter(event => clean(event.text).trim()).slice(-8);
   lines.push("", "RECENT EVENTS");
   if (recent.length) for (const event of recent) lines.push(`  ${clock(event.at)}  ${short(event.text, 300)}`);
   else lines.push("  No recent control events.");
-  const keys = `${agents.length > 1 ? "←→ agent · " : ""}s summary · q quit`;
+  const keys = `${agents.length > 1 ? "←→ agent · " : ""}b board · s summary · q quit`;
   const tail = interactive ? keys : `Summary: infinite team status ${clean(team?.id)}`;
   lines.push("", checkedAt ? `${clean(checkedAt)} · ${tail}` : tail);
   return lines.join("\n");

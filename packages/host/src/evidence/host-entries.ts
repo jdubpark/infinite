@@ -123,6 +123,7 @@ function reportEntry(run: TeamRun, id: string, now: string): HostEntry | undefin
     authorMemberId: member.memberId,
     authorRole: member.role,
     ...(member.taskId === undefined ? {} : { taskId: member.taskId }),
+    ...(member.baseCommit ? { headCommit: member.baseCommit } : {}),
     summary: entrySummary(`${kind}: ${text}`, kind),
     body: {
       memberId: member.memberId,
@@ -146,7 +147,9 @@ function integrationEntry(run: TeamRun, id: string, now: string): HostEntry | un
     authority: "receipt",
     revision: task.revision ?? run.revision,
     at: now,
+    authorMemberId: found.memberId,
     taskId: task.id,
+    ...(commit === undefined ? {} : { headCommit: commit }),
     summary: entrySummary(
       commit === undefined
         ? `task ${task.id} integrated with no change`
@@ -154,6 +157,7 @@ function integrationEntry(run: TeamRun, id: string, now: string): HostEntry | un
       "integration",
     ),
     body: {
+      memberId: found.memberId,
       taskId: task.id,
       ...(commit === undefined ? {} : { commit }),
       ...(changed === undefined ? {} : { changedPaths: { paths: [...changed.paths], truncated: changed.truncated } }),
@@ -173,6 +177,7 @@ function checkEntry(run: TeamRun, id: string, now: string): HostEntry | undefine
     authority: "receipt",
     revision: check.revision,
     at: check.finishedAt ?? check.startedAt ?? now,
+    ...(check.headCommit === undefined ? {} : { headCommit: check.headCommit }),
     summary: entrySummary(
       `${label} ${check.status} (exit ${exitCode ?? "none"}): ${[check.command.command, ...args].join(" ")}`,
       label,

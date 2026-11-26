@@ -313,6 +313,7 @@ The `intake` block is validated by `intakeConfigSchema` in
 | `slack.answerQuestions` | boolean, default `false` | Lets the owner's mention be a question that a read-only mission answers in the thread. Needs `slack.directRequests`. See [questions](#questions). |
 | `slack.classify` | boolean, default `false` | Lets the reading service choose the route when the mention has no `ask:` or `work:`. Needs `slack.answerQuestions` and the top-level `jev` block. An instance that wants only the route reading sets `jev.sessionReadings` to `false`. |
 | `slack.bindByMention` | boolean, default `false` | Binds a thread by a mention of an identifier. Cannot be used with `requireSlackThread`. |
+| `slack.organizationScope` | object, optional | Fail-closed channel and workspace isolation boundary (`#304`): optional `channelIds` allowlist (empty list denies all) plus required non-empty `workspaces` array pinning each checkout's canonical `path` and GitHub `repository` (or `null` with `rootCommit`). Re-verified live via Slack `conversations.info` (rejects IMs, MPIMs, shared/external/org-shared channels, and non-member channels) and exact 1:1 `mission.groupId` checkout checks before accepting events, reading threads, starting missions, or posting replies. See [secondary instances](../deploy/ubuntu/instances.md). |
 | `slack.endpoint` | URL, optional | The Slack Web API base. Only the official HTTPS endpoint, or loopback HTTP when `environment` is `"local"`. |
 | `mission.groupId` | project group ID, required | The group new missions start in. A host project ID works as an alias. |
 | `mission.maxSubtasks` | integer 1 to 12, default `8` | The subtask limit for each mission. |
@@ -511,14 +512,18 @@ it, so a lost response does not post a second comment. With
   Present only when `intake.slack` is configured. `dropped` counts inbound events
   that were refused, and `reason` says why the surface is not connected.
 
+`GET /api/intake/workspace-scope` (owner-only) returns HTTP 200 with `{ "state": "verified" | "blocked" | "unconfigured" }` by running `intakeAudience.workspacesAllowed()` against the configured `intake.mission.groupId` and `intake.slack.organizationScope.workspaces` checkout pins (plus `answerProjectId`). It checks only local checkout/workspace binding—it does not call Slack `conversations.info`, does not return mismatch details, and does not return `403` when `"blocked"`.
+
+Separately, live Slack channel and membership verification (`conversations.info`, rejecting IMs, MPIMs, shared/external/org-shared channels, non-allowlisted channels, and channels the bot has not joined, alongside `workspacesAllowed()`) runs during Slack event handling, thread reads, replies, and again before a queued thread-bound request files or starts a mission (`IntakeService.startQueued()` calls `requireOrganizationSource(record.thread)`, placing a queued request on hold if bot channel membership was lost). When starting a mission, the internal mission creator also enforces `organizationScope` checkout bounds and throws an internal `TeamError` (`403 intake-audience-denied`) on mismatch, which the intake queue catches to place the queued request on hold rather than returning an HTTP 403 directly to the Slack requester.
+
 Both surfaces summarise an unexpected error as its name and code, and write the
 full error to the host log. Failures with fixed text, a mission refusal, a Slack
 request failure, and a Linear request failure, keep that text. See [security](security.md#request-intake).
 
-## Pre-build checks
+## Operational rollout checks
 
-Three checks decide how intake behaves once real Linear and Slack traffic is
-seen. They are recorded here so the decision is not lost.
+Three configuration choices govern how intake behaves against a given Linear and
+Slack workspace:
 
 1. **Linear attribution.** If Linear records issues filed through its Slack agent
    as created by an app rather than by the owner, intake skips them with

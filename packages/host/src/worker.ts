@@ -58,13 +58,15 @@ import { clearEgressEnvironment, workerEgressEnvironment } from "./egress.js";
 import { claudeConfigPath, recordClaudeTrustAsync } from "./workspace-trust.js";
 import { TerminalSnapshots } from "./terminal-snapshot.js";
 import { DEFAULT_TERMINAL_SIZE, isPtyTerminalSize, TERMINAL_SIZE_INDEX_FILE, TerminalBarrier, TerminalSizeIndex } from "./terminal-size.js";
+import { ptyTails } from "./pty-tail.js";
 import { SignalIndex } from "./signal-index.js";
 import { startNativeCodex, validateNativeCodexArgs } from "./native-codex.js";
 import { startNativeOpenCode, validateNativeOpenCodeArgs } from "./native-opencode.js";
 import { createExecutorTunnel, type ExecutorTunnel } from "./executor-tunnel.js";
 import { JsonLineAssembler, toolFromRunLine, usageFromRunLine } from "./opencode-usage.js";
 import { createHybridWorkspace } from "./hybrid-workspace.js";
-import { normalizeWorkerControlRequest, teamAnswerWorkerRequestSchema, workerControlRequestSchema, workerWorkspaceExportRequestSchema,
+import { WorkerScreenActivity } from "./worker-screen-activity.js";
+import { normalizeWorkerControlRequest, resolveBootstrapExecutionIdentity, teamAnswerWorkerRequestSchema, workerControlRequestSchema, workerWorkspaceExportRequestSchema,
   type Bootstrap,
   type ControlActor,
   type ControlLease,
@@ -84,7 +86,7 @@ for await (const chunk of process.stdin) {
 }
 const config = JSON.parse(bootstrap) as Bootstrap;
 bootstrap = "";
-const { session, profile, stateDir, runDir, socketDir } = config;
+const { session, profile, stateDir, runDir, socketDir } = config; const executionIdentity = resolveBootstrapExecutionIdentity(config);
 const workerSocket = socketPath({ runDir, socketDir: ensureSocketDir(socketDir ?? runDir, socketDir !== undefined ? "socketDir" : "runDir") }, session.id);
 const provider = session.provider;
 const key = Buffer.from(config.key, "base64");
@@ -158,24 +160,20 @@ const persist = () => {
   });
 };
 function append(type: Event["type"], data: Event["data"]): Event {
-  try {
-    return journal.append(type, data);
-  } catch (error) {
-    recordingFailure();
-    throw error;
-  }
+  return appendAll(type, [data])[0];
+}
+function appendAll(type: Event["type"], items: readonly Event["data"][]): Event[] {
+  try { return journal.appendAll(type, items); } catch (error) { recordingFailure(); throw error; }
 }
 function flush() {
   clearTimeout(flushTimer);
   flushTimer = undefined;
   const startSeq = journal.seq;
-  let flushedBytes = 0;
-  while (pending.length) {
-    const data = pending.slice(0, 8192);
-    pending = pending.slice(8192);
-    flushedBytes += data.length;
-    append("output", { text: data });
-  }
+  const flushedBytes = pending.length;
+  const chunks: Event["data"][] = [];
+  for (let at = 0; at < pending.length; at += 8192) chunks.push({ text: pending.slice(at, at + 8192) });
+  pending = "";
+  appendAll("output", chunks);
   if (journal.seq - startSeq >= 32 || flushedBytes >= 64 * 1024) signalIndex?.checkpoint(journal.seq);
   const covered = sizeIndex.coveredSeq(journal.seq);
   if (covered !== undefined && covered - lastPersistedCoverage >= 256) persist();
@@ -314,8 +312,9 @@ const transcriptWatch = new TranscriptWatch({
   onUsage: record => { append("usage", { ...record }); },
 });
 const MESSAGE_FIELDS = new Set(["id", "role", "text", "toolName", "ts"]);
-function recordMessage(message: TranscriptMessage) {
-  append("message", Object.fromEntries(Object.entries(message).filter(([key, value]) => MESSAGE_FIELDS.has(key) && value !== undefined)));
+function recordMessages(messages: readonly TranscriptMessage[]) {
+  if (!messages.length) return;
+  appendAll("message", messages.map(message => Object.fromEntries(Object.entries(message).filter(([key, value]) => MESSAGE_FIELDS.has(key) && value !== undefined))));
   if (state.capabilities?.transcript !== 1) {
     state = { ...state, capabilities: { ...state.capabilities, transcript: 1 } };
     persist();
@@ -324,7 +323,7 @@ function recordMessage(message: TranscriptMessage) {
 function onTranscript(body: unknown): HookReply | void {
   const reply = transcriptWatch.post(body);
   if (!reply) return;
-  for (const message of reply.messages) recordMessage(message);
+  recordMessages(reply.messages);
   return reply.secondaries ? { after: reply.after, secondaries: reply.secondaries } : { after: reply.after };
 }
 let handoffReceipt: string | undefined;
@@ -452,8 +451,7 @@ async function onHook(route: HookRoute, body: unknown, run?: string): Promise<Ho
   return reply;
 }
 
-let lastOutputAt = Date.now();
-let outputSinceCheck = false;
+const screenActivity = new WorkerScreenActivity(config.attention.idleAfterMs);
 let missCount = 0;
 let answering: number | undefined;
 
@@ -531,16 +529,10 @@ function checkScreen() {
     const detected = detectPrompt(lines, provider);
     const nowMs = Date.now();
     const at = new Date(nowMs).toISOString();
-    const idle =
-      !outputSinceCheck &&
-      nowMs - lastOutputAt >= config.attention.idleAfterMs &&
-      isIdleScreen(lines, provider);
-    const freshOutput =
-      outputSinceCheck && lastOutputAt > Date.parse(attention.since);
-    const outputThisCheck = outputSinceCheck;
-    outputSinceCheck = false;
-    watchLimit(lines, nowMs, outputThisCheck);
-    let decision = screenDecision(attention, detected, idle, freshOutput, at);
+    const activity = screenActivity.evaluate(attention, lines, provider, isIdleScreen(lines, provider), nowMs);
+    if (activity.changed) publish(activity.attention);
+    watchLimit(lines, nowMs, activity.substantiveChange);
+    let decision = screenDecision(attention, detected, activity.idle, activity.freshOutput, at);
     const open = attention.prompt;
     const replaced =
       detected !== null &&
@@ -559,7 +551,7 @@ function checkScreen() {
           "screen",
         );
         if (replaced)
-          decision = screenDecision(attention, detected, idle, freshOutput, at);
+          decision = screenDecision(attention, detected, activity.idle, activity.freshOutput, at);
       }
     } else missCount = 0;
     if (decision.kind === "merge" && open && !correlates(open, decision.merge)) {
@@ -567,7 +559,7 @@ function checkScreen() {
         { kind: "prompt-closed", promptId: open.id, reason: "superseded" },
         "screen",
       );
-      decision = screenDecision(attention, detected, idle, freshOutput, at);
+      decision = screenDecision(attention, detected, activity.idle, activity.freshOutput, at);
     }
     switch (decision.kind) {
       case "open": {
@@ -584,12 +576,13 @@ function checkScreen() {
         break;
       case "idle":
         if (!native) {
+          screenActivity.clearSpinner();
           const same = attention.state === decision.idle;
-          publish({ ...attention, prompt: undefined, lastTool: undefined, state: decision.idle, since: same ? attention.since : at, source: same ? attention.source : "screen" });
+          publish({ ...attention, spinnerOnlySince: undefined, prompt: undefined, lastTool: undefined, state: decision.idle, since: same ? attention.since : at, source: same ? attention.source : "screen" });
         }
         break;
       case "working":
-        if (!native) publish({ ...attention, prompt: undefined, state: "working", since: at, source: "screen" });
+        if (!native) publish({ ...attention, spinnerOnlySince: undefined, prompt: undefined, state: "working", since: at, source: "screen" });
         break;
       case "close":
       case "none":
@@ -1498,7 +1491,7 @@ server.listen(workerSocket, async () => {
       env.INFINITE_HOOK_URL = hookServer.url;
       env.INFINITE_HOOK_TOKEN = hookToken;
     }
-    const egress = workerEgressEnvironment(session.projectId, session.id, process.env, Date.now(), session.purpose);
+    const egress = workerEgressEnvironment(session.projectId, session.id, process.env, Date.now(), executionIdentity);
     if (egress.status === "invalid") throw new Error("The egress proxy address this worker inherited is unusable, so the session was not started");
     clearEgressEnvironment(env); Object.assign(env, egress.env);
     if (egress.status === "no-key") journal.append("lifecycle", { egress: "no-credential" });
@@ -1573,7 +1566,7 @@ server.listen(workerSocket, async () => {
         onSignal: (signal) => {
           if (signal.kind === "provider-limit") { limitWatch = undefined; recordLimit(signal, "protocol"); } else record(signal, "protocol");
         },
-        onMessage: (message) => { recordMessage(message); },
+        onMessage: (message) => { recordMessages([message]); },
         record: (method) => { append("input-intent", { op: "native", method }); },
       });
       hybrid?.providerReady(native.supportsExecutionSelection);
@@ -1632,8 +1625,9 @@ server.listen(workerSocket, async () => {
       } catch {
         recordingFailure();
       }
-      lastOutputAt = Date.now();
-      outputSinceCheck = true;
+      screenActivity.noteRawOutput(Date.now());
+      const flushed = pending.length >= 256 * 1024;
+      if (flushed) try { flush(); } catch {}
       if (!flushTimer)
         flushTimer = setTimeout(() => {
           try {
@@ -1643,9 +1637,11 @@ server.listen(workerSocket, async () => {
           }
           checkScreen();
         }, 40);
+      return flushed;
     };
     const onData = (data: string) => terminalBarrier.dispatch(() => output(data), Buffer.byteLength(data, "utf8"));
     child.onData(onData);
+    const tails = ptyTails(child, onData);
     const finalDrain = async () => {
       try {
         if (!hookServer || !transcriptWatch.reading) return;
@@ -1662,16 +1658,17 @@ server.listen(workerSocket, async () => {
         try { await runFinalDrain(launch, drainEnv); } finally { drainOpen = false; }
       } catch {}
     };
-    const exited = (exitCode: number) => {
+    const exited = (exitCode: number, forced = false) => {
       if (permissionChannel?.exited(exitCode)) return;
       native?.stop();
       void hybrid?.close().catch(() => {}); executor?.close();
       try {
         flush();
         controller = null;
-        state = { ...state, status: "exited", exitCode, control: null };
+        const tail = tails.marker(forced ? child : undefined);
+        state = { ...state, status: "exited", exitCode, control: null, ...tail };
         publish(applyLifecycle(attention, "exited", new Date().toISOString()));
-        append("lifecycle", { status: "exited", exitCode });
+        append("lifecycle", { status: "exited", exitCode, ...tail });
         signalIndex?.checkpoint(journal.seq);
         persist();
       } catch {
@@ -1705,9 +1702,10 @@ server.listen(workerSocket, async () => {
       sizeIndex.append(resumedEvent.seq, { cols: terminal.cols, rows: terminal.rows });
       persist();
       pty.onData(onData);
+      tails.track(pty);
       pty.onExit(onExit);
     };
-    endSession = () => exited(0);
+    endSession = () => terminalBarrier.dispatch(() => exited(0, true));
   } catch (error) {
     state = { ...state, status: "exited", exitCode: 1 };
     publish(applyLifecycle(attention, "exited", new Date().toISOString()));

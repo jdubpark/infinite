@@ -93,7 +93,17 @@ final class UsageTests: XCTestCase {
 
     func testProjectCostPathKeepsHyphensAndStillEscapesOtherCharacters() {
         XCTAssertEqual(RemoteClient.usageProjectPath("storefront-api", tz: "UTC"), "/usage/projects/storefront-api?tz=UTC")
+        XCTAssertEqual(RemoteClient.usageProjectPath("storefront-api~1", tz: "UTC"), "/usage/projects/storefront-api~1?tz=UTC")
         XCTAssertEqual(RemoteClient.usageProjectPath("a/b", tz: "UTC"), "/usage/projects/a%2Fb?tz=UTC")
+    }
+
+    func testPathSegmentFollowsRFC3986UnreservedAndEncodesAccountPlanPaths() {
+        XCTAssertEqual(RemoteClient.pathSegment("alpha-1_2.3~4"), "alpha-1_2.3~4")
+        XCTAssertEqual(RemoteClient.pathSegment("a b/c?d#e%f"), "a%20b%2Fc%3Fd%23e%25f")
+        XCTAssertEqual(RemoteClient.pathSegment("acct:work+1"), "acct%3Awork%2B1")
+        XCTAssertEqual(RemoteClient.pathSegment("caf\u{00E9}"), "caf%C3%A9")
+        XCTAssertEqual(RemoteClient.accountPlanPath("claude~work"), "/usage/accounts/claude~work/plan")
+        XCTAssertEqual(RemoteClient.accountPlanPath("org/team a?b#c%20caf\u{00E9}"), "/usage/accounts/org%2Fteam%20a%3Fb%23c%2520caf%C3%A9/plan")
     }
 
     func testUnmeasuredWorkNeverShowsAsZero() {

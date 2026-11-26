@@ -1,6 +1,17 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { missionControls, missionExtendChoices, missionExtensionConfirmation, missionLeftLabel, missionShowsReason, missionStateLabel, missionStopLine, missionTimeLeftMs } from "../apps/web/src/mission-model";
+import {
+  missionCanAnswer,
+  missionComposerNotice,
+  missionControls,
+  missionExtendChoices,
+  missionExtensionConfirmation,
+  missionLeftLabel,
+  missionShowsReason,
+  missionStateLabel,
+  missionStopLine,
+  missionTimeLeftMs,
+} from "../apps/web/src/mission-model";
 import type { MissionStatus } from "../apps/web/src/mission-model";
 
 const NOW = Date.parse("2026-11-15T12:00:00.000Z");
@@ -124,4 +135,31 @@ test("mission stop-time lines match live, stopped, and terminal states", () => {
   }
   assert.equal(missionStopLine({ status: "blocked", deadlineAt: past }, NOW, formatDate), undefined,
     "a non-deadline blocked mission cannot be extended");
+});
+
+test("missionCanAnswer enables paused mission answers only when the host marks the paused revision answerable", () => {
+  for (const status of ["planning", "working", "needs-input"] as const) {
+    assert.equal(missionCanAnswer({ status }, "owner", true), true, status);
+  }
+  assert.equal(missionCanAnswer({ status: "paused" }, "owner", true), false, "manually paused mission cannot be answered");
+  assert.equal(missionCanAnswer({ status: "paused", canAnswerPaused: true }, "owner", true), true, "halt-paused mission can be answered");
+  for (const status of ["blocked", "cancelled", "ready-for-review"] as const) {
+    assert.equal(missionCanAnswer({ status, canAnswerPaused: true }, "owner", true), false, status);
+  }
+  assert.equal(missionCanAnswer({ status: "paused", canAnswerPaused: true }, "controller", true), false);
+  assert.equal(missionCanAnswer({ status: "paused", canAnswerPaused: true }, "owner", false), false);
+});
+
+test("missionComposerNotice matches only the recovery actions available for each mission state", () => {
+  assert.equal(missionComposerNotice({ status: "working", deadlineAt: future }, "owner", NOW), null);
+  assert.match(missionComposerNotice({ status: "working", deadlineAt: future }, "controller", NOW) ?? "", /Only an owner/);
+  assert.match(missionComposerNotice({ status: "paused", deadlineAt: future }, "owner", NOW) ?? "", /Resume/);
+  assert.match(missionComposerNotice({ status: "paused", deadlineAt: past }, "owner", NOW) ?? "", /Extend/);
+  assert.doesNotMatch(missionComposerNotice({ status: "paused", deadlineAt: past }, "owner", NOW) ?? "", /Resume/);
+  assert.match(missionComposerNotice({ status: "blocked", stopReason: "deadline", deadlineAt: past }, "owner", NOW) ?? "", /Extend/);
+  assert.doesNotMatch(missionComposerNotice({ status: "blocked", stopReason: "deadline", deadlineAt: past }, "owner", NOW) ?? "", /Resume/);
+
+  const nonDeadlineBlocked = missionComposerNotice({ status: "blocked", deadlineAt: future }, "owner", NOW) ?? "";
+  assert.match(nonDeadlineBlocked, /blocked/i);
+  assert.doesNotMatch(nonDeadlineBlocked, /resume|extend/i);
 });

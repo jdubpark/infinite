@@ -93,7 +93,7 @@ test("the summary card reads the coordinator brief and the log card returns to i
   assert.deepEqual([...order].sort((a, b) => a - b), order);
   assert.ok(!order.includes(-1));
   assert.match(summary, /1\. \[high\] alarm gate\n\s+It decides when the alarm stops\n\s+Ask: Does rolling over count\?/);
-  assert.match(summary.split("\n").at(-1)!, /^l logs · q quit$/);
+  assert.match(summary.split("\n").at(-1)!, /^b board · l logs · q quit$/);
   assert.match(teamSummaryText(detailed, [{ sessionId: "s-pm", status: ready }]).split("\n").at(-1)!, /infinite team status team-1 --logs/);
   const empty = teamSummaryText(detailed, [{ sessionId: "s-pm", status: { state: "empty" } }], "", true);
   assert.match(empty, /Press a to refresh the Brief/);
@@ -121,13 +121,17 @@ test("the summary card reads the coordinator brief and the log card returns to i
   assert.match(logs, /Implementer waiting/);
   assert.match(logs, /Coordinator stopped r1/);
   assert.match(logs, /planning the stop/);
-  assert.match(logs.split("\n").at(-1)!, /^←→ agent · s summary · q quit$/);
+  assert.match(logs.split("\n").at(-1)!, /^←→ agent · b board · s summary · q quit$/);
 });
 
 test("watch keys switch views and agents, scroll, and detach", () => {
   assert.equal(teamWatchCommand("l"), "logs");
-  assert.equal(teamWatchCommand("b"), "summary");
+  assert.equal(teamWatchCommand("b"), "board");
   assert.equal(teamWatchCommand("s"), "summary");
+  assert.equal(teamWatchCommand("\r"), "enter");
+  assert.equal(teamWatchCommand("\n"), "enter");
+  assert.equal(teamWatchCommand("f"), "follow");
+  assert.equal(teamWatchCommand("o"), "openMember");
   assert.equal(teamWatchCommand("n"), "next");
   assert.equal(teamWatchCommand("p"), "prev");
   assert.equal(teamWatchCommand("\u001b[C"), "next");
@@ -227,4 +231,49 @@ test("the evaluator has a name and a place", () => {
   assert.equal(ordered.indexOf("evaluator") > ordered.indexOf("reviewer"), true);
   assert.equal(ordered.indexOf("evaluator") < ordered.indexOf("delivery"), true);
   assert.match(teamMonitorText({ ...team, workspace: "w", branch: "b", projectId: "p" }), /Evaluator/);
+});
+
+test("teamMonitorText and teamSummaryText render WAIT REASONS and member stall/spinner-only annotations", () => {
+  const waitingTeam = {
+    ...team,
+    members: [
+      { memberId: "pm", sessionId: "s-pm", role: "project-manager", revision: 2, title: "Plan", status: "running", stalledAt: "2026-11-26T00:05:00.000Z" },
+      { memberId: "impl", sessionId: "s-impl", role: "implementer", revision: 2, title: "Alarm stop", status: "running", taskId: "task-1", spinnerOnlySince: "2026-11-26T00:03:00.000Z" },
+    ],
+    waitReasons: [
+      { kind: "stalled", memberId: "pm", summary: "Plan stalled without substantive activity." },
+      { kind: "spinner-only", memberId: "impl", summary: "Alarm stop is showing spinner redraws only." },
+    ],
+  };
+  const monitor = teamMonitorText(waitingTeam);
+  assert.match(monitor, /WAIT REASONS \(2\)/);
+  assert.match(monitor, /\[stalled\] Plan stalled without substantive activity\./);
+  assert.match(monitor, /\[spinner-only\] Alarm stop is showing spinner redraws only\./);
+  assert.match(monitor, /Coordinator {2}running {2}Plan · stalled/);
+  assert.match(monitor, /Implementer {2}running {2}Alarm stop · task-1 · spinner-only/);
+
+  const summary = teamSummaryText(waitingTeam, [{ sessionId: "s-pm", status: { state: "ready", summary: { text: "Brief" } } }]);
+  assert.match(summary, /WAIT REASONS \(2\)/);
+  assert.match(summary, /\[stalled\] Plan stalled without substantive activity\./);
+  assert.match(summary, /\[spinner-only\] Alarm stop is showing spinner redraws only\./);
+
+  const unsortedTeam = {
+    ...team,
+    waitReasons: [
+      { kind: "linear-sync", summary: "Linear\x1b[31m sync\nwaiting" },
+      { kind: "worker-slot", summary: "Slot 1" },
+      { kind: "worker-slot", summary: "Slot 2" },
+      { kind: "worker-slot", summary: "Slot 3" },
+      { kind: "worker-slot", summary: "Slot 4" },
+      { kind: "stalled", summary: "Worker stalled" },
+      { kind: "owner-decision", summary: "Need owner\u0007 choice" },
+    ],
+  };
+  const prioritized = teamMonitorText(unsortedTeam);
+  assert.match(prioritized, /WAIT REASONS \(7\)/);
+  assert.match(prioritized, /\+ 1 more/);
+  assert.ok(prioritized.indexOf("[owner-decision]") < prioritized.indexOf("[stalled]"));
+  assert.ok(prioritized.indexOf("[stalled]") < prioritized.indexOf("[worker-slot]"));
+  assert.doesNotMatch(prioritized, /\[linear-sync\]/);
+  assert.doesNotMatch(prioritized, /\u0007|\x1b\[31m/);
 });

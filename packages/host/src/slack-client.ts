@@ -47,6 +47,7 @@ const MAX_THREAD_PAGES = 50;
 const MAX_RECONNECT_DELAY_MS = 60_000;
 const LOOPBACK = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
 const FORM_METHODS = new Set(["auth.test", "conversations.info", "conversations.replies", "apps.connections.open", "chat.getPermalink"]);
+const AUTH_ERRORS = new Set(["invalid_auth", "not_authed", "account_inactive", "token_revoked", "token_expired", "credential_unavailable"]);
 
 export class SlackClient implements IntakeThreadReader {
   private readonly endpoint: string;
@@ -73,7 +74,7 @@ export class SlackClient implements IntakeThreadReader {
     let data: Record<string, any>;
     try { data = await this.call("conversations.info", "bot", { channel: channelId }); }
     catch (error) {
-      if (error instanceof SlackError && error.transient) throw error;
+      if (error instanceof SlackError && (error.transient || AUTH_ERRORS.has(error.code))) throw error;
       return false;
     }
     const channel = data.channel;

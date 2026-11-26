@@ -24,12 +24,13 @@ const toMicros = (ts: string) => {
 const fromMicros = (micros: number) => `${Math.floor(micros / 1_000_000)}.${String(micros % 1_000_000).padStart(6, "0")}`;
 
 export function slackAudienceFixture(groupId = "shop", teamId = "T00000000", ownerUserId = "U00000000") {
-  const scope = { workspaces: [
-    { projectId: "api", path: "/data/instances/work/api", repository: "Example/api" },
-    { projectId: "web", path: "/data/instances/work/web", repository: "Example/web" },
-  ] };
+  const projects = [
+    { id: "api", name: "API", path: "/data/instances/work/api" },
+    { id: "web", name: "Web", path: "/data/instances/work/web" },
+  ];
+  const scope = { workspaces: projects.map(project => ({ projectId: project.id, path: project.path, repository: `Example/${project.id}` })) };
   const config = { intake: { mission: { groupId }, slack: { teamId, ownerUserId, organizationScope: scope } } } as unknown as Config;
-  return { scope, identity: slackAudienceIdentity(config)! };
+  return { scope, projects, identity: slackAudienceIdentity(config)! };
 }
 
 export const testIntakeAudience = (config: Config) => ({

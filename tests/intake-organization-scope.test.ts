@@ -158,7 +158,7 @@ test("Linear comment outbox rechecks Slack grant and current allowed team before
   const issue = ctx.linearServer.file({ createdAt: new Date(ctx.enabled + 4000).toISOString() });
   const thread = { channelId: "C0000000000", threadTs: "1700000000.000100" };
   const receipt = { id: randomUUID(), body: "Started receipt", delivered: false, attempts: 0 };
-  const { id } = await ctx.h.create("Outbox test mission");
+  const { id } = await ctx.missions.create({ requestId: randomUUID(), groupId: "shop", objective: "Outbox test mission", maxSubtasks: 8, maxMinutes: 30 });
   ctx.store.create(record(issue, thread, { started: receipt }, id, slackAudienceIdentity(ctx.config)));
   const linear = new IntakeLinear(ctx.linear), getStates = linear.states.bind(linear);
   let calls = 0;

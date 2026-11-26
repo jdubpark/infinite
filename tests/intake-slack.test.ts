@@ -25,14 +25,14 @@ const BINDING: IntakeThread = { channelId: "C0000000000", threadTs: "1700000000.
 const OTHER: IntakeThread = { channelId: "C0000000001", threadTs: "1700000000.000200" };
 const THIRD: IntakeThread = { channelId: "C0000000002", threadTs: "1700000000.000300" };
 const PROJECT_PATH = "/data/instances/work/api";
-const { scope: TEST_SCOPE, identity: TEST_AUDIENCE_ID } = slackAudienceFixture();
+const { scope: TEST_SCOPE, identity: TEST_AUDIENCE_ID, projects: TEST_PROJECTS } = slackAudienceFixture();
 const ISSUE = randomUUID();
 const NOW = new Date().toISOString();
 const ACK = 'Started on TEST-1 "Export fails on empty rows". I\'ll post questions and the result here.\nReply with a mention to answer or steer.';
 const QUEUED = 'Queued TEST-1 "Export fails on empty rows". It starts when a running request finishes. I\'ll post questions and the result here.';
 const FINISHED = "This request has finished. File a follow-up with Linear's agent in this thread.";
 const ALREADY = "That question was already answered.";
-const CANCEL_REASON = "Cancelled by the owner. Subteam workspaces remain available for inspection.";
+const CANCEL_REASON = "Cancelled by Owner. Subteam workspaces remain available for inspection.";
 const CANCELLED = `Cancelled: ${CANCEL_REASON}\nFile a follow-up with Linear's agent in this thread.`;
 
 type Harness = ReturnType<typeof harness>;
@@ -63,7 +63,7 @@ async function surfaceFor(services: Services, stateRoot: string, options: { bind
   for (const thread of [BINDING, OTHER]) slack.seedThread(thread, [{ user: OWNER, text: "Export fails on empty rows" }]);
   const realClient = slackClient(slack);
   const client = options.wrapClient ? options.wrapClient(realClient) : realClient;
-  const config = { stateDir: join(stateRoot, "intake"), runDir: join(stateRoot, "run"), projects: [{ id: "api", name: "API", path: PROJECT_PATH }], intake: {
+  const config = { stateDir: join(stateRoot, "intake"), runDir: join(stateRoot, "run"), projects: TEST_PROJECTS, intake: {
     linear: { teamIds: [randomUUID()], creatorId: randomUUID(), label: "infinite", commentsMirrorToSlack: false },
     slack: { appTokenFile: slack.appTokenFile, botTokenFile: slack.botTokenFile, teamId: "T00000000", ownerUserId: OWNER,
       bindByMention: options.bindByMention ?? false, endpoint: slack.endpoint, organizationScope: TEST_SCOPE,
@@ -149,7 +149,8 @@ test("decision controls commit only on valid submit and denial keeps the questio
     const isSingle = mode === "single" || mode === "single-alt";
     const options = isSingle ? [`Preserve ${"shared ".repeat(12)}alpha`, `Preserve ${"shared ".repeat(12)}beta`] : ["Skip", "Write blanks"];
     const decision = { id: randomUUID(), memberId: randomUUID(), revision: 1, question: "Choose the export behavior?", options, answerMode: isSingle ? "single" : mode, createdAt: NOW };
-    const mission = { id: randomUUID(), revision: 1, status: "needs-input", decisions: [decision], subtasks: [], events: [] } as unknown as Mission;
+    const mission = { id: randomUUID(), groupId: "shop", repoProjectIds: ["api", "web"], revision: 1, status: "needs-input",
+      decisions: [decision], subtasks: [], events: [] } as unknown as Mission;
     const listeners = new Set<(value: Mission) => void>();
     const missions = {
       peek: (id: string) => id === mission.id ? structuredClone(mission) : undefined,
@@ -166,7 +167,7 @@ test("decision controls commit only on valid submit and denial keeps the questio
   const run = async (mode: "approval" | "single" | "single-alt" | "multiple") => {
     const services = makeDecisionServices(mode);
     const slack = await startSlackServer();
-    const config = { stateDir: join(h.root, `state-${mode}`), runDir: join(h.root, `run-${mode}`), projects: [{ id: "api", name: "API", path: PROJECT_PATH }], intake: {
+    const config = { stateDir: join(h.root, `state-${mode}`), runDir: join(h.root, `run-${mode}`), projects: TEST_PROJECTS, intake: {
       linear: { teamIds: [randomUUID()], creatorId: randomUUID(), label: "infinite", commentsMirrorToSlack: false },
       slack: { appTokenFile: slack.appTokenFile, botTokenFile: slack.botTokenFile, teamId: "T00000000", ownerUserId: OWNER, endpoint: slack.endpoint, organizationScope: TEST_SCOPE },
       mission: { groupId: "shop", maxSubtasks: 8, maxMinutes: 30 }, maxActive: 3, requireSlackThread: true,

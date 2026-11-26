@@ -38,7 +38,7 @@ async function scopedSurface(options: { workspaceAllowed?: () => boolean; direct
   const root = mkdtempSync(join(tmpdir(), "intake-scope-"));
   const slack = await startSlackServer();
   for (const thread of [BINDING, OTHER]) slack.seedThread(thread, [{ user: OWNER, text: "Export context" }]);
-  const scope = TEST_SCOPE;
+  const scope = structuredClone(TEST_SCOPE);
   const config = {
     stateDir: join(root, "state"), runDir: join(root, "run"),
     projects: [{ id: "api", name: "API", path: "/data/instances/work/api" }, { id: "web", name: "Web", path: "/data/instances/work/web" }],
@@ -121,26 +121,35 @@ test("a persisted inbound action waits through revocation and applies once after
 
 test("a queued Slack mutation rechecks the sealed audience before committing", { timeout: 60000 }, async () => {
   const s = await scopedSurface();
+  let releaseQueue = () => {};
   try {
     const { id } = await s.harness.create();
-    s.store.create(record(id, "started", { thread: BINDING, missionId: id, slackAudienceId: slackAudienceIdentity(s.config) }));
-    let entered!: () => void, release!: () => void;
-    const enteredQueue = new Promise<void>(resolve => { entered = resolve; });
-    const blockedQueue = new Promise<void>(resolve => { release = resolve; });
+    const mission = s.harness.get(id)!;
+    const eventId = "Ev-queued-audience-race", text = "Change the exporter.";
+    s.store.create(record(id, "started", { thread: BINDING, missionId: id, slackAudienceId: slackAudienceIdentity(s.config),
+      inbound: [{ eventId, ts: "1700000900.000003", text, receivedAt: NOW,
+        call: { action: "steer", text, revision: mission.revision } }] }));
+    let enteredQueue = false;
+    const blockedQueue = new Promise<void>(resolve => { releaseQueue = resolve; });
     const queued = s.harness.missions as unknown as { enqueue<T>(id: string, task: () => Promise<T>): Promise<T> };
-    const held = queued.enqueue(id, async () => { entered(); await blockedQueue; });
-    await enteredQueue;
+    const held = queued.enqueue(id, async () => { enteredQueue = true; await blockedQueue; });
+    await waitFor(async () => enteredQueue, Boolean, 10000);
+    let mutation: ReturnType<MissionService["steer"]> | undefined;
+    const missionService = s.harness.missions as MissionService;
+    const steer = missionService.steer.bind(missionService);
+    missionService.steer = (missionId, input, source, authorize) => {
+      mutation = steer(missionId, input, source, authorize);
+      return mutation;
+    };
     await s.connect();
-    const eventId = await s.slack.emit(mention(BINDING.channelId, "1700000900.000003", "Change the exporter."));
-    await waitFor(async () => s.store.get(id)!.inbound[0]?.call, Boolean, 10000);
+    await waitFor(async () => mutation !== undefined, Boolean, 10000);
     s.config.intake!.mission.groupId = "reconfigured-group";
-    release();
+    releaseQueue();
     await held;
-    await waitFor(async () => s.slack.acks(), acks => acks.includes(eventId));
-    await delay(100);
+    await assert.rejects(mutation!, /organization_scope_denied/);
     assert.deepEqual(s.harness.get(id)!.steering, [], "The queued action is denied after the audience changes");
     assert.equal(s.store.get(id)!.inbound[0]!.handledAt, undefined, "The denied action remains available as sealed audit evidence");
-  } finally { await s.close(); }
+  } finally { releaseQueue(); await s.close(); }
 });
 
 test("a record sealed for a prior audience cannot be read, published, bound, or acted on after reconfiguration", { timeout: 60000 }, async () => {

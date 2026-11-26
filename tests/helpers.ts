@@ -137,7 +137,7 @@ export async function endSessionWorkers(config: Config, started?: readonly numbe
   }
 }
 
-export async function startHost(options: { agents?: Config["agents"]; config?: Partial<Config>; env?: NodeJS.ProcessEnv } = {}): Promise<Host> {
+export async function startHost(options: { agents?: Config["agents"]; config?: Partial<Config>; env?: NodeJS.ProcessEnv; startStepMs?: number } = {}): Promise<Host> {
   const root = mkdtempSync(join(tmpdir(), "inf-"));
   const port = await freePort();
   const origin = `http://127.0.0.1:${port}`;
@@ -187,17 +187,18 @@ export async function startHost(options: { agents?: Config["agents"]; config?: P
     api.stderr!.on("data", (chunk) => {
       diagnostics += chunk;
     });
-    await waitFor(
-      async () => {
-        try {
-          return (await fetchApi("/me")).status;
-        } catch {
-          if (api.exitCode !== null) throw new Error(diagnostics);
-          return 0;
-        }
-      },
-      (status) => status === 200,
-    );
+    const answer = async () => {
+      try {
+        return (await fetchApi("/me")).status;
+      } catch {
+        if (api.exitCode !== null) throw new Error(diagnostics);
+        return 0;
+      }
+    };
+    const lock = join(config.runDir, "server.lock"), step = options.startStepMs ?? 10000;
+    const loaded = () => { try { return readFileSync(lock, "utf8") === String(api.pid); } catch { return false; } };
+    await waitFor(async () => loaded() || await answer() === 200, (ready) => ready, step);
+    await waitFor(answer, (status) => status === 200, step);
   };
   const stop = async () => {
     const floor = new Promise((resolve) => setTimeout(resolve, 1700));

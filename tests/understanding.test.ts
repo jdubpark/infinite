@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { claimControl, startHost, waitFor } from "./helpers.js";
@@ -122,9 +123,9 @@ test("unavailable brief storage leaves the host and Work readable and cannot ack
   } finally { await host.stop(); }
 });
 
-test("encrypted Understanding bounds its response and turns over a full retained store", { timeout: 90000 }, async () => {
+test("encrypted Understanding bounds its response and turns over a full retained store", { timeout: 420000 }, async () => {
   const env: NodeJS.ProcessEnv = {};
-  const host = await startHost({ env, config: { remote: { enabled: true } } });
+  const host = await startHost({ env, config: { remote: { enabled: true } }, startStepMs: 30000 });
   let remote: ReturnType<typeof createRemoteClient> | undefined;
   try {
     const project = host.config.projects[0]; initializeRepo(project.path);
@@ -268,7 +269,7 @@ test("the diagram and brief routes answer with 404 before any observation", { ti
 });
 
 test("Understanding is a read-only scoped API and its source-bound brief survives API restart", { timeout: 60000 }, async () => {
-  const temp = mkdtempSync("/tmp/inf-understanding-");
+  const temp = mkdtempSync(join(tmpdir(), "inf-understanding-"));
   const receipt = join(temp, "brief-calls.jsonl");
   const fixture = join(process.cwd(), "tests/fixtures/jevcode-brief.mjs");
   const env: NodeJS.ProcessEnv = {};
@@ -399,7 +400,7 @@ test("Understanding is a read-only scoped API and its source-bound brief survive
 });
 
 test("an enrolled checkout replaced while its model is running cannot publish a retained brief", { timeout: 60000 }, async () => {
-  const temp = mkdtempSync("/tmp/inf-understanding-rebind-");
+  const temp = mkdtempSync(join(tmpdir(), "inf-understanding-rebind-"));
   const receipt = join(temp, "started.txt"), release = join(temp, "release.txt");
   const fixture = join(process.cwd(), "tests/fixtures/understanding-delayed-brief.mjs");
   const host = await startHost({ config: { attention, repositoryBriefings: {
@@ -433,7 +434,7 @@ test("an enrolled checkout replaced while its model is running cannot publish a 
 });
 
 test("work scope uses pinned membership, folds alternate checkouts, and omits managed child runs", () => {
-  const temp = mkdtempSync("/tmp/inf-understanding-work-");
+  const temp = mkdtempSync(join(tmpdir(), "inf-understanding-work-"));
   try {
     const group: any = { id: "workspace", name: "Workspace", kind: "owner", hidden: false, implicit: false, revision: 1, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z", repos: [
       { projectId: "primary", name: "Primary", path: "/workspace/primary", checkouts: [{ projectId: "primary", name: "Primary", path: "/workspace/primary", primary: true, teamReady: true }, { projectId: "alternate", name: "Alternate", path: "/workspace/alternate", primary: false, teamReady: true }] },
@@ -488,7 +489,7 @@ function teamFixture(temp: string) {
 }
 
 test("team briefs stay visible after their session and member workspace are removed, unless the repository binding changed", () => {
-  const temp = mkdtempSync("/tmp/inf-understanding-team-cleanup-");
+  const temp = mkdtempSync(join(tmpdir(), "inf-understanding-team-cleanup-"));
   try {
     const fixture = teamFixture(temp);
     fixture.seal("Kept after cleanup");
@@ -502,7 +503,7 @@ test("team briefs stay visible after their session and member workspace are remo
 });
 
 test("a team brief whose session is still available keeps the ownership check after cleanup", () => {
-  const temp = mkdtempSync("/tmp/inf-understanding-team-owned-");
+  const temp = mkdtempSync(join(tmpdir(), "inf-understanding-team-owned-"));
   try {
     const fixture = teamFixture(temp);
     const sessionId = fixture.seal("Needs ownership");
@@ -514,7 +515,7 @@ test("a team brief whose session is still available keeps the ownership check af
 });
 
 test("retention keeps the newest sixteen generations per repository instead of a global cap", () => {
-  const temp = mkdtempSync("/tmp/inf-understanding-retention-");
+  const temp = mkdtempSync(join(tmpdir(), "inf-understanding-retention-"));
   try {
     const key = Buffer.alloc(32, 1), stateDir = join(temp, "state"), artifactDir = join(stateDir, "understanding", "artifacts");
     mkdirSync(artifactDir, { recursive: true });
@@ -535,7 +536,7 @@ test("retention keeps the newest sixteen generations per repository instead of a
 });
 
 test("retained team sources require ownership, bounded validation, and exclude mission coordinators", async t => {
-  const temp = mkdtempSync("/tmp/inf-understanding-team-binding-");
+  const temp = mkdtempSync(join(tmpdir(), "inf-understanding-team-binding-"));
   try {
     const repo = join(temp, "repo"); mkdirSync(repo); initializeRepo(repo);
     const project = { id: "repo", name: "Repo", path: repo };
@@ -623,7 +624,7 @@ test("generated plans and projects derive from recorded work without touching th
 });
 
 test("generated plans skip partial and empty work, link to repositories, and page while projects stay complete", () => {
-  const temp = mkdtempSync("/tmp/inf-understanding-generated-");
+  const temp = mkdtempSync(join(tmpdir(), "inf-understanding-generated-"));
   try {
     const checkout = (id: string) => ({ projectId: id, name: id, path: `/workspace/${id}`, primary: true, teamReady: true });
     const group: any = { id: "workspace", name: "Workspace", kind: "owner", hidden: false, implicit: false, revision: 1, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z", repos: [

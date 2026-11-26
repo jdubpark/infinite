@@ -8,8 +8,8 @@ import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { type Config, type Session, isEvalSession } from "./types.js";
 import { TeamStopRefused, type Manager } from "./manager.js";
-import { extendWitness, hostProcesses, newWitness, recordCommand, type HostProcesses, type ProcessWitness } from "./process-census.js";
-import { leftoverView, notedLeftover, settledLeftover, type StoredLeftover } from "./team-leftover.js";
+import { extendWitness, hostProcesses, liveWitness, newWitness, recordCommand, type HostProcesses, type ProcessWitness } from "./process-census.js";
+import { commandStillRunningEvent, leftoverView, notedLeftover, settledLeftover, type StoredLeftover } from "./team-leftover.js";
 import type { WorkerError } from "./ipc.js";
 import { writeSealed, unseal } from "./vault.js";
 import { accountSettingPrompt, PROVIDER_NAMES, recoveryTurnEnd, type AttentionState, type Prompt, type SignalData } from "@infinite/attention";
@@ -753,6 +753,20 @@ export class TeamService {
     } catch (error) { if (!isBenignFenceError(error, this.closed)) this.diag.warnUnexpected("name-request", error); }
   }
   private event(stored: Stored, text: string) { runEvent(stored.run, text); }
+  private async stillRunning(pending: PendingOperation) {
+    if (!pending.witness || process.platform === "win32") return undefined;
+    try {
+      const processes = this.options?.processes ?? hostProcesses;
+      if (!liveWitness(pending.witness, await processes.table())) return undefined;
+      await new Promise(resolve => setTimeout(resolve, 250));
+      return liveWitness(pending.witness, await processes.table());
+    } catch { return undefined; }
+  }
+  private holdLive(stored: Stored, pending: PendingOperation, live: ReturnType<typeof liveWitness>) {
+    if (!live) return;
+    stored.leftover = notedLeftover(stored.leftover, live.witness, pending.id, timestamp());
+    this.event(stored, commandStillRunningEvent(live.count));
+  }
   private async noteLeftover(stored: Stored, result: CommandResult) {
     if (!result.leftover) return;
     await this.enqueue(stored.run.id, () => {
@@ -1857,10 +1871,11 @@ export class TeamService {
         headCommit: stored.run.headCommit ?? sourceMember.baseCommit, workspace: sourceWorkspace } } : {}) };
     const controller = new AbortController(); this.commands.set(stored.run.id, controller);
     stored.pending = pending; this.save(stored);
-    void commandScope.run(this.commandRecorder(stored, pending.id), () => perform(controller.signal)).then(value => this.enqueue(stored.run.id, () => {
+    void commandScope.run(this.commandRecorder(stored, pending.id), () => perform(controller.signal)).then(async value => { const live = await this.stillRunning(pending); return this.enqueue(stored.run.id, () => {
       if (this.closed || stored.pending?.id !== pending.id) return;
       this.commands.delete(stored.run.id);
       stored.leftover = settledLeftover(stored.leftover, pending);
+      this.holdLive(stored, pending, live);
       try { this.assertBudget(stored.run); } catch (error) { this.block(stored, error); return; }
       if (stored.run.stopReason) { this.block(stored, new TeamError(409, "goal-budget-exhausted", "The goal exhausted its execution budget.")); return; }
       const held = ["paused", "cancelled", "blocked"].includes(stored.run.status) ? stored.run.status : undefined;
@@ -1868,11 +1883,12 @@ export class TeamService {
       try { complete(value); } catch (error) { this.block(stored, error); }
       if (held) stored.run.status = held;
       this.save(stored);
-    }), error => this.enqueue(stored.run.id, () => {
+    }); }, async error => { const live = await this.stillRunning(pending); return this.enqueue(stored.run.id, () => {
       if (this.closed || stored.pending?.id !== pending.id) return;
       this.commands.get(stored.run.id)?.abort();
       this.commands.delete(stored.run.id);
       stored.leftover = settledLeftover(stored.leftover, pending);
+      this.holdLive(stored, pending, live);
       const failed = stored.pending, recorder = this.recorderOf(stored, failed);
       if (recorder?.spawning === 0 && (process.platform !== "win32" || recorder.inFlight === 0)) delete failed.recording;
       failed.failure = { code: error instanceof TeamError ? error.code : "workspace-operation-failed",
@@ -1880,7 +1896,7 @@ export class TeamService {
       this.save(stored);
       this.block(stored, error);
       this.fence.watch(stored);
-    })).catch(() => {});
+    }); }).catch(() => {});
   }
   private block(stored: Stored, error: unknown, sourceMember?: TeamMember) {
     if (stored.run.replay) return void this.replays.blocked(stored, error);

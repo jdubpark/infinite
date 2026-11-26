@@ -55,6 +55,10 @@ export function leftoverCensusEvent(census: CensusCounts) {
   }
 }
 
+export function commandStillRunningEvent(count: number) {
+  return `${count} process(es) that a command of this run started still run after the command ended. The host keeps this run's directories until a census finds none.`;
+}
+
 export function leftoverStatementEvent(detail: string) {
   return `The owner stated that the processes an earlier command of this run left behind have ended. The host's census could not tell (${detail}); it no longer keeps this run's directories for them.`;
 }

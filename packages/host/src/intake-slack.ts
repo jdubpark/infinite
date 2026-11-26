@@ -321,6 +321,7 @@ export class IntakeSlackSurface {
   }
 
   private deferReconcile(issueId: string): void {
+    if (this.state.kind !== "running") return;
     const retry = this.composeRetries.get(issueId) ?? { attempts: 0 };
     if (retry.timer) return;
     retry.attempts += 1;
@@ -447,6 +448,7 @@ export class IntakeSlackSurface {
   }
 
   private wake(issueId: string, at: number): void {
+    if (this.state.kind !== "running") return;
     clearTimeout(this.timers.get(issueId));
     this.timers.set(issueId, setTimeout(() => {
       this.timers.delete(issueId);
@@ -916,6 +918,7 @@ export class IntakeSlackSurface {
   }
 
   private retryDrain(issueId: string): void {
+    if (this.state.kind !== "running") return;
     clearTimeout(this.drainTimers.get(issueId));
     const timer = setTimeout(() => {
       this.drainTimers.delete(issueId);

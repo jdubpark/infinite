@@ -6,7 +6,6 @@ struct MissionDetailView: View {
     @ObservedObject var model: MissionModel
     @State private var confirmCancel = false
     @State private var confirmDiscard = false
-    private var mission: Mission { model.mission }
     private func repoName(_ id: String) -> String { app.projectGroups.repoName(id) ?? app.projectName(id) }
 
     var body: some View {
@@ -15,12 +14,17 @@ struct MissionDetailView: View {
             Divider()
             ScrollView {
                 VStack(alignment: .leading, spacing: 22) {
-                    if !mission.reason.isEmpty { note(mission.reason, color: mission.status == "blocked" ? Palette.error : .orange) }
-                    decisions
-                    result
-                    subtasks
-                    request
-                    history
+                    switch model.loadState {
+                    case .loading(_, let error):
+                        loadingContent(error: error)
+                    case .loaded(let mission):
+                        if !mission.reason.isEmpty { note(mission.reason, color: mission.status == "blocked" ? Palette.error : .orange) }
+                        decisions(mission)
+                        result(mission)
+                        subtasks(mission)
+                        request(mission)
+                        history(mission)
+                    }
                 }.padding(20).frame(maxWidth: 900, alignment: .leading)
             }.frame(maxWidth: .infinity, maxHeight: .infinity)
             Divider()
@@ -39,20 +43,43 @@ struct MissionDetailView: View {
         } message: { Text("The host may already have applied this request. Clearing it does not undo anything.") }
     }
 
+    @ViewBuilder private func loadingContent(error: String?) -> some View {
+        if let error {
+            VStack(alignment: .leading, spacing: 10) {
+                note("Could not load mission details: \(error)", color: .orange)
+                Button("Retry") { Task { await model.retryLoad() } }.controlSize(.small).disabled(model.isRetrying)
+            }
+        } else {
+            HStack(spacing: 10) {
+                ProgressView().controlSize(.small)
+                Text("Loading mission details…").font(.callout).foregroundStyle(.secondary)
+            }
+        }
+    }
+
     private var header: some View {
         HStack(spacing: 10) {
-            StatusGlyph(mission: mission, size: 16)
+            StatusGlyph(missionLoadState: model.loadState, size: 16)
             VStack(alignment: .leading, spacing: 2) {
-                Text(mission.title).font(.system(size: 14, weight: .semibold)).lineLimit(1)
+                Text(model.title.isEmpty ? model.id : model.title).font(.system(size: 14, weight: .semibold)).lineLimit(1)
                 Text(headerLine).font(.caption).foregroundStyle(.secondary).lineLimit(1)
             }
             Spacer(minLength: 8)
-            if !model.fresh { Text("Updates unavailable").font(.caption).foregroundStyle(.orange) }
-            if !mission.statusLabel.isEmpty {
-                Text(mission.statusLabel).font(.caption.weight(.medium)).padding(.horizontal, 9).padding(.vertical, 4)
+            switch model.loadState {
+            case .loading(_, let error):
+                if error == nil {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Text("Updates unavailable").font(.caption).foregroundStyle(.orange)
+                }
+            case .loaded:
+                if !model.fresh { Text("Updates unavailable").font(.caption).foregroundStyle(.orange) }
+            }
+            if !model.statusLabel.isEmpty {
+                Text(model.statusLabel).font(.caption.weight(.medium)).padding(.horizontal, 9).padding(.vertical, 4)
                     .glassSurface(in: Capsule(), tint: statusColor)
             }
-            if model.role == "owner" && mission.canCancel {
+            if let mission = model.mission, model.role == "owner" && mission.canCancel {
                 Menu {
                     if mission.canResume { Button("Resume mission") { Task { await model.perform("resume") } }.disabled(!model.canAct) }
                     if mission.canPause { Button("Pause mission") { Task { await model.perform("pause") } }.disabled(!model.canAct) }
@@ -62,15 +89,21 @@ struct MissionDetailView: View {
         }
     }
     private var headerLine: String {
-        let repos = mission.repoProjectIDs
-        var parts = [mission.groupName]
-        if repos.count > 1 { parts.append("\(repos.count) repos") }
-        if mission.revision > 0 { parts.append("Revision \(mission.revision)") }
-        if !mission.coordinatorStatus.isEmpty { parts.append("Coordinator \(mission.coordinatorStatus)") }
-        return parts.filter { !$0.isEmpty }.joined(separator: " · ")
+        switch model.loadState {
+        case .loading(let seed, _):
+            return seed.groupName
+        case .loaded(let mission):
+            let repos = mission.repoProjectIDs
+            var parts = [mission.groupName]
+            if repos.count > 1 { parts.append("\(repos.count) repos") }
+            if mission.revision > 0 { parts.append("Revision \(mission.revision)") }
+            if !mission.coordinatorStatus.isEmpty { parts.append("Coordinator \(mission.coordinatorStatus)") }
+            return parts.filter { !$0.isEmpty }.joined(separator: " · ")
+        }
     }
     private var statusColor: Color {
-        switch mission.status {
+        switch model.status {
+        case "": return Palette.muted
         case "needs-input": return Palette.attention
         case "blocked": return Palette.error
         case "ready-for-review": return Palette.review
@@ -80,13 +113,13 @@ struct MissionDetailView: View {
         }
     }
 
-    @ViewBuilder private var decisions: some View {
+    @ViewBuilder private func decisions(_ mission: Mission) -> some View {
         let open = mission.ended ? [] : mission.openDecisions
         if !open.isEmpty {
             section("Decisions for you", count: open.count) {
                 let revision = mission.revision
                 ForEach(open) { decision in
-                    DecisionCard(decision: decision.value, caption: caption(decision), disabled: !model.canAct || !mission.canAnswer) { text in
+                    DecisionCard(decision: decision.value, caption: caption(decision, in: mission), disabled: !model.canAct || !mission.canAnswer) { text in
                         Task { await model.answer(decisionID: decision.id, revision: revision, text: text) }
                     }
                     .id(decision.id)
@@ -94,12 +127,12 @@ struct MissionDetailView: View {
             }
         }
     }
-    private func caption(_ decision: MissionDecision) -> String {
+    private func caption(_ decision: MissionDecision, in mission: Mission) -> String {
         let asker = mission.origin(of: decision).map { "Coordinator, for \($0.title) in \(repoName($0.repoProjectID))" } ?? "Coordinator"
         return "\(asker) · \(teamDate(decision.value["createdAt"].string))"
     }
 
-    @ViewBuilder private var result: some View {
+    @ViewBuilder private func result(_ mission: Mission) -> some View {
         if mission.result != .null {
             VStack(alignment: .leading, spacing: 10) {
                 HStack(spacing: 8) {
@@ -116,7 +149,7 @@ struct MissionDetailView: View {
         }
     }
 
-    @ViewBuilder private var subtasks: some View {
+    @ViewBuilder private func subtasks(_ mission: Mission) -> some View {
         let (done, total) = mission.progress
         section("Subtasks", count: total) {
             if total > 0 { Text("\(done) of \(total) done").font(.caption).foregroundStyle(.secondary) }
@@ -130,13 +163,13 @@ struct MissionDetailView: View {
         }
     }
 
-    private var request: some View {
+    private func request(_ mission: Mission) -> some View {
         section("Your request") {
             FoldingText(text: mission.objective, lines: 3)
         }
     }
 
-    @ViewBuilder private var history: some View {
+    @ViewBuilder private func history(_ mission: Mission) -> some View {
         let answered = mission.answeredDecisions
         if !mission.steering.isEmpty || !answered.isEmpty {
             section("Directions and decisions") {
@@ -181,14 +214,16 @@ struct MissionDetailView: View {
                 }
             }
             if model.role != "owner" { Text("This device can view the mission. An owner device answers decisions and steers it.").font(.caption).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading) }
-            else if mission.ended { Text("This mission is cancelled. Its subtasks and history remain available above.").font(.caption).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading) }
+            else if let mission = model.mission, mission.ended { Text("This mission is cancelled. Its subtasks and history remain available above.").font(.caption).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading) }
             else {
+                let statusNotice = !model.notice.isEmpty ? model.notice : (model.loadError ?? (!model.isLoaded ? "Loading mission details…" : "Directions go to the coordinator, which passes them to the subteams it affects."))
+                let noticeError = model.noticeIsError || (model.notice.isEmpty && model.loadError != nil)
                 PromptEditor(text: Binding(get: { model.direction }, set: { model.direction = $0 }), placeholder: "Steer the coordinator: a change, a priority, or a constraint…",
                              enabled: model.canSteer, transparent: true, submit: { Task { await model.steer() } })
                     .frame(height: 64).glassSurface(in: RoundedRectangle(cornerRadius: 14, style: .continuous))
                 HStack(spacing: 12) {
-                    Text(model.notice.isEmpty ? "Directions go to the coordinator, which passes them to the subteams it affects." : model.notice)
-                        .font(.system(size: 11)).foregroundStyle(model.noticeIsError ? Color.orange : .secondary).lineLimit(2).textSelection(.enabled)
+                    Text(statusNotice)
+                        .font(.system(size: 11)).foregroundStyle(noticeError ? Color.orange : .secondary).lineLimit(2).textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
                     Button { Task { await model.steer() } } label: { Label(model.busy ? "Sending…" : "Send direction", systemImage: "arrow.up") }
                         .buttonStyle(.borderedProminent).disabled(!model.canSteer || model.direction.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)

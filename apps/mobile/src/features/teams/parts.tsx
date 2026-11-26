@@ -41,10 +41,12 @@ export function Clamp({ text, lines = 6, style }: { text: string; lines?: number
   </View>;
 }
 
-export function Disclosure({ title, children }: { title: string; children: ReactNode }) {
-  const [open, setOpen] = useState(false);
+export function Disclosure({ title, expanded, onToggle, children }: { title: string; expanded?: boolean; onToggle?: () => void; children: ReactNode }) {
+  const [localOpen, setLocalOpen] = useState(false);
+  const open = expanded ?? localOpen;
+  const toggle = onToggle ?? (() => setLocalOpen(value => !value));
   return <View>
-    <Pressable accessibilityRole="button" accessibilityState={{ expanded: open }} onPress={() => setOpen(value => !value)} style={s.disclosure}>
+    <Pressable accessibilityRole="button" accessibilityState={{ expanded: open }} onPress={toggle} style={s.disclosure}>
       <Glyph name={open ? "down" : "forward"} size={12} color={theme.colors.secondaryInk} />
       <Text style={s.disclosureText}>{title}</Text>
     </Pressable>

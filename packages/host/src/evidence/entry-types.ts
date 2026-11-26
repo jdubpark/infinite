@@ -15,8 +15,10 @@ export type EntryHead = {
   kind: EntryKind;
   author: "host" | "member" | "owner";
   authority: "receipt" | "claim" | "direction";
+  authorMemberId?: string;
   authorRole?: EntryAuthorRole | "mission-coordinator";
   taskId?: string;
+  headCommit?: string;
   paths: string[];
   subtaskIds?: string[];
   summary: string;
@@ -38,6 +40,7 @@ export type HostEntry = {
   authorMemberId?: string;
   authorRole?: EntryAuthorRole;
   taskId?: string;
+  headCommit?: string;
   summary: string;
   body: Record<string, unknown>;
 };

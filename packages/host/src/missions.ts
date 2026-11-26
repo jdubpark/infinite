@@ -261,7 +261,7 @@ export class MissionService {
     });
     mission.usage = addRollups([coordinator, ...subteams]);
     if (stored.clockStoppedAt) mission.clockStoppedAt = stored.clockStoppedAt;
-    return mission;
+    if (mission.status === "paused" && stored.ownerHalt?.revision === mission.revision) mission.canAnswerPaused = true; return mission;
   }
   list() { return [...this.records.values()].map(stored => this.view(stored)).sort((a, b) => b.createdAt.localeCompare(a.createdAt)); }
   understandingRecords() { return [...this.records.values()].map(stored => structuredClone(stored.mission)); }

@@ -39,6 +39,7 @@ import type { CellsResult } from "./outcome-reads.js";
 import type { OutcomeRollup } from "./outcome-rollup.js";
 import { LEGACY_BATCH_MAX, parseLegacyFile, type LegacyLineOutcome } from "./outcome-legacy.js";
 import type { LegacyImportResult } from "./outcome-import.js";
+import { handleUsageRepairsCommand } from "./repair-metrics-cli.js";
 
 type Me = { role: string; capabilities?: { workspaceMirror?: number; mirrorForget?: number }; machine?: { label?: string }; nativeUi?: string[]; execution?: { laptop: boolean; cloudHandoff: boolean }; terminal?: { stream: boolean; raw: boolean; duplex?: boolean; snapshot?: boolean; control?: boolean }; projects: { id: string; name: string }[] };
 const providers = new Set(["claude", "codex", "grok", "opencode"]);
@@ -476,7 +477,7 @@ async function attach(config: ClientConfig, configFile: string, me: Me, session:
 const CLIENT_COMMANDS = new Set(["pair", "resume", "monitor", "recover", "projects", "start", "mission", "board", "understand", "list", "usage", "cost", "evidence", "fuse", "resources", "close", "sync", "pull", "team", "repo", "routine", "autonomy", "routing", "signal", "halt", "egress", "permissions", "goal", "eval", "duels"]);
 export interface ParsedClientArgs { command: string; args: string[]; options: Record<string, string | boolean>; includes: string[] }
 const CLIENT_STRING_OPTIONS = new Set(["--client-config", "--project", "--workspace", "--title", "--token-file", "--output", "--prd", "--provider", "--setup-json", "--check-json", "--linear-team", "--linear-project", "--handoff", "--request-id", "--pending", "--head", "--processes-stopped", "--identity", "--revision", "--file", "--relationship", "--delivery", "--source", "--repository", "--base-branch", "--merge-method", "--teamwork", "--permissions", "--permission-scope", "--permission-limit", "--role", "--autonomy", "--profile", "--run", "--by", "--sources", "--days", "--judge", "--pairs", "--judge-minutes", "--member", "--issue", "--commit", "--at", "--reason", "--withdraw", "--goal", "--mission", "--kind", "--task", "--since", "--direction", "--note", "--set", "--limit", "--before", "--after", "--version", "--routing", "--routing-value", "--routing-contributor", "--routing-points"]);
-const CLIENT_BOOLEAN_OPTIONS = new Set(["--detach", "--host", "--json", "--local-ui", "--takeover", "--laptop", "--cloud", "--stop", "--status", "--apply", "--force", "--watch", "--yes", "--logs", "--dry-run", "--all", "--clear-direction", "--wrong", "--rejected", "--raised", "--keep-paused"]);
+const CLIENT_BOOLEAN_OPTIONS = new Set(["--detach", "--host", "--json", "--local-ui", "--takeover", "--laptop", "--cloud", "--stop", "--status", "--apply", "--force", "--watch", "--yes", "--logs", "--board", "--dry-run", "--all", "--clear-direction", "--wrong", "--rejected", "--raised", "--keep-paused"]);
 
 export function clientCommandCandidate(args: readonly string[]): string | undefined {
   for (let index = 0; index < args.length; index++) {
@@ -515,7 +516,7 @@ export function parseClientArgs(argv: string[]): ParsedClientArgs {
   if (options["--watch"] && command !== "resources") throw new Error("--watch applies to infinite resources");
   if (options["--yes"] && command !== "close") throw new Error("--yes applies to infinite close");
   if (options["--logs"] && command !== "team") throw new Error("--logs applies to infinite team status or infinite team watch");
-  if (options["--logs"] && options["--json"]) throw new Error("Use either --logs or --json");
+  if (options["--logs"] && options["--json"]) throw new Error("Use either --logs or --json"); if (options["--board"] && (command !== "team" || options["--logs"] || options["--json"])) throw new Error(command !== "team" ? "--board applies to infinite team watch" : options["--logs"] ? "Use either --board or --logs" : "Use either --board or --json");
   if (command === "resources" && positional.length) throw new Error("infinite resources takes no arguments");
   if (command === "close" && positional.length !== 1) throw new Error("Usage: infinite close SESSION_ID [--yes] [--takeover]");
   return { command, args: providers.has(command) ? args : positional, options, includes };
@@ -1046,14 +1047,13 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
     if (command === "cost" && positional.length) throw new Error("Usage: infinite cost [plan ACCOUNT USD|reset] [--json]");
     if (command === "usage" || command === "cost") {
       const sub = positional[0], tz = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC", query = `?tz=${encodeURIComponent(tz)}`;
-      if (sub === "projects") { const result = await api.json("/usage/projects" + query); if (options["--json"]) console.log(JSON.stringify(result, null, 2)); else console.log(JSON.stringify(result, null, 2)); return true; }
-      if (sub === "project" || sub === "goal") { if (!positional[1]) throw new Error(`Usage: infinite usage ${sub} ID [--json]`); const result = await api.json(sub === "project" ? `/usage/projects/${encodeURIComponent(positional[1])}${query}` : `/goals/${encodeURIComponent(positional[1])}`); if (options["--json"]) console.log(JSON.stringify(result, null, 2)); else console.log(JSON.stringify(result, null, 2)); return true; }
-      if (sub === "models") { const result = await api.json(`/usage/models?role=${encodeURIComponent(String(options["--role"] ?? "implementer"))}`); if (options["--json"]) console.log(JSON.stringify(result, null, 2)); else console.log(JSON.stringify(result, null, 2)); return true; }
-      if (sub || positional.length) throw new Error("Usage: infinite usage [projects|project ID|goal ID|models [--role ROLE]] [--json]");
+      if (sub === "repairs") return await handleUsageRepairsCommand(positional.slice(1), options, api);
+      if (sub === "projects") { const result = await api.json("/usage/projects" + query); console.log(JSON.stringify(result, null, 2)); return true; }
+      if (sub === "project" || sub === "goal") { if (!positional[1]) throw new Error(`Usage: infinite usage ${sub} ID [--json]`); console.log(JSON.stringify(await api.json(sub === "project" ? `/usage/projects/${encodeURIComponent(positional[1])}${query}` : `/goals/${encodeURIComponent(positional[1])}`), null, 2)); return true; }
+      if (sub === "models") { console.log(JSON.stringify(await api.json(`/usage/models?role=${encodeURIComponent(String(options["--role"] ?? "implementer"))}`), null, 2)); return true; }
+      if (sub || positional.length) throw new Error("Usage: infinite usage [repairs|projects|project ID|goal ID|models [--role ROLE]] [--json]");
       const [summary, daily] = await Promise.all([api.json<import("./usage-service.js").UsageSummary>("/usage"), api.json<{ days: { date: string; usd: number }[] }>(`/usage/daily?days=30&tz=${encodeURIComponent(tz)}`)]);
-      if (options["--json"]) console.log(JSON.stringify({ ...summary, daily }, null, 2));
-      else for (const line of usageOverview(summary, daily)) console.log(line);
-      return true;
+      if (options["--json"]) console.log(JSON.stringify({ ...summary, daily }, null, 2)); else for (const line of usageOverview(summary, daily)) console.log(line); return true;
     }
     if (command === "evidence") {
       if (positional.length !== 1 || positional[0] !== "status") throw new Error("Usage: infinite evidence status [--json]");

@@ -85,8 +85,7 @@ for await (const chunk of process.stdin) {
 }
 const config = JSON.parse(bootstrap) as Bootstrap;
 bootstrap = "";
-const { session, profile, stateDir, runDir, socketDir } = config;
-const executionIdentity = resolveBootstrapExecutionIdentity(config);
+const { session, profile, stateDir, runDir, socketDir } = config; const executionIdentity = resolveBootstrapExecutionIdentity(config);
 const workerSocket = socketPath({ runDir, socketDir: ensureSocketDir(socketDir ?? runDir, socketDir !== undefined ? "socketDir" : "runDir") }, session.id);
 const provider = session.provider;
 const key = Buffer.from(config.key, "base64");

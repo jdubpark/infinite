@@ -894,9 +894,9 @@ export class Manager {
       return result;
     };
     if (session.team) throw new ContentError("Resume this member from its team so its assignment stays consistent");
+    const state = await this.state(sessionId);
     if (session.headless?.channel && deferredCallOpen((after, limit) => this.events(sessionId, after, limit, new Set(["lifecycle"]))))
       throw new ContentError("This session ended while a call waited for the owner's answer. Start a new session instead of resuming it.", 409);
-    const state = await this.state(sessionId);
     if (state.status === "running" || state.status === "starting") return remember({ ...session, ...state });
     const native = state.nativeSession ?? session.resumeNativeSession;
     if (state.status !== "exited") throw new ContentError("The previous process has not confirmed exit. Reconnect before resuming.");

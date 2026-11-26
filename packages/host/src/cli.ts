@@ -354,6 +354,7 @@ infinite signal add --project ID TEXT [--request-id UUID] [--json]
 infinite signal list --project ID [--after SEQ] [--json]
 infinite egress [--project ID] [--json]    Hosts agents reached through the egress proxy
 infinite usage repairs [--project ID] [--days N] [--json]  Repair loop latency and recovery metrics
+infinite usage interrupted [--project ID] [--days N] [--json]  Interrupted-task build trigger gauge (INF-325)
 
 Ctrl+] detaches. Ctrl+G returns to monitor mode. Flags after a provider
 name belong to that provider and use cloud paths.

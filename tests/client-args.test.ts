@@ -588,3 +588,12 @@ test("explain prints the guards of an auto decision", () => {
   })]));
   assert.equal(unpaused[3], "Guards: pause none · spare attempts 3 · share 1 of 4");
 });
+
+test("usage interrupted options parse", () => {
+  const parsed = parseClientArgs(["usage", "interrupted", "--project", "proj-a", "--days", "14", "--json"]);
+  assert.equal(parsed.command, "usage");
+  assert.deepEqual(parsed.args, ["interrupted"]);
+  assert.equal(parsed.options["--project"], "proj-a");
+  assert.equal(parsed.options["--days"], "14");
+  assert.equal(parsed.options["--json"], true);
+});

@@ -1,16 +1,17 @@
-import { useEffect, useState } from "react";
+import { useEffect, useSyncExternalStore } from "react";
 import { ActivityIndicator, StyleSheet } from "react-native";
 import { useRouter } from "expo-router";
 import { SafeAreaView } from "react-native-safe-area-context";
-import { api, closeConnection, connectionKey, type Me } from "../../api/client";
+import { api, closeConnection, type Me } from "../../api/client";
 import { identifyConnection } from "../../store/connection";
 import { forgetMachine, useSharedMachine } from "../../store/machines";
-import { registerForPush, unregisterPush, type PushState } from "../../push/register";
+import { getPushStates, registerForPush, subscribePushStates, unregisterPush, type PushState } from "../../push/register";
 import { Board } from "./Board";
 import { theme } from "../../theme";
 
 const PUSH_NOTES: Record<PushState, string> = {
   registered: "Notifications on for this machine",
+  degraded: "Notifications degraded: failed to refresh push token",
   denied: "Notifications off: permission denied",
   unavailable: "Notifications unavailable until this build has an EAS project id",
 };
@@ -18,7 +19,7 @@ const PUSH_NOTES: Record<PushState, string> = {
 export function BoardHome() {
   const router = useRouter();
   const { loaded, active, connection, profiles, select } = useSharedMachine();
-  const [push, setPush] = useState<Record<string, PushState>>({});
+  const push = useSyncExternalStore(subscribePushStates, getPushStates);
   useEffect(() => {
     let live = true;
     for (const profile of profiles) void (async () => {
@@ -26,8 +27,7 @@ export function BoardHome() {
       if (!live) return;
       if (me.machine?.id) await identifyConnection(profile, me.machine.id);
       if (!live || !me.capabilities?.push) return;
-      const state = await registerForPush(profile);
-      if (live) setPush(previous => ({ ...previous, [connectionKey(profile)]: state }));
+      await registerForPush(profile);
     })().catch(() => {});
     return () => { live = false; };
   }, [profiles]);

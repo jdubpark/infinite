@@ -35,6 +35,7 @@ export type MissionWatchEntryCache = {
   more: boolean;
   error?: string;
   selectedEntry?: { head: EntryHead; body: unknown };
+  detailError?: string;
   loading?: boolean;
 };
 
@@ -69,6 +70,7 @@ export type RunMissionWatchOptions = {
 };
 
 const MAX_RETAINED_OBSERVATIONS = 40;
+const MAX_ENTRY_PAGES = 10;
 const clean = (value: unknown) => String(value ?? "").replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
 const short = (value: unknown, max: number) => {
   const text = clean(value).trim();
@@ -345,9 +347,14 @@ export function missionWatchText(
             lines.push(`  blackboard #${entry.seq}  ${clean(entry.kind)}  ${authorityLabel(entry.authority)}  ${clean(entry.authorRole ?? entry.author)}${taskPart}  ${short(entry.summary, 120)}`);
           }
           if (cache.more) lines.push(`  More entries available (cursor ${cache.cursor}).`);
-          if (state.showDetail && cache.selectedEntry) {
-            lines.push("", `ENTRY DETAIL  blackboard #${cache.selectedEntry.head.seq}  ${clean(cache.selectedEntry.head.kind)}  ${authorityLabel(cache.selectedEntry.head.authority)}`);
-            lines.push(`  ${short(JSON.stringify(cache.selectedEntry.body), 500)}`);
+          if (state.showDetail) {
+            if (cache.selectedEntry) {
+              lines.push("", `ENTRY DETAIL  blackboard #${cache.selectedEntry.head.seq}  ${clean(cache.selectedEntry.head.kind)}  ${authorityLabel(cache.selectedEntry.head.authority)}`);
+              lines.push(`  ${short(JSON.stringify(cache.selectedEntry.body), 500)}`);
+            } else if (cache.detailError) {
+              lines.push("", "ENTRY DETAIL");
+              lines.push(`  Error loading entry detail: ${short(cache.detailError, 200)}`);
+            }
           }
         }
       }
@@ -492,19 +499,23 @@ export async function runMissionWatch(
     }
   };
 
+  let ttyEntered = false;
+  let rawModeEnabled = false;
   process.once("SIGINT", stop);
-  if (tty) {
-    process.stdout.write("\x1b[?1049h\x1b[?25l");
-    process.stdout.on("resize", paint);
-  }
-  if (interactive) {
-    process.stdin.setRawMode(true);
-    process.stdin.setEncoding("utf8");
-    process.stdin.resume();
-    process.stdin.on("data", onData);
-  }
 
   try {
+    if (tty) {
+      process.stdout.write("\x1b[?1049h\x1b[?25l");
+      ttyEntered = true;
+      process.stdout.on("resize", paint);
+    }
+    if (interactive) {
+      process.stdin.setRawMode(true);
+      rawModeEnabled = true;
+      process.stdin.setEncoding("utf8");
+      process.stdin.resume();
+      process.stdin.on("data", onData);
+    }
     do {
       try {
         const query = progressCursor ? `?cursor=${encodeURIComponent(progressCursor)}` : "";
@@ -535,7 +546,7 @@ export async function runMissionWatch(
             ...state,
             lastResyncReason: nextProgress.resync.reason,
             resyncCount: (state.resyncCount ?? 0) + (nextProgress.resync.reason === "initial" ? 0 : 1),
-            observations: [...(state.observations ?? []), ...nextProgress.observations].slice(-MAX_RETAINED_OBSERVATIONS),
+            observations: nextProgress.observations.slice(-MAX_RETAINED_OBSERVATIONS),
           };
         } else {
           const freshObs = nextProgress.observations
@@ -556,28 +567,37 @@ export async function runMissionWatch(
         const teamId = selected?.teamId ?? (child?.kind === "linked" ? child.runId : undefined);
         if (state.showEntries && teamId && (state.follow || !state.entriesByTeam?.[teamId])) {
           try {
-            const page = await api.json<EntryPage>(`/teams/${encodeURIComponent(teamId)}/entries`, undefined, abort.signal);
-            let selectedEntry = state.entriesByTeam?.[teamId]?.selectedEntry;
-            const latestHead = page.entries[page.entries.length - 1];
-            if (state.showDetail && latestHead && selectedEntry?.head.entryId !== latestHead.entryId) {
-              try {
-                selectedEntry = await api.json<{ head: EntryHead; body: unknown }>(
-                  `/teams/${encodeURIComponent(teamId)}/entries/${encodeURIComponent(latestHead.entryId)}`,
-                  undefined,
-                  abort.signal,
-                );
-              } catch {}
+            const allEntries: EntryHead[] = [];
+            const seenIds = new Set<string>();
+            let nextSince: number | undefined;
+            let finalCursor = 0;
+            let hasMore = false;
+            for (let pageIndex = 0; pageIndex < MAX_ENTRY_PAGES; pageIndex += 1) {
+              const entryQuery = nextSince !== undefined ? `?since=${nextSince}` : "";
+              const page = await api.json<EntryPage>(`/teams/${encodeURIComponent(teamId)}/entries${entryQuery}`, undefined, abort.signal);
+              for (const head of page.entries) {
+                if (!seenIds.has(head.entryId)) {
+                  seenIds.add(head.entryId);
+                  allEntries.push(head);
+                }
+              }
+              finalCursor = page.cursor;
+              hasMore = page.more;
+              if (!page.more || page.entries.length === 0 || page.cursor <= (nextSince ?? 0)) break;
+              nextSince = page.cursor;
             }
+            const priorCache = state.entriesByTeam?.[teamId];
             state = {
               ...state,
               entriesByTeam: {
                 ...state.entriesByTeam,
                 [teamId]: {
                   teamId,
-                  entries: page.entries,
-                  cursor: page.cursor,
-                  more: page.more,
-                  selectedEntry,
+                  entries: allEntries,
+                  cursor: finalCursor,
+                  more: hasMore,
+                  selectedEntry: priorCache?.selectedEntry,
+                  detailError: priorCache?.detailError,
                 },
               },
             };
@@ -598,14 +618,59 @@ export async function runMissionWatch(
             };
           }
         }
+
+        if (state.showEntries && teamId && state.showDetail) {
+          const cached = state.entriesByTeam?.[teamId];
+          const latestHead = cached && !cached.error ? cached.entries[cached.entries.length - 1] : undefined;
+          if (cached && latestHead && cached.selectedEntry?.head.entryId !== latestHead.entryId) {
+            try {
+              const selectedEntry = await api.json<{ head: EntryHead; body: unknown }>(
+                `/teams/${encodeURIComponent(teamId)}/entries/${encodeURIComponent(latestHead.entryId)}`,
+                undefined,
+                abort.signal,
+              );
+              state = {
+                ...state,
+                entriesByTeam: {
+                  ...state.entriesByTeam,
+                  [teamId]: {
+                    ...cached,
+                    selectedEntry,
+                    detailError: undefined,
+                  },
+                },
+              };
+            } catch (error) {
+              if (abort.signal.aborted) throw error;
+              state = {
+                ...state,
+                entriesByTeam: {
+                  ...state.entriesByTeam,
+                  [teamId]: {
+                    ...cached,
+                    selectedEntry: undefined,
+                    detailError: clean((error as Error).message),
+                  },
+                },
+              };
+            }
+          }
+        }
+
         notice = "";
         renderCurrent(tty ? new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "");
       } catch (error) {
         if (abort.signal.aborted) break;
         const message = `Update failed: ${clean((error as Error).message)}`;
-        if (tty && card) {
-          notice = `${message}. Showing last received view.`;
-          paint();
+        if (tty) {
+          if (card) {
+            notice = `${message}. Showing last received view.`;
+            paint();
+          } else {
+            card = `${clean(missionId)}  error\n\n${message}\n\n${interactive ? "q quit" : "Ctrl+C detaches"}`;
+            notice = "";
+            paint();
+          }
         } else if (options.once) {
           throw error;
         } else {
@@ -631,10 +696,14 @@ export async function runMissionWatch(
     if (options.signal) options.signal.removeEventListener("abort", onExternalAbort);
     if (interactive) {
       process.stdin.off("data", onData);
-      process.stdin.setRawMode(false);
+      if (rawModeEnabled) {
+        try {
+          process.stdin.setRawMode(false);
+        } catch {}
+      }
       process.stdin.pause();
     }
-    if (tty) {
+    if (ttyEntered) {
       process.stdout.off("resize", paint);
       process.stdout.write("\x1b[?25h\x1b[?1049l");
     }

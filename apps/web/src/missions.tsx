@@ -63,6 +63,8 @@ export function MissionPage({ id, me, connected, openTeam, halt }: { id: string;
   const request = mutations.use(key), pending = request.pending;
   const [busy, setBusy] = useState(false);
   const mounted = useRef(true);
+  const activeKeyRef = useRef(key);
+  activeKeyRef.current = key;
   const progressRef = useRef<MissionProgressState>(initialMissionProgressState());
 
   useEffect(() => {
@@ -78,6 +80,7 @@ export function MissionPage({ id, me, connected, openTeam, halt }: { id: string;
     setDismissedResyncCount(0);
     setSelectedSubtaskId(null);
     setMission(null);
+    setBusy(false);
   }, [key]);
 
   useEffect(() => {
@@ -129,12 +132,13 @@ export function MissionPage({ id, me, connected, openTeam, halt }: { id: string;
     options: { minutes?: number; decisionId?: string; text?: string } = {},
   ) {
     if (!mission || !fresh || me.role !== "owner" || busy) return;
+    const targetKey = key;
     let body = pending;
     if (!body) {
       if (action === "extend" || action === "pause" || action === "resume" || action === "cancel") {
         if (!missionControls(mission, me.role, fresh, Date.now())[action]) return undefined;
         if (action === "extend" && (options.minutes === undefined || !Number.isInteger(options.minutes) || options.minutes < 5 || options.minutes > 1440)) return;
-        body = mutations.begin(key, {
+        body = mutations.begin(targetKey, {
           requestId: crypto.randomUUID(),
           revision: mission.revision,
           action,
@@ -143,7 +147,7 @@ export function MissionPage({ id, me, connected, openTeam, halt }: { id: string;
       } else if (action === "answer") {
         const text = options.text?.trim();
         if (!canAnswer || !options.decisionId || !text) return;
-        body = mutations.begin(key, {
+        body = mutations.begin(targetKey, {
           requestId: crypto.randomUUID(),
           revision: mission.revision,
           action,
@@ -153,7 +157,7 @@ export function MissionPage({ id, me, connected, openTeam, halt }: { id: string;
       } else if (action === "steer") {
         const text = options.text?.trim();
         if (!canSteer || !text) return;
-        body = mutations.begin(key, {
+        body = mutations.begin(targetKey, {
           requestId: crypto.randomUUID(),
           revision: mission.revision,
           action,
@@ -182,8 +186,8 @@ export function MissionPage({ id, me, connected, openTeam, halt }: { id: string;
           : body.action === "steer"
             ? "Direction recorded. Revision " + result.revision + "."
             : body.action[0].toUpperCase() + body.action.slice(1) + " recorded. Revision " + result.revision + ".";
-      const accepted = mutations.complete(key, body.requestId, { id: result.id }, message);
-      if (mounted.current) {
+      const accepted = mutations.complete(targetKey, body.requestId, { id: result.id }, message);
+      if (mounted.current && activeKeyRef.current === targetKey) {
         receive(result);
         if (accepted && body.action === "steer") setDirection("");
         view.refresh();
@@ -192,18 +196,18 @@ export function MissionPage({ id, me, connected, openTeam, halt }: { id: string;
     } catch (failure) {
       const wasRejected = rejected(failure);
       mutations.fail(
-        key,
+        targetKey,
         body.requestId,
         (failure as Error).message + (wasRejected ? " Refresh the mission before sending another request." : " Delivery is unconfirmed. Retry will use the same request."),
         wasRejected,
       );
-      if (mounted.current && wasRejected) {
+      if (mounted.current && activeKeyRef.current === targetKey && wasRejected) {
         view.refresh();
         progressView.refresh();
       }
     } finally {
       inFlight.delete(body.requestId);
-      if (mounted.current) setBusy(false);
+      if (mounted.current && activeKeyRef.current === targetKey) setBusy(false);
     }
   }
 

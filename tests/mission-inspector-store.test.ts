@@ -334,3 +334,68 @@ test("compactAssignments splits active from finished and links prior stopped/rep
   assert.deepEqual(implGroup.priorAttempts.map(item => item.memberId), ["m-old-1", "m-old-2"]);
   assert.deepEqual(result.finished.map(item => item.memberId), ["m-scout-done", "m-task-b"]);
 });
+
+test("resync clears prior observations so matching sequences in new generation or instance are never dropped, and stale generation pages are ignored", () => {
+  const INST_3 = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+
+  let state = applyMissionProgressPage(
+    initialMissionProgressState(),
+    makePage(GEN_1, INST_1, 1, { required: true, reason: "initial" }),
+  );
+  state = applyMissionProgressPage(
+    state,
+    makePage(GEN_1, INST_1, 3, { required: false }, [
+      makeObservation(GEN_1, INST_1, 2, "working"),
+      makeObservation(GEN_1, INST_1, 3, "needs-input"),
+    ]),
+  );
+  assert.deepEqual(state.observations.map(item => item.sequence), [2, 3]);
+
+  state = applyMissionProgressPage(
+    state,
+    makePage(GEN_2, INST_2, 1, { required: true, reason: "host-restarted" }),
+  );
+  assert.equal(state.observations.length, 0);
+  state = applyMissionProgressPage(
+    state,
+    makePage(GEN_2, INST_2, 3, { required: false }, [
+      makeObservation(GEN_2, INST_2, 2, "paused"),
+      makeObservation(GEN_2, INST_2, 3, "working"),
+    ]),
+  );
+  assert.deepEqual(state.observations.map(item => [item.cursor, item.sequence]), [
+    [makeCursor(GEN_2, MISSION_ID, INST_2, 2), 2],
+    [makeCursor(GEN_2, MISSION_ID, INST_2, 3), 3],
+  ]);
+
+  state = applyMissionProgressPage(
+    state,
+    makePage(GEN_2, INST_3, 1, { required: true, reason: "history-evicted" }),
+  );
+  assert.equal(state.observations.length, 0);
+  state = applyMissionProgressPage(
+    state,
+    makePage(GEN_2, INST_3, 3, { required: false }, [
+      makeObservation(GEN_2, INST_3, 2, "blocked"),
+      makeObservation(GEN_2, INST_3, 3, "ready-for-review"),
+    ]),
+  );
+  assert.deepEqual(state.observations.map(item => [item.cursor, item.sequence]), [
+    [makeCursor(GEN_2, MISSION_ID, INST_3, 2), 2],
+    [makeCursor(GEN_2, MISSION_ID, INST_3, 3), 3],
+  ]);
+
+  const afterStaleGen1 = applyMissionProgressPage(
+    state,
+    makePage(GEN_1, INST_1, 4, { required: false }, [makeObservation(GEN_1, INST_1, 4, "cancelled")]),
+  );
+  assert.equal(afterStaleGen1, state);
+  assert.equal(afterStaleGen1.generation, GEN_2);
+  assert.equal(afterStaleGen1.cursor, makeCursor(GEN_2, MISSION_ID, INST_3, 3));
+
+  const afterStaleInst2 = applyMissionProgressPage(
+    state,
+    makePage(GEN_2, INST_2, 4, { required: false }, [makeObservation(GEN_2, INST_2, 4, "cancelled")]),
+  );
+  assert.equal(afterStaleInst2, state);
+});

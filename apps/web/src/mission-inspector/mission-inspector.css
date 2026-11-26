@@ -172,6 +172,10 @@
   color: var(--muted);
 }
 
+.mission-subtask-header .text-button {
+  flex-shrink: 0;
+}
+
 .mission-inspector-tabs {
   display: inline-flex;
   gap: 4px;
@@ -183,7 +187,7 @@
 }
 
 .mission-inspector-tabs button {
-  min-height: 38px;
+  min-height: 44px;
   padding: 6px 12px;
   border: 0;
   border-radius: 6px;
@@ -314,7 +318,7 @@
 .mission-entries-controls select {
   width: auto;
   min-width: 160px;
-  min-height: 40px;
+  min-height: 44px;
   padding: 7px 10px;
   font-size: 12px;
 }

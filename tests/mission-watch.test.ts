@@ -371,3 +371,49 @@ test("runMissionWatch updates progress cursor across polls, survives resync, and
   );
   assert.equal(TEAM_2.length > 0, true);
 });
+
+test("runMissionWatch pages past entry 50 with since and surfaces detail errors even when follow is off", async () => {
+  const mission = makeMission();
+  const pagedPaths: string[] = [];
+  const pagedFrames: string[] = [];
+  const page1Entries = Array.from({ length: 50 }, (_, index) => ({
+    ...sampleEntries[0]!,
+    entryId: `e-${index + 1}`,
+    seq: index + 1,
+    summary: `Entry ${index + 1}`,
+  }));
+  const page2Entries = [
+    {
+      ...sampleEntries[1]!,
+      entryId: "e-51",
+      seq: 51,
+      summary: "Latest paged entry 51",
+    },
+  ];
+
+  await runMissionWatch(
+    {
+      json: async <T>(path: string): Promise<T> => {
+        pagedPaths.push(path);
+        if (path === `/missions/${MISSION_ID}`) return mission as T;
+        if (path === `/teams/${TEAM_1}/entries`) return { entries: page1Entries, cursor: 50, more: true } as T;
+        if (path === `/teams/${TEAM_1}/entries?since=50`) return { entries: page2Entries, cursor: 51, more: false } as T;
+        if (path === `/teams/${TEAM_1}/entries/e-51`) throw new Error("detail store timeout");
+        return makeProgress({ required: true, reason: "initial" }, GEN_1, 1) as T;
+      },
+    },
+    MISSION_ID,
+    {
+      tty: false,
+      interactive: false,
+      once: true,
+      initialState: { showEntries: true, showDetail: true, follow: false },
+      onFrame: text => pagedFrames.push(text),
+    },
+  );
+
+  assert.equal(pagedPaths.includes(`/teams/${TEAM_1}/entries?since=50`), true);
+  assert.equal(pagedPaths.includes(`/teams/${TEAM_1}/entries/e-51`), true);
+  assert.match(pagedFrames[0]!, /Latest paged entry 51/);
+  assert.match(pagedFrames[0]!, /Error loading entry detail: detail store timeout/);
+});

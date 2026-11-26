@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ArrowUpRight, RefreshCw, X } from "lucide-react";
 import { useApi, type DecisionRecommendation, type Me } from "../api";
 import { Decision } from "../team-decision";
@@ -172,6 +172,12 @@ const roleLabel = (role: MissionProgressMember["role"]) => {
       return "Delivery";
     case "evaluator":
       return "Evaluator";
+    case "permission-coordinator":
+      return "Permission coordinator";
+    case "judge":
+      return "Judge";
+    default:
+      return role;
   }
 };
 
@@ -424,7 +430,7 @@ export function MissionSubtaskInspector({
               {tab === "status" ? (
                 <ChildStatusPanel subtask={selectedSubtask} child={child} formatDate={formatDate} />
               ) : (
-                teamId && <ChildBlackboardPanel teamId={teamId} formatDate={formatDate} />
+                teamId && <ChildBlackboardPanel key={teamId} teamId={teamId} formatDate={formatDate} />
               )}
             </div>
           )}
@@ -584,9 +590,13 @@ function ChildBlackboardPanel({ teamId, formatDate }: { teamId: string; formatDa
   const [detailLoading, setDetailLoading] = useState(false);
   const [detailError, setDetailError] = useState("");
   const [reloadNonce, setReloadNonce] = useState(0);
+  const listEpochRef = useRef(0);
+  const detailEpochRef = useRef(0);
 
   useEffect(() => {
     let active = true;
+    const epoch = ++listEpochRef.current;
+    detailEpochRef.current += 1;
     setLoading(true);
     setError("");
     setEntries([]);
@@ -594,29 +604,33 @@ function ChildBlackboardPanel({ teamId, formatDate }: { teamId: string; formatDa
     setMore(false);
     setSelectedId(null);
     setDetail(null);
+    setDetailLoading(false);
     setDetailError("");
     const params = new URLSearchParams();
     if (kindFilter) params.set("kind", kindFilter);
     api<EntryPageView>(`/teams/${teamId}/entries${params.size ? `?${params}` : ""}`)
       .then(page => {
-        if (!active) return;
+        if (!active || listEpochRef.current !== epoch) return;
         setEntries(page.entries);
         setCursor(page.cursor);
         setMore(page.more);
       })
       .catch(failure => {
-        if (active) setError((failure as Error).message);
+        if (active && listEpochRef.current === epoch) setError((failure as Error).message);
       })
       .finally(() => {
-        if (active) setLoading(false);
+        if (active && listEpochRef.current === epoch) setLoading(false);
       });
     return () => {
       active = false;
+      listEpochRef.current += 1;
+      detailEpochRef.current += 1;
     };
   }, [api, teamId, kindFilter, reloadNonce]);
 
   async function loadMore() {
     if (loading || !more) return;
+    const epoch = ++listEpochRef.current;
     setLoading(true);
     setError("");
     try {
@@ -624,6 +638,7 @@ function ChildBlackboardPanel({ teamId, formatDate }: { teamId: string; formatDa
       if (kindFilter) params.set("kind", kindFilter);
       params.set("since", String(cursor));
       const page = await api<EntryPageView>(`/teams/${teamId}/entries?${params}`);
+      if (listEpochRef.current !== epoch) return;
       setEntries(previous => {
         const seen = new Set(previous.map(item => item.entryId));
         return [...previous, ...page.entries.filter(item => !seen.has(item.entryId))];
@@ -631,24 +646,27 @@ function ChildBlackboardPanel({ teamId, formatDate }: { teamId: string; formatDa
       setCursor(page.cursor);
       setMore(page.more);
     } catch (failure) {
-      setError((failure as Error).message);
+      if (listEpochRef.current === epoch) setError((failure as Error).message);
     } finally {
-      setLoading(false);
+      if (listEpochRef.current === epoch) setLoading(false);
     }
   }
 
   async function openEntry(entryId: string) {
+    const epoch = ++detailEpochRef.current;
     setSelectedId(entryId);
     setDetailLoading(true);
     setDetailError("");
     try {
       const found = await api<EntryDetailView>(`/teams/${teamId}/entries/${entryId}`);
+      if (detailEpochRef.current !== epoch) return;
       setDetail(found);
     } catch (failure) {
+      if (detailEpochRef.current !== epoch) return;
       setDetail(null);
       setDetailError((failure as Error).message);
     } finally {
-      setDetailLoading(false);
+      if (detailEpochRef.current === epoch) setDetailLoading(false);
     }
   }
 

@@ -26,7 +26,9 @@ export type TeamRole =
   | "integrator"
   | "reviewer"
   | "delivery"
-  | "evaluator";
+  | "evaluator"
+  | "permission-coordinator"
+  | "judge";
 
 export type MissionSubtaskStatus = "queued" | "running" | "done" | "cancelled" | "blocked";
 export type MissionMemberRecordedStatus = "queued" | "running" | "waiting" | "reported" | "stopped" | "unavailable";
@@ -208,18 +210,25 @@ export function missionProgressResyncNotice(reason: MissionProgressResyncReason 
   }
 }
 
+function observationKey(item: MissionProgressObservation): string {
+  const parsed = parseMissionProgressCursor(item.cursor);
+  if (parsed) return `${parsed.generation}:${parsed.instance}:${parsed.sequence}`;
+  return `${item.cursor}:${item.sequence}`;
+}
+
 function appendObservations(
   existing: readonly MissionProgressObservation[],
   incoming: readonly MissionProgressObservation[],
   afterSequence: number,
 ): { observations: MissionProgressObservation[]; maxSequence: number } {
-  const seen = new Set(existing.map(item => item.sequence));
+  const seen = new Set(existing.map(observationKey));
   const accepted: MissionProgressObservation[] = [];
   let maxSequence = afterSequence;
   const sorted = [...incoming].sort((a, b) => a.sequence - b.sequence);
   for (const item of sorted) {
-    if (item.sequence <= afterSequence || seen.has(item.sequence)) continue;
-    seen.add(item.sequence);
+    const key = observationKey(item);
+    if (item.sequence <= afterSequence || seen.has(key)) continue;
+    seen.add(key);
     accepted.push(item);
     if (item.sequence > maxSequence) maxSequence = item.sequence;
   }
@@ -238,12 +247,8 @@ export function applyMissionProgressPage(state: MissionProgressState, page: Miss
   const sameMission = state.missionId === null || state.missionId === page.missionId;
 
   if (page.resync.required) {
-    const baseObservations = sameMission ? state.observations : [];
-    const observations = sameMission
-      ? mergeUniqueObservations(baseObservations, page.observations)
-      : page.observations.slice(-MAX_PROGRESS_OBSERVATIONS);
-    const maxObsSequence = page.observations.reduce((max, item) => Math.max(max, item.sequence), 0);
-    const nextSequence = Math.max(cursorSequence, maxObsSequence);
+    const { observations, maxSequence } = appendObservations([], page.observations, 0);
+    const nextSequence = Math.max(cursorSequence, maxSequence);
     const isQuietInitial = page.resync.reason === "initial";
     return {
       missionId: page.missionId,
@@ -274,18 +279,12 @@ export function applyMissionProgressPage(state: MissionProgressState, page: Miss
   }
 
   if (state.generation !== null && state.generation !== page.generation) {
-    const { observations, maxSequence } = appendObservations(state.observations, page.observations, 0);
-    return {
-      missionId: page.missionId,
-      generation: page.generation,
-      cursor: page.cursor,
-      snapshot: page.snapshot,
-      observations,
-      lastSequence: Math.max(cursorSequence, maxSequence),
-      lastResyncReason: state.lastResyncReason,
-      resyncCount: state.resyncCount,
-      observedAt: page.observedAt,
-    };
+    return state;
+  }
+
+  const currentParsed = parseMissionProgressCursor(state.cursor);
+  if (parsed && currentParsed && parsed.instance !== currentParsed.instance) {
+    return state;
   }
 
   if (parsed && parsed.sequence < state.lastSequence) {
@@ -306,22 +305,6 @@ export function applyMissionProgressPage(state: MissionProgressState, page: Miss
     resyncCount: state.resyncCount,
     observedAt: page.observedAt,
   };
-}
-
-function mergeUniqueObservations(
-  existing: readonly MissionProgressObservation[],
-  incoming: readonly MissionProgressObservation[],
-): MissionProgressObservation[] {
-  if (!incoming.length) return existing.slice(-MAX_PROGRESS_OBSERVATIONS);
-  const existingKeys = new Set(existing.map(item => `${item.cursor}#${item.sequence}`));
-  const next = [...existing];
-  for (const item of [...incoming].sort((a, b) => a.sequence - b.sequence)) {
-    const key = `${item.cursor}#${item.sequence}`;
-    if (existingKeys.has(key)) continue;
-    existingKeys.add(key);
-    next.push(item);
-  }
-  return next.slice(-MAX_PROGRESS_OBSERVATIONS);
 }
 
 export function compactAssignments(assignments: readonly MissionProgressMember[]): CompactAssignmentsResult {

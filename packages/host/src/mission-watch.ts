@@ -79,6 +79,7 @@ export type ResolvedWatchChild =
 
 const MAX_RETAINED_OBSERVATIONS = 40;
 const MAX_RETAINED_ENTRIES = 200;
+const REFRESH_WINDOW_ENTRIES = 50;
 const MAX_ENTRY_PAGES = 10;
 const clean = (value: unknown) => String(value ?? "").replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
 const short = (value: unknown, max: number) => {
@@ -248,6 +249,25 @@ const isConfirmedFinished = (member: Pick<MissionProgressMember, "recordedStatus
 const isAwaitingExit = (member: Pick<MissionProgressMember, "recordedStatus" | "exitConfirmedAt">) =>
   member.recordedStatus === "reported" && !member.exitConfirmedAt;
 
+export function currentWatchAssignmentCount(assignments: readonly MissionProgressMember[]): number {
+  const active = assignments.filter(member => !isConfirmedFinished(member));
+  const activeTaskSlots = new Set(
+    active.filter(member => member.taskId !== undefined).map(member => `${member.role}\0${member.taskId}`),
+  );
+  const finishedTaskSlots = new Set<string>();
+  let finishedUnscoped = 0;
+  for (const member of assignments) {
+    if (!isConfirmedFinished(member)) continue;
+    if (member.taskId === undefined) {
+      finishedUnscoped += 1;
+      continue;
+    }
+    const slot = `${member.role}\0${member.taskId}`;
+    if (!activeTaskSlots.has(slot)) finishedTaskSlots.add(slot);
+  }
+  return active.length + finishedTaskSlots.size + finishedUnscoped;
+}
+
 function compactMemberLines(assignments: readonly MissionProgressMember[], showFinished: boolean): string[] {
   const active = assignments.filter(item => !isConfirmedFinished(item));
   const finished = assignments.filter(item => isConfirmedFinished(item));
@@ -353,7 +373,7 @@ export function missionWatchText(
       const resolved = resolveWatchChild(mission, subtask, progress?.snapshot ?? null);
       const childSummary =
         resolved.kind === "linked"
-          ? `${clean(resolved.child.status)} · ${resolved.child.assignments.length} assigned`
+          ? `${clean(resolved.child.status)} · ${currentWatchAssignmentCount(resolved.child.assignments)} assigned`
           : resolved.kind === "unavailable"
             ? "progress unavailable"
             : clean(resolved.kind);
@@ -651,8 +671,9 @@ export async function runMissionWatch(
           try {
             const mergedById = new Map<string, EntryHead>();
             for (const existing of priorCache?.entries ?? []) mergedById.set(existing.entryId, existing);
-            let nextSince: number | undefined = priorCache && priorCache.cursor > 0 ? priorCache.cursor : undefined;
-            let finalCursor = priorCache?.cursor ?? 0;
+            const startCursor = priorCache?.cursor ?? 0;
+            let nextSince: number | undefined = startCursor > 0 ? startCursor : undefined;
+            let finalCursor = startCursor;
             let hasMore = false;
             for (let pageIndex = 0; pageIndex < MAX_ENTRY_PAGES; pageIndex += 1) {
               const entryQuery = nextSince !== undefined ? `?since=${nextSince}` : "";
@@ -665,9 +686,33 @@ export async function runMissionWatch(
               if (!page.more || page.entries.length === 0 || page.cursor <= (nextSince ?? 0)) break;
               nextSince = page.cursor;
             }
+            if (startCursor > 0 && !hasMore) {
+              const refreshWindow = [...mergedById.values()]
+                .sort((a, b) => a.seq - b.seq)
+                .slice(-REFRESH_WINDOW_ENTRIES);
+              if (refreshWindow.some(entry => entry.seq <= startCursor)) {
+                const refreshSince = Math.max(0, refreshWindow[0]!.seq - 1);
+                const refreshQuery = refreshSince > 0 ? `?since=${refreshSince}` : "";
+                const refreshed = await api.json<EntryPage>(
+                  `/teams/${encodeURIComponent(verifiedTeamId)}/entries${refreshQuery}`,
+                  undefined,
+                  abort.signal,
+                );
+                for (const head of refreshed.entries) {
+                  mergedById.set(head.entryId, head);
+                }
+                if (refreshed.cursor > finalCursor) finalCursor = refreshed.cursor;
+              }
+            }
             const mergedEntries = [...mergedById.values()]
               .sort((a, b) => a.seq - b.seq)
               .slice(-MAX_RETAINED_ENTRIES);
+            const syncedSelectedEntry = priorCache?.selectedEntry
+              ? {
+                  ...priorCache.selectedEntry,
+                  head: mergedById.get(priorCache.selectedEntry.head.entryId) ?? priorCache.selectedEntry.head,
+                }
+              : undefined;
             state = {
               ...state,
               entriesByTeam: {
@@ -677,7 +722,7 @@ export async function runMissionWatch(
                   entries: mergedEntries,
                   cursor: finalCursor,
                   more: hasMore,
-                  selectedEntry: priorCache?.selectedEntry,
+                  selectedEntry: syncedSelectedEntry,
                   detailError: priorCache?.detailError,
                 },
               },

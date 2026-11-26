@@ -8,6 +8,7 @@ import type { Mission } from "../packages/host/src/mission-types.js";
 import type { TeamRun } from "../packages/host/src/team-types.js";
 import {
   applyMissionWatchCommand,
+  currentWatchAssignmentCount,
   initialMissionWatchState,
   missionWatchCommand,
   missionWatchResyncBanner,
@@ -582,7 +583,14 @@ test("real projectMissionChild projection surfaces replaced implementer attempts
   });
 
   const page = await service.read(MISSION_ID);
+  const linked = page.snapshot.subtasks[0]?.child;
+  assert.equal(linked?.kind, "linked");
+  if (linked?.kind === "linked") {
+    assert.equal(linked.assignments.length, 2);
+    assert.equal(currentWatchAssignmentCount(linked.assignments), 1);
+  }
   const text = missionWatchText(mission, page, initialMissionWatchState());
+  assert.match(text, /API changes.*\(implementing · 1 assigned\)/);
   assert.match(text, /implementer · t1\s+recorded:running\s+worker:running\s+r2/);
   assert.match(text, /earlier attempt: recorded:stopped\s+r2/);
 });
@@ -737,4 +745,85 @@ test("runMissionWatch --json keeps stdout valid NDJSON and routes transient poll
   assert.equal(parsed[1].mission.revision, 5);
   assert.equal(jsonFrames.some(line => line.includes("Update failed") || line.includes("Ctrl+C")), false);
   assert.match(stderrChunks.join(""), /Update failed: upstream poll timeout/);
+});
+
+test("runMissionWatch refreshes cached entry states to withdrawn and superseded while following", async () => {
+  const mission = makeMission();
+  let serverEntries: EntryHead[] = [
+    { ...sampleEntries[0]!, entryId: "e-1", seq: 42, state: "active", summary: "Initial check" },
+    { ...sampleEntries[1]!, entryId: "e-2", seq: 43, state: "active", summary: "Initial finding" },
+  ];
+  const frames: string[] = [];
+  const abort = new AbortController();
+  let poll = 0;
+
+  await runMissionWatch(
+    {
+      json: async <T>(path: string): Promise<T> => {
+        if (path === `/missions/${MISSION_ID}`) {
+          poll += 1;
+          if (poll === 2) {
+            serverEntries = [
+              { ...serverEntries[0]!, state: "withdrawn" },
+              { ...serverEntries[1]!, state: "superseded" },
+              {
+                ...sampleEntries[1]!,
+                entryId: "e-3",
+                seq: 44,
+                supersedes: "e-2",
+                state: "active",
+                summary: "Updated finding",
+              },
+            ];
+          } else if (poll === 3) {
+            serverEntries = [
+              serverEntries[0]!,
+              serverEntries[1]!,
+              { ...serverEntries[2]!, state: "withdrawn" },
+            ];
+            abort.abort();
+          }
+          return mission as T;
+        }
+        if (path.startsWith(`/missions/${MISSION_ID}/progress`)) {
+          return makeProgress(
+            poll === 1 ? { required: true, reason: "initial" } : { required: false },
+            GEN_1,
+            poll,
+          ) as T;
+        }
+        if (path.startsWith(`/teams/${TEAM_1}/entries/`)) {
+          const entryId = path.slice(`/teams/${TEAM_1}/entries/`.length);
+          const head = serverEntries.find(item => item.entryId === entryId)!;
+          return { head, body: { entryId } } as T;
+        }
+        if (path.startsWith(`/teams/${TEAM_1}/entries`)) {
+          const match = /\?since=(\d+)/.exec(path);
+          const since = match ? Number(match[1]) : 0;
+          const slice = serverEntries.filter(item => item.seq > since).slice(0, 50);
+          const cursor = slice.length ? slice[slice.length - 1]!.seq : since;
+          const more = serverEntries.some(item => item.seq > cursor);
+          return { entries: slice, cursor, more } as T;
+        }
+        throw new Error(`Unexpected path: ${path}`);
+      },
+    },
+    MISSION_ID,
+    {
+      tty: false,
+      interactive: false,
+      pollIntervalMs: 1,
+      signal: abort.signal,
+      initialState: { showEntries: true, showDetail: true, follow: true },
+      onFrame: text => frames.push(text),
+    },
+  );
+
+  assert.equal(frames.length, 3);
+  assert.doesNotMatch(frames[0]!, /\[withdrawn\]|\[superseded\]/);
+  assert.match(frames[1]!, /blackboard #42\s+check\s+host receipt\s+\[withdrawn\]/);
+  assert.match(frames[1]!, /blackboard #43\s+finding\s+agent claim\s+\[superseded\]/);
+  assert.match(frames[1]!, /blackboard #44\s+finding\s+agent claim\s+implementer/);
+  assert.match(frames[2]!, /blackboard #44\s+finding\s+agent claim\s+\[withdrawn\]/);
+  assert.match(frames[2]!, /ENTRY DETAIL\s+blackboard #44\s+finding\s+agent claim\s+\[withdrawn\]/);
 });

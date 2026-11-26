@@ -417,3 +417,22 @@ export function compactAssignments(assignments: readonly MissionProgressMember[]
     finished: unlinkedFinished,
   };
 }
+
+export function currentAssignmentCount(assignments: readonly MissionProgressMember[]): number {
+  const active = assignments.filter(member => !isConfirmedFinishedMember(member));
+  const activeTaskSlots = new Set(
+    active.filter(member => member.taskId !== undefined).map(member => `${member.role}\0${member.taskId}`),
+  );
+  const finishedTaskSlots = new Set<string>();
+  let finishedUnscoped = 0;
+  for (const member of assignments) {
+    if (!isConfirmedFinishedMember(member)) continue;
+    if (member.taskId === undefined) {
+      finishedUnscoped += 1;
+      continue;
+    }
+    const slot = `${member.role}\0${member.taskId}`;
+    if (!activeTaskSlots.has(slot)) finishedTaskSlots.add(slot);
+  }
+  return active.length + finishedTaskSlots.size + finishedUnscoped;
+}

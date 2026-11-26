@@ -358,12 +358,50 @@ test("child projection rejects a run whose mission or project binding does not m
   }
 });
 
-test("child projection retains bounded prior attempts for current tasks without crowding out current assignments", () => {
-  const priorMembers = Array.from({ length: 4 }, (_, index) => ({
+test("child projection retains bounded same-revision prior attempts without attributing earlier plan revisions or crowding out current assignments", () => {
+  const earlierRevisionMember = {
     runId: childId,
     memberId: randomUUID(),
     sessionId: randomUUID(),
-    revision: index < 2 ? 1 : 2,
+    revision: 1,
+    role: "implementer" as const,
+    taskId: "task-api",
+    status: "stopped" as const,
+    exitConfirmedAt: at,
+  };
+  const replannedRun = {
+    id: childId,
+    projectId: "api",
+    missionId,
+    revision: 2,
+    status: "implementing",
+    updatedAt: at,
+    tasks: [{ id: "task-api", revision: 2, memberId }],
+    members: [
+      earlierRevisionMember,
+      {
+        runId: childId,
+        memberId,
+        sessionId: memberSession,
+        revision: 2,
+        role: "implementer" as const,
+        taskId: "task-api",
+        status: "running" as const,
+      },
+    ],
+    checks: [],
+  } as unknown as TeamRun;
+  const replanned = projectMissionChild(replannedRun, missionId, "api");
+  assert.equal(replanned.kind, "linked");
+  if (replanned.kind !== "linked") return;
+  assert.deepEqual(replanned.assignments.map(item => item.memberId), [memberId]);
+  assert.equal(replanned.assignmentsTruncated, undefined);
+
+  const priorMembers = Array.from({ length: 4 }, () => ({
+    runId: childId,
+    memberId: randomUUID(),
+    sessionId: randomUUID(),
+    revision: 2,
     role: "implementer" as const,
     taskId: "task-api",
     status: "stopped" as const,
@@ -386,7 +424,7 @@ test("child projection retains bounded prior attempts for current tasks without 
     status: "implementing",
     updatedAt: at,
     tasks: [{ id: "task-api", revision: 2, memberId }],
-    members: [...priorMembers, currentMember],
+    members: [earlierRevisionMember, ...priorMembers, currentMember],
     checks: [],
   } as unknown as TeamRun;
 
@@ -399,6 +437,7 @@ test("child projection retains bounded prior attempts for current tasks without 
     projected.assignments.slice(1).map(item => item.memberId),
     priorMembers.slice(-3).map(item => item.memberId),
   );
+  assert.equal(projected.assignments.some(item => item.memberId === earlierRevisionMember.memberId), false);
 
   const currentTwelve = Array.from({ length: 12 }, (_, index) => ({
     runId: childId,

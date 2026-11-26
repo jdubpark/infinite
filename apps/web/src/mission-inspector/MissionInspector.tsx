@@ -4,6 +4,7 @@ import { useApi, type DecisionRecommendation, type Me } from "../api";
 import { Decision } from "../team-decision";
 import {
   compactAssignments,
+  currentAssignmentCount,
   isAwaitingExitMember,
   missionProgressResyncNotice,
   resolveMissionChild,
@@ -379,7 +380,7 @@ export function MissionSubtaskInspector({
               const resolved = resolveMissionChild(mission, subtask, progress.snapshot, { progressError, progressLoading });
               const childLabel =
                 resolved.kind === "linked"
-                  ? `${resolved.child.status} · ${resolved.child.assignments.length} assigned`
+                  ? `${resolved.child.status} · ${currentAssignmentCount(resolved.child.assignments)} assigned`
                   : resolved.kind === "loading"
                     ? "loading progress"
                     : resolved.kind === "unavailable"

@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import {
   applyMissionProgressPage,
   compactAssignments,
+  currentAssignmentCount,
   initialMissionProgressState,
   isAwaitingExitMember,
   MAX_PROGRESS_OBSERVATIONS,
@@ -587,8 +588,25 @@ test("real projectMissionChild projection feeds replaced implementer prior attem
   assert.equal(resolved.kind, "linked");
   if (resolved.kind !== "linked") return;
   const compacted = compactAssignments(resolved.child.assignments);
+  assert.equal(resolved.child.assignments.length, 2);
+  assert.equal(currentAssignmentCount(resolved.child.assignments), 1);
   assert.equal(compacted.active.length, 1);
   assert.equal(compacted.active[0]?.member.memberId, replacementId);
   assert.deepEqual(compacted.active[0]?.priorAttempts.map(item => item.memberId), [replacedId]);
   assert.equal(compacted.finished.length, 0);
+
+  const finishedWithReplacement: MissionProgressMember[] = [
+    { ...resolved.child.assignments[0]!, recordedStatus: "stopped", exitConfirmedAt: "2026-11-26T02:05:00.000Z" },
+    resolved.child.assignments[1]!,
+    {
+      runId: childRunId,
+      memberId: randomUUID(),
+      sessionId: randomUUID(),
+      revision: 2,
+      role: "reviewer",
+      recordedStatus: "running",
+      workerStatus: "running",
+    },
+  ];
+  assert.equal(currentAssignmentCount(finishedWithReplacement), 2);
 });

@@ -88,14 +88,14 @@ export function projectMissionChild(run: TeamRun, expectedMissionId: string, exp
   }
   const priorSelected = new Map<string, TeamMember>();
   let priorTruncated = false;
-  const collectPrior = (role: TeamMember["role"], taskId: string, currentMemberId: string) => {
+  const collectPrior = (role: TeamMember["role"], taskId: string, currentMemberId: string, planRevision: number) => {
     const candidates = recentMembers.filter(member =>
       member.runId === run.id
       && member.memberId !== currentMemberId
       && !selected.has(member.memberId)
       && member.role === role
       && member.taskId === taskId
-      && member.revision <= run.revision,
+      && member.revision === planRevision,
     );
     if (candidates.length > MAX_PRIOR_ATTEMPTS_PER_SLOT) priorTruncated = true;
     for (const candidate of candidates.slice(-MAX_PRIOR_ATTEMPTS_PER_SLOT)) {
@@ -104,11 +104,11 @@ export function projectMissionChild(run: TeamRun, expectedMissionId: string, exp
   };
   for (const task of currentTasks) {
     const member = selected.get(task.memberId!);
-    if (member) collectPrior(member.role, task.id, member.memberId);
+    if (member) collectPrior(member.role, task.id, member.memberId, task.revision ?? run.revision);
   }
   for (const task of currentScouts) {
     const member = selected.get(task.memberId!);
-    if (member) collectPrior("scout", task.id, member.memberId);
+    if (member) collectPrior("scout", task.id, member.memberId, run.discovery!.revision);
   }
   const currentMembers = [...selected.values()];
   const priorMembers = [...priorSelected.values()];

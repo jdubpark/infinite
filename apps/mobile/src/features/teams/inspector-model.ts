@@ -26,7 +26,7 @@ const WAIT_REASON_PRIORITY: Record<TeamWaitReasonKind, number> = {
 };
 
 export function waitReasonLabel(kind: TeamWaitReasonKind): string {
-  return WAIT_REASON_LABELS[kind];
+  return WAIT_REASON_LABELS[kind] ?? kind;
 }
 
 export function waitReasonTone(kind: TeamWaitReasonKind): "error" | "attention" | undefined {
@@ -49,7 +49,7 @@ export function orderMobileWaitReasons(reasons: readonly TeamWaitReason[] | unde
     .map(({ reason }) => reason);
 }
 
-const CLOSED_TEAM_STATUSES = new Set<TeamStatus>(["ready-for-review", "cancelled", "no-change", "merged"]);
+const SUPPRESSED_LIST_WAIT_STATUSES = new Set<TeamStatus>(["ready-for-review", "cancelled", "no-change", "merged", "paused", "blocked"]);
 const SPINNER_FALLBACK_MEMBER_STATUSES = new Set(["running", "waiting"]);
 const SPINNER_ONLY_PRIORITY = WAIT_REASON_PRIORITY["spinner-only"];
 
@@ -78,7 +78,7 @@ export function summarizeMobileListWaitReason(
   team: Pick<TeamListItem, "status" | "revision" | "waitReasons" | "members">,
   formatTime: (iso: string) => string = shortDate,
 ): MobileListWaitReasonSummary | undefined {
-  if (CLOSED_TEAM_STATUSES.has(team.status)) return undefined;
+  if (SUPPRESSED_LIST_WAIT_STATUSES.has(team.status)) return undefined;
 
   const ordered = orderMobileWaitReasons(team.waitReasons);
   const top = ordered[0];
@@ -87,7 +87,7 @@ export function summarizeMobileListWaitReason(
   if (top && topPriority <= SPINNER_ONLY_PRIORITY) {
     return {
       kind: top.kind,
-      label: waitReasonLabel(top.kind) ?? top.kind,
+      label: waitReasonLabel(top.kind),
       summary: normalizeWaitReasonSummary(top.summary),
       extraCount: ordered.length - 1,
       tone: waitReasonTone(top.kind),
@@ -98,6 +98,7 @@ export function summarizeMobileListWaitReason(
     member.revision === team.revision
     && SPINNER_FALLBACK_MEMBER_STATUSES.has(member.status)
     && !member.stalledAt?.trim()
+    && !member.pendingLimit
     && Boolean(member.spinnerOnlySince?.trim()),
   );
 
@@ -115,7 +116,7 @@ export function summarizeMobileListWaitReason(
 
   return {
     kind: top.kind,
-    label: waitReasonLabel(top.kind) ?? top.kind,
+    label: waitReasonLabel(top.kind),
     summary: normalizeWaitReasonSummary(top.summary),
     extraCount: ordered.length - 1,
     tone: waitReasonTone(top.kind),

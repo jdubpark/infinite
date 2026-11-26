@@ -869,7 +869,7 @@ test("summarizeMobileListWaitReason falls back to active current-revision spinne
     tone: "error",
   });
 
-  for (const closedStatus of ["cancelled", "no-change", "merged", "ready-for-review"] as const) {
+  for (const closedStatus of ["cancelled", "no-change", "merged", "ready-for-review", "paused", "blocked"] as const) {
     assert.equal(summarizeMobileListWaitReason(makeTeam({
       status: closedStatus,
       revision: 2,
@@ -877,4 +877,84 @@ test("summarizeMobileListWaitReason falls back to active current-revision spinne
       members: [makeMember("m-spin", { revision: 2, status: "running", spinnerOnlySince: "2026-11-26T00:12:00.000Z" })],
     })), undefined);
   }
+
+  const pendingLimitMember = summarizeMobileListWaitReason(makeTeam({
+    status: "implementing",
+    revision: 2,
+    waitReasons: [{ kind: "provider-limit", summary: "Provider codex limit active." }],
+    members: [
+      makeMember("m-limited", { revision: 2, status: "running", pendingLimit: true, spinnerOnlySince: "2026-11-26T00:12:00.000Z" }),
+    ],
+  }));
+  assert.deepEqual(pendingLimitMember, {
+    kind: "provider-limit",
+    label: "Provider limit",
+    summary: "Provider codex limit active.",
+    extraCount: 0,
+    tone: "attention",
+  });
+
+  assert.equal(summarizeMobileListWaitReason(makeTeam({
+    status: "implementing",
+    revision: 2,
+    waitReasons: [],
+    members: [
+      makeMember("m-limited", { revision: 2, status: "running", pendingLimit: true, spinnerOnlySince: "2026-11-26T00:12:00.000Z" }),
+    ],
+  })), undefined);
+
+  const hostSpinnerAlreadyPresent = summarizeMobileListWaitReason(makeTeam({
+    status: "implementing",
+    revision: 2,
+    waitReasons: [{ kind: "spinner-only", summary: "Host spinner summary", memberId: "m-spin" }],
+    members: [
+      makeMember("m-spin", { revision: 2, status: "running", spinnerOnlySince: "2026-11-26T00:12:00.000Z" }),
+    ],
+  }));
+  assert.deepEqual(hostSpinnerAlreadyPresent, {
+    kind: "spinner-only",
+    label: "Spinner-only",
+    summary: "Host spinner summary",
+    extraCount: 0,
+    tone: "attention",
+  });
+
+  const blankTitleFallback = summarizeMobileListWaitReason(makeTeam({
+    status: "implementing",
+    revision: 2,
+    waitReasons: [],
+    members: [
+      makeMember("m-blank", { revision: 2, role: "implementer", title: "   ", status: "running", spinnerOnlySince: "2026-11-26T00:12:00.000Z" }),
+    ],
+  }), iso => `fmt(${iso})`);
+  assert.deepEqual(blankTitleFallback, {
+    kind: "spinner-only",
+    label: "Spinner-only",
+    summary: "Implementer showing spinner redraws since fmt(2026-11-26T00:12:00.000Z)",
+    extraCount: 0,
+    tone: "attention",
+  });
+
+  const futureKind = "future-gate" as TeamWaitReasonKind;
+  assert.equal(waitReasonLabel(futureKind), "future-gate");
+  assert.deepEqual(
+    orderMobileWaitReasons([
+      { kind: futureKind, summary: "Future wait" },
+      { kind: "linear-sync", summary: "Linear pending" },
+    ]).map(item => item.kind),
+    ["linear-sync", futureKind],
+  );
+  assert.deepEqual(
+    summarizeMobileListWaitReason(makeTeam({
+      status: "implementing",
+      waitReasons: [{ kind: futureKind, summary: "  Future   gate  " }],
+    })),
+    {
+      kind: futureKind,
+      label: "future-gate",
+      summary: "Future gate",
+      extraCount: 0,
+      tone: undefined,
+    },
+  );
 });

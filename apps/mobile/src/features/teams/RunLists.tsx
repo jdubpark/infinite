@@ -79,7 +79,7 @@ function TeamRunRow({ connection, team: received, role, machine, now, kind, done
   const canContinue = canContinueBlockedTeam(team, role);
   const resume = () => request.send(`/teams/${team.id}/resume`, "Resume", team.revision);
   const { kind: rowKind } = canResume ? { kind: "blocked" as const } : { kind };
-  const waitSummary = team.status === "blocked" ? undefined : summarizeMobileListWaitReason(team);
+  const waitSummary = summarizeMobileListWaitReason(team);
   const normalizedNote = note.replace(/\s+/g, " ").trim();
   const duplicateActionCount = Boolean(
     waitSummary
@@ -119,11 +119,13 @@ function TeamRunRow({ connection, team: received, role, machine, now, kind, done
           {team.status === "blocked" ? <Text style={s.blockedReason} numberOfLines={2}>{team.reason ?? " "}</Text>
             : note ? <Text style={s.alert} numberOfLines={1}>{note}</Text>
               : <Text style={s.meta} numberOfLines={1}>{[project(team.projectId), team.linear?.issue?.identifier, team.goal ? `Goal cycle ${team.goal.cycle}` : ""].filter(Boolean).join(" · ")}</Text>}
-          {shownWait ? <Text style={[s.waitLine, shownWait.tone === "attention" && s.attentionText, shownWait.tone === "error" && s.errorText]} numberOfLines={1}>
-            <Text style={s.waitLabel}>{shownWait.label}</Text>
-            {shownWait.summary ? ` · ${shownWait.summary}` : ""}
-            {shownWait.extraCount > 0 ? ` (+${shownWait.extraCount})` : ""}
-          </Text> : null}
+          {shownWait ? <View style={s.waitRow}>
+            <Text style={[s.waitLine, shownWait.tone === "attention" && s.attentionText, shownWait.tone === "error" && s.errorText]} numberOfLines={1}>
+              <Text style={s.waitLabel}>{shownWait.label}</Text>
+              {shownWait.summary ? ` · ${shownWait.summary}` : ""}
+            </Text>
+            {shownWait.extraCount > 0 ? <Text style={[s.waitExtra, shownWait.tone === "attention" && s.attentionText, shownWait.tone === "error" && s.errorText]}>(+{shownWait.extraCount})</Text> : null}
+          </View> : null}
         </View>
       </Pressable>
       {canResume ? <Button compact busy={request.busy} secondary title="Resume" disabled={request.busy || Boolean(request.pending)} onPress={resume} /> : null}
@@ -191,8 +193,10 @@ export const listStyles = StyleSheet.create({
   errorText: { color: theme.colors.error },
   meta: { fontSize: 12, lineHeight: 17, color: theme.colors.mutedInk, flexShrink: 1 },
   alert: { fontSize: 13, lineHeight: 18, color: theme.colors.warningInk },
+  waitRow: { flexDirection: "row", alignItems: "center", gap: 4 },
   waitLine: { fontSize: 12, lineHeight: 17, color: theme.colors.mutedInk, flexShrink: 1 },
   waitLabel: { fontWeight: "600" },
+  waitExtra: { fontSize: 12, lineHeight: 17, color: theme.colors.mutedInk, flexShrink: 0 },
   blockedReason: { minHeight: 34, fontSize: 12, lineHeight: 17, color: theme.colors.error, flexShrink: 1 },
   notice: { backgroundColor: theme.colors.warningSurface, color: theme.colors.warningInk, fontSize: 12, lineHeight: 18, padding: 12, borderRadius: theme.radius.card, marginTop: 12 },
   empty: { paddingVertical: 40, paddingHorizontal: 12, gap: 8, alignItems: "center" },

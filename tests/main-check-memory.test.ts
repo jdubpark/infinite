@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { MainCheckService, type MainCheckPorts } from "../packages/host/src/main-check.js";
-import { emptyRecord, type MainCheckRecord } from "../packages/host/src/main-check-state.js";
+import { emptyRecord, type MainCheckRecord, type Retiring } from "../packages/host/src/main-check-state.js";
 import type { TeamProject } from "../packages/host/src/team-types.js";
 import type { CommandResult } from "../packages/host/src/team-workspace.js";
 import type { Config } from "../packages/host/src/types.js";
@@ -281,44 +281,73 @@ test("after a boot change a hidden process holds no copy on Linux, and on macOS 
   }
 });
 
-test("a host stop after a check finished while start tokens of its commands were still being read, right away or after one late token was saved, leaves a copy the next service retires in the same boot once its processes end (INF-502)", async () => {
+async function finishedWithUnreadTokens(early: number) {
+  const host = new Host();
+  const world = host.world.ports({ id: 1, stopped: false });
+  const unread: { pid: number; deliver: () => void }[] = [];
+  let holding = false;
+  const processes: MainCheckPorts["processes"] = {
+    ...world.processes,
+    start: async pid => {
+      const token = await world.processes.start(pid);
+      if (holding) await new Promise<void>(deliver => unread.push({ pid, deliver }));
+      return token;
+    },
+  };
+  const run: MainCheckPorts["run"] = (...args) => {
+    holding = true;
+    return world.run(...args);
+  };
+  const directory = await admitted(host, { processes, run });
+  for (let second = 0; second < 60 && !host.view().last; second += 1) await host.advance(1_000);
+  assert.equal(host.view().last?.outcome, "passed");
+  assert.ok(unread.length > early, `${unread.length} start tokens were still being read when the check finished`);
+  const finished = host.record()?.retiring?.[0];
+  const late = unread.splice(0, early);
+  for (const { deliver } of late) deliver();
+  await turns();
+  await host.advance(1_000);
+  return { host, directory, finished, late, unread };
+}
+
+test("a check that finishes while start tokens of its commands are still being read saves each command without a token as a group and a session, and no recording flag, at the finish and after one late token is saved (INF-502)", async () => {
   for (const early of [0, 1]) {
-    const host = new Host();
-    const world = host.world.ports({ id: 1, stopped: false });
-    const held: { pid: number; deliver: () => void }[] = [];
-    let holding = false;
-    const processes: MainCheckPorts["processes"] = {
-      ...world.processes,
-      start: async pid => {
-        const token = await world.processes.start(pid);
-        if (holding) await new Promise<void>(deliver => held.push({ pid, deliver }));
-        return token;
-      },
-    };
-    const run: MainCheckPorts["run"] = (...args) => {
-      holding = true;
-      return world.run(...args);
-    };
-    const directory = await admitted(host, { processes, run });
-    for (let second = 0; second < 60 && !host.view().last; second += 1) await host.advance(1_000);
-    assert.equal(host.view().last?.outcome, "passed");
-    assert.ok(held.length > early, `${held.length} start tokens were still being read when the check finished`);
-    const late = held.splice(0, early);
-    for (const { deliver } of late) deliver();
-    await turns();
-    await host.advance(1_000);
-    const saved = host.record()?.retiring?.[0]?.witness.processes.map(item => item.pid) ?? [];
-    assert.ok(late.every(({ pid }) => saved.includes(pid)), "each late token was saved after the finish");
-    const leftover = host.world.hide(`${ANCHOR_ROOT}/${directory}`);
+    const { host, finished, late, unread } = await finishedWithUnreadTokens(early);
+    const saved = host.record()?.retiring?.[0];
+    assert.ok(late.every(({ pid }) => saved?.witness.processes.some(item => item.pid === pid)), "each late token was saved after the finish");
+    const moments: [string, Retiring | undefined, number[]][] = [
+      ["at the finish", finished, [...late, ...unread].map(item => item.pid)],
+      [`after ${early} late token(s) were saved`, saved, unread.map(item => item.pid)],
+    ];
+    for (const [moment, entry, commands] of moments) {
+      assert.ok(entry, `${moment}: the copy is retiring`);
+      assert.equal(entry.recording, undefined, `${moment}: the retiring entry carries no recording flag`);
+      for (const pid of commands) {
+        assert.equal(entry.witness.processes.some(item => item.pid === pid), false, `${moment}: command ${pid} has no start token on disk`);
+        assert.ok(entry.witness.groups.includes(pid) && entry.witness.sessions.includes(pid), `${moment}: command ${pid} is on disk as a group and a session`);
+      }
+    }
     await host.service.close();
-    for (const { deliver } of held) deliver();
+  }
+});
+
+test("after a host stop, a live process in the group and session of a command whose start token was never saved holds the copy, and once it ends the copy retires in the same boot (INF-502)", async () => {
+  for (const early of [0, 1]) {
+    const { host, directory, unread } = await finishedWithUnreadTokens(early);
+    const command = unread[0]!.pid;
+    const child = host.world.hide();
+    Object.assign(host.world.processes.get(child)!, { pgid: command, sid: command, uninspectable: false });
+    await host.service.close();
+    for (const { deliver } of unread) deliver();
     await host.open();
-    await host.advance(PASS_MS);
-    assert.equal(retiringOf(host), 1, `${early} late token(s) saved: a process of the run holds the copy after the host start`);
-    assert.equal(host.view().waiting, "processes");
-    host.world.end(leftover);
+    for (let pass = 1; pass <= 3; pass += 1) {
+      await host.advance(PASS_MS);
+      assert.equal(retiringOf(host), 1, `${early} late token(s) saved, pass ${pass}: process ${child} in the group of command ${command} holds the copy`);
+      assert.equal(host.view().waiting, "processes");
+    }
+    host.world.end(child);
     await untilRetired(host);
-    assert.equal(retiringOf(host), 0, `${early} late token(s) saved: the copy retired in the same boot once its processes ended`);
+    assert.equal(retiringOf(host), 0, `${early} late token(s) saved: the copy retired in the same boot once that process ended`);
     assert.equal(host.world.runs.get(`${ANCHOR_ROOT}/${directory}`)?.exists, false, "the copy was removed");
   }
 });

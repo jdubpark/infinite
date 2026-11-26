@@ -6,8 +6,9 @@ import { planDigest } from "./run-events.js";
 import type { Capsule, EvalFeatures, EvalJobWait, TrialEnding } from "./eval-types.js";
 import { JUDGE_PACKAGE_DIR, type Judgement, type JudgeEnding } from "./judge-types.js";
 import type { CalibrationWait } from "./judge-store.js";
-import { judgePrompt } from "./judge-prompt.js";
+import { judgePromptSpec } from "./judge-prompt.js";
 import type { ProviderLimit } from "./provider-limits.js";
+import type { TeamPromptSection } from "./team-prompt-sections.js";
 import type { Config, ExecutionIdentity, Provider, SessionPurpose } from "./types.js";
 import type { TeamCommand, TeamMember, TeamModelProfile, TeamReport, TeamRun } from "./team-types.js";
 import { assertMemberReadOnly, assertSecureAncestors, TeamError } from "./team-workspace.js";
@@ -58,7 +59,7 @@ export type ReplayHost = {
   cancel(holder: ReplayHolder): Promise<void>;
   sessionStatus(sessionId: string): Promise<string | undefined>;
   activeMember(member: TeamMember): boolean;
-  prepare(holder: ReplayHolder, onPrepared: (member: TeamMember) => void, prebuilt: { prompt: string; profile: TeamModelProfile }): void;
+  prepare(holder: ReplayHolder, onPrepared: (member: TeamMember) => void, prebuilt: { prompt: string; promptSections?: TeamPromptSection[]; profile: TeamModelProfile }): void;
   operation(holder: ReplayHolder, perform: (signal: AbortSignal) => Promise<unknown>, complete: () => void, member: TeamMember): void;
 };
 
@@ -274,7 +275,7 @@ export class TeamReplay {
     const { run } = holder, replay = run.replay;
     if (replay?.purpose !== "duel") return false;
     if (replay.ending || run.members.length || run.status !== "implementing" || !run.lineup) return true;
-    this.host.prepare(holder, () => {}, { prompt: judgePrompt(run.lineup.coordinator.provider), profile: run.lineup.coordinator });
+    this.host.prepare(holder, () => {}, { ...judgePromptSpec(run.lineup.coordinator.provider), profile: run.lineup.coordinator });
     return true;
   }
 

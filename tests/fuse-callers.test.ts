@@ -101,7 +101,8 @@ test("a goal waits at check before it prepares a cycle", async () => {
   } finally { bare.close(); g.close(); }
 });
 
-test("a routine waits at check and keeps its schedule", async () => {
+test("a routine waits at check and keeps its schedule", async t => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
   const root = mkdtempSync(join(tmpdir(), "fuse-routine-"));
   const stateDir = join(root, "state"); mkdirSync(stateDir);
   const config = {
@@ -127,7 +128,7 @@ test("a routine waits at check and keeps its schedule", async () => {
     intervalMinutes: 5, maxOccurrences: 2, startsAt: start, expiresAt: new Date(Date.now() + 30 * 60_000).toISOString() };
   try {
     const created: Routine = await routines.create(routine);
-    await new Promise(resolve => setTimeout(resolve, 30));
+    t.mock.timers.tick(30);
     await routines.tick();
     await routines.tick();
     const waiting = routines.get(created.id);

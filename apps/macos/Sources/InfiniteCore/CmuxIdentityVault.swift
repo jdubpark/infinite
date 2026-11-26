@@ -17,9 +17,7 @@ struct CmuxIdentityVault {
         }
         let directory = URL(fileURLWithPath: String(cString: path), isDirectory: true)
         do {
-            var query = baseQuery
-            query[kSecReturnData as String] = true
-            query[kSecMatchLimit as String] = kSecMatchLimitOne
+            let query = KeychainQuery.read(service: service, account: profileID)
             var item: CFTypeRef?
             let status = SecItemCopyMatching(query as CFDictionary, &item)
             guard status == errSecSuccess || status == errSecItemNotFound else { throw keychainError(status) }
@@ -56,12 +54,10 @@ struct CmuxIdentityVault {
         }
         guard !archive.isEmpty else { return }
         let payload = try JSONEncoder().encode(archive)
-        let update = [kSecValueData as String: payload]
-        let status = SecItemUpdate(baseQuery as CFDictionary, update as CFDictionary)
+        let update: [String: Any] = [kSecValueData as String: payload]
+        let status = SecItemUpdate(KeychainQuery.match(service: service, account: profileID) as CFDictionary, update as CFDictionary)
         if status == errSecItemNotFound {
-            var query = baseQuery
-            query[kSecValueData as String] = payload
-            query[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+            let query = KeychainQuery.add(service: service, account: profileID, data: payload)
             let created = SecItemAdd(query as CFDictionary, nil)
             guard created == errSecSuccess else { throw keychainError(created) }
         } else if status != errSecSuccess { throw keychainError(status) }
@@ -71,12 +67,10 @@ struct CmuxIdentityVault {
         try FileManager.default.removeItem(at: directory)
     }
 
-    private var baseQuery: [String: Any] {
-        [kSecClass as String: kSecClassGenericPassword,
-         kSecAttrService as String: service, kSecAttrAccount as String: profileID]
-    }
-
-    private func keychainError(_ status: OSStatus) -> CmuxTransportError {
-        .failed("The cmux identity could not be secured in Keychain (\(status)).")
+    func keychainError(_ status: OSStatus) -> CmuxTransportError {
+        if status == errSecInteractionNotAllowed {
+            return .failed("Keychain is locked or requires permission to access the cmux identity. Unlock Keychain and try again.")
+        }
+        return .failed("The cmux identity could not be secured in Keychain (\(status)).")
     }
 }

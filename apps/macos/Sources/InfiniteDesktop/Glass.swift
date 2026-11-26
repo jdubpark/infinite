@@ -66,7 +66,41 @@ struct StatusGlyph: View {
         case .aborted: kind = .stopped
         }
     }
+    init(teamSeed: TeamSeed, size: CGFloat = 14) {
+        self.size = size
+        switch teamSeed.typedStatus {
+        case .unknown(let raw) where raw.isEmpty: kind = .todo
+        case .cancelled: kind = .cancelled
+        case .noChange: kind = .stopped
+        case .merged: kind = .done
+        case .paused: kind = .paused
+        case .blocked: kind = .blocked
+        case .needsInput: kind = .attention
+        case .readyForReview: kind = .review
+        case .planning, .discovering, .implementing, .integrating, .verifying, .reviewing, .delivering, .unknown:
+            kind = .progress(0.25)
+        }
+    }
+    init(teamLoadState: TeamLoadState, size: CGFloat = 14) {
+        switch teamLoadState {
+        case .loading(let seed, _): self.init(teamSeed: seed, size: size)
+        case .listSeed(let run), .loaded(let run, _): self.init(team: run, size: size)
+        }
+    }
     init(item: BoardItem, size: CGFloat = 14) { self.init(Self.board(item.column, item.status, item.progressFraction), size: size) }
+    init(missionSeed: MissionSeed, size: CGFloat = 14) {
+        if missionSeed.status.isEmpty {
+            self.init(.todo, size: size)
+        } else {
+            self.init(Self.board(missionSeed.column, missionSeed.status, missionSeed.progressFraction), size: size)
+        }
+    }
+    init(missionLoadState: MissionLoadState, size: CGFloat = 14) {
+        switch missionLoadState {
+        case .loading(let seed, _): self.init(missionSeed: seed, size: size)
+        case .loaded(let mission): self.init(mission: mission, size: size)
+        }
+    }
     init(mission: Mission, size: CGFloat = 14) {
         let (done, total) = mission.progress
         self.init(Self.board(mission.column, mission.status, total > 0 ? max(0.25, Double(done) / Double(total)) : 0.25), size: size)

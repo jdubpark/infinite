@@ -467,7 +467,7 @@ private actor ControlCallTracker {
         await missionSteer1.value
         XCTAssertFalse(missionModel.busy)
         XCTAssertEqual(missionModel.mutationState, .idle)
-        XCTAssertEqual(missionModel.mission.revision, 2)
+        XCTAssertEqual(missionModel.mission?.revision, 2)
         XCTAssertEqual(missionModel.notice, "Revision mismatch The mission was refreshed; review it before sending again.")
 
         await missionModel.steer()
@@ -513,12 +513,180 @@ private actor ControlCallTracker {
         await teamSteer1.value
         XCTAssertFalse(teamModel.busy)
         XCTAssertEqual(teamModel.mutationState, .idle)
-        XCTAssertEqual(teamModel.run.revision, 2)
+        XCTAssertEqual(teamModel.run?.revision, 2)
         XCTAssertEqual(teamModel.notice, "Revision mismatch The team was refreshed; review it before sending again.")
 
         await teamModel.steer()
         XCTAssertFalse(teamModel.busy)
         XCTAssertFalse(teamModel.fresh)
         XCTAssertEqual(teamModel.notice, "Revision mismatch Could not refresh the team: Poll failed")
+    }
+
+    func testMissionModelPreFetchLoadingStateGatesMutationsHandlesErrorsAndTransitionsToLoaded() async {
+        let boardItem = BoardItem(.object([
+            "kind": .string("mission"),
+            "id": .string("m-seed"),
+            "title": .string("Checkout limits"),
+            "groupId": .string("storefront"),
+            "projectName": .string("Storefront"),
+            "column": .string("needs-input"),
+            "status": .string("needs-input"),
+            "subtasks": .object(["total": .number(4), "running": .number(1), "done": .number(2)])
+        ]))
+        let seed = MissionSeed(id: "m-seed", row: boardItem)
+        actor MissionPollRecorder {
+            var calls: [(String, Bool)] = []
+            var pollAttempt = 0
+            func record(_ path: String, hasBody: Bool) -> Int {
+                calls.append((path, hasBody))
+                if !hasBody { pollAttempt += 1 }
+                return pollAttempt
+            }
+        }
+        let recorder = MissionPollRecorder()
+        let loadedPayload: JSON = .object([
+            "id": .string("m-seed"),
+            "groupId": .string("storefront"),
+            "groupName": .string("Storefront"),
+            "title": .string("Checkout limits"),
+            "objective": .string("Add checkout limits across services."),
+            "revision": .number(3),
+            "status": .string("working"),
+            "updatedAt": .string("2026-01-01T00:05:00.000Z")
+        ])
+
+        let model = MissionModel(
+            seed: seed,
+            client: makeClient(),
+            role: "owner",
+            sendRequest: { _, path, body in
+                let attempt = await recorder.record(path, hasBody: body != nil)
+                if body != nil { return .object([:]) }
+                switch attempt {
+                case 1: throw DesktopError("Host unreachable")
+                case 2: return .object(["id": .string("other-mission"), "revision": .number(1)])
+                default: return loadedPayload
+                }
+            }
+        )
+
+        XCTAssertEqual(model.loadState, .loading(seed: seed, error: nil))
+        XCTAssertNil(model.mission)
+        XCTAssertFalse(model.isLoaded)
+        XCTAssertNil(model.loadError)
+        XCTAssertEqual(model.id, "m-seed")
+        XCTAssertEqual(model.title, "Checkout limits")
+        XCTAssertEqual(model.status, "needs-input")
+        XCTAssertEqual(model.statusLabel, "Needs your input")
+        XCTAssertEqual(model.groupID, "storefront")
+        XCTAssertEqual(model.groupName, "Storefront")
+        XCTAssertEqual(seed.progressFraction, 0.5)
+        XCTAssertFalse(model.canAct)
+        XCTAssertFalse(model.canSteer)
+
+        model.direction = "Should not send before load"
+        await model.steer()
+        await model.answer(decisionID: "d1", revision: 1, text: "Yes")
+        await model.perform("pause")
+        let callsBeforePoll = await recorder.calls
+        XCTAssertTrue(callsBeforePoll.isEmpty)
+
+        model.setDisplayVisible(true)
+        await model.poll()
+        XCTAssertEqual(model.loadState, .loading(seed: seed, error: "Host unreachable"))
+        XCTAssertNil(model.mission)
+        XCTAssertEqual(model.loadError, "Host unreachable")
+        XCTAssertFalse(model.fresh)
+        XCTAssertFalse(model.canAct)
+
+        await model.poll()
+        XCTAssertNil(model.mission)
+        XCTAssertEqual(model.loadError, "The server returned a mismatched mission.")
+        XCTAssertFalse(model.fresh)
+
+        await model.poll()
+        XCTAssertEqual(model.loadState, .loaded(Mission(loadedPayload)))
+        XCTAssertEqual(model.mission?.objective, "Add checkout limits across services.")
+        XCTAssertEqual(model.mission?.revision, 3)
+        XCTAssertTrue(model.isLoaded)
+        XCTAssertNil(model.loadError)
+        XCTAssertTrue(model.fresh)
+        XCTAssertTrue(model.canAct)
+        XCTAssertTrue(model.canSteer)
+    }
+
+    func testAppModelCreatesExplicitLoadingModelsWithoutSyntheticPayloads() async {
+        let profile = HostProfile(id: "p1", label: "Host", origin: "https://host.example.com")
+        let deps = AppModelDependencies(
+            loadProfiles: { ([profile], profile.id) },
+            saveProfiles: { _, _ in },
+            readToken: { _ in "token" },
+            fetchIdentity: { _ in .object(["role": .string("owner")]) },
+            readDraft: { _ in DraftRecord() },
+            saveDraft: { _, _ in },
+            clearDraftIfMatching: { _, _ in },
+            sendRequest: { _, _, _ in .object([:]) },
+            closeClient: { _ in }
+        )
+        let app = AppModel(deps: deps)
+        await app.connect()
+
+        let missionModel = app.missionModel(for: "m-new")
+        XCTAssertNotNil(missionModel)
+        XCTAssertEqual(missionModel?.loadState, .loading(seed: MissionSeed(id: "m-new"), error: nil))
+        XCTAssertNil(missionModel?.mission)
+        XCTAssertFalse(missionModel?.isLoaded ?? true)
+
+        let loadedMission = Mission(.object([
+            "id": .string("m-new"),
+            "title": .string("Platform rollout"),
+            "status": .string("working"),
+            "revision": .number(2),
+            "subtasks": .array([
+                .object([
+                    "id": .string("sub-1"),
+                    "repoProjectId": .string("api-repo"),
+                    "title": .string("API rollout"),
+                    "status": .string("running"),
+                    "teamId": .string("team-sub-1"),
+                    "teamStatus": .string("implementing")
+                ])
+            ])
+        ]))
+        missionModel?.observe(loadedMission)
+
+        let subteamModel = app.teamModel(for: "team-sub-1")
+        XCTAssertNotNil(subteamModel)
+        XCTAssertEqual(
+            subteamModel?.loadState,
+            .loading(
+                seed: TeamSeed(
+                    id: "team-sub-1",
+                    title: "API rollout",
+                    status: "implementing",
+                    projectID: "api-repo",
+                    missionID: "m-new"
+                ),
+                error: nil
+            )
+        )
+        XCTAssertNil(subteamModel?.run)
+        XCTAssertEqual(subteamModel?.managed, true)
+        XCTAssertEqual(subteamModel?.projectID, "api-repo")
+
+        let unknownTeam = app.teamModel(for: "team-unlisted")
+        XCTAssertEqual(unknownTeam?.loadState, .loading(seed: TeamSeed(id: "team-unlisted"), error: nil))
+        XCTAssertNil(unknownTeam?.run)
+
+        let listedRun = TeamRun(.object([
+            "id": .string("team-listed"),
+            "title": .string("Listed team"),
+            "status": .string("implementing"),
+            "revision": .number(4)
+        ]))
+        app.teams = [listedRun]
+        let listedModel = app.teamModel(for: "team-listed")
+        XCTAssertEqual(listedModel?.loadState, .listSeed(listedRun))
+        XCTAssertEqual(listedModel?.run, listedRun)
     }
 }

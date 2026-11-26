@@ -475,9 +475,8 @@ enum HostConnectionState: Equatable {
     func missionModel(for id: String) -> MissionModel? {
         if let existing = missionModels[id] { return existing }
         guard let client else { return nil }
-        let row = board.items.first { $0.id == id }
-        let model = MissionModel(mission: Mission(.object(["id": .string(id), "title": .string(row?.title ?? ""), "status": .string(row?.status ?? ""), "groupName": .string(row?.projectName ?? "")])),
-                                 client: client, role: me["role"].string)
+        let row = board.items.first { $0.kind == .mission && $0.id == id } ?? board.items.first { $0.id == id }
+        let model = MissionModel(seed: MissionSeed(id: id, row: row), client: client, role: me["role"].string)
         model.setDisplayVisible(displayVisible)
         missionModels[id] = model; return model
     }
@@ -531,7 +530,7 @@ enum HostConnectionState: Equatable {
         resumingTeams.insert(id)
         teamResumeFailures[id] = nil
         if model.behind { await model.poll() }
-        guard !model.behind, model.run.offersResume else {
+        guard !model.behind, model.run?.offersResume == true else {
             resumingTeams.remove(id)
             teamResumeFailures[id] = TeamResumeFailure(message: model.behind
                 ? "This team changed and could not be read again. Try again, or open the team."
@@ -548,10 +547,31 @@ enum HostConnectionState: Equatable {
     func teamModel(for id: String) -> TeamModel? {
         if let existing = teamModels[id] { return existing }
         guard let client else { return nil }
-        let team = teams.first { $0.id == id } ?? TeamRun(.object(["id": .string(id)]))
-        let model = TeamModel(run: team, client: client, role: me["role"].string)
+        let model: TeamModel
+        if let team = teams.first(where: { $0.id == id }) {
+            model = TeamModel(run: team, client: client, role: me["role"].string)
+        } else {
+            model = TeamModel(seed: teamSeed(for: id), client: client, role: me["role"].string)
+        }
         model.setDisplayVisible(displayVisible)
         teamModels[id] = model; return model
+    }
+    private func teamSeed(for id: String) -> TeamSeed {
+        for missionModel in missionModels.values {
+            if let mission = missionModel.mission, let subtask = mission.subtasks.first(where: { $0.teamID == id }) {
+                return TeamSeed(
+                    id: id,
+                    title: subtask.title,
+                    status: subtask.teamStatus,
+                    projectID: subtask.repoProjectID,
+                    missionID: mission.id
+                )
+            }
+        }
+        if let row = board.items.first(where: { $0.kind == .team && $0.id == id }) {
+            return TeamSeed(id: id, title: row.title, status: row.status)
+        }
+        return TeamSeed(id: id, missionID: selectedTeamID == id ? (teamOpenedFrom ?? "") : "")
     }
     private func pruneTeamModel(_ id: String) {
         guard id != selectedTeamID, let model = teamModels[id], !model.busy, model.pending == nil, model.direction.isEmpty else { return }

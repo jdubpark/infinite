@@ -1,6 +1,121 @@
 import SwiftUI
 import InfiniteCore
 
+struct MissionSeed: Equatable, Sendable {
+    let id: String
+    let title: String
+    let status: String
+    let groupID: String
+    let groupName: String
+    let column: BoardColumn
+    let progressFraction: Double
+
+    init(
+        id: String,
+        title: String = "",
+        status: String = "",
+        groupID: String = "",
+        groupName: String = "",
+        column: BoardColumn? = nil,
+        progressFraction: Double = 0.25
+    ) {
+        self.id = id
+        self.title = title
+        self.status = status
+        self.groupID = groupID
+        self.groupName = groupName
+        self.column = column ?? Self.column(for: status)
+        self.progressFraction = progressFraction
+    }
+
+    init(id: String, row: BoardItem?) {
+        self.init(
+            id: id,
+            title: row?.title ?? "",
+            status: row?.status ?? "",
+            groupID: row?.groupID ?? "",
+            groupName: row?.projectName ?? "",
+            column: row?.column,
+            progressFraction: row?.progressFraction ?? 0.25
+        )
+    }
+
+    var typedStatus: Mission.Status { Mission.Status(status) }
+
+    var statusLabel: String {
+        guard !status.isEmpty else { return "" }
+        return Mission.labels[status] ?? status.replacingOccurrences(of: "-", with: " ").capitalizedFirst
+    }
+
+    private static func column(for status: String) -> BoardColumn {
+        switch Mission.Status(status) {
+        case .needsInput, .blocked: return .needsInput
+        case .readyForReview: return .review
+        case .cancelled: return .ended
+        case .planning, .working, .paused, .unknown: return .working
+        }
+    }
+}
+
+enum MissionLoadState: Equatable, Sendable {
+    case loading(seed: MissionSeed, error: String?)
+    case loaded(Mission)
+
+    var id: String {
+        switch self {
+        case .loading(let seed, _): return seed.id
+        case .loaded(let mission): return mission.id
+        }
+    }
+
+    var mission: Mission? {
+        if case .loaded(let mission) = self { return mission }
+        return nil
+    }
+
+    var isLoaded: Bool { mission != nil }
+
+    var loadError: String? {
+        if case .loading(_, let error) = self { return error }
+        return nil
+    }
+
+    var title: String {
+        switch self {
+        case .loading(let seed, _): return seed.title
+        case .loaded(let mission): return mission.title
+        }
+    }
+
+    var status: String {
+        switch self {
+        case .loading(let seed, _): return seed.status
+        case .loaded(let mission): return mission.status
+        }
+    }
+
+    var statusLabel: String {
+        switch self {
+        case .loading(let seed, _): return seed.statusLabel
+        case .loaded(let mission): return mission.statusLabel
+        }
+    }
+
+    var groupID: String {
+        switch self {
+        case .loading(let seed, _): return seed.groupID
+        case .loaded(let mission): return mission.groupID
+        }
+    }
+
+    var groupName: String {
+        switch self {
+        case .loading(let seed, _): return seed.groupName
+        case .loaded(let mission): return mission.groupName
+        }
+    }
+}
+
 @MainActor final class MissionModel: ObservableObject {
     private enum PollOutcome {
         case updated
@@ -8,7 +123,7 @@ import InfiniteCore
         case failed(String)
     }
 
-    @Published private(set) var mission: Mission
+    @Published private(set) var loadState: MissionLoadState
     @Published var direction = ""
     @Published private(set) var mutationState: MutationState = .idle
     @Published private(set) var notice = ""
@@ -27,22 +142,48 @@ import InfiniteCore
     private var pollGeneration = UUID()
 
     init(
-        mission: Mission,
+        seed: MissionSeed,
         client: RemoteClient,
         role: String,
         sendRequest: @escaping @Sendable (RemoteClient, String, JSON?) async throws -> JSON = { try await $0.request($1, body: $2) }
     ) {
-        self.mission = mission
+        self.loadState = .loading(seed: seed, error: nil)
         self.client = client
         self.role = role
         self.sendRequest = sendRequest
     }
 
-    var id: String { mission.id }
+    init(
+        mission: Mission,
+        client: RemoteClient,
+        role: String,
+        sendRequest: @escaping @Sendable (RemoteClient, String, JSON?) async throws -> JSON = { try await $0.request($1, body: $2) }
+    ) {
+        self.loadState = .loaded(mission)
+        self.client = client
+        self.role = role
+        self.sendRequest = sendRequest
+    }
+
+    var id: String { loadState.id }
+    var mission: Mission? { loadState.mission }
+    var isLoaded: Bool { loadState.isLoaded }
+    var loadError: String? { loadState.loadError }
+    var title: String { loadState.title }
+    var status: String { loadState.status }
+    var statusLabel: String { loadState.statusLabel }
+    var groupID: String { loadState.groupID }
+    var groupName: String { loadState.groupName }
 
     func observe(_ next: Mission) {
-        guard next.id == mission.id, next.revision > mission.revision || (next.revision == mission.revision && next.updatedAt >= mission.updatedAt) else { return }
-        if next != mission { mission = next }
+        guard next.id == id else { return }
+        switch loadState {
+        case .loading:
+            loadState = .loaded(next)
+        case .loaded(let current):
+            guard next.revision > current.revision || (next.revision == current.revision && next.updatedAt >= current.updatedAt) else { return }
+            if next != current { loadState = .loaded(next) }
+        }
     }
 
     func startPolling() {
@@ -94,35 +235,51 @@ import InfiniteCore
     private func performPoll(_ generation: UUID) async -> PollOutcome {
         guard displayVisible, generation == pollGeneration else { return .skipped }
         do {
-            let value = try await sendRequest(client, "/missions/\(mission.id)", nil)
+            let value = try await sendRequest(client, "/missions/\(id)", nil)
             guard displayVisible, generation == pollGeneration else { return .skipped }
-            observe(Mission(value))
+            let fetched = Mission(value)
+            guard fetched.id == id else {
+                let message = "The server returned a mismatched mission."
+                if case .loading(let seed, _) = loadState { loadState = .loading(seed: seed, error: message) }
+                if fresh { fresh = false }
+                return .failed(message)
+            }
+            observe(fetched)
             if !fresh { fresh = true }
             return .updated
         } catch {
             guard displayVisible, generation == pollGeneration else { return .skipped }
+            if case .loading(let seed, _) = loadState {
+                loadState = .loading(seed: seed, error: error.localizedDescription)
+            }
             if fresh { fresh = false }
             return .failed(error.localizedDescription)
         }
     }
 
-    var canAct: Bool { fresh && role == "owner" && mutationState == .idle }
-    var canSteer: Bool { canAct && !mission.ended }
+    var canAct: Bool { isLoaded && fresh && role == "owner" && mutationState == .idle }
+    var canSteer: Bool {
+        guard case .loaded(let mission) = loadState else { return false }
+        return canAct && !mission.ended
+    }
 
     func steer() async {
+        guard case .loaded(let mission) = loadState else { return }
         let text = direction.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
-        await mutate("Direction") { .action(missionID: self.mission.id, name: "steer", revision: self.mission.revision, text: text, requestID: $0) }
+        await mutate("Direction") { .action(missionID: mission.id, name: "steer", revision: mission.revision, text: text, requestID: $0) }
     }
 
     func answer(decisionID: String, revision: Int, text: String) async {
+        guard case .loaded(let mission) = loadState else { return }
         let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, !decisionID.isEmpty else { return }
-        await mutate("Answer") { .answer(missionID: self.mission.id, decisionID: decisionID, revision: revision, text: text, requestID: $0) }
+        await mutate("Answer") { .answer(missionID: mission.id, decisionID: decisionID, revision: revision, text: text, requestID: $0) }
     }
 
     func perform(_ action: String) async {
-        await mutate(action == "cancel" ? "Cancellation" : action.capitalizedFirst) { .action(missionID: self.mission.id, name: action, revision: self.mission.revision, requestID: $0) }
+        guard case .loaded(let mission) = loadState else { return }
+        await mutate(action == "cancel" ? "Cancellation" : action.capitalizedFirst) { .action(missionID: mission.id, name: action, revision: mission.revision, requestID: $0) }
     }
 
     private func mutate(_ label: String, _ request: (String) -> MissionRequest) async {
@@ -149,9 +306,10 @@ import InfiniteCore
         do {
             let result = try await sendRequest(client, mutation.path, mutation.body)
             let next = Mission(result["mission"] == .null ? result : result["mission"])
-            if next.id == mission.id { observe(next) } else { await poll() }
+            if next.id == id { observe(next) } else { await poll() }
             mutationState = .idle
-            notice = "\(mutation.label) recorded · revision \(mission.revision)."
+            let revision = mission?.revision ?? next.revision
+            notice = "\(mutation.label) recorded · revision \(revision)."
             noticeIsError = false
             if mutation.path.hasSuffix("/steer") { direction = "" }
         } catch let error as DesktopError where error.code == "delivery-unknown" {

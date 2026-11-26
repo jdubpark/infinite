@@ -159,8 +159,11 @@ const persist = () => {
   });
 };
 function append(type: Event["type"], data: Event["data"]): Event {
+  return appendAll(type, [data])[0];
+}
+function appendAll(type: Event["type"], items: Event["data"][]): Event[] {
   try {
-    return journal.append(type, data);
+    return journal.appendAll(type, items);
   } catch (error) {
     recordingFailure();
     throw error;
@@ -170,13 +173,11 @@ function flush() {
   clearTimeout(flushTimer);
   flushTimer = undefined;
   const startSeq = journal.seq;
-  let flushedBytes = 0;
-  while (pending.length) {
-    const data = pending.slice(0, 8192);
-    pending = pending.slice(8192);
-    flushedBytes += data.length;
-    append("output", { text: data });
-  }
+  const flushedBytes = pending.length;
+  const chunks: Event["data"][] = [];
+  for (let at = 0; at < pending.length; at += 8192) chunks.push({ text: pending.slice(at, at + 8192) });
+  pending = "";
+  appendAll("output", chunks);
   if (journal.seq - startSeq >= 32 || flushedBytes >= 64 * 1024) signalIndex?.checkpoint(journal.seq);
   const covered = sizeIndex.coveredSeq(journal.seq);
   if (covered !== undefined && covered - lastPersistedCoverage >= 256) persist();
@@ -1628,6 +1629,8 @@ server.listen(workerSocket, async () => {
         recordingFailure();
       }
       screenActivity.noteRawOutput(Date.now());
+      const flushed = pending.length >= 256 * 1024;
+      if (flushed) try { flush(); } catch {}
       if (!flushTimer)
         flushTimer = setTimeout(() => {
           try {
@@ -1637,6 +1640,7 @@ server.listen(workerSocket, async () => {
           }
           checkScreen();
         }, 40);
+      return flushed;
     };
     const onData = (data: string) => terminalBarrier.dispatch(() => output(data), Buffer.byteLength(data, "utf8"));
     child.onData(onData);
@@ -1701,7 +1705,7 @@ server.listen(workerSocket, async () => {
       pty.onData(onData);
       pty.onExit(onExit);
     };
-    endSession = () => exited(0);
+    endSession = () => terminalBarrier.dispatch(() => exited(0));
   } catch (error) {
     state = { ...state, status: "exited", exitCode: 1 };
     publish(applyLifecycle(attention, "exited", new Date().toISOString()));

@@ -459,7 +459,7 @@ async function runBoard(api: Api, config: ClientConfig, configPath: string, opti
   if (requested && projectIndex < 0) throw new Error(`Unknown project ID: ${requested}`);
   const target = () => projects[projectIndex]!.id;
   const visibleBoard = () => options["--project"]
-    ? { ...board, items: board.items.filter(item => item.groupId === target() || (!item.groupId && item.projectName === projects[projectIndex]!.name)) }
+    ? { ...board, items: board.items.filter(item => item.groupId === target()) }
     : board;
   const selectedItem = () => boardItem(visibleBoard(), cursor);
   const clearAnswerMode = (message?: string) => {

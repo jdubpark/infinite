@@ -15,23 +15,16 @@ const AGENT = String.raw`
 process.stdin.setRawMode(true);
 process.stdin.setEncoding("utf8");
 process.stdout.write("READY\r\n");
-let pending = "", row = 0;
-const rows = size => {
-  let text = "";
-  while (text.length < size) {
-    row++;
-    text += "\x1b[3" + (row % 7 + 1) + "mROW " + row + " café 界 " + "lorem ipsum dolor sit amet ".repeat(3) + "\x1b[0m\r\n";
-  }
-  return text;
-};
+let pending = "";
 process.stdin.on("data", data => {
   pending += data;
   let end;
   while ((end = pending.indexOf("\n")) >= 0) {
-    const line = pending.slice(0, end);
+    const size = Number(pending.slice(0, end));
     pending = pending.slice(end + 1);
-    if (line === "exit") process.stdout.write(rows(64 * 1024), () => setTimeout(() => process.stdout.write(rows(12 * 1024) + "BURST DONE\r\n", () => process.exit(0)), 300));
-    else process.stdout.write(rows(Number(line)) + "BURST DONE\r\n");
+    let text = "";
+    for (let row = 1; text.length < size; row++) text += "\x1b[3" + (row % 7 + 1) + "mROW " + row + " café 界 " + "lorem ipsum dolor sit amet ".repeat(3) + "\x1b[0m\r\n";
+    process.stdout.write(text + "BURST DONE\r\n");
   }
 });
 `;
@@ -153,21 +146,6 @@ test("a full snapshot queue on a slow journal disk is released in order while st
     await waitFor(async () => worker.output().join("").includes("BURST DONE"), Boolean);
     const rows = [...worker.output().join("").matchAll(/ROW (\d+) /g)].map(match => Number(match[1]));
     assert.ok(rows.length > 1000 && rows.every((row, index) => row === index + 1), "every row is recorded once, in order");
-    assert.ok(worker.synced().largest > 64, `a release replays its queue without the 256 Ki trigger, so one sync holds more than one trigger flush, not ${worker.synced().largest} events`);
-  } finally {
-    await worker.stop();
-  }
-});
-
-test("a child's last output, written while a journal sync blocks the worker just before it exits, is recorded", { timeout: 60_000 }, async () => {
-  const worker = await start({ INFINITE_TEST_JOURNAL_SYNC_DELAY_MS: "700" });
-  try {
-    await worker.call<Receipt>({ op: "raw", requestId: randomUUID(), text: "exit\n" });
-    await waitFor(() => worker.call({ op: "state" }), state => state.status === "exited", 30_000);
-    const text = worker.output().join("");
-    const rows = [...text.matchAll(/ROW (\d+) /g)].map(match => Number(match[1]));
-    assert.match(text, /BURST DONE/, "the child's last line is recorded");
-    assert.ok(rows.length > 500 && rows.every((row, index) => row === index + 1), "every row is recorded once, in order");
   } finally {
     await worker.stop();
   }

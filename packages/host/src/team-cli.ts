@@ -451,17 +451,19 @@ async function uploadCommit(api: Api, projectId: string, root: string, commit: s
     const cwd = realpathSync(source);
     const manifest = await captureWorkspace({ roots: [cwd], cwd, storeDir: tempStore });
     captured(manifest.id);
-    const { generation } = await api.json<{ generation: string }>(`/projects/${projectId}/sync/begin`, {});
-    const octets = { "Content-Type": "application/octet-stream" };
+    const publisherHeaders = { "X-Infinite-Sync-Publisher": randomUUID() };
+    const { generation } = await api.json<{ generation: string }>(`/projects/${projectId}/sync/begin`, {}, undefined, publisherHeaders);
+    const syncHeaders = { ...publisherHeaders, "X-Infinite-Sync-Generation": generation };
+    const octets = { ...syncHeaders, "Content-Type": "application/octet-stream" };
     await uploadMissingChunks({ storeDir: tempStore, hashes: manifest.entries.flatMap(entry => entry.chunks ?? []), transport: {
-      has: async (hashes, signal) => (await api.json<{ missing: unknown }>(`/projects/${projectId}/sync/has`, { hashes }, signal)).missing,
+      has: async (hashes, signal) => (await api.json<{ missing: unknown }>(`/projects/${projectId}/sync/has`, { hashes }, signal, syncHeaders)).missing,
       putBatch: async (body, signal) => {
         try { await (await api.request(`/projects/${projectId}/sync/blobs`, body, AbortSignal.any([signal, AbortSignal.timeout(BATCH_TIMEOUT)]), octets, "PUT")).body?.cancel(); }
         catch (error) { if (olderHost(error)) return "unsupported"; throw error; }
       },
       put: async (hash, bytes, signal) => { await (await api.request(`/projects/${projectId}/sync/blob/${hash}`, bytes, AbortSignal.any([signal, AbortSignal.timeout(CHUNK_TIMEOUT)]), octets, "PUT")).body?.cancel(); },
     } });
-    const committed = await api.json<any>(`/projects/${projectId}/sync/commit`, { generation, manifest }, undefined, undefined, undefined, 300000);
+    const committed = await api.json<any>(`/projects/${projectId}/sync/commit`, { generation, manifest }, undefined, syncHeaders, undefined, 300000);
     const current = await api.json<any>(`/projects/${projectId}`);
     return { manifestId: manifest.id, committed, sync: current.sync };
   } finally { rmSync(cloned, { recursive: true, force: true }); }

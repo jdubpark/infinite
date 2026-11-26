@@ -79,7 +79,7 @@ export class SlackClient implements IntakeThreadReader {
     }
     const channel = data.channel;
     if (!isRecord(channel)) return false;
-    const channelType = (channel.is_channel === true && channel.is_group === false && channel.is_private === false)
+    const channelType = (channel.is_channel === true && channel.is_group === false && typeof channel.is_private === "boolean")
       || (channel.is_group === true && channel.is_channel === false && channel.is_private === true);
     return workspaceAllowed()
       && channel.id === channelId && channelType

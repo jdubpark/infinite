@@ -40,6 +40,8 @@ test("organization scope admits the documented joined local channel shape and gu
     timeoutMs: 2000, teamId: slack.teamId, organizationScope: workspaceScope(), workspaceAllowed });
 
   assert.equal(await client.organizationChannelAllowed(binding.channelId), true);
+  slack.setConversationInfo(binding.channelId, { is_private: true });
+  assert.equal(await client.organizationChannelAllowed(binding.channelId), true, "A joined private channel can have is_channel=true");
   assert.ok(Array.isArray(await client.thread(binding)), "Slack's documented local-channel response omits the optional external-workspace flag");
   await client.post(binding, "allowed reply", "scope:1");
   assert.equal(slack.posts(binding).length, 1);
@@ -59,6 +61,7 @@ test("organization scope denies external, pending, mixed, private-message, and u
     { shared_team_ids: [slack.teamId, "TOTHER"] },
     { is_im: true },
     { is_mpim: true },
+    { is_private: undefined },
     { is_member: false },
     { context_team_id: undefined },
   ];

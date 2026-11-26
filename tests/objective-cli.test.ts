@@ -283,6 +283,8 @@ test("correction errors map to sentences", async () => {
 
   const older = fakeApi({ status: 404 }, true);
   await assert.rejects(handleGoalClientCommand(["record", G, "retire", "c1"], { "--version": "3", "--request-id": R }, older.api), { message: "This host does not accept corrections. Upgrade the host." });
+  const codedMissing = fakeApi({ status: 404, code: "route-not-found" }, true);
+  await assert.rejects(handleGoalClientCommand(["record", G, "retire", "c1"], { "--version": "3", "--request-id": R }, codedMissing.api), { message: "This host does not accept corrections. Upgrade the host." });
 
   const invalidId = fakeApi();
   await assert.rejects(handleGoalClientCommand(["record", G, "retire", "C1"], { "--version": "3", "--request-id": R }, invalidId.api), { message: "The correction is invalid." });

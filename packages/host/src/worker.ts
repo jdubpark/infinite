@@ -58,6 +58,7 @@ import { clearEgressEnvironment, workerEgressEnvironment } from "./egress.js";
 import { claudeConfigPath, recordClaudeTrustAsync } from "./workspace-trust.js";
 import { TerminalSnapshots } from "./terminal-snapshot.js";
 import { DEFAULT_TERMINAL_SIZE, isPtyTerminalSize, TERMINAL_SIZE_INDEX_FILE, TerminalBarrier, TerminalSizeIndex } from "./terminal-size.js";
+import { SignalIndex } from "./signal-index.js";
 import { startNativeCodex, validateNativeCodexArgs } from "./native-codex.js";
 import { startNativeOpenCode, validateNativeOpenCodeArgs } from "./native-opencode.js";
 import { createExecutorTunnel, type ExecutorTunnel } from "./executor-tunnel.js";
@@ -89,10 +90,12 @@ const provider = session.provider;
 const key = Buffer.from(config.key, "base64");
 config.key = "";
 const dir = join(stateDir, "sessions", session.id);
-const journal = new Journal(join(dir, "events"), key, session.id);
+let signalIndex: SignalIndex | undefined;
+const journal = new Journal(join(dir, "events"), key, session.id, { onAppend: (event, meta) => { signalIndex?.observe(event, meta); } });
 if (journal.seq !== 0)
   throw new Error("Refusing to start a second process for an existing session");
 const sizeIndex = new TerminalSizeIndex(join(dir, TERMINAL_SIZE_INDEX_FILE), key, session.id);
+signalIndex = new SignalIndex(dir, key, session.id, journal.seq);
 const terminal = new headless.Terminal({ ...DEFAULT_TERMINAL_SIZE, scrollback: 5000, allowProposedApi: true });
 const snapshots = new TerminalSnapshots(terminal);
 type AnswerRequest = Extract<WorkerRequest, { op: "answer" }>;
@@ -168,10 +171,13 @@ function appendAll(type: Event["type"], items: Event["data"][]): Event[] {
 function flush() {
   clearTimeout(flushTimer);
   flushTimer = undefined;
+  const startSeq = journal.seq;
+  const flushedBytes = pending.length;
   const chunks: Event["data"][] = [];
   for (let at = 0; at < pending.length; at += 8192) chunks.push({ text: pending.slice(at, at + 8192) });
   pending = "";
   appendAll("output", chunks);
+  if (journal.seq - startSeq >= 32 || flushedBytes >= 64 * 1024) signalIndex?.checkpoint(journal.seq);
   const covered = sizeIndex.coveredSeq(journal.seq);
   if (covered !== undefined && covered - lastPersistedCoverage >= 256) persist();
 }
@@ -1670,6 +1676,7 @@ server.listen(workerSocket, async () => {
         state = { ...state, status: "exited", exitCode, control: null };
         publish(applyLifecycle(attention, "exited", new Date().toISOString()));
         append("lifecycle", { status: "exited", exitCode });
+        signalIndex?.checkpoint(journal.seq);
         persist();
       } catch {
         recordingFailure();
@@ -1678,6 +1685,7 @@ server.listen(workerSocket, async () => {
         await finalDrain();
         try {
           if (provider !== "opencode") append("usage-coverage", { ...transcriptWatch.finish(hooksReady, true) });
+          signalIndex?.checkpoint(journal.seq);
           persist();
         } catch {}
         const finish = () => { if (handoffStopping) setTimeout(finish, 100); else void exitWorker(0); };
@@ -1711,6 +1719,7 @@ server.listen(workerSocket, async () => {
       status: "exited",
       error: (error as Error).message,
     });
+    signalIndex?.checkpoint(journal.seq);
     persist();
     void exitWorker(1);
   }

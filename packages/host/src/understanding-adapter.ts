@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { isAbsolute } from "node:path";
@@ -7,11 +7,12 @@ import { parseMermaid, type Diagram, type UnderstandingBrief, type KnowledgeClai
 import { expectedIdentity, normalizeRemote, readGit } from "./checkout-identity.js";
 import { agentModelClientEnvironment } from "./egress.js";
 import { failureReason } from "./failure-reason.js";
-import { signalGroup, watchLeader } from "./process-group.js";
+import { signalGroup, spawnGroup, watchLeader } from "./process-group.js";
 import { createContextAdapter, runRepositoryContext, understandingOutputLimits, type RepoContext, type RepositoryBriefOutput, type UnderstandingAdapter, type UnderstandingAdapterOptions } from "./understanding-runtime.js";
 import type { Config } from "./types.js";
 
 const MAX_STDOUT = 1024 * 1024;
+const STOP_GRACE_MS = 500;
 
 const hash = (value: unknown) => createHash("sha1").update(JSON.stringify(value)).digest("hex");
 const citationSchema = z.object({ source: z.string().min(1).max(1024), line: z.number().int().positive() }).strict();
@@ -70,7 +71,7 @@ export function validateBrief(value: unknown, root: string, context: RepoContext
 function run(command: string, args: string[], options: UnderstandingAdapterOptions & { cwd: string; timeoutMs?: number; maxBytes?: number; env?: NodeJS.ProcessEnv }): Promise<string> {
   return new Promise((resolvePromise, rejectPromise) => {
     let child: ChildProcess;
-    try { child = spawn(command, args, { cwd: options.cwd, env: options.env ?? agentModelClientEnvironment(), stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32" }); }
+    try { child = spawnGroup(command, args, { cwd: options.cwd, env: options.env ?? agentModelClientEnvironment(), stdio: ["ignore", "pipe", "pipe"] }, STOP_GRACE_MS); }
     catch { rejectPromise(new Error("understanding-process-unavailable")); return; }
     const leader = watchLeader(child);
     let output = Buffer.alloc(0), stderrTail = Buffer.alloc(0), reason: string | undefined, closed: number | null | undefined, escalated = false, settled = false;
@@ -87,7 +88,7 @@ function run(command: string, args: string[], options: UnderstandingAdapterOptio
       const escalation = setTimeout(() => {
         signalGroup(child, "SIGKILL");
         escalated = true; finish();
-      }, 500);
+      }, STOP_GRACE_MS);
       escalation.unref();
     };
     const timer = setTimeout(() => stop("understanding-process-timeout"), options.timeoutMs);

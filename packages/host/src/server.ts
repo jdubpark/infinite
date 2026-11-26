@@ -450,12 +450,12 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
     return { ...publicSession, ...(managed ? { managedBy: managed } : {}), handoff, executionLocation: executionLocation(session), backend: "infinite", machineId: config.machine!.id,
       resumable: resumable(session) && ["unavailable", "available"].includes(handoff.status) };
   };
-  const sessionEvents = async (sessionId: string, after: number, limit = 200) => {
+  const sessionEvents = async (sessionId: string, after: number, limit = 200, types?: Set<string>) => {
     if (cmux && !existsSync(join(config.stateDir, "sessions", sessionId, "meta.sealed"))) {
       await cmux.get(sessionId);
-      return cmux.events(sessionId, after, limit);
+      return cmux.events(sessionId, after, limit, types);
     }
-    return manager.events(sessionId, after, limit);
+    return manager.events(sessionId, after, limit, types);
   };
   const live = new LiveFeed({
     sessions: async () => ({ sessions: await listSessions() }),
@@ -1556,8 +1556,8 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
         await cmux.get(sessionId);
         const after = z.coerce.number().int().min(0).max(Number.MAX_SAFE_INTEGER).default(0).parse(req.query.after);
         const limit = z.coerce.number().int().min(1).max(200).default(200).parse(req.query.limit);
-        const page = cmux.events(sessionId, after, limit);
         const types = typeof req.query.types === "string" ? new Set(req.query.types.split(",")) : undefined;
+        const page = cmux.events(sessionId, after, limit, types?.size === 1 && types.has("signal") ? types : undefined);
         return void res.json({ ...page, events: types ? page.events.filter(e => types.has(e.type)) : page.events });
       }
       if (action === "/messages") return void res.json(await cmux.messages(sessionId,
@@ -1741,7 +1741,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
           )
         : undefined;
     const sessionId = id.parse(req.params.id);
-    const page = await sessionEvents(sessionId, after, limit);
+    const page = await sessionEvents(sessionId, after, limit, types?.size === 1 && types.has("signal") ? types : undefined);
     res.json({ ...page, events: types ? page.events.filter(event => types.has(event.type)) : page.events });
   });
   app.post("/api/sessions/:id/control", refuseManagedClaim, requireRole(["owner", "controller"]), async (req, res) => {

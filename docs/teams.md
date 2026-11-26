@@ -1,5 +1,11 @@
 # Goals and agent teams
 
+![Orchestration Hierarchy and Team Pipeline](diagrams/orchestration-hierarchy.svg)
+
+> **Navigation:** This is the detailed reference for Teams, Goals, Routines, Blackboard, Evaluation, Adaptive Routing, Permissions, Halt/Fuse, and Main Check. For the architectural overview and closed-loop diagrams, see [System Architecture](architecture.md) and [Self-Improvement Loops](diagrams/self-improvement-loop.svg).
+>
+> **Jump to section:** [Start from a terminal](#start-from-a-terminal) · [Scheduled routines](#scheduled-routines) · [GitHub-tracked sources](#github-tracked-sources) · [Blackboard & entry tools](#blackboard-and-member-entry-tools) · [Workspace retention](#workspace-retention) · [Member traces](#member-traces) · [Eval capture](#eval-capture) · [Eval mining & validation](#eval-mining-and-validation) · [Head publication](#head-publication) · [Provider-side delivery](#optional-provider-side-delivery) · [Project context](#project-context-and-explicit-relationships) · [Session handoff](#let-an-ordinary-session-request-a-team) · [Goals & Objective Record](#start-and-steer-a-goal) · [Linear tracking](#linear-tracking) · [Usage & budgets](#usage-and-budgets) · [Provider limits](#provider-usage-limits-and-fallbacks) · [Roles & execution](#roles-and-execution) · [Model routing](#model-routing) · [Permission delegation](#delegating-permission-decisions) · [Autonomy mode](#autonomy-mode) · [Shadow routing](#shadow-routing) · [Auto routing](#auto-routing) · [Launch-rate fuse](#launch-rate-fuse) · [Project signals](#project-signals) · [Halt](#halt) · [Main check](#main-check) · [Configuration](#configuration) · [Questions & steering](#team-questions-and-steering) · [Blocked runs](#blocked-runs) · [Reports & recovery](#reports-and-recovery) · [API](#api) · [Model scorecard](#model-scorecard)
+
 Open **Goals** in the web client to give the agents a product outcome, evidence,
 and limits. The coordinator investigates the project, selects a useful change,
 and sends bounded tasks to parallel workers. A successful cycle produces an
@@ -392,6 +398,8 @@ Each integration records what changed. The run's `changes` lists the files chang
 Runs also write run events to the evidence store: `run.created`, `run.blocked`, and `run.settled`, with a summary of the run's counts when it settles. Each run keeps its events in a small outbox inside its record until the store accepts them, and a restart does not lose them. The events only record what the run did. A run behaves the same whether or not its events are stored, and a store that stays unavailable never stops or changes a run.
 
 Runs also mirror their reports, integrations, check results, and owner directions into the evidence store as entries, and record each member's launch sizes. The owner reads them with `infinite team entries` and `infinite team entry`. Entries and sizes never change a run.
+
+### Blackboard and member entry tools
 
 Member entry tools are off by default. `config.teams.blackboard.tools` turns them on. The switch has no default, and it is part of the routine digest, so a routine blocks when it changes. A run pins the switch at creation only when it is `true` and the evidence store is ready. A run created otherwise keeps today's prompts and context files for its whole life. With the switch on, project managers, scouts, implementers, integrators, and reviewers get three tools: `entry_post`, `entry_list`, and `entry_get`. A post is one of `contract`, `finding`, `blocker`, or `handoff`, and a handoff needs the author's own task. Every member entry is a claim by its member, and it never changes an assignment, a scope, or the reporting rules. The session worker refuses a post that holds a private key, a known access token shape, the member's hook token or hook address, or a credential the host gave the session (a GitHub grant, an egress proxy password); the refusal names the field and never repeats the text. Caps per attempt: 20 posts and 64 KiB of bodies, 12 KiB per body, 16 KiB per request, and 256 KiB served across reads, with 200 read calls. A run holds at most 400 member entries. A member's context file carries a digest of at most 4,096 bytes. The owner withdraws an entry with `infinite team entry TEAM_ID ENTRY_ID withdraw`. Members then stop listing and getting it, and the owner still reads its body. The member tools declare their result types in `tools/list`, so a member's program can read a result's fields without printing it first. Each write result also carries its receipt sentence in `message`, because some clients show the model only the structured result.
 
@@ -2774,12 +2782,16 @@ Before relying on the detectors unattended, confirm on the target host:
 
 | Role | Responsibility | Output |
 | --- | --- | --- |
-| Coordinator (project manager) | Inspect the request and evidence, choose a scoped opportunity, define owned paths and dependencies, and select allowed worker profiles | Short brief and plan, discovery request, question, or no-change report |
-| Scout | Answer a bounded research question without editing the repository | Findings with sources and observations |
-| Implementer | Build its task in a separate working copy within its owned paths | Result, question, blocker, or explicit escalation request |
-| Integrator | Repair an integrated result after failed checks or review feedback | Repair result within the approved scope |
-| Reviewer | Inspect the integrated change and its evidence without editing it | Approval or changes requested; UI evidence when applicable |
-| Judge | Compare two patches of one task in a read-only copy, blind to who wrote them | A `judgement` report, a question, or a blocker |
+| Coordinator (`project-manager`) | Inspect the request and evidence, choose a scoped opportunity, define owned paths and dependencies, and select allowed worker profiles | Short brief and plan, discovery request, question, or no-change report |
+| Scout (`scout`) | Answer a bounded research question without editing the repository | Findings with sources and observations |
+| Implementer (`implementer`) | Build its task in a separate working copy within its owned paths | Result, question, blocker, or explicit escalation request |
+| Integrator (`integrator`) | Repair an integrated result after failed checks or review feedback | Repair result within the approved scope |
+| Reviewer (`reviewer`) | Inspect the integrated change and its evidence without editing it | Approval or changes requested; acceptance and UI evidence when applicable |
+| Delivery (`delivery`) | Publish and merge or open a PR for the exact reviewed integration commit under repository delivery policy | `delivery`, `delivery-repair`, `delivery-reconciliation`, or `pull-request` report |
+| Permission coordinator (`permission-coordinator`) | Legacy per-run coordinator handling bounded one-shot permission prompts when the host `PermissionAgent` does not serve the run | `permission-decision` (`approve-once`, `escalate`, or `request-evidence`) |
+| Intent checker (`intent-checker`) | Cross-family read-only check of the coordinator's plan against the sealed `ObjectiveRecord` before dispatch | `intent-check` report (derived criteria, assumptions, questions, or correction) |
+| Evaluator (`evaluator`) | Cross-family read-only assessment of reviewed or no-change work against the `ObjectiveRecord` and host receipts | Provisional `verdict` report (never marks a product goal achieved) |
+| Judge (`judge`) | Compare two patches of one task in a read-only copy, blind to who wrote them | A `judgement` report, a question, or a blocker |
 
 The judge is not part of a task run. In this phase only a calibration job starts one (see [Judge calibration](#judge-calibration)).
 
@@ -4038,9 +4050,15 @@ a five-minute quiet window so a silent review can recover before a goal deadline
 One replacement then continues the same task in that workspace, with feedback
 that the earlier attempt stalled. A second
 stall on the same assignment blocks the team with the reason "An agent showed no
-activity twice on the same assignment." Activity means attention activity from the
-member's terminal or hooks. Screen output also counts, so an agent stuck behind an
-animated spinner looks active. Older runs blocked by the former one-hour limit
+activity twice on the same assignment." Activity means attention signals from hooks
+or protocol, or genuine substantive screen changes on hookless terminals; animated
+spinner glyphs, elapsed timers, and status-line token or cost ticker redraws alone do
+not reset the stall window (the session records `spinnerOnlySince` when raw output
+continues without substantive screen changes). Team views also expose host-derived
+`waitReasons` (`worker-slot`, `dependency`, `owner-decision`, `provider-prompt`,
+`provider-limit`, `integration-order`, `linear-sync`, `spinner-only`, `stalled`)
+projected strictly from recorded team and member state without guessing progress.
+Older runs blocked by the former one-hour limit
 still resume. A team blocked only by a stall can resume with
 `infinite team resume ID`. That starts a fresh plan from the integration commit;
 stopped member copies remain subject to the workspace retention policy.
@@ -4180,6 +4198,7 @@ mutation returns the current Goal or Team record.
 | `GET /api/goals` | None; returns `{goals}` | Any paired device |
 | `GET /api/goals/:id` | None; returns the goal, cycles, limits, and assessments | Any paired device |
 | `GET /api/goals/:id/record[?version=N]` | Optional `version` (a positive integer); returns the objective record at that version, with its log | Owner, controller, or viewer |
+| `POST /api/goals/:id/record` | `requestId`, `version`, objective record corrections (criteria, assumptions, rules, non-goals) | Owner |
 | `POST /api/goals` | Creation fields below | Owner |
 | `POST /api/goals/:id/steer` | `requestId`, `revision`, `text` | Owner/controller |
 | `POST /api/goals/:id/pause`, `/resume`, `/cancel` | `requestId`, `revision` | Owner |
@@ -4249,7 +4268,17 @@ cycle's PM selects capacity for its work. The refusal uses `409` with
 | `POST /api/teams/:id/continue` | `requestId` (UUID), `revision`, optional trimmed `text` (1–8,000 characters) | Owner; continuable standalone blocked runs |
 | `POST /api/teams/:id/decisions/:decisionId/answer` | `requestId`, `revision`, `text` | Owner/controller |
 | `POST /api/teams/:id/pause`, `/resume`, `/cancel` | `requestId`, `revision` | Owner; standalone teams |
+| `DELETE /api/teams/:id` | None; removes a settled cancelled, merged, or no-change run and its workspace | Owner |
 | `POST /api/teams/:id/tasks/:taskId/rating` | `requestId`, `score` (1–5), optional `note` (≤1,000 characters) | Owner |
+| `GET /api/teams/:id/entries`, `GET /api/teams/:id/entries/:entryId`, `POST /api/teams/:id/entries/:entryId/withdraw` | List/read blackboard entries (`?kind=`, `?task=`, `?since=`); withdraw hides an entry from members | Reads: any paired device; `withdraw`: Owner |
+| `GET /api/teams/:id/context-usage` | None; returns recorded launch and blackboard read sizes per member (`member_scopes`) | Any paired device |
+| `GET /api/teams/:id/routing/:taskId` | None; explains the shadow or auto routing decision for a task | Any paired device |
+| `POST /api/teams/:id/reconcile-delivery`, `/reconcile-verification` | `requestId`, `revision`, reconciliation attestation fields (standalone runs) | Owner |
+| `GET /api/teams/:id/members/:memberId/runtime`, `POST /api/teams/:id/members/:memberId/retire` | Inspect live process census or retire a member runtime tree (`SIGSTOP` -> `SIGKILL`) | Reads: any; `retire`: Owner |
+| `POST /api/teams/:id/permissions/revoke`, `/routing/revoke` | `requestId`, `revision`; revokes active permission delegation or auto routing for the run | Owner |
+| `GET /api/teams/:id/bundle` | None; downloads the run's inspection bundle | Owner |
+
+Related subsystem routes documented in their respective sections above and in [System Architecture](architecture.md#api-surface-index): `/api/routines/*` (scheduled routines), `/api/fuse` and `POST /api/fuse/close` (launch-rate fuse), `/api/permissions/*` (host permission agent journal, delegations, unlocks, and replay), `/api/routing/*` (project routing status and exploration pause/resume), `/api/outcomes/*` (outcome ledger), `/api/eval/*` (replay eval jobs and priors), and `/api/duels/judges/*` (judge calibrations).
 
 `GET /api/teams` without `view` answers every run in full, which is what
 installed clients read. `view=list` answers one compact row per run for list

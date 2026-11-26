@@ -756,3 +756,38 @@ for (const mutant of ACTIVITY_MUTANTS) {
     await assert.rejects(() => runActivitySimulator(t, seed, mutant.name), mutant.expectedOp);
   });
 }
+
+test("spinnerOnlySince changes persist without advancing lastActivityAt", async t => {
+  const f = schedulerFixture();
+  const initialActivityAt = "2026-10-18T00:05:00.000Z";
+  t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-10-18T00:06:00.000Z") });
+  try {
+    f.run.status = "implementing";
+    f.run.parallelismCeiling = 4;
+    f.run.parallelism = 4;
+    f.run.createdAt = "2026-10-18T00:00:00.000Z";
+    f.run.updatedAt = initialActivityAt;
+    f.run.lastActivityAt = initialActivityAt;
+    f.run.members[0]!.status = "running";
+    f.run.members[0]!.startedAt = "2026-10-18T00:01:00.000Z";
+    f.run.members[0]!.lastActivityAt = initialActivityAt;
+    f.writeTeam();
+
+    const teams = f.openTeam();
+    const scheduler = internal(teams);
+    const stored = scheduler.record(f.run.id);
+
+    t.mock.timers.tick(60_000);
+    stored.run.members[0]!.spinnerOnlySince = new Date().toISOString();
+    scheduler.save(stored);
+
+    const sealed = f.readRecord<{ run: TeamRun }>("team", f.run.id).run;
+    assert.equal(sealed.members[0]!.spinnerOnlySince, "2026-10-18T00:07:00.000Z");
+    assert.equal(sealed.lastActivityAt, initialActivityAt);
+    assert.equal(sealed.updatedAt, "2026-10-18T00:07:00.000Z");
+    teams.close();
+  } finally {
+    t.mock.timers.reset();
+    f.close();
+  }
+});

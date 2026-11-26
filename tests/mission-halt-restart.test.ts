@@ -117,3 +117,86 @@ test("a halt release after restart settles a subteam whose pause reached it befo
     }
   }
 });
+
+test("mission view sets canAnswerPaused only while an owner halt matches the paused revision", async () => {
+  const f = schedulerFixture();
+  const missionId = randomUUID();
+  const decision1 = randomUUID();
+  const decision2 = randomUUID();
+  const at = new Date().toISOString();
+  const mission: Mission = {
+    id: missionId,
+    groupId: "fixture-group",
+    groupName: "Fixture",
+    repoProjectIds: ["fixture"],
+    title: "Mission with decisions",
+    objective: "Answer questions cleanly",
+    maxSubtasks: 1,
+    maxMinutes: 60,
+    deadlineAt: new Date(Date.now() + 60 * 60000).toISOString(),
+    revision: 1,
+    status: "needs-input",
+    createdAt: at,
+    updatedAt: at,
+    lineup: mixedLineup,
+    subtasks: [],
+    decisions: [
+      { id: decision1, question: "First choice?", options: ["A", "B"], createdAt: at },
+      { id: decision2, question: "Second choice?", options: ["C", "D"], createdAt: at },
+    ],
+    steering: [],
+    events: [],
+  };
+  const missionDirectory = join(f.config.stateDir, "missions");
+  mkdirSync(missionDirectory, { recursive: true, mode: 0o700 });
+  writeSealed(join(missionDirectory, `${missionId}.sealed`), f.key, `mission:${missionId}`, {
+    mission,
+    fingerprint: "fixture",
+    receipts: {},
+    folder: f.run.workspace,
+    repos: [],
+    attempts: [],
+    inbox: [],
+    notes: [],
+    notified: [],
+    launches: {},
+    ops: [],
+    refusals: 0,
+  });
+
+  const host = open(f, missionId);
+  try {
+    assert.equal(host.missions.get(missionId).canAnswerPaused, undefined);
+
+    await host.missions.pause(missionId, { requestId: randomUUID(), revision: host.missions.get(missionId).revision });
+    const manuallyPaused = host.missions.get(missionId);
+    assert.equal(manuallyPaused.status, "paused");
+    assert.equal(manuallyPaused.canAnswerPaused, undefined);
+    await assert.rejects(
+      host.missions.answer(missionId, decision1, { requestId: randomUUID(), revision: manuallyPaused.revision, text: "A" }),
+      /Resume the mission before answering/,
+    );
+
+    await host.missions.resume(missionId, { requestId: randomUUID(), revision: host.missions.get(missionId).revision });
+    await host.halt.engage(scope, { requestId: randomUUID() }, owner);
+    const haltPaused = host.missions.get(missionId);
+    assert.equal(haltPaused.status, "paused");
+    assert.equal(haltPaused.canAnswerPaused, true);
+
+    const answered = await host.missions.answer(missionId, decision1, { requestId: randomUUID(), revision: haltPaused.revision, text: "A" });
+    assert.equal(answered.status, "paused");
+    assert.equal(answered.canAnswerPaused, true);
+
+    await host.halt.release(scope, { requestId: randomUUID(), keepPaused: true }, owner);
+    const keptPaused = host.missions.get(missionId);
+    assert.equal(keptPaused.status, "paused");
+    assert.equal(keptPaused.canAnswerPaused, undefined);
+    await assert.rejects(
+      host.missions.answer(missionId, decision2, { requestId: randomUUID(), revision: keptPaused.revision, text: "C" }),
+      /Resume the mission before answering/,
+    );
+  } finally {
+    host.close();
+    f.close();
+  }
+});

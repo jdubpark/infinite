@@ -1472,7 +1472,7 @@ export class TeamService {
   }
   private async resumeRun(stored: Stored, inPlace = false, record?: () => void) {
     const run = stored.run;
-    if (!inPlace) await this.invalidatePermissionDecisions(stored, "The team resumed under a new revision.");
+    if (!inPlace) await this.invalidatePermissionDecisions(stored, "A resume started before the permission request could be answered.");
     record?.();
     if (inPlace) { run.status = "needs-input"; run.reason = undefined; return; }
     run.revision++; run.tasks = []; run.review = undefined; run.round = 0; stored.checkHead = undefined;

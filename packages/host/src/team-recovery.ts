@@ -347,7 +347,7 @@ export class TeamRecovery {
     if (await teamHead(originalWorkspace, prefix) !== recovery.headCommit)
       throw new TeamError(409, "verification-recovery-head-changed", "The integration HEAD changed while Resume prepared a clean copy. Its original workspace was preserved for reconciliation.");
 
-    await this.host.invalidatePermissionDecisions(stored, "The team resumed under a new revision.");
+    await this.host.invalidatePermissionDecisions(stored, "A resume started before the permission request could be answered.");
     const next = structuredClone(stored);
     if (!this.host.mutation(next, "resume", body)) return this.host.view(stored);
     next.run.workspace = recovered.workspace;

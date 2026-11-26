@@ -843,6 +843,19 @@ test("POST /api/teams/:id/cancel updates stopped goal cycles for leftover blocke
       assert.equal(persisted.status, "blocked");
       assert.equal(persisted.cycles[1]?.status, "cancelled");
     });
+
+    await t.test("goal cleanup removes the cancelled leftover run record after workspace removal", async () => {
+      blockedRun.workspaceRemovedAt = new Date().toISOString();
+      blockedRun.workspace = join(config.teams!.workspaceDir, "removed-blocked", "integration");
+      const internals = host.goals as unknown as { closed: boolean; step(stored: unknown): Promise<void> };
+      internals.closed = false;
+      try { await internals.step(goalRecord); } finally { internals.closed = true; }
+      assert.throws(() => host.teams.get(blockedRun.id), (error: unknown) => error instanceof TeamError && error.code === "team-not-found");
+      const goal = host.goals.get(goalId);
+      assert.equal(goal.status, "blocked");
+      assert.equal(goal.cycles[0]?.teamId, blockedRun.id);
+      assert.equal(goal.cycles[0]?.status, "cancelled");
+    });
   });
 });
 
@@ -855,6 +868,7 @@ test("POST /api/teams/:id/cancel refuses leftover run cancel when the stopped go
     const seedCase = (
       goalOverrides: Partial<ProductGoal>,
       extraGoalFields: (run: TeamRun) => Record<string, unknown> = () => ({}),
+      runStatus: TeamRun["status"] = "blocked",
     ) => {
       const goalId = randomUUID();
       const deadlineAt = goalOverrides.deadlineAt ?? defaultDeadlineAt;
@@ -862,7 +876,7 @@ test("POST /api/teams/:id/cancel refuses leftover run cancel when the stopped go
         ...structuredClone(fixture.run),
         id: randomUUID(),
         revision: 1,
-        status: "blocked",
+        status: runStatus,
         reason: "The child stopped with a blocker.",
         members: [],
         goal: makeGoalContext(goalId, 1, deadlineAt),
@@ -872,7 +886,7 @@ test("POST /api/teams/:id/cancel refuses leftover run cancel when the stopped go
         activeTeamId: undefined,
         deadlineAt,
         ceilingAt: deadlineAt,
-        cycles: [{ teamId: run.id, cycle: 1, goalRevision: 1, status: "blocked", startedAt: at, memberCount: 0, autonomy: "supervised" }],
+        cycles: [{ teamId: run.id, cycle: 1, goalRevision: 1, status: runStatus, startedAt: at, memberCount: 0, autonomy: "supervised" }],
         ...goalOverrides,
       }, extraGoalFields(run)));
       return run;
@@ -904,6 +918,14 @@ test("POST /api/teams/:id/cancel refuses leftover run cancel when the stopped go
       assert.equal(response.status, 409);
       assert.equal(response.body.code, "goal-owned-team");
       assert.equal(host.teams.get(run.id).status, "blocked");
+    });
+
+    await t.test("refuses cancel for a stopped goal's ready-for-review cycle", async () => {
+      const run = seedCase({ status: "ready-for-review" }, () => ({}), "ready-for-review");
+      const response = await postTeamAction(run.id, "cancel", run.revision);
+      assert.equal(response.status, 409);
+      assert.equal(response.body.code, "goal-owned-team");
+      assert.equal(host.teams.get(run.id).status, "ready-for-review");
     });
   });
 });

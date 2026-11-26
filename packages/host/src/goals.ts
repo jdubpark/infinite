@@ -25,6 +25,7 @@ import { answerProvisional, applyLateVerdict, assertVerdictAnswer, continueGoal,
 import { correctionSchema, type CriterionInput } from "./objective-input.js";
 import { objectiveError, recordView, type ObjectiveRecordView } from "./objective-record.js";
 import { goalMetricsRead, pruneMetrics, settleMetrics } from "./goal-metrics.js";
+import { cancelReleasedGoalRun } from "./goal-released-run.js";
 
 type Action = { requestId: string; revision: number };
 type PendingControl = { action: "pause" | "resume" | "cancel" | "steer" | "parallelism"; requestId: string; teamId: string; revision: number; text?: string; parallelism?: number; halt?: HaltRunMark };
@@ -159,10 +160,7 @@ export class GoalService {
     this.save(stored);
   }
   statuses() { return [...this.records.values()].map(({ goal }) => ({ id: goal.id, title: goal.title, status: goal.status, reason: goal.reason })); }
-  ownsActiveTeam(teamId: string) {
-    return [...this.records.values()].some(({ goal }) =>
-      !terminal.has(goal.status) && goal.activeTeamId === teamId);
-  }
+  ownsActiveTeam(teamId: string) { return [...this.records.values()].some(({ goal }) => !terminal.has(goal.status) && goal.activeTeamId === teamId); }
   retainsTeamRun(teamId: string) {
     return [...this.records.values()].some(({ goal, launch }) => !terminal.has(goal.status) && (goal.standing
       ? goal.activeTeamId === teamId || launch?.request.requestId === teamId || latestReviewed(goal.cycles)?.teamId === teamId
@@ -293,6 +291,8 @@ export class GoalService {
   pause(id: string, input: Action) { return this.action(id, "pause", goalActionSchema.parse(input)); }
   resume(id: string, input: Action) { return this.action(id, "resume", goalActionSchema.parse(input)); }
   cancel(id: string, input: Action) { return this.action(id, "cancel", goalActionSchema.parse(input)); }
+  cancelReleasedRun(teamId: string, body: Action) { return cancelReleasedGoalRun({ records: this.records, terminal, teams: this.teams,
+    enqueue: (id, task) => this.enqueue(id, task), refresh: (stored, team) => this.refresh(stored, team), event: (stored, text) => this.event(stored, text), save: stored => this.save(stored) }, teamId, body); }
   private action(id: string, action: "pause" | "resume" | "cancel", body: Action) {
     return this.enqueue(id, () => {
       const stored = this.record(id), goal = stored.goal;

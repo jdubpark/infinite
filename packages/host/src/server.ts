@@ -1321,10 +1321,8 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
     return res.json(await startInProject(body.projectId, () => teams.create(body)));
   });
   const standaloneTeam = (value: unknown, allowOrphanedBlockedCancel = false) => {
-    const teamId = id.parse(value);
-    const team = teams.get(teamId);
-    if (allowOrphanedBlockedCancel && team.status === "blocked") {
-      if (goals.ownsActiveTeam(teamId)) throw new TeamError(409, "goal-owned-team", "Control this feature from its goal. Team decisions can still be answered here.");
+    const teamId = id.parse(value), team = teams.get(teamId);
+    if (allowOrphanedBlockedCancel && !team.goal && team.status === "blocked") {
       if (missions.ownsActiveSubteam(teamId)) throw new TeamError(409, "mission-owned-team", "Control this subteam from its mission.");
       return teamId;
     }
@@ -1352,8 +1350,10 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
     res.json(await (teams.get(teamId).goal ? goals.answer(teamId, decisionId, body) : teams.answer(teamId, decisionId, body)));
   });
   for (const action of ["pause", "resume", "cancel"] as const) {
-    app.post(`/api/teams/:id/${action}`, requireRole(["owner"]), async (req, res) =>
-      res.json(await teams[action](standaloneTeam(req.params.id, action === "cancel"), teamActionSchema.parse(req.body))));
+    app.post(`/api/teams/:id/${action}`, requireRole(["owner"]), async (req, res) => {
+      const teamId = id.parse(req.params.id);
+      res.json(await (action === "cancel" && teams.get(teamId).goal && !missions.ownsActiveSubteam(teamId) ? goals.cancelReleasedRun(teamId, teamActionSchema.parse(req.body)) : teams[action](standaloneTeam(teamId, action === "cancel"), teamActionSchema.parse(req.body))));
+    });
   }
   app.get("/api/machine/resources", async (_req, res) => res.json(await desktopResources.sample()));
   app.post("/api/projects/resolve", requireRole(["owner"]), requireOwnerCli, (req, res) => {

@@ -2067,6 +2067,8 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
       }
       if ((error as NodeJS.ErrnoException).code === "ENOENT")
         return res.status(404).json({ error: "Session not found" });
+      if ((error as WorkerError).code === "resize-refused")
+        return res.status(503).json({ code: "resize-refused", error: (error as Error).message });
       if (["control-busy", "control-lost"].includes((error as WorkerError).code ?? ""))
         return res.status(409).json({
           code: (error as WorkerError).code,

@@ -275,8 +275,10 @@ export function connectTerminals(server: Server, manager: Manager, authenticate:
               } catch (error) {
                 if (!active()) break;
                 const workerError = error as WorkerError;
-                if (workerError.code === "control-busy" || workerError.code === "control-lost" || workerError.code === "resize-refused") {
+                if (workerError.code === "control-busy" || workerError.code === "control-lost") {
                   await send({ refusal: { requestId: "requestId" in frame.input ? frame.input.requestId : undefined, code: workerError.code } }).catch(() => fail(1011));
+                } else if (workerError.code === "resize-refused") {
+                  await send({ resizeRefusal: { requestId: "requestId" in frame.input ? frame.input.requestId : undefined, code: workerError.code, error: workerError.message } }).catch(() => fail(1011));
                 } else {
                   fail(1011);
                   break;

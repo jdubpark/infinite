@@ -430,7 +430,7 @@ async function attach(config: ClientConfig, configFile: string, me: Me, session:
         for await (const page of duplex ? duplex.pages() : legacyPages()) {
             clearTimeout(watchdog); watchdog = setTimeout(() => stalled.abort(), 20000);
             if (page.error) throw new Error("Stream interrupted");
-            if (page.refusal?.code === "resize-refused") refusedResize();
+            if (page.resizeRefusal) refusedResize();
             else if (page.refusal) loseControl(new TerminalControlError(page.refusal.code).message);
             if (page.snapshot) {
               render = terminalRenderer();

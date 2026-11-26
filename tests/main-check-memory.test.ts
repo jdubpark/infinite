@@ -56,6 +56,10 @@ class Host {
 
   async start(record: MainCheckRecord, ports: Partial<MainCheckPorts> = {}) {
     this.world.records.set("alpha", JSON.stringify(record));
+    await this.open(ports);
+  }
+
+  async open(ports: Partial<MainCheckPorts> = {}) {
     const config = {
       stateDir: `${ROOT}/state`,
       projects: [{ id: "alpha", name: "Alpha", path: `${ROOT}/projects/alpha`, source: { mode: "github", repository: "example/alpha", baseBranch: "main" }, team: structuredClone(TEAM) }],
@@ -164,8 +168,8 @@ const anchorIn = (host: Host, directory: string): Anchor | undefined => {
 };
 const retiringOf = (host: Host) => host.record()?.retiring?.length ?? 0;
 
-async function admitted(host: Host) {
-  await host.start(observed());
+async function admitted(host: Host, ports: Partial<MainCheckPorts> = {}) {
+  await host.start(observed(), ports);
   const directory = host.record()?.running?.directory;
   assert.ok(directory, "the head was admitted at start");
   return directory;
@@ -274,5 +278,47 @@ test("after a boot change a hidden process holds no copy on Linux, and on macOS 
     await host.start({ ...emptyRecord(), retiring: [{ directory: "alpha-2026-11-20-main-check-0000b007", root: ANCHOR_ROOT, witness: { boot: "boot-0", processes: [], sessions: [], groups: [] } }] }, { platform });
     await host.advance(PASS_MS);
     assert.equal(retiringOf(host), left, platform);
+  }
+});
+
+test("a host stop after a check finished while start tokens of its commands were still being read, right away or after one late token was saved, leaves a copy the next service retires in the same boot once its processes end (INF-502)", async () => {
+  for (const early of [0, 1]) {
+    const host = new Host();
+    const world = host.world.ports({ id: 1, stopped: false });
+    const held: { pid: number; deliver: () => void }[] = [];
+    let holding = false;
+    const processes: MainCheckPorts["processes"] = {
+      ...world.processes,
+      start: async pid => {
+        const token = await world.processes.start(pid);
+        if (holding) await new Promise<void>(deliver => held.push({ pid, deliver }));
+        return token;
+      },
+    };
+    const run: MainCheckPorts["run"] = (...args) => {
+      holding = true;
+      return world.run(...args);
+    };
+    const directory = await admitted(host, { processes, run });
+    for (let second = 0; second < 60 && !host.view().last; second += 1) await host.advance(1_000);
+    assert.equal(host.view().last?.outcome, "passed");
+    assert.ok(held.length > early, `${held.length} start tokens were still being read when the check finished`);
+    const late = held.splice(0, early);
+    for (const { deliver } of late) deliver();
+    await turns();
+    await host.advance(1_000);
+    const saved = host.record()?.retiring?.[0]?.witness.processes.map(item => item.pid) ?? [];
+    assert.ok(late.every(({ pid }) => saved.includes(pid)), "each late token was saved after the finish");
+    const leftover = host.world.hide(`${ANCHOR_ROOT}/${directory}`);
+    await host.service.close();
+    for (const { deliver } of held) deliver();
+    await host.open();
+    await host.advance(PASS_MS);
+    assert.equal(retiringOf(host), 1, `${early} late token(s) saved: a process of the run holds the copy after the host start`);
+    assert.equal(host.view().waiting, "processes");
+    host.world.end(leftover);
+    await untilRetired(host);
+    assert.equal(retiringOf(host), 0, `${early} late token(s) saved: the copy retired in the same boot once its processes ended`);
+    assert.equal(host.world.runs.get(`${ANCHOR_ROOT}/${directory}`)?.exists, false, "the copy was removed");
   }
 });

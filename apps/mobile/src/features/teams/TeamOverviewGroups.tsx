@@ -3,8 +3,16 @@ import { Button } from "../../components/Button";
 import { Card, Chip, ProgressBar } from "../../components/Glass";
 import { StatusIcon } from "../../components/Icon";
 import { theme } from "../../theme";
-import { deriveMobileOutcomeGroups, deriveReviewerAcceptanceClaims, partitionMobileRoster } from "./inspector-model";
-import { MEMBER_LABELS, memberKind, ROLE_NAMES, teamProgress, type TeamMember, type TeamView } from "./model";
+import {
+  deriveMobileOutcomeGroups,
+  deriveReviewerAcceptanceClaims,
+  memberScreenNotices,
+  orderMobileWaitReasons,
+  partitionMobileRoster,
+  waitReasonLabel,
+  waitReasonTone,
+} from "./inspector-model";
+import { MEMBER_LABELS, memberKind, ROLE_NAMES, shortDate, teamProgress, type TeamMember, type TeamView } from "./model";
 import { Clamp, Disclosure, Section, t } from "./parts";
 
 const ASSESSMENT_LABELS: Record<"met" | "not-met" | "inconclusive" | "pending-owner", string> = {
@@ -30,6 +38,7 @@ export function TeamOverviewGroups({
   team: TeamView;
   onSelectMember: (member: TeamMember) => void;
 }) {
+  const waitReasons = orderMobileWaitReasons(team.waitReasons);
   const groups = deriveMobileOutcomeGroups(team);
   const reviewerClaims = deriveReviewerAcceptanceClaims(team);
   const { active, finished } = partitionMobileRoster(team.members, team.revision);
@@ -38,6 +47,28 @@ export function TeamOverviewGroups({
   const progress = teamProgress(team);
 
   return <>
+    {waitReasons.length ? <Section title="Waiting on" count={waitReasons.length}>
+      <Card style={s.card}>
+        {waitReasons.map((reason, index) => {
+          const member = reason.memberId ? memberById.get(reason.memberId) : undefined;
+          const timing = [
+            reason.since ? `Since ${shortDate(reason.since)}` : undefined,
+            reason.resetsAt ? `Resets ${shortDate(reason.resetsAt)}` : undefined,
+          ].filter(Boolean).join(" · ");
+          return <View key={`${reason.kind}/${reason.decisionId ?? reason.memberId ?? reason.taskId ?? index}`} style={[s.waitRow, index > 0 && [s.waitRowGap, s.rowRule]]}>
+            <View style={s.waitHead}>
+              <Chip label={waitReasonLabel(reason.kind)} tone={waitReasonTone(reason.kind)} />
+              {timing ? <Text style={[t.note, s.fill]} numberOfLines={1}>{timing}</Text> : null}
+            </View>
+            <Clamp text={reason.summary} lines={3} />
+            {member ? <View style={s.actions}>
+              <Button compact secondary glyph="terminal" title="Open log" onPress={() => onSelectMember(member)} />
+            </View> : null}
+          </View>;
+        })}
+      </Card>
+    </Section> : null}
+
     <Section title="Outcome groups" count={groups.length || undefined}>
       {groups.length ? <Card style={s.card}>
         {groups.map((group, index) => <View key={group.id} style={[s.groupRow, index > 0 && s.rowRule]}>
@@ -98,6 +129,11 @@ export function TeamOverviewGroups({
                 {ROLE_NAMES[member.role] ?? member.role}{taskTitle ? ` · ${taskTitle}` : ""}
               </Text>
               <Text style={t.note} numberOfLines={1}>{MEMBER_LABELS[member.status] ?? member.status}</Text>
+              {memberScreenNotices(member).map(notice => (
+                <Text key={notice.kind} style={notice.tone === "error" ? t.error : t.warning} numberOfLines={2}>
+                  {notice.text}
+                </Text>
+              ))}
             </View>
           </Pressable>;
         })}
@@ -115,6 +151,11 @@ export function TeamOverviewGroups({
               </Text>
               <Text style={t.note}>{MEMBER_LABELS[member.status] ?? member.status}{member.revision !== team.revision ? ` · rev ${member.revision}` : ""}</Text>
             </View>
+            {memberScreenNotices(member).map(notice => (
+              <Text key={notice.kind} style={notice.tone === "error" ? t.error : t.warning} numberOfLines={2}>
+                {notice.text}
+              </Text>
+            ))}
             {member.stoppedReason ? <Text style={t.warning} numberOfLines={2}>Stopped: {member.stoppedReason}</Text> : null}
             <View style={s.actions}>
               <Button compact secondary glyph="terminal" title="Open log" onPress={() => onSelectMember(member)} />
@@ -136,6 +177,9 @@ export function TeamOverviewGroups({
 const s = StyleSheet.create({
   fill: { flex: 1 },
   card: { gap: 10 },
+  waitRow: { gap: 6 },
+  waitRowGap: { paddingTop: 10 },
+  waitHead: { flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 8 },
   groupRow: { gap: 6, paddingTop: 8 },
   rowRule: { borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: theme.colors.rule },
   rowHead: { flexDirection: "row", alignItems: "center", gap: 8 },

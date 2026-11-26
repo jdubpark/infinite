@@ -26,7 +26,7 @@ import { AgentApproval } from "./TeamApprovals";
 import { TeamEvidenceSection } from "./TeamEvidenceSection";
 import { TeamOverviewGroups } from "./TeamOverviewGroups";
 import { AgentLog, UnderstandingSummary } from "./TeamSummary";
-import { partitionMobileRoster } from "./inspector-model";
+import { memberScreenNotices, partitionMobileRoster } from "./inspector-model";
 import { orderedMembers } from "./summary";
 import { CostLine, RatingControl, RubricLine } from "../cost/parts";
 import { useTaskRating } from "../cost/useCost";
@@ -167,6 +167,11 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
           <Text style={t.note} numberOfLines={1}>{[work(member), agentLabel(member)].filter(Boolean).join(" · ")}</Text>
           {coordinatorOwned(member) ? <Text style={t.note} numberOfLines={2}>{`Coordinator reviewing${session?.attention.now ? `: ${session.attention.now}` : ""}`}</Text>
             : session?.attention.now ? <Text style={[s.now, personOwned.has(member.memberId) && s.attentionText]} numberOfLines={2}>{session.attention.now}</Text> : null}
+          {memberScreenNotices(member).map(notice => (
+            <Text key={notice.kind} style={notice.tone === "error" ? t.error : t.warning} numberOfLines={2}>
+              {notice.text}
+            </Text>
+          ))}
           {member.stoppedReason ? <Text style={t.warning} numberOfLines={2}>Stopped: {member.stoppedReason}</Text> : null}
         </View>
         <Glyph name={open ? "down" : "forward"} size={12} color={theme.colors.mutedInk} />

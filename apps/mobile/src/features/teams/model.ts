@@ -53,7 +53,27 @@ export type TeamContinuation = { revision: number; requestId: string; at: string
 export type TeamMember = {
   memberId: string; sessionId: string; role: TeamRole; revision: number; title: string; status: string;
   taskId?: string; provider?: string; modelProfile?: ModelProfile; stoppedReason?: string;
-  startedAt?: string; reportedAt?: string; lastActivityAt?: string; stalledAt?: string;
+  startedAt?: string; reportedAt?: string; lastActivityAt?: string; spinnerOnlySince?: string; stalledAt?: string;
+};
+export type TeamWaitReasonKind =
+  | "worker-slot"
+  | "dependency"
+  | "owner-decision"
+  | "provider-prompt"
+  | "provider-limit"
+  | "integration-order"
+  | "linear-sync"
+  | "spinner-only"
+  | "stalled";
+export type TeamWaitReason = {
+  kind: TeamWaitReasonKind;
+  summary: string;
+  taskId?: string;
+  memberId?: string;
+  decisionId?: string;
+  blockedByTaskIds?: string[];
+  since?: string;
+  resetsAt?: string;
 };
 export type TeamDecision = { id: string; memberId: string; revision: number; question: string; options: string[]; createdAt: string; answer?: string; answeredAt?: string; answeredBy?: "owner" | "coordinator" | "connector"; source?: { kind: "connector"; id: string; name: string }; recommendation?: { answers: string[]; reason: string; outcome?: "matched" | "different" | "other" } };
 export type TeamWorkers = { limit: number; max: number; running: number; ready: number };
@@ -62,6 +82,7 @@ export type TeamCheck = { command: TeamCommand; phase?: "setup"; headCommit?: st
 export type TeamView = {
   id: string; projectId: string; provider: string; title: string; objective: string; parallelism: number;
   workers?: TeamWorkers;
+  waitReasons?: TeamWaitReason[];
   revision: number; status: TeamStatus; createdAt: string; updatedAt: string; workspace: string;
   branch: string; baseCommit: string; headCommit?: string; tasks: TeamTask[]; members: TeamMember[];
   decisions: TeamDecision[]; checks: TeamCheck[]; steering: { text: string; revision: number; at: string; source?: { kind: "connector" | "github-review"; id: string; name: string } | "coordinator" | "slack" }[];
@@ -82,7 +103,7 @@ export type TeamView = {
   permissionsRevokedAt?: string;
   permissionDecisions?: PermissionDecision[];
 };
-export type TeamListItem = Pick<TeamView, "id" | "projectId" | "provider" | "title" | "parallelism" | "workers" | "revision" | "status" | "createdAt" | "updatedAt"
+export type TeamListItem = Pick<TeamView, "id" | "projectId" | "provider" | "title" | "parallelism" | "workers" | "waitReasons" | "revision" | "status" | "createdAt" | "updatedAt"
   | "workspace" | "branch" | "baseCommit" | "headCommit" | "decisions" | "events" | "reason" | "linear" | "goal" | "missionId" | "resumable" | "continuable" | "permissionsRevokedAt"> & {
   members: (Omit<TeamMember, "modelProfile"> & { modelProfile?: Pick<ModelProfile, "label" | "provider" | "tier"> })[];
   tasks: Pick<TeamTask, "id" | "title" | "status" | "paths" | "memberId" | "ownerRating">[];

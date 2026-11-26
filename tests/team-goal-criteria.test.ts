@@ -170,6 +170,11 @@ test("a new goal plan gets one correction, replacement keeps its pin, and accept
     stalled.prompt = member.prompt;
     fixture.state.status = "exited";
     await scheduler.replaceStalledMember(stored, stalled);
+    assert.equal(stored.pending, undefined, "the host queued no replacement for the superseded PM");
+    assert.equal(stored.run.members.length, 2, "a superseded PM is not replaced while a newer live PM exists in the same revision");
+
+    member.status = "stopped";
+    await scheduler.replaceStalledMember(stored, stalled);
     await waitFor(() => stored.pending === undefined && stored.run.members.length >= 3, "the marked PM replacement is prepared");
     await teams.idle();
     const replacement = stored.run.members.at(-1)!;

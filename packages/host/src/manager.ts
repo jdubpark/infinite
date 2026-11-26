@@ -27,7 +27,7 @@ import type { FuseGate } from "./fuse/types.js";
 import { haltReason } from "./halt/rules.js";
 import { agentAcceptOption, isCollapsedPermissionPrompt, oneShotRejectOption, permissionEvidenceHash, oneShotPermissionOption } from "./team-permissions.js";
 import { nativeContinuationSchema, teamModelProfileSchema, type NativeContinuation, type TeamAssignment, type TeamModelProfile, type TeamPermissionDecision } from "./team-types.js";
-import { hasHostLaunchFields, headlessLaunch, matchesSessionRequestFingerprint, missionCoordinatorLaunch, permissionCoordinatorLaunch, sessionAgentProfile, sessionRequestFingerprint, stripHostLaunchFields, teamModelLaunch, withoutSharedContext } from "./launch.js";
+import { hasHostLaunchFields, headlessLaunch, matchesSessionRequestFingerprint, missionCoordinatorLaunch, parseMissionCoordinatorProvider, permissionCoordinatorLaunch, sessionAgentProfile, sessionRequestFingerprint, stripHostLaunchFields, teamModelLaunch, withoutSharedContext } from "./launch.js";
 import { withNativeContinuation } from "./native-continuation.js";
 import { SESSION_PERMISSION_ACTOR_LABEL, isRequesterNotice, sessionPermissionRequestId, type SessionPermissionAnswer } from "./permission-session-requests.js";
 import { deferredCallOpen, type HeadlessPermissionChannel } from "./permission-headless.js";
@@ -157,6 +157,8 @@ export function withDefaultAttention(
   };
 }
 export class Manager {
+  private contexts?: ProjectContexts;
+  get projectContexts() { return this.contexts ??= new ProjectContexts(this.config, this.key); }
   private readonly sessionQueues = new Map<string, Promise<unknown>>();
   private readonly conversationQueues = new Map<string, Promise<unknown>>();
   private readonly pendingCreates = new Set<string>();
@@ -205,8 +207,9 @@ export class Manager {
     readonly config: Config,
     readonly key: Buffer,
     hostProbe: HostLoadProbe = readHostLoad,
-    options?: { socketDir?: string },
+    options?: { socketDir?: string; projectContexts?: ProjectContexts },
   ) {
+    this.contexts = options?.projectContexts;
     assertRunnerDeployment(config);
     const configuredSocketDir = options?.socketDir ?? config.socketDir;
     this.socketDir = ensureSocketDir(configuredSocketDir ?? config.runDir, configuredSocketDir !== undefined ? "socketDir" : "runDir");
@@ -367,10 +370,6 @@ export class Manager {
   }
 
   metaRevision(id: string): string | undefined { return this.listedMeta.revision(id); }
-  context(projectId: string) { return new ProjectContexts(this.config, this.key).context(projectId); }
-  setContext(projectId: string, text: string, expectedVersion: number) {
-    return new ProjectContexts(this.config, this.key).setContext(projectId, text, expectedVersion);
-  }
   create(request: CreateSession, startedBy?: "owner"): Promise<Session & WorkerState> {
     if (request.continuation !== undefined)
       throw new ContentError("Native continuation is only available for managed coordinator team sessions", 400);
@@ -994,9 +993,9 @@ export class Manager {
       if (!configuredProfile) throw new Error("Provider is not configured on this host");
       let profile = request.teamModelProfile ? teamModelLaunch(configuredProfile, request.teamModelProfile) : configuredProfile;
       if (request.team?.role === "permission-coordinator") profile = permissionCoordinatorLaunch(request.provider, profile);
-      if (request.team?.role === "mission-coordinator") profile = missionCoordinatorLaunch(request.provider, profile);
+      if (request.team?.role === "mission-coordinator") profile = missionCoordinatorLaunch(parseMissionCoordinatorProvider(request.provider), profile);
       if (request.continuation) profile = withNativeContinuation(profile, request.continuation);
-      const context = withoutSharedContext(new ProjectContexts(this.config, this.key).snapshot(request.projectId), executionIdentity);
+      const context = withoutSharedContext(this.projectContexts.snapshot(request.projectId), executionIdentity);
       const session: Session = {
         id,
         ...(request.team ? { team: request.team } : {}),

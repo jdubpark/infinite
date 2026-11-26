@@ -6,25 +6,48 @@ import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { randomBytes, randomUUID } from "node:crypto";
 import { workerCall, type WorkerError } from "../packages/host/src/ipc.js";
-import { readEvents } from "../packages/host/src/vault.js";
+import { readEvents, unseal } from "../packages/host/src/vault.js";
+import { DEFAULT_TERMINAL_SIZE, readTerminalSizeIndex, TERMINAL_SIZE_INDEX_FILE } from "../packages/host/src/terminal-size.js";
 import { waitFor } from "./helpers.js";
 import type { Bootstrap, ControlLease, Event, Receipt, WorkerRequest, WorkerState } from "../packages/host/src/types.js";
 
 const BURST = 4 * 1024 * 1024;
 const AGENT = String.raw`
+import { execFileSync } from "node:child_process";
 process.stdin.setRawMode(true);
 process.stdin.setEncoding("utf8");
 process.stdout.write("READY\r\n");
-let pending = "";
+let pending = "", row = 0;
+const rows = size => {
+  let text = "";
+  while (text.length < size) {
+    row++;
+    text += "\x1b[3" + (row % 7 + 1) + "mROW " + row + " café 界 " + "lorem ipsum dolor sit amet ".repeat(3) + "\x1b[0m\r\n";
+  }
+  return text;
+};
+let burstOnResize;
+process.stdout.on("resize", () => {
+  if (burstOnResize) process.stdout.write(burstOnResize);
+  burstOnResize = undefined;
+});
 process.stdin.on("data", data => {
   pending += data;
   let end;
   while ((end = pending.indexOf("\n")) >= 0) {
-    const size = Number(pending.slice(0, end));
+    const line = pending.slice(0, end);
     pending = pending.slice(end + 1);
-    let text = "";
-    for (let row = 1; text.length < size; row++) text += "\x1b[3" + (row % 7 + 1) + "mROW " + row + " café 界 " + "lorem ipsum dolor sit amet ".repeat(3) + "\x1b[0m\r\n";
-    process.stdout.write(text + "BURST DONE\r\n");
+    if (line.startsWith("flood ")) {
+      const [delay, size] = line.slice(6).split(" ").map(Number);
+      setTimeout(() => process.stdout.write(rows(size) + "BURST DONE\r\n", () => process.exit(0)), delay);
+    } else if (line === "exit") process.stdout.write(rows(64 * 1024), () => setTimeout(() => process.stdout.write(rows(12 * 1024) + "BURST DONE\r\n", () => process.exit(0)), 300));
+    else if (line === "size") {
+      const [height, width] = execFileSync("stty", ["size"], { stdio: ["inherit", "pipe", "ignore"], encoding: "utf8" }).trim().split(" ");
+      process.stdout.write("SIZE " + width + "x" + height + "\r\n");
+    } else if (line.startsWith("burst-on-resize ")) {
+      burstOnResize = rows(Number(line.slice(16))) + "BURST DONE\r\n";
+      process.stdout.write("ARMED\r\n");
+    } else process.stdout.write(rows(Number(line)) + "BURST DONE\r\n");
   }
 });
 `;
@@ -55,15 +78,28 @@ async function start(env: Record<string, string>) {
   worker.stderr.on("data", data => { diagnostics += data; });
   worker.stdin.end(JSON.stringify(bootstrap));
   const call = <T = WorkerState>(request: WorkerRequest, timeout?: number) => workerCall<T>(runDir, id, request, timeout);
-  const output = () => {
+  const read = (type: Event["type"]) => {
     const events: Event[] = [];
     for (let cursor = 0, more = true; more;) {
-      const page = readEvents(join(stateDir, "sessions", id, "events"), key, id, cursor, 200, new Set(["output"]));
+      const page = readEvents(join(stateDir, "sessions", id, "events"), key, id, cursor, 200, new Set([type]));
       events.push(...page.events);
       cursor = page.cursor;
       more = page.more;
     }
-    return events.map(event => String(event.data.text));
+    return events;
+  };
+  const output = () => read("output").map(event => String(event.data.text));
+  const sizes = async () => {
+    await call<Receipt>({ op: "raw", requestId: randomUUID(), text: "size\n" });
+    const { screen } = await waitFor(() => call({ op: "state", screen: true }), state => /SIZE \d+x\d+/.test(state.screen), 60_000);
+    const [, cols, rows] = /SIZE (\d+)x(\d+)/.exec(screen)!;
+    const index = readTerminalSizeIndex(join(stateDir, "sessions", id, TERMINAL_SIZE_INDEX_FILE), key, id).entries.at(-1);
+    return {
+      program: { cols: Number(cols), rows: Number(rows) },
+      state: (await call({ op: "state" })).terminalSize,
+      index: index && { cols: index.cols, rows: index.rows },
+      resizes: read("lifecycle").filter(event => event.data.event === "resize").length,
+    };
   };
   const stop = async (agent?: number) => {
     if (agent) try { process.kill(agent, "SIGKILL"); } catch {}
@@ -84,8 +120,19 @@ async function start(env: Record<string, string>) {
     }, state => Boolean(state?.screen.includes("READY")));
   } catch (error) { await stop(); throw error; }
   return {
-    call, output, stop,
+    call, output, sizes, stop,
     burst: (size: number) => call<Receipt>({ op: "raw", requestId: randomUUID(), text: `${size}\n` }),
+    journal: () => {
+      const events: Event[] = [];
+      for (let cursor = 0, more = true; more;) {
+        const page = readEvents(join(stateDir, "sessions", id, "events"), key, id, cursor, 200);
+        events.push(...page.events);
+        cursor = page.cursor;
+        more = page.more;
+      }
+      return events;
+    },
+    saved: () => unseal<WorkerState>(key, `${id}:status`, readFileSync(join(stateDir, "sessions", id, "status.sealed"), "utf8")),
     synced: () => JSON.parse(readFileSync(report, "utf8")) as { synced: number; largest: number },
   };
 }
@@ -151,6 +198,36 @@ test("a full snapshot queue on a slow journal disk is released in order while st
   }
 });
 
+test("a child's last output, written while a journal sync blocks the worker just before it exits, is recorded", { timeout: 60_000 }, async () => {
+  const worker = await start({ INFINITE_TEST_JOURNAL_SYNC_DELAY_MS: "700" });
+  try {
+    await worker.call<Receipt>({ op: "raw", requestId: randomUUID(), text: "exit\n" });
+    await waitFor(() => worker.call({ op: "state" }), state => state.status === "exited", 30_000);
+    const text = worker.output().join("");
+    const rows = [...text.matchAll(/ROW (\d+) /g)].map(match => Number(match[1]));
+    assert.match(text, /BURST DONE/, "the child's last line is recorded");
+    assert.ok(rows.length > 500 && rows.every((row, index) => row === index + 1), "every row is recorded once, in order");
+  } finally {
+    await worker.stop();
+  }
+});
+
+test("a child that exits while a full snapshot queue is released keeps the output it wrote before exiting", { timeout: 120_000 }, async () => {
+  const worker = await start({ INFINITE_TEST_JOURNAL_SYNC_DELAY_MS: "700", INFINITE_TEST_TERMINAL_DRAIN_DELAY_MS: "900" });
+  try {
+    await worker.call<Receipt>({ op: "raw", requestId: randomUUID(), text: `flood 1100 ${2 * 1024 * 1024 + 16 * 1024}\n` });
+    try { await worker.call({ op: "snapshot" }, 60_000); }
+    catch (error) { if ((error as WorkerError).code !== "snapshot-unavailable") throw error; }
+    await waitFor(() => worker.call({ op: "state" }), state => state.status === "exited", 60_000);
+    const text = worker.output().join("");
+    const rows = [...text.matchAll(/ROW (\d+) /g)].map(match => Number(match[1]));
+    assert.match(text, /BURST DONE/, "the child's last line is recorded");
+    assert.ok(rows.every((row, index) => row === index + 1), "every row is recorded once, in order");
+  } finally {
+    await worker.stop();
+  }
+});
+
 test("a failed journal sync during an output flush enters recording-error and reports none of that flush", { timeout: 40_000 }, async () => {
   const worker = await start({ INFINITE_TEST_JOURNAL_SYNC_FAIL: "1" });
   let agent: number | undefined;
@@ -161,5 +238,51 @@ test("a failed journal sync during an output flush enters recording-error and re
     assert.equal(state.seq, worker.synced().synced, "the worker reports only events whose sync succeeded");
   } finally {
     await worker.stop(agent);
+  }
+});
+
+test("after a failed sync the journal takes no more events, so it reads end to end once the disk recovers, and the child's exit is still saved", { timeout: 40_000 }, async () => {
+  const worker = await start({ INFINITE_TEST_JOURNAL_SYNC_FAIL: "once" });
+  let agent: number | undefined;
+  try {
+    agent = (await worker.call({ op: "state" })).pid;
+    await worker.burst(1024 * 1024);
+    const failed = await waitFor(() => worker.call({ op: "state" }), state => state.status === "recording-error");
+    await new Promise(resolve => setTimeout(resolve, 600));
+    const later = await worker.call({ op: "state" });
+    assert.deepEqual([later.status, later.seq], ["recording-error", failed.seq]);
+    const events = worker.journal();
+    assert.deepEqual(events.map(event => event.seq), events.map((_, index) => index + 1));
+    process.kill(agent!, "SIGKILL");
+    const saved = await waitFor(async () => worker.saved(), state => state.exitCode !== undefined);
+    assert.equal(saved.status, "recording-error");
+    assert.equal(worker.journal().length, events.length);
+  } finally {
+    await worker.stop(agent);
+  }
+});
+
+test("a resize refused by a full output queue leaves the program, the worker's state, the journal and the size index at the old size", { timeout: 90_000 }, async () => {
+  const worker = await start({ INFINITE_TEST_TERMINAL_DRAIN_DELAY_MS: "5000" });
+  try {
+    await worker.call<Receipt>({ op: "raw", requestId: randomUUID(), text: `burst-on-resize ${BURST}\n` });
+    await waitFor(() => worker.call({ op: "state", screen: true }), state => state.screen.includes("ARMED"));
+    await assert.rejects(worker.call({ op: "resize", cols: 100, rows: 30 }), { message: "Snapshot output queue is full" });
+    const old = { ...DEFAULT_TERMINAL_SIZE };
+    assert.deepEqual(await worker.sizes(), { program: old, state: old, index: old, resizes: 0 });
+  } finally {
+    await worker.stop();
+  }
+});
+
+test("a resize refused at the drain deadline leaves the program, the worker's state, the journal and the size index at the last applied size", { timeout: 60_000 }, async () => {
+  const worker = await start({ INFINITE_TEST_TERMINAL_DRAIN_DELAY_MS: "1500", INFINITE_TEST_TERMINAL_DRAIN_FAST: "1" });
+  try {
+    await worker.call({ op: "resize", cols: 110, rows: 31 });
+    await assert.rejects(worker.call({ op: "resize", cols: 100, rows: 30 }), { message: "Terminal renderer is busy" });
+    const applied = { cols: 110, rows: 31 };
+    assert.deepEqual(await worker.sizes(), { program: applied, state: applied, index: applied, resizes: 1 });
+  } finally {
+    await worker.stop();
   }
 });

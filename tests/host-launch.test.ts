@@ -9,6 +9,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { EGRESS_ENVIRONMENT_NAMES } from "../packages/host/src/egress.js";
 import { codeModeEnabled } from "../packages/host/src/code-mode.js";
 import { buildLaunch, headlessLaunch, headlessResumeProfile, missionCoordinatorLaunch, permissionCoordinatorLaunch, teamModelLaunch } from "../packages/host/src/launch.js";
+import { parseMissionCoordinatorProvider, type MissionCoordinatorProvider } from "../packages/host/src/mission-types.js";
 import { addClaudeCodeModeToLaunchEnv, addProjectIdToLaunchEnv } from "../packages/host/src/worker-env.js";
 import { claudeConfigPath, codexTrustArgs, recordClaudeTrust, recordClaudeTrustAsync, repositoryCodexConfig } from "../packages/host/src/workspace-trust.js";
 import { DEFAULT_HOOKS, readConfig } from "../packages/host/src/config.js";
@@ -248,7 +249,14 @@ test("mission coordinators can only read repositories and report, and only on Cl
 
   const variadic = missionCoordinatorLaunch("claude", { command: "claude", args: ["--tools", "Read", "Bash", "--mcp-config", "a.json", "b.json", "--model", "opus"] });
   assert.ok(!variadic.args.includes("Bash") && !variadic.args.includes("a.json") && !variadic.args.includes("b.json") && variadic.args.includes("opus"));
-  assert.throws(() => missionCoordinatorLaunch("codex", { command: "codex", args: [] }), /require Claude Code/);
+  assert.equal(parseMissionCoordinatorProvider("claude"), "claude");
+  assert.throws(() => parseMissionCoordinatorProvider("codex"), /require Claude Code/);
+  assert.throws(() => parseMissionCoordinatorProvider("opencode"), /require Claude Code/);
+  assert.throws(() => missionCoordinatorLaunch("codex" as MissionCoordinatorProvider, { command: "codex", args: [] }), /require Claude Code/);
+  assert.throws(() => {
+    // @ts-expect-error missionCoordinatorLaunch rejects Codex at compile time
+    missionCoordinatorLaunch("codex", { command: "codex", args: [] });
+  }, /require Claude Code/);
 
   const launch = buildLaunch("claude", claude, "Report the mission", hooks, relay, enabled, true);
   assert.ok(launch.args.at(-1) === "Report the mission");
@@ -320,7 +328,7 @@ test("Codex team launch configures its authenticated MCP report tool and require
         settings.set(override.slice(0, equals), JSON.parse(override.slice(equals + 1)));
       }
     }
-    assert.equal(settings.size, 5);
+    assert.equal(settings.size, 4);
     assert.equal(settings.get("command"), process.execPath);
     const serverArgs = settings.get("args") as string[];
     assert.equal(serverArgs.at(-1), relayPath.replace("hook-relay", "team-mcp"));
@@ -328,9 +336,9 @@ test("Codex team launch configures its authenticated MCP report tool and require
       assert.equal(serverArgs[0], "--import");
       assert.match(serverArgs[1], /^file:\/\/\/.+\/tsx\//);
     }
-    assert.deepEqual(settings.get("env_vars"), ["INFINITE_HOOK_URL", "INFINITE_HOOK_TOKEN", "INFINITE_TEAM_ASSIGNMENT", "INFINITE_MISSION_ASSIGNMENT", "INFINITE_PROJECT_ID"]);
+    assert.deepEqual(settings.get("env_vars"), ["INFINITE_HOOK_URL", "INFINITE_HOOK_TOKEN", "INFINITE_TEAM_ASSIGNMENT", "INFINITE_PROJECT_ID"]);
     assert.equal(settings.get("tools.report.approval_mode"), "approve");
-    assert.equal(settings.get("tools.mission_report.approval_mode"), "approve");
+    assert.equal(settings.get("tools.mission_report.approval_mode"), undefined);
     assert.ok(launch.args.includes("--sandbox") && launch.args.includes("workspace-write"));
     assert.ok(launch.args.includes("sandbox_workspace_write.network_access=false"));
     assert.ok(launch.args.includes("on-request"));
@@ -339,7 +347,7 @@ test("Codex team launch configures its authenticated MCP report tool and require
   assert.throws(() => buildLaunch("codex", { command: "codex", args: [] }, "task", null, relay, enabled, true), /Codex team reporting/);
 });
 
-test("Codex forwards configured egress names to team, mission, and handoff MCP servers", () => {
+test("Codex forwards configured egress names to team and handoff MCP servers", () => {
   const profile = { command: "codex", args: [] };
   const launch = (egressConfigured: boolean) => buildLaunch("codex", profile, "task", hooks, relay, enabled,
     true, undefined, "session-1", undefined, undefined, false, egressConfigured);
@@ -351,7 +359,7 @@ test("Codex forwards configured egress names to team, mission, and handoff MCP s
   };
   const ordinary = launch(false);
   const routed = launch(true);
-  const teamBase = ["INFINITE_HOOK_URL", "INFINITE_HOOK_TOKEN", "INFINITE_TEAM_ASSIGNMENT", "INFINITE_MISSION_ASSIGNMENT", "INFINITE_PROJECT_ID"];
+  const teamBase = ["INFINITE_HOOK_URL", "INFINITE_HOOK_TOKEN", "INFINITE_TEAM_ASSIGNMENT", "INFINITE_PROJECT_ID"];
   const handoffBase = ["INFINITE_HOOK_URL", "INFINITE_HOOK_TOKEN"];
 
   assert.deepEqual(envVars(ordinary.args, "infinite_team"), teamBase);
@@ -701,7 +709,7 @@ test("entry tools join the team launch only when on", () => {
       settings.set(override.slice(0, equals), JSON.parse(override.slice(equals + 1)));
     }
   }
-  assert.equal(settings.size, 9);
+  assert.equal(settings.size, 8);
   assert.equal(settings.get("env.INFINITE_TEAM_ENTRY_TOOLS"), "1");
   assert.equal(settings.get("tools.entry_post.approval_mode"), "approve");
   assert.equal(settings.get("tools.entry_list.approval_mode"), "approve");

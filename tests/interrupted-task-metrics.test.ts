@@ -1,6 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import express from "express";
 import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
 import { EventOutbox } from "../packages/host/src/evidence/outbox.js";
@@ -610,5 +613,313 @@ test("escalation replacement sets contextFeedback preserving prior feedback and 
   } finally {
     store.close();
     f.close();
+  }
+});
+
+test("attributes scout discovery recoveries and blocks with zero tasks as zero interrupted tasks rather than unknown", () => {
+  const scoutRecovery = makeRun({
+    id: "run-scout-rec",
+    revision: 2,
+    continuations: [
+      {
+        revision: 1,
+        requestId: "r-scout",
+        at: "2026-11-25T10:00:00.000Z",
+        reason: "Automatic PM recovery after agent-question: Which service owns auth?",
+        headCommit: COMMIT_A,
+        tasks: [],
+      },
+    ],
+    members: [
+      makeMember({ runId: "run-scout-rec", memberId: "m-scout-1", role: "scout", revision: 1, taskId: "scout-auth" }),
+    ],
+  });
+  const scoutBlocked = makeRun({
+    id: "run-scout-blk",
+    revision: 1,
+    status: "blocked",
+    blockCode: "agent-blocked",
+    updatedAt: "2026-11-25T10:05:00.000Z",
+    tasks: [],
+    members: [
+      makeMember({ runId: "run-scout-blk", memberId: "m-scout-2", role: "scout", revision: 1, taskId: "scout-db" }),
+    ],
+  });
+  const danglingImplementer = makeRun({
+    id: "run-impl-dangling",
+    revision: 2,
+    continuations: [
+      {
+        revision: 1,
+        requestId: "r-impl",
+        at: "2026-11-25T10:10:00.000Z",
+        reason: "Automatic PM recovery after agent-blocked: Dangling task",
+        headCommit: COMMIT_A,
+        tasks: [],
+      },
+    ],
+    members: [
+      makeMember({ runId: "run-impl-dangling", memberId: "m-impl", role: "implementer", revision: 1, taskId: "missing-task" }),
+    ],
+  });
+
+  const eventsByRun: Record<string, RunEvent[]> = {
+    "run-scout-rec": [
+      makeEvent({
+        seq: 1,
+        runId: "run-scout-rec",
+        revision: 2,
+        at: "2026-11-25T10:00:00.000Z",
+        kind: "run.revision-advanced",
+        data: { v: 1, cause: "automatic-recovery", fromRevision: 1, baseChanged: false, sourceCode: "agent-question", sourceMemberId: "m-scout-1" },
+      }),
+    ],
+    "run-scout-blk": [
+      makeEvent({
+        seq: 2,
+        runId: "run-scout-blk",
+        revision: 1,
+        at: "2026-11-25T10:05:00.000Z",
+        kind: "run.blocked",
+        data: { v: 1, code: "agent-blocked", sourceMemberId: "m-scout-2" },
+      }),
+    ],
+    "run-impl-dangling": [
+      makeEvent({
+        seq: 3,
+        runId: "run-impl-dangling",
+        revision: 2,
+        at: "2026-11-25T10:10:00.000Z",
+        kind: "run.revision-advanced",
+        data: { v: 1, cause: "automatic-recovery", fromRevision: 1, baseChanged: false, sourceCode: "agent-blocked", sourceMemberId: "m-impl" },
+      }),
+    ],
+  };
+
+  const report = computeInterruptedTaskMetrics([scoutRecovery, scoutBlocked, danglingImplementer], runId => eventsByRun[runId] ?? [], { now: NOW_MS });
+  assert.equal(report.interruptedTasksTotal, 0);
+  assert.equal(report.recoveriesCounted, 1);
+  assert.equal(report.blocksCounted, 1);
+  assert.equal(report.unknownRecoveries, 1);
+  assert.equal(report.unknownBlocks, 0);
+  const scoutSamples = report.samples.filter(sample => sample.runId.startsWith("run-scout-"));
+  assert.equal(scoutSamples.length, 2);
+  assert.ok(scoutSamples.every(sample => !sample.unknown && sample.interruptedCount === 0));
+  const danglingSample = report.samples.find(sample => sample.runId === "run-impl-dangling");
+  assert.equal(danglingSample?.unknown, true);
+  assert.equal(danglingSample?.unknownReason, "unmapped-source-task");
+});
+
+test("counts unattributed blocked runs with empty tasks and rev > 1 missing continuations as unknown", () => {
+  const missingEventEmpty = makeRun({
+    id: "run-blk-no-event-empty",
+    status: "blocked",
+    blockCode: "agent-question",
+    updatedAt: "2026-11-25T10:10:00.000Z",
+    tasks: [],
+  });
+  const missingMemberEmpty = makeRun({
+    id: "run-blk-no-member-empty",
+    status: "blocked",
+    blockCode: "agent-blocked",
+    updatedAt: "2026-11-25T10:15:00.000Z",
+    tasks: [],
+  });
+  const rev2MissingContinuations = makeRun({
+    id: "run-rev2-empty-continuations",
+    revision: 2,
+    status: "ready-for-review",
+    continuations: [],
+  });
+
+  const eventsByRun: Record<string, RunEvent[]> = {
+    "run-blk-no-event-empty": [],
+    "run-blk-no-member-empty": [
+      makeEvent({
+        seq: 1,
+        runId: "run-blk-no-member-empty",
+        revision: 1,
+        at: "2026-11-25T10:15:00.000Z",
+        kind: "run.blocked",
+        data: { v: 1, code: "agent-blocked" },
+      }),
+    ],
+    "run-rev2-empty-continuations": [
+      makeEvent({
+        seq: 2,
+        runId: "run-rev2-empty-continuations",
+        revision: 2,
+        at: "2026-11-25T10:20:00.000Z",
+        kind: "run.revision-advanced",
+        data: { v: 1, cause: "automatic-recovery", fromRevision: 1, baseChanged: false, sourceCode: "agent-question", sourceMemberId: "m1" },
+      }),
+    ],
+  };
+
+  const report = computeInterruptedTaskMetrics(
+    [missingEventEmpty, missingMemberEmpty, rev2MissingContinuations],
+    runId => eventsByRun[runId] ?? [],
+    { now: NOW_MS },
+  );
+  assert.equal(report.blocksCounted, 0);
+  assert.equal(report.recoveriesCounted, 0);
+  assert.equal(report.unknownBlocks, 2);
+  assert.equal(report.unknownRecoveries, 1);
+  assert.equal(report.samples.find(sample => sample.runId === "run-blk-no-event-empty")?.unknownReason, "missing-blocked-event");
+  assert.equal(report.samples.find(sample => sample.runId === "run-blk-no-member-empty")?.unknownReason, "missing-source-member");
+  assert.equal(report.samples.find(sample => sample.runId === "run-rev2-empty-continuations")?.unknownReason, "missing-continuation-snapshot");
+});
+
+test("counts earlier automatic-recovery and later run.blocked on the same run once each without double-counting", () => {
+  const run = makeRun({
+    id: "run-rec-then-blk",
+    revision: 2,
+    status: "blocked",
+    blockCode: "agent-blocked",
+    updatedAt: "2026-11-25T11:00:00.000Z",
+    continuations: [
+      {
+        revision: 1,
+        requestId: "req-1",
+        at: "2026-11-25T10:00:00.000Z",
+        reason: "Automatic PM recovery after agent-question: Pick API",
+        headCommit: COMMIT_A,
+        tasks: [
+          makeTask("t1", "running", [], 1),
+          makeTask("t2", "pending", [], 1),
+          makeTask("t3", "pending", ["t1"], 1),
+        ],
+      },
+    ],
+    tasks: [
+      makeTask("t1", "integrated", [], 2),
+      makeTask("t2", "running", [], 2),
+      makeTask("t4", "pending", [], 2),
+    ],
+    members: [
+      makeMember({ runId: "run-rec-then-blk", memberId: "m1", role: "implementer", revision: 1, taskId: "t1" }),
+      makeMember({ runId: "run-rec-then-blk", memberId: "m2", role: "implementer", revision: 2, taskId: "t2" }),
+    ],
+  });
+  const events: RunEvent[] = [
+    makeEvent({
+      seq: 1,
+      runId: "run-rec-then-blk",
+      revision: 2,
+      at: "2026-11-25T10:00:00.000Z",
+      kind: "run.revision-advanced",
+      data: { v: 1, cause: "automatic-recovery", fromRevision: 1, baseChanged: false, sourceCode: "agent-question", sourceMemberId: "m1" },
+    }),
+    makeEvent({
+      seq: 2,
+      runId: "run-rec-then-blk",
+      revision: 2,
+      at: "2026-11-25T11:00:00.000Z",
+      kind: "run.blocked",
+      data: { v: 1, code: "agent-blocked", sourceMemberId: "m2" },
+    }),
+  ];
+
+  const report = computeInterruptedTaskMetrics([run], () => events, { now: NOW_MS });
+  assert.equal(report.recoveriesCounted, 1);
+  assert.equal(report.blocksCounted, 1);
+  assert.equal(report.unknownRecoveries, 0);
+  assert.equal(report.unknownBlocks, 0);
+  assert.equal(report.interruptedTasksTotal, 2);
+  assert.deepEqual(report.bySourceCode, { "agent-question": 1, "agent-blocked": 1 });
+  assert.deepEqual(report.samples.map(sample => ({ kind: sample.kind, revision: sample.revision, interruptedCount: sample.interruptedCount })), [
+    { kind: "block", revision: 2, interruptedCount: 1 },
+    { kind: "recovery", revision: 1, interruptedCount: 1 },
+  ]);
+});
+
+test("GET /api/usage/interrupted-tasks paginates real EvidenceStore events independently of usage readable()", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "inf-interrupted-store-"));
+  const store = new EvidenceStore({ databasePath: evidenceDatabasePath(dir), vaultKey: randomBytes(32) });
+  try {
+    const run = makeRun({
+      id: "run-store-page",
+      projectId: "proj-store",
+      revision: 2,
+      status: "blocked",
+      blockCode: "agent-blocked",
+      updatedAt: "2026-11-25T11:00:00.000Z",
+      continuations: [
+        {
+          revision: 1,
+          requestId: "req-store",
+          at: "2026-11-25T10:00:00.000Z",
+          reason: "Automatic PM recovery after agent-question: Pick API",
+          headCommit: COMMIT_A,
+          tasks: [makeTask("t1", "running", [], 1), makeTask("t2", "pending", [], 1)],
+        },
+      ],
+      tasks: [makeTask("t1", "integrated", [], 2), makeTask("t2", "running", [], 2), makeTask("t3", "pending", [], 2)],
+      members: [
+        makeMember({ runId: "run-store-page", memberId: "m1", role: "implementer", revision: 1, taskId: "t1" }),
+        makeMember({ runId: "run-store-page", memberId: "m2", role: "implementer", revision: 2, taskId: "t2" }),
+      ],
+    });
+
+    store.write(tx => {
+      for (let i = 0; i < 505; i += 1) {
+        store.appendEvent(tx, {
+          key: `steer:run-store-page:${i}`,
+          runId: "run-store-page",
+          revision: 1,
+          at: "2026-11-25T09:00:00.000Z",
+          kind: "run.revision-advanced",
+          data: { v: 1, cause: "steer", fromRevision: 0, baseChanged: false },
+        });
+      }
+      store.appendEvent(tx, {
+        key: "rec:run-store-page:1",
+        runId: "run-store-page",
+        revision: 2,
+        at: "2026-11-25T10:00:00.000Z",
+        kind: "run.revision-advanced",
+        data: { v: 1, cause: "automatic-recovery", fromRevision: 1, baseChanged: false, sourceCode: "agent-question", sourceMemberId: "m1" },
+      });
+      store.appendEvent(tx, {
+        key: "blk:run-store-page:2",
+        runId: "run-store-page",
+        revision: 2,
+        at: "2026-11-25T11:00:00.000Z",
+        kind: "run.blocked",
+        data: { v: 1, code: "agent-blocked", sourceMemberId: "m2" },
+      });
+    });
+
+    const app = express();
+    registerRepairMetricsRoute(app, {
+      runs: () => [],
+      interruptedRuns: () => [run],
+      memberUsage: () => ({ measured: false, coverage: "none" }),
+      evidence: store,
+      readable: () => false,
+      now: () => NOW_MS,
+    });
+    const server = app.listen(0, "127.0.0.1");
+    await new Promise<void>(resolve => server.once("listening", resolve));
+    const port = (server.address() as { port: number }).port;
+    try {
+      const ok = await fetch(`http://127.0.0.1:${port}/api/usage/interrupted-tasks?project=proj-store`);
+      assert.equal(ok.status, 200);
+      const body = await ok.json() as InterruptedTaskReport;
+      assert.equal(body.recoveriesCounted, 1);
+      assert.equal(body.blocksCounted, 1);
+      assert.equal(body.interruptedTasksTotal, 2);
+      assert.deepEqual(body.bySourceCode, { "agent-question": 1, "agent-blocked": 1 });
+
+      store.close();
+      const down = await fetch(`http://127.0.0.1:${port}/api/usage/interrupted-tasks`);
+      assert.equal(down.status, 503);
+      assert.deepEqual(await down.json(), { code: "evidence-unavailable", error: "The evidence store is unavailable." });
+    } finally {
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    }
+  } finally {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
   }
 });

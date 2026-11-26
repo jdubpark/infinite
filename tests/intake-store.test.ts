@@ -109,6 +109,20 @@ test("a returned record is a copy", () => {
   } finally { h.close(); }
 });
 
+test("a Slack audience identity is immutable after record admission", () => {
+  const h = setup();
+  try {
+    const store = h.open();
+    store.create({ ...record(A), slackAudienceId: "audience-a" });
+    assert.throws(() => store.update(A, item => { item.slackAudienceId = "audience-b"; }), /audience identity cannot be changed/);
+    assert.equal(store.get(A)!.slackAudienceId, "audience-a");
+
+    store.create(record(B));
+    assert.throws(() => store.update(B, item => { item.slackAudienceId = "audience-a"; }), /audience identity cannot be changed/);
+    assert.equal(store.get(B)!.slackAudienceId, undefined, "historic unscoped records cannot be backfilled during replay");
+  } finally { h.close(); }
+});
+
 test("create detaches stored state from the input record and nested references", () => {
   const h = setup();
   try {

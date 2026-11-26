@@ -1,13 +1,24 @@
 import type express from "express";
 import { z } from "zod";
-import type { EventQuery } from "./evidence/store.js";
+import type { EventQuery, EvidenceStore } from "./evidence/store.js";
 import { EvidenceError, type EvidenceStatus, type RunEvent } from "./evidence/types.js";
 import { computeInterruptedTaskMetrics } from "./interrupted-task-metrics.js";
-import { computeRepairLoopMetrics } from "./repair-metrics.js";
-import type { TeamMember, TeamRun } from "./team-types.js";
+import {
+  computeRepairLoopMetrics,
+  type RepairMetricsMember,
+  type RepairMetricsRun,
+  type RepairRunEvent,
+  type RepairRunFilter,
+} from "./repair-metrics.js";
+import type { TeamRun } from "./team-types.js";
 import type { Provider } from "./types.js";
 import type { UsageTotals } from "./usage.js";
 import type { SessionUsage, UnmeasuredUsage } from "./usage-service.js";
+
+const DAY_MS = 86_400_000;
+const EVENT_KINDS = ["review.recorded", "repair.started", "ledger.gap"];
+const INTERRUPTED_EVENT_KINDS = ["run.revision-advanced", "run.blocked"];
+const EVENT_PAGE_LIMIT = 500;
 
 const repairLoopsQuerySchema = z.object({
   project: z.string().regex(/^[a-z0-9-]{1,80}$/).optional(),
@@ -21,9 +32,24 @@ export type RepairMetricsEventsReader =
     status?(): EvidenceStatus;
   };
 
+export function readRepairRunEvents(evidence: Pick<EvidenceStore, "events">, runId: string): RepairRunEvent[] {
+  const events: RepairRunEvent[] = [];
+  let after = 0;
+  for (;;) {
+    const page = evidence.events({ runId, kinds: EVENT_KINDS, after, limit: EVENT_PAGE_LIMIT });
+    events.push(...page.events);
+    if (!page.more || page.cursor <= after) break;
+    after = page.cursor;
+  }
+  return events;
+}
+
 export interface RepairMetricsRouteDeps {
-  runs: () => readonly TeamRun[];
+  runs: (filter?: RepairRunFilter) => readonly RepairMetricsRun[];
+  interruptedRuns?: () => readonly TeamRun[];
   memberUsage: (runId: string, memberId: string) => SessionUsage | UnmeasuredUsage;
+  runEvents?: (runId: string) => readonly RepairRunEvent[];
+  evidence?: Pick<EvidenceStore, "events"> & { status?(): EvidenceStatus };
   readable?: () => boolean;
   events?: RepairMetricsEventsReader;
   now?: () => number;
@@ -41,9 +67,9 @@ function readRunEvents(events: RepairMetricsEventsReader, runId: string): readon
   const list: RunEvent[] = [];
   let after = 0;
   for (;;) {
-    const page = events.events({ runId, kinds: ["run.revision-advanced", "run.blocked"], after, limit: 500 });
+    const page = events.events({ runId, kinds: INTERRUPTED_EVENT_KINDS, after, limit: EVENT_PAGE_LIMIT });
     list.push(...page.events);
-    if (!page.more) return list;
+    if (!page.more || page.cursor <= after) return list;
     after = page.cursor;
   }
 }
@@ -52,7 +78,11 @@ export function registerRepairMetricsRoute(app: Pick<express.Express, "get">, de
   app.get("/api/usage/repair-loops", (req, res) => {
     const query = repairLoopsQuerySchema.parse(req.query);
     if (deps.readable && !deps.readable()) throw new EvidenceError("unavailable", "The usage ledger is unavailable.");
-    const lookup = (member: TeamMember, _fallbackProvider: Provider): UsageTotals | undefined => {
+    const now = deps.now ? deps.now() : Date.now();
+    const cutoffMs = now - query.days * DAY_MS;
+    const filter: RepairRunFilter = { ...(query.project === undefined ? {} : { projectId: query.project }), cutoffMs };
+    const lookup = (member: RepairMetricsMember, _fallbackProvider: Provider): UsageTotals | undefined => {
+      if (member.status !== "stopped") return undefined;
       const found = deps.memberUsage(member.runId, member.memberId);
       if (!found.measured) {
         if (found.unavailable) throw new EvidenceError("unavailable", "The usage ledger is unavailable.");
@@ -61,10 +91,13 @@ export function registerRepairMetricsRoute(app: Pick<express.Express, "get">, de
       if (found.coverage !== "complete" || found.pricing.unknown > 0) return undefined;
       return found;
     };
-    const report = computeRepairLoopMetrics(deps.runs(), lookup, {
+    const runEvents = deps.runEvents
+      ?? (deps.evidence ? (runId: string) => readRepairRunEvents(deps.evidence!, runId) : undefined);
+    const report = computeRepairLoopMetrics(deps.runs(filter), lookup, {
       ...(query.project === undefined ? {} : { projectId: query.project }),
       days: query.days,
-      ...(deps.now ? { now: deps.now() } : {}),
+      now,
+      ...(runEvents ? { runEvents } : {}),
     });
     return void res.json(report);
   });
@@ -72,9 +105,10 @@ export function registerRepairMetricsRoute(app: Pick<express.Express, "get">, de
   app.get("/api/usage/interrupted-tasks", (req, res) => {
     const query = repairLoopsQuerySchema.parse(req.query);
     try {
-      assertEventsReady(deps.events);
-      if (deps.readable && !deps.readable()) throw new EvidenceError("unavailable", "The evidence store is unavailable.");
-      const report = computeInterruptedTaskMetrics(deps.runs(), runId => readRunEvents(deps.events!, runId), {
+      const eventsSource = deps.events ?? deps.evidence;
+      assertEventsReady(eventsSource);
+      const runs = (deps.interruptedRuns ?? (() => deps.runs() as readonly TeamRun[]))();
+      const report = computeInterruptedTaskMetrics(runs, runId => readRunEvents(eventsSource, runId), {
         ...(query.project === undefined ? {} : { projectId: query.project }),
         days: query.days,
         ...(deps.now ? { now: deps.now() } : {}),

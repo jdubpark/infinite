@@ -36,27 +36,37 @@ function buildMetricsParams(positional: string[], options: Options, usageMessage
 }
 
 function sampleCost(loop: RepairLoopSample): string {
-  if (!loop.measured || loop.tokens === undefined || loop.usd === undefined) return "unmeasured";
-  return `${loop.tokens} tok / $${formatUsd(loop.usd)}`;
+  if (loop.measured && loop.tokens !== undefined && loop.usd !== undefined) return `${loop.tokens} tok / $${formatUsd(loop.usd)}`;
+  if (loop.unfinished) return loop.outcome === "in-progress" ? "in-progress" : "unfinished";
+  return "unmeasured";
 }
 
 export function formatRepairLoopReport(report: RepairLoopReport): string[] {
   const { totals } = report;
   const header = `Repair loops · last ${report.windowDays}d${report.projectId ? ` · project ${clean(report.projectId)}` : ""}`;
+  const unfinishedPart = totals.unfinishedLoops > 0 ? `, ${totals.unfinishedLoops} unfinished loops` : "";
   const lines = [
     header,
     `Runs examined ${totals.runsExamined} · loops ${totals.loopsTotal} (resolved ${totals.resolved}, unresolved ${totals.unresolved}, in-progress ${totals.inProgress})`,
     `Causes: review ${totals.byCause.review}, check ${totals.byCause.check}, delivery ${totals.byCause.delivery}`,
     `Denominator overhead: cold replacements ${totals.coldReplacements}, failed resumes ${totals.failedResumes}`,
     `Duration (resolved): median ${formatMinutes(totals.medianMinutes)} · p90 ${formatMinutes(totals.p90Minutes)}`,
-    `Measured cost: median ${totals.medianTokens === null ? "unknown" : `${totals.medianTokens} tokens`} · ${totals.medianUsd === null ? "unknown" : `$${formatUsd(totals.medianUsd)}`} (${totals.measuredLoops} measured loops, ${totals.unmeasuredLoops} unmeasured loops, ${totals.unmeasuredMembers} unmeasured members — unmeasured omitted, never zero)`,
+    `Measured cost: median ${totals.medianTokens === null ? "unknown" : `${totals.medianTokens} tokens`} · ${totals.medianUsd === null ? "unknown" : `$${formatUsd(totals.medianUsd)}`} (${totals.measuredLoops} measured loops, ${totals.unmeasuredLoops} unmeasured loops${unfinishedPart}, ${totals.unmeasuredMembers} unmeasured members — unmeasured omitted, never zero)`,
   ];
+  if (totals.incompleteRuns > 0) {
+    lines.push(`Warning: event coverage is incomplete for ${totals.incompleteRuns} of ${totals.runsExamined} examined runs (ledger gap or missing repair/review events); loop counts may undercount actual repairs.`);
+  }
   if (!report.loops.length) {
-    lines.push("No repair loops recorded in this window.");
+    lines.push(totals.incompleteRuns > 0
+      ? "No repair loops reconstructed from complete ledger events in this window."
+      : "No repair loops recorded in this window.");
     return lines;
   }
   if (totals.unmeasuredLoops > 0) {
     lines.push(`Warning: ${totals.unmeasuredLoops} of ${totals.loopsTotal} loops have unmeasured member usage and are excluded from token/USD medians.`);
+  }
+  if (totals.unfinishedLoops > 0) {
+    lines.push(`Note: ${totals.unfinishedLoops} of ${totals.loopsTotal} loops are still unfinished (in-progress or active members) and are excluded from final token/USD medians.`);
   }
   lines.push("", `Recent loops (${report.loops.length} of ${totals.loopsTotal}):`);
   lines.push("RUN         PROJECT               REV  CAUSE     OUTCOME      ROUNDS  ATTEMPTS  COLD  RESUME  DUR    COST");

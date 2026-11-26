@@ -9,6 +9,7 @@ import type { CreateGoal, ProductGoal } from "../../packages/host/src/goal-types
 import { createTeamSchema, teamGoalContextSchema, type CreateTeam, type TeamGoalContext, type TeamLineup, type TeamView } from "../../packages/host/src/team-types.js";
 import { emptyUsage } from "../../packages/host/src/team-usage.js";
 import { TeamError, type TeamService } from "../../packages/host/src/teams.js";
+import type { VerdictDetail } from "../../packages/host/src/team-verdicts.js";
 import type { RunAssessment } from "../../packages/host/src/verdict-types.js";
 import type { Project } from "../../packages/host/src/types.js";
 import { startHost, waitFor, type Host } from "../helpers.js";
@@ -115,6 +116,7 @@ export function stubTeams() {
   const views = new Map<string, TeamView>();
   const launches: { request: CreateTeam; context: TeamGoalContext }[] = [];
   const cancels: string[] = [];
+  const details = new Map<string, unknown>();
   const usage = () => ({ total: emptyUsage(), byProfile: {}, byProvider: {}, unmeasuredMembers: 0, partialMembers: 0 });
   const service = {
     launches, cancels,
@@ -124,6 +126,10 @@ export function stubTeams() {
       return structuredClone(found);
     },
     goalIdOf: (id: string) => views.get(id)?.goal?.id,
+    assessmentOf: (id: string) => { const view = views.get(id); return view === undefined ? undefined : { revision: view.revision, assessment: view.assessment }; },
+    verdicts: { detail: (id: string) => details.get(id) as VerdictDetail | undefined },
+    detail(id: string, value: Pick<VerdictDetail, "verdictId" | "revision" | "head" | "criteria">) { details.set(id, value); },
+    forget(id: string) { views.delete(id); details.delete(id); },
     hasDeliveryAttempt: () => false,
     async createForGoal(request: CreateTeam, context: TeamGoalContext) {
       createTeamSchema.parse(request);
@@ -157,17 +163,18 @@ export function assessmentOf(met: number, notMet: number): RunAssessment {
 
 export const BRIEF = { title: "Feature", expectedOutcome: "Outcome" } as TeamView["brief"];
 
-export function stubFixture(t: TestContext, mode: Mode = "autonomous") {
+export function stubFixture(t: TestContext, mode: Mode = "autonomous", scanned = false) {
   t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-11-14T00:00:00.000Z") });
   const f = schedulerFixture();
   f.config.teams = { ...f.config.teams!, lineup };
   f.config.projects[0]!.team = { checks: [{ command: process.execPath, args: ["-e", "0"] }], objective: { ...SWITCHES } } as Project["team"];
   f.config.projects[0]!.autonomy = mode;
+  if (scanned) f.config.projects[0]!.source = { mode: "github", repository: "example/fixture", baseBranch: "main" };
   const teams = stubTeams();
   const goals = new GoalService(f.config, f.key, teams as unknown as TeamService);
   t.after(() => { goals.close(); f.close(); });
   const advance = (minutes: number) => t.mock.timers.setTime(Date.now() + minutes * minute);
-  return { teams, goals, advance };
+  return { teams, goals, advance, config: f.config };
 }
 
 export async function until<T>(read: () => T, accept: (value: T) => boolean, what: string, ms = 8000): Promise<T> {

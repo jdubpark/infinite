@@ -118,7 +118,7 @@ function evaluateAttributedTasks(
       interruptedCount: countUnblockedInterrupted(tasks, member.taskId),
     };
   }
-  if (member.role !== "implementer" && !member.taskId && nonIntegrated.length === 0) {
+  if (member.role !== "implementer" && (!member.taskId || member.role === "scout") && nonIntegrated.length === 0) {
     return { ok: true, interruptedCount: 0 };
   }
   return {
@@ -156,7 +156,7 @@ export function computeInterruptedTaskMetrics(
     if (run.replay) continue;
     if (projectId !== undefined && run.projectId !== projectId) continue;
     const continuations = run.continuations ?? [];
-    if (continuations.length === 0 && run.status !== "blocked") continue;
+    if (run.revision <= 1 && continuations.length === 0 && run.status !== "blocked") continue;
 
     const events = eventsForRun(run.id);
     const continuationsByRevision = new Map<number, TeamContinuation>();
@@ -283,33 +283,19 @@ export function computeInterruptedTaskMetrics(
       const at = blockEvent && parseTime(blockEvent.at) !== undefined ? blockEvent.at : (run.updatedAt ?? run.createdAt);
       if (!inWindow(at, cutoffMs, now)) continue;
 
-      const nonIntegrated = run.tasks.filter(task => task.status !== "integrated");
       if (!blockEvent) {
-        if (nonIntegrated.length === 0) {
-          blocksCounted += 1;
-          samples.push({
-            runId: run.id,
-            projectId: run.projectId,
-            kind: "block",
-            revision: run.revision,
-            at,
-            sourceCode,
-            interruptedCount: 0,
-          });
-        } else {
-          unknownBlocks += 1;
-          samples.push({
-            runId: run.id,
-            projectId: run.projectId,
-            kind: "block",
-            revision: run.revision,
-            at,
-            sourceCode,
-            interruptedCount: 0,
-            unknown: true,
-            unknownReason: "missing-blocked-event",
-          });
-        }
+        unknownBlocks += 1;
+        samples.push({
+          runId: run.id,
+          projectId: run.projectId,
+          kind: "block",
+          revision: run.revision,
+          at,
+          sourceCode,
+          interruptedCount: 0,
+          unknown: true,
+          unknownReason: "missing-blocked-event",
+        });
         continue;
       }
 
@@ -318,34 +304,20 @@ export function computeInterruptedTaskMetrics(
         : undefined;
       const evaluation = evaluateAttributedTasks(run, run.revision, run.tasks, sourceMemberId);
       if (!evaluation.ok) {
-        if (nonIntegrated.length === 0) {
-          blocksCounted += 1;
-          samples.push({
-            runId: run.id,
-            projectId: run.projectId,
-            kind: "block",
-            revision: run.revision,
-            at,
-            sourceCode,
-            ...(evaluation.sourceMemberId ? { sourceMemberId: evaluation.sourceMemberId } : {}),
-            interruptedCount: 0,
-          });
-        } else {
-          unknownBlocks += 1;
-          samples.push({
-            runId: run.id,
-            projectId: run.projectId,
-            kind: "block",
-            revision: run.revision,
-            at,
-            sourceCode,
-            ...(evaluation.sourceMemberId ? { sourceMemberId: evaluation.sourceMemberId } : {}),
-            ...(evaluation.sourceTaskId ? { sourceTaskId: evaluation.sourceTaskId } : {}),
-            interruptedCount: 0,
-            unknown: true,
-            unknownReason: evaluation.reason,
-          });
-        }
+        unknownBlocks += 1;
+        samples.push({
+          runId: run.id,
+          projectId: run.projectId,
+          kind: "block",
+          revision: run.revision,
+          at,
+          sourceCode,
+          ...(evaluation.sourceMemberId ? { sourceMemberId: evaluation.sourceMemberId } : {}),
+          ...(evaluation.sourceTaskId ? { sourceTaskId: evaluation.sourceTaskId } : {}),
+          interruptedCount: 0,
+          unknown: true,
+          unknownReason: evaluation.reason,
+        });
         continue;
       }
 

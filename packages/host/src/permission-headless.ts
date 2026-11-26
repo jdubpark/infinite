@@ -3,7 +3,7 @@ import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { chmodSync, lstatSync, realpathSync, rmSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { matchDestructive } from "@infinite/attention";
-import { MAX_SOCKET_PATH_BYTES, canonicalOrResolved, isTrustedPrivateDir, permissionChannelPath, runDirOf, socketDirOf, type SocketTarget } from "./ipc.js";
+import { MAX_SOCKET_PATH_BYTES, canonicalOrResolved, destroyWhenSilent, isTrustedPrivateDir, permissionChannelPath, runDirOf, socketDirOf, type SocketTarget } from "./ipc.js";
 import { headlessLaunch } from "./launch.js";
 import { REJECT_CODES, requesterNotice, type InterruptClass, type RejectCode } from "./permission-policy.js";
 import { teamPermissionAssignment } from "./team-permission-adapter.js";
@@ -57,7 +57,7 @@ export function channelCall(socket: string, request: ChannelRequest, timeoutMs: 
   return new Promise((resolve, reject) => {
     const connection = createConnection(socket);
     let data = "";
-    connection.setTimeout(timeoutMs, () => connection.destroy(new Error("The permission channel did not answer in time")));
+    destroyWhenSilent(connection, timeoutMs, "The permission channel did not answer in time");
     connection.on("connect", () => connection.write(JSON.stringify(request) + "\n"));
     connection.on("data", chunk => {
       data += chunk;

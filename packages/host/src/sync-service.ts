@@ -6,6 +6,10 @@ import { basename, dirname, join, resolve, sep } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { captureWorkspace, type WorkspaceManifest, type WorkspaceStoreTarget } from "./workspace-checkpoint.js";
+import {
+  collectSharedPool, currentBootId, currentProcessStart, discoverClientWorkspaceScopes,
+  hasLegacyClientWriters, manifestChunkHashes, pruneScopeRefs,
+} from "./workspace-pool-gc.js";
 import { uploadMissingChunks } from "./chunk-upload.js";
 import { shouldCaptureWorkspace, watchWorkspaceChanges } from "./workspace-changes.js";
 
@@ -15,7 +19,11 @@ export interface SyncServiceOptions {
   publisherId?: string;
   startupInactivityMs?: number;
 }
-export interface SyncState { pid: number; projectId: string; root: string; origin: string; startedAt: string; publisherId?: string; lastCommitAt?: string; lastManifest?: string; problem?: string; skipped?: number }
+export interface SyncState {
+  pid: number; projectId: string; root: string; origin: string; startedAt: string;
+  publisherId?: string; lastCommitAt?: string; lastManifest?: string; problem?: string; skipped?: number;
+  poolLeases?: true; bootId?: string; processStart?: string;
+}
 export interface SyncStart { skipped: { count: number; paths: string[] } }
 
 const STARTUP_TIMEOUT = 60000;
@@ -238,7 +246,14 @@ async function runSyncService(): Promise<void> {
     if (config.startupInactivityMs) { inactivity = config.startupInactivityMs; clearTimeout(startup); startup = setTimeout(stop, inactivity); }
     const storeDir: WorkspaceStoreTarget = config.sharedPoolDirectory
       ? { directory: config.storeDir, sharedPoolDirectory: config.sharedPoolDirectory } : config.storeDir;
-    const state: SyncState = { pid: process.pid, projectId: config.projectId, root: config.root, origin: config.origin, startedAt: new Date().toISOString(), publisherId: config.publisherId };
+    const hostBoot = currentBootId();
+    const procStart = await currentProcessStart();
+    const state: SyncState = {
+      pid: process.pid, projectId: config.projectId, root: config.root, origin: config.origin,
+      startedAt: new Date().toISOString(), publisherId: config.publisherId, poolLeases: true,
+      ...(hostBoot !== "unsupported" ? { bootId: hostBoot } : {}),
+      ...(procStart !== undefined ? { processStart: procStart } : {}),
+    };
     writeState(config.stateFile, state);
     const record = () => { if (!abort.signal.aborted && readSyncState(config.stateFile)?.pid === process.pid) writeState(config.stateFile, state); };
     let skipped: string[] = [];
@@ -248,7 +263,7 @@ async function runSyncService(): Promise<void> {
       process.send?.({ type: "ready", skipped: { count: skipped.length, paths: skipped.slice(0, 20) } }, error => { if (error) stop(); });
     };
     let previous: WorkspaceManifest | undefined, committed: string | undefined, lastFull = 0, failures = 0, pushFailures = 0, held = false;
-    let firstIteration = true, previousIterationFailed = false, lastCaptureStartedAt = 0, lastPendingCheckAt = 0;
+    let firstIteration = true, previousIterationFailed = false, lastCaptureStartedAt = 0, lastPendingCheckAt = 0, lastPoolGcAt = Date.now();
     changeDetector = await watchWorkspaceChanges([config.root], join(config.storeDir, "watch-cache"));
     while (!abort.signal.aborted && readSyncState(config.stateFile)?.pid === process.pid) {
       let content: string | undefined, pushing = false;
@@ -295,7 +310,22 @@ async function runSyncService(): Promise<void> {
           if (await pendingReason(config, abort.signal) !== "apply-failed") { held = false; pushFailures = 0; delete state.problem; record(); }
         } else if (capture && !held && state.problem) { delete state.problem; record(); }
         failures = 0;
+        const hadReported = reported;
         ready();
+        if (hadReported && config.sharedPoolDirectory && previous && content === committed) {
+          await pruneScopeRefs({ scopeDirectory: config.storeDir, keepHashes: manifestChunkHashes([previous]), sharedPoolDirectory: config.sharedPoolDirectory, signal: abort.signal }).catch(() => {});
+          if (Date.now() - lastPoolGcAt >= 60 * 60 * 1000) {
+            lastPoolGcAt = Date.now();
+            await discoverClientWorkspaceScopes(config.sharedPoolDirectory)
+              .then(clientScopes => collectSharedPool({
+                sharedPoolDirectory: config.sharedPoolDirectory!,
+                scopeDirectories: [...new Set([config.storeDir, ...clientScopes])],
+                hasLegacyWriters: () => hasLegacyClientWriters(dirname(config.sharedPoolDirectory!), process.pid),
+                signal: abort.signal,
+              }))
+              .catch(() => {});
+          }
+        }
         previousIterationFailed = false;
       } catch (error) {
         if (abort.signal.aborted) break;

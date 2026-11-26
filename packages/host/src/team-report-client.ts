@@ -1,6 +1,5 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
-import { HOOK_CAPABILITIES_HEADER, QUESTION_RECOMMENDATION_CAPABILITY } from "./hooks.js";
 import { teamReportEnvelopeSchema, teamReportSchema, type TeamReportEnvelope } from "./team-types.js";
 import { missionReportArgumentsSchema, missionReportEnvelopeSchema, missionReportSchema } from "./mission-types.js";
 
@@ -54,36 +53,12 @@ export function createReportEnvelope(input: unknown, env: NodeJS.ProcessEnv = pr
   if (Buffer.byteLength(JSON.stringify(envelope)) > MAX_TEAM_REPORT_BYTES) throw new ReportError("Report exceeds 64 KiB.");
   return envelope;
 }
-function supportsQuestionRecommendation(response: Response): boolean {
-  const header = response.headers.get(HOOK_CAPABILITIES_HEADER);
-  if (!header) return false;
-  return header.split(",").some(capability => capability.trim().toLowerCase() === QUESTION_RECOMMENDATION_CAPABILITY);
-}
-function questionForOlderWorker(report: { kind: string }): Record<string, unknown> | undefined {
-  if (report.kind !== "question" || !("recommendation" in report)) return undefined;
-  return Object.fromEntries(Object.entries(report).filter(([key]) => key !== "recommendation"));
-}
-async function readLegacyQuestionFallback(
-  response: Response,
-  report: { kind: string },
-): Promise<{ fallback?: Record<string, unknown>; rawBody?: string }> {
-  if (response.status !== 400 || supportsQuestionRecommendation(response)) return {};
-  const older = questionForOlderWorker(report);
-  if (!older) return {};
-  const rawBody = await response.text();
-  return rawBody.length === 0 ? { fallback: older } : { rawBody };
-}
 export async function submitTeamReport(input: unknown, env: NodeJS.ProcessEnv = process.env): Promise<TeamReportEnvelope> {
-  const { endpoint, token, binding } = hookCapability(env, "team-report");
-  let envelope = createReportEnvelope(input, env);
-  let response = await postTeamReport(endpoint, token, envelope);
-  const { fallback, rawBody } = await readLegacyQuestionFallback(response, envelope.report);
-  if (fallback) {
-    envelope = teamReportEnvelopeSchema.parse({ ...binding, report: fallback, requestId: reportIdentity({ ...binding, report: fallback }) });
-    response = await postTeamReport(endpoint, token, envelope);
-  }
+  const { endpoint, token } = hookCapability(env, "team-report");
+  const envelope = createReportEnvelope(input, env);
+  const response = await postTeamReport(endpoint, token, envelope);
   if (response.status >= 400 && response.status < 500) {
-    const detail = (rawBody ?? await response.text()).trim().slice(0, 2000);
+    const detail = (await response.text()).trim().slice(0, 2000);
     throw new ReportError(detail || `Report refused (${response.status}). Inspect this member's recorded report; do not bypass the refusal.`);
   }
   await response.body?.cancel();
@@ -147,21 +122,14 @@ export function createMissionReportEnvelope(input: unknown, env: NodeJS.ProcessE
   return envelope;
 }
 export async function submitMissionReport(input: unknown, env: NodeJS.ProcessEnv = process.env): Promise<MissionReportEnvelope> {
-  const { endpoint, token, binding } = missionReportEnvironment(env);
-  let envelope = createMissionReportEnvelope(input, env);
-  const post = (body: MissionReportEnvelope) => fetch(endpoint, {
+  const { endpoint, token } = missionReportEnvironment(env);
+  const envelope = createMissionReportEnvelope(input, env);
+  const response = await fetch(endpoint, {
     method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-    body: JSON.stringify(body), signal: AbortSignal.timeout(10000), redirect: "error",
+    body: JSON.stringify(envelope), signal: AbortSignal.timeout(10000), redirect: "error",
   });
-  let response = await post(envelope);
-  const { fallback, rawBody } = await readLegacyQuestionFallback(response, envelope.report);
-  if (fallback) {
-    const content = { report: fallback, ...(envelope.note === undefined ? {} : { note: envelope.note }) };
-    envelope = missionReportEnvelopeSchema.parse({ ...binding, ...content, requestId: reportIdentity({ ...binding, ...content }) });
-    response = await post(envelope);
-  }
   if (response.status >= 400 && response.status < 500) {
-    const detail = (rawBody ?? await response.text()).trim().slice(0, 2000);
+    const detail = (await response.text()).trim().slice(0, 2000);
     throw new ReportError(detail || `Report refused or unconfirmed (${response.status}). Stop and inspect this attempt's recorded report; do not bypass the refusal or submit a different report.`);
   }
   await response.body?.cancel();

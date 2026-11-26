@@ -7,8 +7,6 @@ export type HookRoute = "claude" | "codex" | "codex-notify" | "team-report" | "m
 const ROUTES = new Set<string>(["claude", "codex", "codex-notify", "team-report", "mission-report", "team-handoff", "transcript", "drain", "team-entry",
   "permission-check", "permission-request"]);
 const MAX_BODY = 256 * 1024;
-export const HOOK_CAPABILITIES_HEADER = "X-Infinite-Hook-Capabilities";
-export const QUESTION_RECOMMENDATION_CAPABILITY = "question-recommendation";
 export class HookPayloadError extends Error {
   constructor(readonly status: number, message = "Hook payload was refused") { super(message); }
 }
@@ -45,7 +43,6 @@ export function startHookServer(opts: {
       res.writeHead(401).end();
       return;
     }
-    res.setHeader(HOOK_CAPABILITIES_HEADER, QUESTION_RECOMMENDATION_CAPABILITY);
     let body = "";
     let bytes = 0;
     let tooBig = false;

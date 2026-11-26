@@ -601,8 +601,10 @@ export interface TeamMember extends TeamAssignment {
   startedAt?: string;
   reportedAt?: string;
   lastActivityAt?: string;
+  spinnerOnlySince?: string;
   pendingLimit?: boolean;
   stalledAt?: string;
+  stalledSourceMemberId?: string;
   report?: TeamReport;
   cursor: number;
   entryCursor?: number;
@@ -742,6 +744,28 @@ export interface TeamRun {
   review?: { verdict: "approved" | "changes-requested"; summary: string; revision: number; uiEvidence?: string; acceptance?: TeamAcceptanceEvidence[] };
   round: number;
 }
+export type TeamWaitReasonKind =
+  | "worker-slot"
+  | "dependency"
+  | "owner-decision"
+  | "provider-prompt"
+  | "provider-limit"
+  | "integration-order"
+  | "linear-sync"
+  | "spinner-only"
+  | "stalled";
+
+export interface TeamWaitReason {
+  kind: TeamWaitReasonKind;
+  summary: string;
+  taskId?: string;
+  memberId?: string;
+  decisionId?: string;
+  blockedByTaskIds?: string[];
+  since?: string;
+  resetsAt?: string;
+}
+
 export type TeamView = Omit<TeamRun, "members" | "permissionDecisions" | "permissionRecovery"> & {
   pendingOperation?: TeamPendingOperation;
   members: Omit<TeamMember, "prompt" | "contextFeedback" | "nativeSessionId" | "continuation" | "turns" | "pendingFeedback" | "goalCriteriaPlan">[];
@@ -750,6 +774,7 @@ export type TeamView = Omit<TeamRun, "members" | "permissionDecisions" | "permis
   usage: UsageRollup;
   providerLimits: ProviderLimit[];
   workers: { limit: number; max: number; running: number; ready: number };
+  waitReasons?: TeamWaitReason[];
   resumable: boolean;
   continuable: boolean;
 };

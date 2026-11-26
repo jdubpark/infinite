@@ -116,6 +116,7 @@ export class MissionReview<S extends MissionReviewStored> implements MissionRevi
     this.replace(stored, review, { ...fieldsOf(review), state: "forwarding", forwardRequestId });
     this.host.event(stored, `The coordinator forwarded the owner's review ${review.reviewId} to subtask ${subtask.id}.`);
     stored.ops.push({ kind: "review-forward", subtaskId: subtask.id, teamId: review.runId, requestId: forwardRequestId, text, ...(source ? { source } : {}) });
+    for (const batch of stored.deliveredUnapplied ?? []) batch.inbox = batch.inbox.filter(message => message.type !== "review-direction" || message.reviewId !== review.reviewId);
     return { kind: "queued" };
   }
 

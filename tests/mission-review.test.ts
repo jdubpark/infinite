@@ -510,3 +510,37 @@ test("across a pause, a review the coordinator received is not sent again and it
     assert.deepEqual(reviewMessages(await g.messages(n + 1)), [], "and is not sent again");
   } finally { g.close(); }
 });
+
+test("a forward held by a paused run outside the mission keeps its review out of a fresh conversation, which still learns the repository is held", { timeout: 90000 }, async () => {
+  const h = scripted();
+  try {
+    const { id, teamId, direction } = await delivered(h);
+    await h.missions.reviewDirection(id, direction());
+    await h.report(2, { kind: "wait", summary: "Reading the review." });
+    assert.equal(reviewMessages(await h.messages(3)).length, 1);
+    await h.confirmNative(3);
+    await h.signal(3, { kind: "tool-start", tool: "Read", input: {}, quiet: true });
+    await h.missions.pause(id, action(h, id));
+    await until(() => h.get(id), mission => mission.coordinator?.status === "stopped");
+    await h.missions.resume(id, action(h, id));
+    const resumed = (await h.attempt(4)).request.continuation;
+    assert.equal(resumed?.mode, "resume");
+    await h.confirmNative(4);
+    await h.usage(4, 130000);
+    h.runs.set("paused-api", { id: "paused-api", projectId: "api", missionId: "", status: "paused", revision: 1, decisions: [], updatedAt: new Date().toISOString() });
+    await h.report(4, { kind: "steer-subtask", subtaskId: "a", text: forwarded });
+    const fresh = (await h.attempt(5)).request.continuation;
+    assert.equal(fresh?.mode, "start");
+    assert.notEqual(fresh?.nativeSessionId, resumed?.nativeSessionId);
+    const messages = await h.messages(5) as MissionMessage[];
+    assert.deepEqual(messages.filter(message => message.type === "repository-held").map(message => message.reviewId), ["PRR_1"]);
+    assert.deepEqual(reviewMessages(messages), [], "the fresh conversation is not asked to forward the queued review again");
+    await h.report(5, { kind: "follow-up", inMinutes: 5, reason: "Check whether the API repository is free.", check: "Look at the run that holds it." });
+    await until(() => h.get(id), mission => (mission.followUps ?? []).some(item => item.state === "open"));
+    h.set("paused-api", { status: "implementing" });
+    h.set("paused-api", { status: "ready-for-review" });
+    await until(() => h.get(id), received);
+    assert.deepEqual(h.steers, [{ teamId, text: forwarded }]);
+    assert.equal(h.refusals(id), 0);
+  } finally { h.close(); }
+});

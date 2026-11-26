@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { ASSESSMENT_LABEL, awaitsProvisionalAnswer, countsText, criterionState, newestVerdictId, ownerOutcomeLabel, resultText, type AssessedGoal } from "../apps/mobile/src/features/teams/goal-verdicts.ts";
+import { readFileSync } from "node:fs";
+import { ASSESSMENT_LABEL, REMOTE_CRITERIA_NOTE, awaitsProvisionalAnswer, countsText, criterionState, newestVerdictId, ownerOutcomeLabel, resultText, type AssessedGoal } from "../apps/mobile/src/features/teams/goal-verdicts.ts";
 import type { GoalAssessment } from "../apps/mobile/src/api/client.ts";
 
 const assessment = (overrides: Partial<GoalAssessment> = {}): GoalAssessment => ({
@@ -36,4 +37,14 @@ test("the answer names the newest assessed cycle", () => {
   const newest = assessment({ verdictId: "22222222-2222-4222-8222-222222222222" });
   assert.equal(newestVerdictId([cycle(1, assessment()), cycle(2, newest), cycle(3)]), newest.verdictId);
   assert.equal(newestVerdictId([cycle(1)]), undefined);
+});
+
+test("remote mobile criteria note explains the remote boundary honestly without calling verdicts", () => {
+  assert.match(REMOTE_CRITERIA_NOTE, /per-criterion/i);
+  assert.match(REMOTE_CRITERIA_NOTE, /unavailable over remote access/i);
+  assert.match(REMOTE_CRITERIA_NOTE, /web client/i);
+  assert.match(REMOTE_CRITERIA_NOTE, /infinite goal verdicts/);
+  assert.ok(!/achieved|done|passed|verified/i.test(REMOTE_CRITERIA_NOTE));
+  const detailSource = readFileSync(new URL("../apps/mobile/src/features/teams/GoalDetail.tsx", import.meta.url), "utf8");
+  assert.ok(!/\/verdicts\b/.test(detailSource));
 });

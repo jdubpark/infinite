@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto";
 import type { RunAssessment } from "../packages/host/src/verdict-types.js";
 import { TeamError } from "../packages/host/src/teams.js";
 import type { ProductGoal } from "../packages/host/src/goal-types.js";
-import { CONTINUE_EVENT, DELIVERY_HOLD_REASON, LATE_RECEIPT_EVENT, PROVISIONAL_EVENT, PROVISIONAL_REASON } from "../packages/host/src/goal-verdicts.js";
+import { CONTINUE_EVENT, DELIVERY_HOLD_REASON, LATE_RECEIPT_EVENT, PROVISIONAL_EVENT, PROVISIONAL_REASON, PROVISIONAL_WITHDRAWN_REASON } from "../packages/host/src/goal-verdicts.js";
 import { BRIEF, NOTE, SWITCHES, assessmentOf, criterion, finite, hostFixture, outcomeOf, standing, stubFixture, until } from "./fixtures/verdict-goals.js";
 
 const AGENT_ASSESSMENT = "Agent assessment, provisional";
@@ -294,7 +294,7 @@ test("a goal holds its next launch for a delivery receipt and stops provisional-
   assert.equal(after.cycles[0]!.assessment?.verdictId, reverted.verdictId);
   assert.deepEqual(after.cycles[0]!.supersededVerdictIds, [first.verdictId, late.verdictId]);
   assert.equal(after.stopReason, "provisional-met");
-  assert.equal(after.reason, PROVISIONAL_REASON);
+  assert.equal(after.reason, PROVISIONAL_WITHDRAWN_REASON, "a reverted landing withdraws the provisional reason; the goal stays stopped for the owner");
   assert.equal(count(after, PROVISIONAL_EVENT), 1);
   const answered = await goals.outcome(created.id, outcomeOf(after, { verdictId: first.verdictId }) as never);
   assert.equal(answered.outcomes.length, 1, "The owner's answer names an earlier id and is accepted");

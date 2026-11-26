@@ -43,6 +43,7 @@ interface Stored {
 }
 
 const UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i;
+const compareCodeUnits = (left: string, right: string) => (left < right ? -1 : left > right ? 1 : 0);
 const LEASE_MS = 30_000;
 const MAX_QUEUED = 8;
 const OBSERVATION_WAIT_MS = 5_000;
@@ -69,7 +70,7 @@ export class CmuxSessions {
     this.client = new CmuxClient(config.cmux?.command ?? "cmux");
     this.directory = join(config.stateDir, "cmux");
     mkdirSync(this.directory, { recursive: true, mode: 0o700 });
-    for (const id of readdirSync(this.directory).filter((value) => UUID.test(value))) {
+    for (const id of readdirSync(this.directory).filter((value) => UUID.test(value)).sort(compareCodeUnits)) {
       try {
         const stored = unseal<Stored>(key, `cmux:${id}:meta`, readFileSync(join(this.directory, id, "meta.sealed"), "utf8"));
         if (stored.session.id !== id) continue;
@@ -396,7 +397,7 @@ export class CmuxSessions {
   }
 
   list() {
-    const rows = () => [...this.records.values()].map((record) => {
+    const rows = () => [...this.records.values()].sort((left, right) => compareCodeUnits(left.session.id, right.session.id)).map((record) => {
       const { context: _context, initialPrompt: _prompt, nativeArgs: _args, ...session } = record.session;
       const { screen: _screen, ...state } = this.state(record);
       return { ...session, ...state, attention: { ...state.attention, lastMessage: state.attention.lastMessage?.slice(0, 280) } };

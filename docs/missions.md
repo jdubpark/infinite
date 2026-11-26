@@ -448,9 +448,12 @@ A superseded or refused forward is reported to the coordinator as a refused
 `steer-subtask`; it does not count toward the three refusals that block a
 mission. While a forward is queued, the coordinator cannot report a `result`.
 Every coordinator prompt lists queued forwards in the mission state as
-`queuedForwards`, with the review ID, so a new conversation knows the review is
-already forwarded. A further `steer-subtask` on that subtask is refused with
-that note and does not count toward the three refusals either.
+`queuedForwards`, with the review ID and a note: the review is already
+forwarded, the host sends it to the subteam when it can, and the coordinator is
+told if the forward ends without reaching the subteam. A further
+`steer-subtask` on that subtask is refused with that note and does not count
+toward the three refusals either. A `steer-subtask` on another finished subtask
+is refused as before and counts.
 
 A mission started by [intake](intake.md) that a review reopens returns its
 intake record from `finished` to `started` in the same change. The record keeps

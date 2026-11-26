@@ -578,3 +578,32 @@ test("a forward queued behind a live run outside the mission is in a fresh conve
     assert.equal(h.refusals(id), 0);
   } finally { h.close(); }
 });
+
+test("a forward queued for one subtask does not excuse a steer of another finished subtask: that refusal counts", { timeout: 90000 }, async () => {
+  const h = scripted();
+  try {
+    const { id } = await h.create();
+    await h.report(1, { kind: "dispatch", summary: "An API change and a web change", subtasks: [plan("a", "api"), plan("b", "web")] });
+    const started = await until(() => h.get(id), mission => mission.subtasks.length === 2 && mission.subtasks.every(item => item.teamId));
+    const team = (subtaskId: string) => started.subtasks.find(item => item.id === subtaskId)!.teamId!;
+    const deliver = (subtaskId: string) => h.set(team(subtaskId), { status: "ready-for-review", pullRequest: { revision: 1, headCommit: HEAD, pullRequestUrl, summary: "Delivered.", reportedAt: new Date().toISOString(), branch: `infinite/${subtaskId}` } });
+    deliver("b");
+    await until(() => h.get(id), mission => mission.subtasks.find(item => item.id === "b")?.status === "done");
+    await h.attempt(2);
+    await h.report(2, { kind: "wait", summary: "Waiting for subtask a." });
+    deliver("a");
+    await until(() => h.get(id), mission => mission.subtasks.every(item => item.status === "done"));
+    await h.attempt(3);
+    await h.missions.reviewDirection(id, { requestId: reviewRequestId(team("a"), "PRR_1"), runId: team("a"), subtaskId: "a", reviewId: "PRR_1", pullRequestUrl, text: requested, revision: 1, headCommit: HEAD });
+    await h.report(3, { kind: "wait", summary: "Reading the review." });
+    assert.equal(reviewMessages(await h.messages(4)).length, 1);
+    h.runs.set("live-api", { id: "live-api", projectId: "api", missionId: "", status: "implementing", revision: 1, decisions: [], updatedAt: new Date().toISOString() });
+    await h.report(4, { kind: "steer-subtask", subtaskId: "a", text: forwarded });
+    await until(() => h.get(id), mission => events(mission).includes(forwardedEvent));
+    await h.missions.steer(id, { ...action(h, id), text: "Also check the web client." });
+    await h.attempt(5);
+    await h.report(5, { kind: "steer-subtask", subtaskId: "b", text: "Update the web client too." });
+    await until(() => h.get(id), mission => events(mission).some(text => text.startsWith("The coordinator's steer-subtask report was refused: Subtask b has no running or blocked subteam.")));
+    await waitFor(async () => h.refusals(id), count => count === 1, 10000);
+  } finally { h.close(); }
+});

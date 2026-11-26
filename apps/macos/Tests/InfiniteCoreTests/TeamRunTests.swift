@@ -1,7 +1,6 @@
 import XCTest
 @testable import InfiniteCore
 
-/// The team dashboard reads the host's run record directly; these pin the few derived facts it shows.
 final class TeamRunTests: XCTestCase {
     private func run(_ fields: [String: JSON]) -> TeamRun {
         var base: [String: JSON] = [
@@ -35,6 +34,7 @@ final class TeamRunTests: XCTestCase {
         XCTAssertEqual(team.summaryLine, "Implementing · 1/3 tasks integrated")
         XCTAssertEqual(run(["status": .string("ready-for-review"), "tasks": .array(tasks)]).summaryLine, "Ready for your review")
         XCTAssertEqual(run(["status": .string("some-new-state")]).statusLabel, "Some new state")
+        XCTAssertEqual(run(["status": .string("some-new-state")]).typedStatus, .unknown("some-new-state"))
     }
 
     func testActiveMembersBelongToTheCurrentRevisionAndAreLive() {
@@ -47,7 +47,6 @@ final class TeamRunTests: XCTestCase {
         XCTAssertEqual(TeamRun.roleName("auditor"), "Auditor")
     }
 
-    /// Waiting for review is never complete; only a reported merge is, and an unknown state still counts as ongoing.
     func testHomeBoardGroupsEveryHostState() {
         let expected: [String: ProjectState] = [
             "planning": .ongoing, "discovering": .ongoing, "implementing": .ongoing, "integrating": .ongoing, "verifying": .ongoing,
@@ -70,7 +69,6 @@ final class TeamRunTests: XCTestCase {
         XCTAssertEqual(run(["linear": .object(["issue": .object(["identifier": .string("INF-7")])])]).linearIssue, "INF-7")
     }
 
-    /// Routine host saves move updatedAt; the age a person sees follows the run's history instead.
     func testLastActivityFollowsHistoryNotRoutineSaves() {
         let events: JSON = .array([["at": "2026-10-18T01:00:00.000Z", "text": "Plan reported."], ["at": "2026-10-18T02:30:00.000Z", "text": "Checks passed."]].map { .object($0.mapValues { .string($0) }) })
         XCTAssertEqual(run(["updatedAt": .string("2026-10-18T09:00:00.000Z"), "events": events]).lastActivityAt, "2026-10-18T02:30:00.000Z")
@@ -126,7 +124,6 @@ final class TeamRunTests: XCTestCase {
     func testTaskColumnsFollowDependencyDepthAndSurviveBadEdges() {
         let team = run(["tasks": .array([task("a", "integrated"), task("b", "integrated"), task("c", "pending", after: ["a", "b"]), task("d", "pending", after: ["c", "missing"])])])
         XCTAssertEqual(team.taskColumns.map { $0.map { $0["id"].string } }, [["a", "b"], ["c"], ["d"]])
-        // A cycle still shows both tasks instead of dropping them or looping forever.
         let cycle = run(["tasks": .array([task("x", "pending", after: ["y"]), task("y", "pending", after: ["x"])])])
         XCTAssertEqual(Set(cycle.taskColumns.flatMap { $0.map { $0["id"].string } }), ["x", "y"])
     }

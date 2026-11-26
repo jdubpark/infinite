@@ -8,8 +8,6 @@ import InfiniteCore
     @StateObject private var visibility = DisplayVisibilityMonitor()
     @NSApplicationDelegateAdaptor(DesktopDelegate.self) private var delegate
     init() {
-        // A locked Keychain or changed signing identity must produce a usable
-        // connection error instead of blocking the UI in a background prompt.
         SecKeychainSetUserInteractionAllowed(false)
     }
     var body: some Scene {
@@ -48,7 +46,6 @@ private struct DisplayVisibilityUpdates: ViewModifier {
     }
 }
 
-/// Everything beyond the session list lives in the menu bar and separate windows.
 struct WorkspaceCommands: Commands {
     @ObservedObject var app: AppModel
     @Environment(\.openWindow) private var openWindow
@@ -122,34 +119,33 @@ struct DesktopView: View {
     private var filteredGroups: [ProjectGroup] {
         app.projectGroups.groups.filter { search.isEmpty || ([$0.name] + $0.repos.map(\.name)).joined(separator: " ").localizedCaseInsensitiveContains(search) }
     }
-    /// One list selects Home, Cost, a project, or a session; prefixes keep the three from colliding.
-    /// While a mission or team is open nothing is selected, so any row leads back.
     private var selection: Binding<String?> {
         Binding(get: {
-            if app.showingUnderstanding { return "understand" }
-            if app.showingHome { return app.projectFilter.map { "project:" + $0 } ?? "home" }
-            if app.showingCost { return "cost" }
-            if app.selectedTeamID == nil && app.selectedMissionID == nil, let id = app.selectedID { return "session:" + id }
-            return nil
+            switch app.route {
+            case .understanding: return "understand"
+            case .home: return app.projectFilter.map { "project:" + $0 } ?? "home"
+            case .cost: return "cost"
+            case .mission, .team: return nil
+            case .sessions: return app.selectedID.map { "session:" + $0 }
+            }
         }, set: { value in
             guard let value else { return }
-            let leavingSession = !app.showingHome && !app.showingCost && app.selectedTeamID == nil && app.selectedMissionID == nil
-            if leavingSession, let current = app.selectedID, value != "session:" + current { app.terminals[current]?.markRead() }
+            if app.route == .sessions, let current = app.selectedID, value != "session:" + current { app.terminals[current]?.markRead() }
             if value == "understand" { app.showUnderstanding() }
             else if value == "cost" { app.showCost() }
             else if value.hasPrefix("session:") { app.openSession(String(value.dropFirst(8))) }
             else { app.showHome(project: value.hasPrefix("project:") ? String(value.dropFirst(8)) : nil) }
         })
     }
-    private var missionModel: MissionModel? { app.showingHome || app.showingCost || app.showingUnderstanding ? nil : app.selectedMissionID.flatMap(app.missionModel(for:)) }
-    private var teamModel: TeamModel? { app.showingHome || app.showingCost || app.showingUnderstanding || missionModel != nil ? nil : app.selectedTeamID.flatMap(app.teamModel(for:)) }
     private var pageTitle: String {
-        if app.showingUnderstanding { return "Understand" }
-        if app.showingHome { return app.projectFilter.flatMap(app.projectGroups.group)?.name ?? "Home" }
-        if app.showingCost { return "Cost" }
-        if let missionModel { return missionModel.mission.title }
-        if let teamModel { return teamModel.run.title }
-        return app.sessions.first { $0.id == app.selectedID }?.title ?? "Infinite"
+        switch app.route {
+        case .understanding: return "Understand"
+        case .home: return app.projectFilter.flatMap(app.projectGroups.group)?.name ?? "Home"
+        case .cost: return "Cost"
+        case .mission(let id): return app.missionModel(for: id)?.mission.title ?? "Infinite"
+        case .team(let id, _): return app.teamModel(for: id)?.run.title ?? "Infinite"
+        case .sessions: return app.sessions.first { $0.id == app.selectedID }?.title ?? "Infinite"
+        }
     }
     var body: some View {
         NavigationSplitView {
@@ -186,12 +182,9 @@ struct DesktopView: View {
         } message: { Text("This stops the agent process on the server. Its recording stays available.") }
     }
 
-    /// Home, every project, then sessions: the person's own, plus any team member stopped on a
-    /// provider permission prompt, so no prompt is only reachable through its team's page.
     private var sidebar: some View {
         let groups = filteredGroups
         let sessions = filteredSessions.filter { $0.value["team"] == .null || $0.needsYou || searching }
-        // Board rows waiting on the person, plus standalone sessions stopped on a provider prompt.
         let waiting = app.board.count(.needsInput) + app.sessions.filter { $0.value["team"] == .null && $0.needsYou }.count
         let live = sessions.filter(\.running)
         let ended = sessions.filter { !$0.running }
@@ -223,7 +216,6 @@ struct DesktopView: View {
         }
         .safeAreaInset(edge: .bottom, spacing: 0) { footer }
     }
-    /// The connected server, its state in words, and the way to switch or add one.
     private var footer: some View {
         HStack(spacing: 10) {
             Circle().fill(app.connected ? Palette.connected : app.connecting || app.sessionsDisplayStale ? Palette.attention : Color.secondary).frame(width: 7, height: 7)
@@ -239,7 +231,6 @@ struct DesktopView: View {
                 Button(app.connected ? "Refresh" : "Reconnect") { Task { if app.connected { await app.refresh() } else { await app.connect() } } }.disabled(app.active == nil)
             } label: { Text(app.active?.label ?? "No server").font(.callout.weight(.medium)).lineLimit(1).truncationMode(.tail) }
             .menuStyle(.borderlessButton).tint(.primary)
-            // The connection state always shows in full; a long server name truncates instead.
             Text(app.connected ? "Connected" : app.connecting ? "Connecting…" : app.active == nil ? "Not paired" : app.sessionsDisplayStale ? (app.sessionsLoaded ? "Offline" : "Unreachable") : "Checking…")
                 .font(.caption).foregroundStyle(app.sessionsDisplayStale && !app.connected ? .orange : .secondary).lineLimit(1)
                 .frame(width: 78, alignment: .leading)
@@ -255,7 +246,6 @@ struct DesktopView: View {
         .glassSurface(in: RoundedRectangle(cornerRadius: 14, style: .continuous))
         .padding(10)
     }
-    /// A session row says "Needs you" while its agent waits on a provider prompt; that is never answered for it.
     private func rows(_ sessions: [AgentSession]) -> some View {
         ForEach(sessions) { row in
             HStack(spacing: 9) {
@@ -283,8 +273,7 @@ struct DesktopView: View {
 
     @ViewBuilder private var detail: some View {
         VStack(spacing: 0) {
-            // Session panes stay mounted underneath Home, Cost, missions, and team dashboards, so switching back is instant.
-            let covered = app.active == nil || app.showingHome || app.showingCost || app.showingUnderstanding || missionModel != nil || teamModel != nil
+            let covered = app.active == nil || app.route != .sessions
             if app.active != nil { haltBanners }
             ZStack {
                 Group {
@@ -303,22 +292,28 @@ struct DesktopView: View {
                     } else { panes }
                 }.opacity(covered ? 0 : 1).allowsHitTesting(!covered).accessibilityHidden(covered)
                 if app.active == nil { welcome }
-                else if app.showingUnderstanding { UnderstandingView(app: app) }
-                else if app.showingHome { HomeView(app: app) }
-                else if app.showingCost, let cost = app.costModel() { CostView(app: app, model: cost) }
-                else if let missionModel { MissionDetailView(app: app, model: missionModel).id(missionModel.id) }
-                else if let teamModel { TeamDetailView(app: app, model: teamModel).id(teamModel.id) }
+                else {
+                    switch app.route {
+                    case .understanding: UnderstandingView(app: app)
+                    case .home: HomeView(app: app)
+                    case .cost: if let cost = app.costModel() { CostView(app: app, model: cost) }
+                    case .mission(let id): if let model = app.missionModel(for: id) { MissionDetailView(app: app, model: model).id(model.id) }
+                    case .team(let id, _): if let model = app.teamModel(for: id) { TeamDetailView(app: app, model: model).id(model.id) }
+                    case .sessions: EmptyView()
+                    }
+                }
             }
         }.frame(maxWidth: .infinity, maxHeight: .infinity).background(Palette.background)
     }
-    /// A host halt shows on every page; a project halt on the pages of the host projects it holds, and as one line on the overview.
     @ViewBuilder private var haltBanners: some View {
-        if app.showingUnderstanding { HaltBanners(app: app, page: .projects(app.haltRepoIDs(group: app.understandingWorkspaceID))) }
-        else if app.showingHome { HaltBanners(app: app, page: app.projectFilter.map { .projects(app.haltRepoIDs(group: $0)) } ?? .overview) }
-        else if app.showingCost { if let cost = app.costModel() { CostHaltBanners(app: app, model: cost) } else { HaltBanners(app: app, page: .projects([])) } }
-        else if let missionModel { MissionHaltBanners(app: app, model: missionModel) }
-        else if let teamModel { TeamHaltBanners(app: app, model: teamModel) }
-        else { HaltBanners(app: app, page: .projects(app.visibleIDs.compactMap { id in app.sessions.first { $0.id == id }?.project })) }
+        switch app.route {
+        case .understanding: HaltBanners(app: app, page: .projects(app.haltRepoIDs(group: app.understandingWorkspaceID)))
+        case .home: HaltBanners(app: app, page: app.projectFilter.map { .projects(app.haltRepoIDs(group: $0)) } ?? .overview)
+        case .cost: if let cost = app.costModel() { CostHaltBanners(app: app, model: cost) } else { HaltBanners(app: app, page: .projects([])) }
+        case .mission(let id): if let model = app.missionModel(for: id) { MissionHaltBanners(app: app, model: model) }
+        case .team(let id, _): if let model = app.teamModel(for: id) { TeamHaltBanners(app: app, model: model) }
+        case .sessions: HaltBanners(app: app, page: .projects(app.visibleIDs.compactMap { id in app.sessions.first { $0.id == id }?.project }))
+        }
     }
     private var welcome: some View {
         VStack(spacing: 14) {
@@ -329,18 +324,17 @@ struct DesktopView: View {
             Button("Connect server…") { app.showingPair = true }.buttonStyle(.borderedProminent).controlSize(.large)
         }.frame(maxWidth: .infinity, maxHeight: .infinity).padding(40)
     }
-    /// Recent terminals stay mounted off-screen, so switching back is instant and keeps their scrollback.
     private var panes: some View {
         GeometryReader { area in
             let visible = app.visibleIDs
-            let rendererVisible = app.displayVisible && !app.showingHome && !app.showingCost && missionModel == nil && teamModel == nil
+            let rendererVisible = app.displayVisible && app.route == .sessions
             let width = max(1, (area.size.width - CGFloat(visible.count - 1)) / CGFloat(max(1, visible.count)))
             ZStack(alignment: .topLeading) {
                 ForEach(app.mounted, id: \.self) { id in
                     if let model = app.model(for: id) {
                         let slot = visible.firstIndex(of: id)
                         SessionPane(model: model, closeView: visible.count > 1 && id == app.secondaryID ? { app.secondaryID = nil } : nil,
-                                    openMission: { app.selectedMissionID = $0 }, rendererVisible: rendererVisible && slot != nil)
+                                    openMission: { app.openMission($0) }, rendererVisible: rendererVisible && slot != nil)
                             .frame(width: slot == nil ? area.size.width : width, height: area.size.height)
                             .offset(x: slot.map { CGFloat($0) * (width + 1) } ?? 0)
                             .opacity(slot == nil ? 0 : 1)
@@ -356,7 +350,6 @@ struct DesktopView: View {
     }
 }
 
-/// A sidebar project: its name, a repository count when it spans several, and how many rows wait on the owner.
 struct ProjectSidebarRow: View {
     let group: ProjectGroup
     let waiting: Int
@@ -382,7 +375,6 @@ func statusColor(_ session: AgentSession) -> Color {
 struct SessionPane: View {
     @ObservedObject var model: SessionModel
     var closeView: (() -> Void)?
-    /// Opens the mission that runs this session, when it has one; its line then leads there.
     var openMission: ((String) -> Void)? = nil
     var rendererVisible = true
     @State private var confirmEnd = false
@@ -393,8 +385,6 @@ struct SessionPane: View {
             header.padding(.horizontal, 14).padding(.vertical, 10)
             Divider()
             ZStack {
-                // The terminal is created the first time the screen is shown and kept afterwards,
-                // so returning to it is immediate; chat needs no renderer at all.
                 if model.screenShown {
                     GeometryReader { area in
                         let generation = model.rendererGeneration
@@ -422,7 +412,7 @@ struct SessionPane: View {
         } message: { Text("This stops the agent process on the server. Its recording stays available.") }
         .alert("Have you checked the terminal?", isPresented: $confirmClear) {
             Button("Keep pending send", role: .cancel) {}
-            Button("Clear after review") { model.clearPending() }
+            Button("Clear after review") { Task { await model.clearPending() } }
         } message: { Text("The previous prompt may already have been delivered. Clearing it does not cancel server work.") }
     }
     private var header: some View {
@@ -451,7 +441,6 @@ struct SessionPane: View {
             if let closeView { Button(action: closeView) { Image(systemName: "xmark") }.buttonStyle(.plain).help("Close this view; the agent keeps running") }
         }
     }
-    /// Text would land in the open dialog; the screen view, where the dialog is visible, still allows it.
     private var promptBlocks: Bool { model.prompt != nil && session.needsYou && model.view == .chat }
     private var footer: (text: String, color: Color) {
         if model.draft.pendingID != nil { return (model.notice.isEmpty ? "Delivery unconfirmed. Check the terminal before retrying." : model.notice, .orange) }
@@ -466,8 +455,17 @@ struct SessionPane: View {
     }
     private var composer: some View {
         VStack(spacing: 8) {
+            if !model.draftLoaded, let draftError = model.draftLoadError {
+                HStack(spacing: 8) {
+                    Text(draftError).font(.caption).foregroundStyle(.orange).lineLimit(2)
+                    Spacer()
+                    Button("Retry Loading Draft") { Task { await model.retryInitialDraftLoad() } }.controlSize(.small)
+                }
+            }
             PromptEditor(text: Binding(get: { model.draft.text }, set: model.setDraft), placeholder: "Message \(providerName(session.provider))…",
-                         enabled: model.canSend && model.role != "viewer" && !promptBlocks, transparent: true, submit: { Task { await model.send() } })
+                         enabled: model.canSend && model.role != "viewer" && !promptBlocks,
+                         editable: model.draftLoaded && model.role != "viewer",
+                         transparent: true, submit: { Task { await model.send() } })
                 .frame(height: 76).glassSurface(in: RoundedRectangle(cornerRadius: 14, style: .continuous))
             HStack(spacing: 12) {
                 Text(footer.text).font(.system(size: 11)).foregroundStyle(footer.color).lineLimit(2).help(footer.text).textSelection(.enabled)
@@ -481,7 +479,7 @@ struct SessionPane: View {
                     .disabled(model.draft.pendingID == nil || !model.ready || model.sending)
                 Button("Clear…") { confirmClear = true }
                     .frame(width: 62).opacity(model.draft.pendingID != nil && !model.sending ? 1 : 0)
-                    .disabled(model.draft.pendingID == nil || model.sending)
+                    .disabled(model.draft.pendingID == nil || model.sending || model.clearingPending)
                 Button { Task { await model.send() } } label: {
                     Group { if model.sending { ProgressView().controlSize(.small) } else { Label("Send", systemImage: "arrow.up") } }.frame(width: 72)
                 }.buttonStyle(.borderedProminent).opacity(model.draft.pendingID == nil || model.sending ? 1 : 0)
@@ -489,7 +487,6 @@ struct SessionPane: View {
             }
         }
     }
-    /// The line every mission-managed session shows. While the terminal is closed its notice shows here, since the composer's footer is hidden.
     private func managedFooter(_ management: SessionManagement) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             MissionManagedNote(missionID: management.missionId, openMission: openMission)
@@ -556,6 +553,7 @@ struct CreateView: View {
     @State private var busy = false
     @State private var error = ""
     @State private var clearPending = false
+    @State private var clearTarget: PendingClearTarget?
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             Text("New session").font(.title2.weight(.semibold))
@@ -566,7 +564,9 @@ struct CreateView: View {
             }.disabled(app.pendingCreation.pendingID != nil)
             if app.pendingCreation.pendingID != nil {
                 Text("A creation request is pending. Retry uses its original agent, project, and request identity. Check the session list before starting a different request.").font(.callout).foregroundStyle(.orange)
-                Button("Clear after checking sessions…") { clearPending = true }.disabled(busy)
+                Button("Clear after checking sessions…") {
+                    if let id = app.pendingCreation.pendingID { clearTarget = PendingClearTarget(profileID: app.activeID, requestID: id); clearPending = true }
+                }.disabled(busy)
             }
             if let selected = app.projects.first(where: { $0["id"].string == project }) {
                 Text(selected["path"].string).font(.system(size: 12, design: .monospaced)).foregroundStyle(.secondary).textSelection(.enabled)
@@ -578,8 +578,11 @@ struct CreateView: View {
             }.buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction).disabled(busy || project.isEmpty) }
         }.padding(26).frame(width: 480)
             .alert("Clear the pending creation?", isPresented: $clearPending) {
-                Button("Keep pending", role: .cancel) {}
-                Button("I checked the sessions") { app.clearCreation() }
+                Button("Keep pending", role: .cancel) { clearTarget = nil }
+                Button("I checked the sessions") {
+                    app.clearCreation(expectedProfileID: clearTarget?.profileID, expectedRequestID: clearTarget?.requestID)
+                    clearTarget = nil
+                }
             } message: { Text("The server may already have created this agent. Clearing does not stop it.") }
             .onAppear { project = app.projects.first?["id"].string ?? ""; if !app.me["providers"].array.map(\.string).contains(provider) { provider = app.me["providers"].array.first?.string ?? "" } }
     }
@@ -659,7 +662,6 @@ struct ResourceView: View {
                 ForEach(Array(resources["unavailable"].array.enumerated()), id: \.offset) { _, value in Text("\(value["field"].string): \(value["reason"].string)").font(.caption).foregroundStyle(.secondary) }
             }.padding(26).frame(maxWidth: 1000, alignment: .leading)
         }.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        // Samples are only requested while this window is open.
         .onAppear { app.resourceWatchers += 1; Task { await app.refresh(includeResources: true) } }
         .onDisappear { app.resourceWatchers -= 1 }
     }

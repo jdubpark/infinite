@@ -104,7 +104,7 @@ export function apiClient(origin: string, tokens: Record<Role, string>, signal?:
 export async function stopSessionWorkers(config: Config) {
   let ids: string[] = [], answered = 0;
   try {
-    ids = readdirSync(join(config.stateDir, "sessions")).filter((n) => /^[a-f0-9-]{36}$/.test(n));
+    ids = readdirSync(join(config.stateDir, "sessions")).filter((n) => /^[a-f0-9-]{36}$/i.test(n));
   } catch {
   }
   for (const id of ids)

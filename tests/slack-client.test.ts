@@ -14,9 +14,10 @@ const mention = (text = "<@U00000001> build it") => ({
   type: "app_mention", user: "U00000000", channel: binding.channelId, ts: "1700000100.000001", thread_ts: binding.threadTs, text,
 });
 
-async function setup(options?: { teamId?: string; botUserId?: string }) {
+async function setup(options?: { teamId?: string; botUserId?: string; organizationScope?: { channelIds?: string[] } }) {
   const slack = await startSlackServer(options);
-  const client = new SlackClient({ botTokenFile: slack.botTokenFile, appTokenFile: slack.appTokenFile, endpoint: slack.endpoint, timeoutMs: 2000 });
+  const client = new SlackClient({ botTokenFile: slack.botTokenFile, appTokenFile: slack.appTokenFile, endpoint: slack.endpoint, timeoutMs: 2000,
+    ...(options?.organizationScope ? { teamId: slack.teamId, organizationScope: options.organizationScope } : {}) });
   return { slack, client };
 }
 
@@ -24,6 +25,61 @@ test("authTest returns the workspace and bot identity", async t => {
   const { slack, client } = await setup();
   t.after(() => slack.close());
   assert.deepEqual(await client.authTest(), { teamId: slack.teamId, userId: slack.botUserId, botId: slack.botId });
+});
+
+test("organization scope admits the documented joined local channel shape and guards thread reads and sends", async t => {
+  const { slack } = await setup({ organizationScope: {} });
+  t.after(() => slack.close());
+  slack.seedThread(binding, [{ user: "U00000000", text: "owner request" }]);
+  const client = new SlackClient({ botTokenFile: slack.botTokenFile, appTokenFile: slack.appTokenFile, endpoint: slack.endpoint,
+    timeoutMs: 2000, teamId: slack.teamId, organizationScope: {} });
+
+  assert.equal(await client.organizationChannelAllowed(binding.channelId), true);
+  assert.ok(Array.isArray(await client.thread(binding)), "Slack's documented local-channel response omits the optional external-workspace flag");
+  await client.post(binding, "allowed reply", "scope:1");
+  assert.equal(slack.posts(binding).length, 1);
+  assert.ok(slack.calls.filter(call => call.method === "conversations.info").length >= 3,
+    "Each admission, read, and send boundary checks current provider state");
+});
+
+test("organization scope denies external, pending, mixed, private-message, and uncertain provider records", async t => {
+  const { slack } = await setup({ organizationScope: {} });
+  t.after(() => slack.close());
+  const client = new SlackClient({ botTokenFile: slack.botTokenFile, appTokenFile: slack.appTokenFile, endpoint: slack.endpoint,
+    timeoutMs: 2000, teamId: slack.teamId, organizationScope: {} });
+  const denied: Record<string, unknown>[] = [
+    { is_shared: true, is_ext_shared: true },
+    { is_pending_ext_shared: true, pending_shared: [{ team_id: "TOTHER" }] },
+    { context_team_id: "TOTHER", shared_team_ids: ["TOTHER"] },
+    { shared_team_ids: [slack.teamId, "TOTHER"] },
+    { is_im: true },
+    { is_mpim: true },
+    { is_member: false },
+    { context_team_id: undefined },
+  ];
+  for (const info of denied) {
+    slack.setConversationInfo(binding.channelId, info);
+    assert.equal(await client.organizationChannelAllowed(binding.channelId), false, JSON.stringify(info));
+    assert.equal(await client.thread(binding), "unreadable", JSON.stringify(info));
+    await assert.rejects(client.post(binding, "denied", "scope:denied"),
+      (error: SlackError) => error.code === "organization_scope_denied", JSON.stringify(info));
+  }
+  slack.setConversationError(binding.channelId, "missing_scope");
+  assert.equal(await client.organizationChannelAllowed(binding.channelId), false, "A missing scope is not treated as authorization");
+  assert.equal(await client.thread(binding), "unreadable");
+  assert.equal(slack.posts(binding).length, 0, "No denied read or send reached Slack");
+});
+
+test("an empty explicit channel grant closes organization scope without provider fallback", async t => {
+  const { slack } = await setup({ organizationScope: { channelIds: [] } });
+  t.after(() => slack.close());
+  const client = new SlackClient({ botTokenFile: slack.botTokenFile, appTokenFile: slack.appTokenFile, endpoint: slack.endpoint,
+    timeoutMs: 2000, teamId: slack.teamId, organizationScope: { channelIds: [] } });
+  assert.equal(await client.organizationChannelAllowed(binding.channelId), false);
+  assert.equal(slack.calls.filter(call => call.method === "conversations.info").length, 0);
+  await assert.rejects(client.post(binding, "denied", "scope:empty"),
+    (error: SlackError) => error.code === "organization_scope_denied");
+  assert.equal(slack.posts(binding).length, 0);
 });
 
 test("thread pages through replies and keeps the outbound key", async t => {

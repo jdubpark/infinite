@@ -266,6 +266,8 @@ npm run export:android -w @infinite/mobile
 npm run export:ios -w @infinite/mobile
 ```
 
+On a resource-constrained verification runner, `INFINITE_TEST_CONCURRENCY=1 npm run check` runs test files serially. The default runs up to four files at once.
+
 The integration test starts 12 real demo PTYs, kills and restarts the API process, checks the same PIDs continue, replays recordings, and checks authorization and duplicate delivery. The vault test checks segment boundaries and authentication failures. These do not establish live Claude/Codex/Grok/OpenCode compatibility or cloud security.
 
 An actual Android debug build was installed on the Pixel 9 emulator. Pairing, steering, native back navigation, and saved pairing after app restart were exercised. Android and iOS JavaScript bundles export successfully; iPhone native builds, physical phones, and release signing remain unverified. The terminal protocol regression also checks cursor-query responses without an attached client and a compact screen that preserves full history in the recording.

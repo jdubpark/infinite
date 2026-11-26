@@ -12,14 +12,17 @@ Non-obvious architectural, protocol, security, concurrency, and compatibility de
 | [0006](0006-host-concurrency-and-lock-free-storage.md) | Host Lock-Free Storage, Pipeline Concurrency, and Partitioned Coordination | `packages/host/` | Accepted |
 | [0007](0007-host-state-machines-and-fail-closed-boundaries.md) | Host State Machines, Fail-Closed Halts, Eval Isolation, and Transport Boundaries | `packages/host/` | Accepted |
 | [0008](0008-wave2-domain-and-service-state-machines.md) | Wave 2A Domain, Background Service, and Session Control State Machines | `packages/host/`, `apps/mobile/`, `apps/web/` | Accepted |
+| [0009](0009-wave2-lockfree-services-and-swift-actors.md) | Wave 2 Lock-Free Services, Partitioned Queues, Bounded Execution, and Swift Actors | `packages/host/`, `apps/macos/` | Accepted |
 | [0010](0010-egress-and-github-proxy-security.md) | Egress Proxy Isolation and GitHub Credential Proxy Security | `scripts/` | Accepted |
 | [0011](0011-build-watch-graph-and-test-tooling.md) | Build, Native Workspace Watch, Code Graph, and Verification Tooling | `scripts/`, `.agents/skills/` | Accepted |
 | [0012](0012-web-client-ui-and-transport-invariants.md) | Web Client UI, Transport, Freshness, and Cost Accounting Invariants | `apps/web/` | Accepted |
 | [0013](0013-ubuntu-deployment-and-isolation.md) | Ubuntu Host Deployment, Service Isolation, and Encrypted Backups | `deploy/ubuntu/` | Accepted |
 | [0014](0014-mobile-client-invariants.md) | Mobile Client Invariants, Lifecycle, and Honesty Boundaries | `apps/mobile/` | Accepted |
+| [0015](0015-macos-state-machines-and-invariants.md) | macOS Typed State Machines and Client Invariants | `apps/macos/` | Accepted |
 | [0016](0016-wave3-per-entity-orchestration-queues.md) | Per-Entity Orchestration Queues and Orchestration Service Invariants | `packages/host/` | Accepted |
 | [0017](0017-host-eval-evidence-outcome-routing-invariants.md) | Host Eval, Evidence, Objective, Outcome, and Routing Invariants | `packages/host/` | Accepted |
 | [0018](0018-test-harness-and-verification-invariants.md) | Test Harness, Simulator, and Verification Invariants | `tests/` | Accepted |
+| [0019](0019-orchestration-wire-and-domain-type-invariants.md) | Orchestration Wire and Domain State-Machine Type Invariants | `packages/host/` | Accepted |
 | [0020](0020-host-orchestration-permissions-judges-invariants.md) | Host Orchestration, Permissions, Verdicts, Goals, and Judges Invariants | `packages/host/` | Accepted |
 | [0021](0021-host-core-runtime-integrations-invariants.md) | Host Core Runtime, Security, Telemetry, Memory, and Integration Invariants | `packages/host/` | Accepted |
 | [0022](0022-css-systemd-and-remaining-tests-invariants.md) | CSS, Systemd Unit, and Remaining Test Harness Invariants | `apps/web/`, `deploy/ubuntu/`, `scripts/`, `tests/` | Accepted |

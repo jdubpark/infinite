@@ -390,10 +390,14 @@ else if (command === "plan-fleet") {
     const { sessions, teams, goals, pushStore, server, mcpServer, closeConnections, fuse, permissions, mainCheck } = host;
     let stopping: Promise<void> | undefined;
     const stop = () => stopping ??= (async () => {
-      const closing = closeConnections();
-      await new Promise<void>(resolve => server.close(() => resolve()));
-      await closing;
-      unlock();
+      try {
+        const closing = closeConnections();
+        closing.catch(() => {});
+        await new Promise<void>(resolve => server.close(() => resolve()));
+        await closing;
+      } finally {
+        unlock();
+      }
     })();
     const bind = (listener: typeof server, port: number) => new Promise<void>((resolve, reject) => {
       const failed = (error: Error) => { listener.off("listening", ready); reject(error); };
@@ -405,7 +409,10 @@ else if (command === "plan-fleet") {
     try {
       if (mcpServer) await bind(mcpServer, config.mcp!.port);
       await bind(server, config.port);
-    } catch (error) { await stop(); throw error; }
+    } catch (error) {
+      try { await stop(); } catch (stopError) { console.error(stopError); }
+      throw error;
+    }
     console.log(`Infinite: ${config.origin}\nExecution host: ${config.environment}\nClosing this API does not stop agent workers.`);
     if (config.push?.enabled) {
       const accessToken = config.push.accessTokenFile
@@ -437,11 +444,16 @@ else if (command === "plan-fleet") {
       if (!config.push.events.includes("autonomy-interrupt")) console.warn("Push is on, but push.events has no autonomy-interrupt: an open spend fuse will send no notification.");
       if (!config.push.events.includes("main-check") && config.projects.some(project => mainCheckSetting(project.team) !== undefined)) console.warn("Push is on and a project sets team.mainCheck, but push.events has no main-check: a change of main's health will send no notification.");
     }
-    const failed = (error: Error) => { void stop().then(() => { throw error; }); };
+    const failed = (error: Error) => { void stop().catch(stopError => console.error(stopError)).then(() => { throw error; }); };
     server.on("error", failed);
     mcpServer?.on("error", failed);
     for (const signal of ["SIGTERM", "SIGINT"] as const)
-      process.once(signal, () => { void stop().then(() => process.exit(0)); });
+      process.once(signal, () => {
+        void stop().then(
+          () => process.exit(0),
+          error => { console.error(error); process.exit(1); },
+        );
+      });
   } else {
     const manager = new Manager(config, key);
     if (command === "list")

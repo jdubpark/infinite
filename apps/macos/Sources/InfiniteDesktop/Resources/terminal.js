@@ -10,15 +10,11 @@ document.addEventListener('visibilitychange', updateCursorBlink);
 updateCursorBlink();
 const fit = new FitAddon.FitAddon();
 terminal.loadAddon(fit); terminal.open(document.getElementById('terminal'));
-// GPU rendering keeps full-screen TUI redraws smooth; the DOM renderer remains the fallback.
 try {
   const webgl = new WebglAddon.WebglAddon();
   webgl.onContextLoss(() => webgl.dispose());
   terminal.loadAddon(webgl);
 } catch (error) { console.warn('WebGL renderer unavailable', error); }
-// Without control this Mac cannot resize the server PTY. A snapshot that carries the
-// server's size keeps it, because reflowing a full-screen TUI scrambles it; replayed
-// output without a known size is fitted to the viewport as the best available guess.
 let follows = false, pinned = false;
 const fitViewport = () => {
   if (pinned && !follows) return;

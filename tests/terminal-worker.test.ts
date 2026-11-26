@@ -2,15 +2,21 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
+import { createConnection } from "node:net";
 import { join, resolve } from "node:path";
 import { randomBytes, randomUUID } from "node:crypto";
 import headless from "@xterm/headless";
+import { WebSocket } from "ws";
+import { hashToken } from "../packages/host/src/config.js";
 import { workerCall } from "../packages/host/src/ipc.js";
-import { readEvents, unseal } from "../packages/host/src/vault.js";
+import { Manager } from "../packages/host/src/manager.js";
+import { connectTerminals } from "../packages/host/src/terminal-stream.js";
+import { readEvents, unseal, writeSealed } from "../packages/host/src/vault.js";
 import { permissionEvidenceHash, oneShotPermissionOption } from "../packages/host/src/team-permissions.js";
 import { requesterNotice } from "../packages/host/src/permission-policy.js";
 import { waitFor } from "./helpers.js";
-import type { Bootstrap, ControlActor, ControlLease, Event, Receipt, TerminalSnapshot, WorkerRequest, WorkerState } from "../packages/host/src/types.js";
+import type { Bootstrap, Config, ControlActor, ControlLease, Event, Receipt, TerminalSnapshot, WorkerRequest, WorkerState } from "../packages/host/src/types.js";
 import type { TeamAssignment } from "../packages/host/src/team-types.js";
 
 const AGENT = String.raw`
@@ -176,7 +182,7 @@ async function fixture(provider: "demo" | "claude" | "codex" = "demo", initialPr
       catch (error) { if (worker.exitCode !== null) throw new Error(diagnostics || String(error)); return undefined; }
     }, state => Boolean(state?.screen.includes("READY")));
   } catch (error) { await stop(); throw error; }
-  return { id, cwd: realpathSync(root), runtime, call, events, output, command, stop, persisted: () => unseal<WorkerState>(key, `${id}:status`, readFileSync(join(stateDir, "sessions", id, "status.sealed"), "utf8")) };
+  return { id, root, stateDir, runDir, key, session: bootstrap.session, cwd: realpathSync(root), runtime, call, events, output, command, stop, persisted: () => unseal<WorkerState>(key, `${id}:status`, readFileSync(join(stateDir, "sessions", id, "status.sealed"), "utf8")) };
 }
 
 function teamAnswerRequest(worker: Awaited<ReturnType<typeof fixture>>, team: TeamAssignment, prompt: NonNullable<WorkerState["attention"]["prompt"]>, requestId: string, actor: ControlActor, leaseId: string, decisionId: string) {
@@ -353,7 +359,18 @@ test("worker control fences input and resize, keeps retry receipts stable, and r
     await worker.call({ op: "resize", cols: 88, rows: 26, actor: b, leaseId: leaseB.id });
     const resized = await worker.call<TerminalSnapshot>({ op: "snapshot" });
     assert.deepEqual([resized.cols, resized.rows], [88, 26]);
-    await worker.call({ op: "control", action: "release", actor: b, leaseId: leaseB.id });
+    const renewedWithLegacyFlag = await worker.call<ControlLease>({ op: "control", action: "renew", actor: b, leaseId: leaseB.id, takeover: false } as unknown as WorkerRequest);
+    assert.equal(renewedWithLegacyFlag.id, leaseB.id);
+    await assert.rejects(worker.call({ op: "control", action: "claim", actor: b, leaseId: "" }), /Invalid session control/);
+    for (const action of ["renew", "release"] as const)
+      await assert.rejects(worker.call({ op: "control", action, actor: b } as unknown as WorkerRequest), { code: "control-lost" });
+    await assert.rejects(worker.call({ op: "control", action: "renew", actor: b, leaseId: leaseB.id, takeover: true } as unknown as WorkerRequest), /Invalid session control/);
+    await assert.rejects(worker.call({ op: "workspace-export", method: "sync/unknown" } as unknown as WorkerRequest), { code: "unsupported" });
+    await assert.rejects(worker.call({ op: "workspace-export", method: "sync/blob", hash: "A".repeat(64) } as unknown as WorkerRequest), /Invalid workspace export request/);
+    await assert.rejects(worker.call({ op: "workspace-export", method: "sync/export", extra: true } as unknown as WorkerRequest), /Invalid workspace export request/);
+    await assert.rejects(worker.call({ op: "workspace-export", method: "sync/blob" } as unknown as WorkerRequest), /A content hash is required/);
+    await assert.rejects(worker.call({ op: "workspace-export", method: "sync/export" }), { code: "unsupported" });
+    await worker.call({ op: "control", action: "release", actor: b, leaseId: leaseB.id, takeover: false } as unknown as WorkerRequest);
     await worker.command("released");
     const lease = await worker.call<ControlLease>({ op: "control", action: "claim", actor: a });
     const observing = await worker.call({ op: "state" });
@@ -693,4 +710,219 @@ test("native conversation identity comes only from authenticated matching provid
     assert.deepEqual(worker.persisted().nativeSession, identified.nativeSession);
     assert.deepEqual(worker.persisted().runtime, worker.runtime);
   } finally { await worker.stop(); }
+});
+
+test("terminal sockets dispatch zero control claims or PTY writes after aborting while awaiting ready or state", { timeout: 25_000 }, async () => {
+  const worker = await fixture("demo");
+  const token = randomBytes(32).toString("base64url");
+  const device = { id: "owner-1", label: "Owner", role: "owner" as const, hash: hashToken(token) };
+  mkdirSync(join(worker.stateDir, "sessions", worker.id), { recursive: true });
+  writeSealed(join(worker.stateDir, "sessions", worker.id, "meta.sealed"), worker.key, `${worker.id}:meta`, {
+    session: worker.session,
+    fingerprint: "terminal-abort-fixture",
+  });
+  const server = createServer();
+  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  const port = (server.address() as { port: number }).port;
+  const keyFile = join(worker.root, "key");
+  writeFileSync(keyFile, worker.key, { mode: 0o600 });
+  const config = {
+    port, origin: `http://127.0.0.1:${port}`, stateDir: worker.stateDir, runDir: worker.runDir,
+    keyFile, environment: "local", enableDemo: true, maxSessions: 4,
+    tokens: [device], projects: [], agents: {},
+  } as Config;
+  const manager = new Manager(config, worker.key);
+  let controlCalls = 0;
+  const originalControl = manager.controlSession.bind(manager);
+  manager.controlSession = ((...args: Parameters<Manager["controlSession"]>) => {
+    controlCalls++;
+    return originalControl(...args);
+  }) as Manager["controlSession"];
+
+  const originalState = manager.state.bind(manager);
+  let stateInterceptor: ((id: string, screen?: boolean) => Promise<WorkerState>) | undefined;
+  manager.state = ((id: string, screen?: boolean) =>
+    stateInterceptor ? stateInterceptor(id, screen) : originalState(id, screen)) as Manager["state"];
+
+  let missionManaged: () => Promise<boolean> = async () => false;
+  const closeTerminals = connectTerminals(server, manager, value => value === token ? device : undefined, () => missionManaged());
+  const connect = () => new Promise<WebSocket>((resolve, reject) => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/api/sessions/${worker.id}/terminal?after=0`);
+    ws.once("open", () => resolve(ws));
+    ws.once("error", reject);
+  });
+  try {
+    let releaseReady!: (managed: boolean) => void;
+    missionManaged = () => new Promise<boolean>(resolve => { releaseReady = resolve; });
+    const legacySocket = await connect();
+    const legacyClosed = new Promise<number>(resolve => legacySocket.once("close", code => resolve(code)));
+    legacySocket.send(JSON.stringify({ token }));
+    legacySocket.send(JSON.stringify({ op: "raw", requestId: randomUUID(), text: "ABORTED_LEGACY_WRITE\n" }));
+    legacySocket.send("not-json");
+    assert.equal(await legacyClosed, 1008);
+    releaseReady(false);
+    await new Promise(resolve => setTimeout(resolve, 150));
+    assert.equal(controlCalls, 0);
+    assert.equal((await worker.call({ op: "state" })).control, null);
+    assert.equal(worker.events().filter(event => event.type === "input-intent").length, 0);
+    assert.doesNotMatch(worker.output(), /ABORTED_LEGACY_WRITE/);
+
+    missionManaged = () => new Promise<boolean>(resolve => { releaseReady = resolve; });
+    const controlSocket = await connect();
+    const controlClosed = new Promise<number>(resolve => controlSocket.once("close", code => resolve(code)));
+    controlSocket.send(JSON.stringify({ token, clientId: randomUUID() }));
+    controlSocket.send(JSON.stringify({ op: "control", requestId: randomUUID(), action: "claim" }));
+    controlSocket.send("not-json");
+    assert.equal(await controlClosed, 1008);
+    releaseReady(false);
+    await new Promise(resolve => setTimeout(resolve, 150));
+    assert.equal(controlCalls, 0);
+    assert.equal((await worker.call({ op: "state" })).control, null);
+
+    missionManaged = async () => true;
+    const liveState = await originalState(worker.id);
+    const managedSocket = await connect();
+    const managedClosed = new Promise<number>(resolve => managedSocket.once("close", code => resolve(code)));
+    const initialStateFrame = new Promise<void>(resolve => {
+      const onMessage = (raw: WebSocket.RawData) => {
+        if ("state" in (JSON.parse(raw.toString()) as Record<string, unknown>)) {
+          managedSocket.off("message", onMessage);
+          resolve();
+        }
+      };
+      managedSocket.on("message", onMessage);
+    });
+    managedSocket.send(JSON.stringify({ token }));
+    await initialStateFrame;
+
+    let markManagedCheckReached!: () => void;
+    let releaseManagedState!: (state: WorkerState) => void;
+    const managedCheckReached = new Promise<void>(resolve => { markManagedCheckReached = resolve; });
+    const managedStateGate = new Promise<WorkerState>(resolve => { releaseManagedState = resolve; });
+    let interceptedInputState = false;
+    stateInterceptor = async (id, screen) => {
+      if (!interceptedInputState) {
+        interceptedInputState = true;
+        markManagedCheckReached();
+        return managedStateGate;
+      }
+      return originalState(id, screen);
+    };
+    managedSocket.send(JSON.stringify({ op: "raw", requestId: randomUUID(), text: "ABORTED_MANAGED_WRITE\n" }));
+    await managedCheckReached;
+    managedSocket.send("not-json");
+    assert.equal(await managedClosed, 1008);
+    releaseManagedState({ ...liveState, attention: { ...liveState.attention, state: "needs-you" } });
+    await new Promise(resolve => setTimeout(resolve, 150));
+    stateInterceptor = undefined;
+    assert.equal(controlCalls, 0);
+    assert.equal((await worker.call({ op: "state" })).control, null);
+    assert.equal(worker.events().filter(event => event.type === "input-intent").length, 0);
+    assert.doesNotMatch(worker.output(), /ABORTED_MANAGED_WRITE/);
+
+    const sendMaskedText = (socket: ReturnType<typeof createConnection>, text: string) => {
+      const payload = Buffer.from(text, "utf8");
+      const mask = randomBytes(4);
+      const header = payload.length < 126
+        ? Buffer.from([0x81, 0x80 | payload.length])
+        : Buffer.from([0x81, 0xfe, (payload.length >> 8) & 0xff, payload.length & 0xff]);
+      const masked = Buffer.allocUnsafe(payload.length);
+      for (let i = 0; i < payload.length; i++) masked[i] = payload[i]! ^ mask[i & 3]!;
+      socket.write(Buffer.concat([header, mask, masked]));
+    };
+    const openRawWs = () => new Promise<{ socket: ReturnType<typeof createConnection>; closeFrameReceived: Promise<number> }>((resolve, reject) => {
+      const raw = createConnection({ host: "127.0.0.1", port });
+      let upgraded = false;
+      let buffer = Buffer.alloc(0);
+      let markCloseFrame!: (code: number) => void;
+      const closeFrameReceived = new Promise<number>(done => { markCloseFrame = done; });
+      const parseFrames = () => {
+        while (buffer.length >= 2) {
+          const opcode = buffer[0]! & 0x0f;
+          let len = buffer[1]! & 0x7f;
+          let offset = 2;
+          if (len === 126) { if (buffer.length < 4) return; len = buffer.readUInt16BE(2); offset = 4; }
+          else if (len === 127) { if (buffer.length < 10) return; len = Number(buffer.readBigUInt64BE(2)); offset = 10; }
+          if (buffer.length < offset + len) return;
+          const payload = buffer.subarray(offset, offset + len);
+          buffer = buffer.subarray(offset + len);
+          if (opcode === 0x08) markCloseFrame(payload.length >= 2 ? payload.readUInt16BE(0) : 1005);
+        }
+      };
+      raw.on("error", reject);
+      raw.on("data", chunk => {
+        buffer = Buffer.concat([buffer, chunk]);
+        if (!upgraded) {
+          const end = buffer.indexOf("\r\n\r\n");
+          if (end < 0) return;
+          assert.match(buffer.subarray(0, end).toString("utf8"), /^HTTP\/1\.1 101 /);
+          upgraded = true;
+          buffer = buffer.subarray(end + 4);
+          resolve({ socket: raw, closeFrameReceived });
+        }
+        parseFrames();
+      });
+      raw.once("connect", () => {
+        raw.write([
+          `GET /api/sessions/${worker.id}/terminal?after=0 HTTP/1.1`,
+          `Host: 127.0.0.1:${port}`,
+          "Upgrade: websocket",
+          "Connection: Upgrade",
+          "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==",
+          "Sec-WebSocket-Version: 13",
+          "",
+          "",
+        ].join("\r\n"));
+      });
+    });
+
+    missionManaged = async () => true;
+    let gracefulStateCalls = 0;
+    let markReaderReached!: () => void;
+    let markInputReached!: () => void;
+    let releaseReaderState!: (state: WorkerState) => void;
+    let releaseInputState!: (state: WorkerState) => void;
+    const readerReached = new Promise<void>(resolve => { markReaderReached = resolve; });
+    const inputReached = new Promise<void>(resolve => { markInputReached = resolve; });
+    const readerStateGate = new Promise<WorkerState>(resolve => { releaseReaderState = resolve; });
+    const inputStateGate = new Promise<WorkerState>(resolve => { releaseInputState = resolve; });
+    stateInterceptor = async (id, screen) => {
+      gracefulStateCalls++;
+      if (gracefulStateCalls === 1) return originalState(id, screen);
+      if (gracefulStateCalls === 2) {
+        markReaderReached();
+        return readerStateGate;
+      }
+      if (gracefulStateCalls === 3) {
+        markInputReached();
+        return inputStateGate;
+      }
+      return originalState(id, screen);
+    };
+    const { socket: rawSocket, closeFrameReceived } = await openRawWs();
+    try {
+      sendMaskedText(rawSocket, JSON.stringify({ token }));
+      await readerReached;
+      sendMaskedText(rawSocket, JSON.stringify({ op: "raw", requestId: randomUUID(), text: "GRACEFUL_CLOSE_WRITE\n" }));
+      sendMaskedText(rawSocket, JSON.stringify({ op: "raw", requestId: randomUUID(), text: "GRACEFUL_CLOSE_QUEUED\n" }));
+      await inputReached;
+      releaseReaderState({ ...liveState, status: "exited", exitCode: 0 });
+      assert.equal(await closeFrameReceived, 1000);
+      assert.equal(rawSocket.destroyed, false, "peer has not sent close ack yet so server stays in CLOSING before ws close fires");
+      releaseInputState({ ...liveState, attention: { ...liveState.attention, state: "needs-you" } });
+      await new Promise(resolve => setTimeout(resolve, 150));
+      stateInterceptor = undefined;
+      assert.equal(controlCalls, 0);
+      assert.equal((await worker.call({ op: "state" })).control, null);
+      assert.equal(worker.events().filter(event => event.type === "input-intent").length, 0);
+      assert.doesNotMatch(worker.output(), /GRACEFUL_CLOSE_WRITE|GRACEFUL_CLOSE_QUEUED/);
+    } finally {
+      rawSocket.destroy();
+    }
+  } finally {
+    closeTerminals();
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+    await worker.stop();
+  }
 });

@@ -39,6 +39,7 @@ type Stored = {
   control?: PendingControl;
   extensionIntent?: GoalExtensionIntent;
   launchRetryAt?: string;
+  endedAs?: { teamId: string; status: string; headCommit?: string };
   ownerHalt?: { haltId: string; revision: number; run?: { teamId: string; token: string } };
   objectiveRecord?: unknown;
   objectiveNotice?: ObjectiveUnavailable;
@@ -63,7 +64,7 @@ function snapshotRollup(cycle: GoalCycle): StoredRollup {
   if (snapshot?.total && snapshot.byProfile && snapshot.byProvider && Number.isInteger(snapshot.unmeasuredMembers))
     return { total: snapshot.total, byProfile: snapshot.byProfile, byProvider: snapshot.byProvider, unmeasuredMembers: snapshot.unmeasuredMembers };
   const rollup = emptyRollup(cycle.memberCount);
-  if (snapshot) rollup.total = snapshot;
+  if (snapshot) rollup.total = { cost: snapshot.cost, tokens: snapshot.tokens, messages: snapshot.messages, pricing: { ...snapshot.pricing, catalog: snapshot.pricing.catalog ?? 0 } };
   return rollup;
 }
 
@@ -720,7 +721,10 @@ export class GoalService {
         }
       } else {
       this.refresh(stored, team);
-      if (["ready-for-review", "merged", "no-change", "blocked", "cancelled"].includes(team.status)) {
+      const ended = ["ready-for-review", "merged", "no-change", "blocked", "cancelled"].includes(team.status);
+      if (!ended) delete stored.endedAs;
+      const classified = ended && stored.endedAs?.teamId === team.id && stored.endedAs.status === team.status && stored.endedAs.headCommit === team.headCommit;
+      if (ended) {
         settleMetrics(stored, team.id, this.teams.reviewedObservations?.(team.id));
         if (["running", "needs-input"].includes(goal.status) && ["ready-for-review", "merged", "no-change"].includes(team.status) && team.linear && team.linear.status !== "synced") {
           if (team.linear.status === "blocked") {
@@ -730,7 +734,8 @@ export class GoalService {
         }
         if (team.members.every(member => ["stopped", "waiting"].includes(member.status))) goal.activeTeamId = undefined;
         if (goal.standing) { if (!goal.activeTeamId) this.settleCycle(stored, goal.cycles.find(value => value.teamId === team!.id)!, team); }
-        else if (["running", "needs-input"].includes(goal.status)) {
+        else if (["running", "needs-input"].includes(goal.status) && !classified) {
+          stored.endedAs = { teamId: team.id, status: team.status, headCommit: team.headCommit };
           if (team.status === "blocked" || team.status === "cancelled") {
             const deadlineStopped = team.stopReason === "deadline" || goal.stopReason === "deadline" || goal.deadlineContinuation === true;
             if (deadlineStopped) { goal.stopReason = "deadline"; goal.deadlineContinuation = true; }

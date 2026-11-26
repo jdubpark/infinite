@@ -13,8 +13,6 @@ import InfiniteCore
         if reset { snapshot = data; history = Data(); replayAvailable = true }
         else if replayAvailable { history.append(data) }
         if snapshot.count + history.count > 8 * 1024 * 1024 {
-            // A byte suffix is not a terminal snapshot: it may begin inside an
-            // escape sequence or depend on modes established before the suffix.
             snapshot = Data(); history = Data(); replayAvailable = false
         }
         receive?(data, reset, columns, rows)
@@ -29,9 +27,7 @@ import InfiniteCore
 struct TerminalSurface: NSViewRepresentable {
     let pipe: TerminalPipe
     var acceptsInput: Bool
-    /// Fit the terminal to this view and resize the PTY; only a lease holder may.
     var followsViewport: Bool = false
-    /// Cursor animation runs only while this terminal is on a visible page.
     var isVisible: Bool = true
     var onInput: (String) -> Void
     var onResize: (Int, Int) -> Void
@@ -95,7 +91,6 @@ struct TerminalSurface: NSViewRepresentable {
         func control(_ enabled: Bool) {
             guard !disposed else { return }
             let next = enabled && !overflowed
-            // SwiftUI re-runs updateNSView on every poll; only a real change crosses the bridge.
             if controlled == next { return }
             controlled = next
             Task { try? await view?.callAsyncJavaScript("window.infiniteTerminal.control(enabled)", arguments: ["enabled": next], in: nil, contentWorld: .page) }
@@ -172,7 +167,7 @@ struct PromptEditor: NSViewRepresentable {
     @Binding var text: String
     var placeholder = ""
     var enabled: Bool
-    /// Inside a glass container the editor draws no fill of its own.
+    var editable = true
     var transparent = false
     var submit: () -> Void
     func makeCoordinator() -> Coordinator { Coordinator(self) }
@@ -194,14 +189,17 @@ struct PromptEditor: NSViewRepresentable {
         context.coordinator.parent = self
         guard let view = scroll.documentView as? DraftTextView else { return }
         if view.string != text { view.string = text }
+        view.isEditable = editable
         view.placeholder = placeholder
-        // Drafting remains possible while offline; enabled gates submission only.
         view.canSubmit = enabled
     }
     final class Coordinator: NSObject, NSTextViewDelegate {
         var parent: PromptEditor
         init(_ parent: PromptEditor) { self.parent = parent }
-        func textDidChange(_ notification: Notification) { if let view = notification.object as? NSTextView { parent.text = view.string } }
+        func textDidChange(_ notification: Notification) {
+            guard parent.editable else { return }
+            if let view = notification.object as? NSTextView { parent.text = view.string }
+        }
     }
     final class DraftTextView: NSTextView {
         var onSubmit: (() -> Void)?; var canSubmit = false

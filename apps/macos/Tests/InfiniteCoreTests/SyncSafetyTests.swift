@@ -131,8 +131,6 @@ final class SyncSafetyTests: XCTestCase {
         XCTAssertEqual((try FileManager.default.attributesOfItem(atPath: file.path)[.posixPermissions] as? NSNumber)?.intValue, 0o600)
     }
 
-    /// The installed app keeps the draft key and folder it always used; every other build gets its own, so a
-    /// rehearsal copy or unbundled binary never reads, rotates, or writes beside the installed app's drafts.
     func testDraftLocationIsTheInstalledAppsOnlyForItsBundleID() {
         XCTAssertEqual(DraftLocation(bundleID: "dev.infinite.desktop").service, "dev.infinite.desktop.device")
         XCTAssertEqual(DraftLocation(bundleID: "dev.infinite.desktop").directory, "Infinite/Drafts")
@@ -184,7 +182,6 @@ final class SyncSafetyTests: XCTestCase {
         let components = try JSON.array([.object(["id": .string("component-a")])]).data()
         let detail = try JSON.object(["component": .object(["id": .string("component-a")]), "relationships": .array([])]).data()
 
-        // Exercise overview-first and knowledge-first writer orders, then cold-open as an offline reader.
         try await store.mergeOverview(host: "host-A", credential: "credential-A", workspace: "workspace-4",
                                       membershipRevision: 4, data: overview)
         try await store.mergeKnowledge(host: "host-A", credential: "credential-A", workspace: "workspace-4",
@@ -264,6 +261,36 @@ final class SyncSafetyTests: XCTestCase {
         XCTAssertNil(decodedTextOnly.pending)
     }
 
+    func testDraftStoreSharesRegistryAndSerializesConcurrentSaves() async throws {
+        let location = DraftLocation(bundleID: "dev.infinite.drafts-\(UUID().uuidString.lowercased())")
+        let directory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent(location.directory, isDirectory: true)
+        defer {
+            try? FileManager.default.removeItem(at: directory)
+            try? DeviceKeychain.remove("encrypted-drafts", service: location.service)
+        }
+
+        let first = await DraftStore.shared(location: location)
+        let second = await DraftStore.shared(location: location)
+        XCTAssertTrue(first === second)
+
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            for index in 0..<8 {
+                let record = DraftRecord(text: "draft-\(index)", pending: PendingSend(id: "req-\(index)", text: "send-\(index)"))
+                group.addTask {
+                    try await first.save(record, identity: "session-\(index)")
+                }
+            }
+            try await group.waitForAll()
+        }
+
+        for index in 0..<8 {
+            let loaded = try await second.read("session-\(index)")
+            XCTAssertEqual(loaded.text, "draft-\(index)")
+            XCTAssertEqual(loaded.pending, PendingSend(id: "req-\(index)", text: "send-\(index)"))
+        }
+    }
+
     private func assertOfflineSnapshot(_ store: UnderstandingSnapshotStore, workspace: String, revision: Int,
                                        overview: Data, catalog: Data, components: Data, detail: Data,
                                        file: StaticString = #filePath, line: UInt = #line) async throws {
@@ -281,5 +308,165 @@ final class SyncSafetyTests: XCTestCase {
                        "component-a", file: file, line: line)
         XCTAssertEqual(try JSON.parse(XCTUnwrap(cached.envelope.componentDetails["component-a"], file: file, line: line))["component"]["id"].string,
                        "component-a", file: file, line: line)
+    }
+
+    func testCancelledTaskPreventsInstallAsyncAndTransfersFromProceeding() async throws {
+        var root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        root = try LocalFiles.canonicalRoot(root)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let target = root.appendingPathComponent("cancelled.txt")
+        let stagedImmediate = try LocalFiles.stage(root: root, path: "cancelled.txt")
+        try stagedImmediate.handle.write(contentsOf: Data("should not install".utf8))
+
+        let gate = AsyncStream<Void>.makeStream()
+        let preCancelled = Task {
+            for await _ in gate.stream {}
+            try await LocalFiles.installAsync(stagedImmediate, expected: nil)
+        }
+        preCancelled.cancel()
+        gate.continuation.finish()
+        do {
+            try await preCancelled.value
+            XCTFail("Expected pre-cancelled installAsync to throw CancellationError")
+        } catch is CancellationError {}
+        XCTAssertFalse(FileManager.default.fileExists(atPath: target.path))
+
+        let stagedBlocked = try LocalFiles.stage(root: root, path: "cancelled.txt")
+        try stagedBlocked.handle.write(contentsOf: Data("blocked by coordinator".utf8))
+        let coordinatorEntered = DispatchSemaphore(value: 0)
+        let releaseCoordinator = DispatchSemaphore(value: 0)
+        let holderReleased = LockFreeInt64(0)
+        defer {
+            holderReleased.store(1)
+            releaseCoordinator.signal()
+        }
+        DispatchQueue.global(qos: .userInitiated).async {
+            var coordinationError: NSError?
+            NSFileCoordinator().coordinate(writingItemAt: stagedBlocked.destination, options: .forReplacing, error: &coordinationError) { _ in
+                coordinatorEntered.signal()
+                releaseCoordinator.wait()
+            }
+        }
+        XCTAssertEqual(coordinatorEntered.wait(timeout: .now() + 2), .success)
+        let inFlightInstall = Task {
+            try await LocalFiles.installAsync(stagedBlocked, expected: nil)
+        }
+        try await Task.sleep(for: .milliseconds(30))
+        let cancelStarted = Date()
+        inFlightInstall.cancel()
+        do {
+            try await inFlightInstall.value
+            XCTFail("Expected in-flight installAsync to throw CancellationError")
+        } catch is CancellationError {}
+        XCTAssertLessThan(Date().timeIntervalSince(cancelStarted), 1.0)
+        XCTAssertEqual(holderReleased.load(), 0)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: target.path))
+
+        let committedTarget = root.appendingPathComponent("committed.txt")
+        try Data("old".utf8).write(to: committedTarget)
+        let oldVersion = try XCTUnwrap(LocalFiles.version(root: root, path: "committed.txt"))
+        let stagedCommit = try LocalFiles.stage(root: root, path: "committed.txt")
+        try stagedCommit.handle.write(contentsOf: Data("new committed content".utf8))
+        var commitChecks = 0
+        try LocalFiles.install(stagedCommit, expected: oldVersion, isCancelled: {
+            commitChecks += 1
+            return commitChecks > 6
+        })
+        XCTAssertEqual(try String(contentsOf: committedTarget, encoding: .utf8), "new committed content")
+
+        let conflictTarget = root.appendingPathComponent("conflict.txt")
+        try Data("initial".utf8).write(to: conflictTarget)
+        let previewVersion = try XCTUnwrap(LocalFiles.version(root: root, path: "conflict.txt"))
+        try Data("competing edit".utf8).write(to: conflictTarget)
+        let stagedConflict = try LocalFiles.stage(root: root, path: "conflict.txt")
+        try stagedConflict.handle.write(contentsOf: Data("new content".utf8))
+        var conflictChecks = 0
+        do {
+            try LocalFiles.install(stagedConflict, expected: previewVersion, isCancelled: {
+                conflictChecks += 1
+                return conflictChecks > 5
+            })
+            XCTFail("Expected local-conflict DesktopError to be preserved")
+        } catch let error as DesktopError {
+            XCTAssertEqual(error.code, "local-conflict")
+        }
+
+        let source = root.appendingPathComponent("upload-source.txt")
+        try Data("payload".utf8).write(to: source)
+        let version = try XCTUnwrap(LocalFiles.version(root: root, path: "upload-source.txt"))
+        let profile = HostProfile(id: "p1", label: "A", origin: "https://a.example.com")
+        let transfer = FileTransfer(client: RemoteClient(profile: profile, token: "t"), projectID: "proj")
+
+        let uploadTask = Task {
+            await Task.yield()
+            try await transfer.upload(root: root, localPath: "upload-source.txt", remotePath: "upload-source.txt", source: version, expectedRemote: nil) { _ in }
+        }
+        uploadTask.cancel()
+        do {
+            try await uploadTask.value
+            XCTFail("Expected cancelled upload to throw CancellationError")
+        } catch is CancellationError {}
+
+        let downloadTask = Task {
+            await Task.yield()
+            try await transfer.download(remotePath: "missing.txt", root: root, localPath: "dest.txt", source: version, expectedLocal: nil) { _ in }
+        }
+        downloadTask.cancel()
+        do {
+            try await downloadTask.value
+            XCTFail("Expected cancelled download to throw CancellationError")
+        } catch is CancellationError {}
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("dest.txt").path))
+    }
+
+    func testDraftStoreReadOrCreatePendingIsAtomicAcrossConcurrentCallers() async throws {
+        let location = DraftLocation(bundleID: "dev.infinite.atomic-\(UUID().uuidString.lowercased())")
+        let directory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent(location.directory, isDirectory: true)
+        defer {
+            try? FileManager.default.removeItem(at: directory)
+            try? DeviceKeychain.remove("encrypted-drafts", service: location.service)
+        }
+        let store = await DraftStore.shared(location: location)
+        try await store.save(DraftRecord(), identity: "warmup")
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: directory.path)
+        do {
+            _ = try await store.readOrCreatePending(identity: "sess-1:resume", text: "resume")
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+            XCTFail("Expected readOrCreatePending to fail on read-only draft directory")
+        } catch {}
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+
+        let results = try await withThrowingTaskGroup(of: DraftRecord.self) { group in
+            for _ in 0..<8 {
+                group.addTask {
+                    try await store.readOrCreatePending(identity: "sess-1:resume", text: "resume")
+                }
+            }
+            var collected: [DraftRecord] = []
+            for try await item in group { collected.append(item) }
+            return collected
+        }
+        XCTAssertEqual(results.count, 8)
+        let ids = results.map(\.pendingID)
+        XCTAssertTrue(ids.allSatisfy { $0 != nil })
+        let uniqueIDs = Set(ids)
+        XCTAssertEqual(uniqueIDs.count, 1)
+        let acquiredID = try XCTUnwrap(uniqueIDs.first.flatMap { $0 })
+
+        let reopened = DraftStore(location: location)
+        let persisted = try await reopened.read("sess-1:resume")
+        XCTAssertEqual(persisted.pendingID, acquiredID)
+        XCTAssertEqual(persisted.pendingText, "resume")
+
+        try await reopened.clearIfMatching(requestID: "wrong-id", identity: "sess-1:resume")
+        let retained = try await reopened.read("sess-1:resume")
+        XCTAssertEqual(retained.pendingID, acquiredID)
+
+        try await reopened.clearIfMatching(requestID: acquiredID, identity: "sess-1:resume")
+        let cleared = try await reopened.read("sess-1:resume")
+        XCTAssertEqual(cleared, DraftRecord())
     }
 }

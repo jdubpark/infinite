@@ -20,8 +20,6 @@ func teamColor(_ team: TeamRun) -> Color {
 private let teamClock: DateFormatter = { let f = DateFormatter(); f.dateStyle = .short; f.timeStyle = .short; return f }()
 func teamDate(_ value: String) -> String { ISO8601DateFormatter.flexible.date(from: value).map(teamClock.string(from:)) ?? value }
 
-/// Everything a person needs to follow and steer one run: open decisions, member sessions that
-/// need them, the work plan, the host's check and review evidence, and a direction composer.
 struct TeamDetailView: View {
     @ObservedObject var app: AppModel
     @ObservedObject var model: TeamModel
@@ -62,7 +60,7 @@ struct TeamDetailView: View {
             }
             Divider()
             if model.managed {
-                MissionManagedNote(missionID: team.missionID) { app.selectedMissionID = $0 }.padding(12)
+                MissionManagedNote(missionID: team.missionID) { app.openMission($0) }.padding(12)
             } else {
                 composer.padding(12)
             }
@@ -83,7 +81,7 @@ struct TeamDetailView: View {
     private var header: some View {
         HStack(spacing: 10) {
             if let mission = app.teamOpenedFrom {
-                Button { app.selectedMissionID = mission } label: { Image(systemName: "chevron.left") }
+                Button { app.openMission(mission) } label: { Image(systemName: "chevron.left") }
                     .buttonStyle(.borderless).help("Back to the mission").accessibilityLabel("Back to the mission")
             }
             StatusGlyph(team: team, size: 16)
@@ -119,8 +117,6 @@ struct TeamDetailView: View {
         if !team.reason.isEmpty { note(team.reason, color: .orange) }
     }
 
-    /// The team's claim of readiness, the evidence behind it at a glance, and what to do next.
-    /// Nothing here approves or merges; the person decides outside the host or sends a direction.
     private var reviewPanel: some View {
         let checks = team.currentChecks
         let passed = checks.filter { $0["status"].string == "passed" }.count
@@ -168,12 +164,10 @@ struct TeamDetailView: View {
         }
     }
 
-    /// A mission's subteam answers its questions through the coordinator, so its open decisions carry no answer controls here.
     @ViewBuilder private var decisions: some View {
         let open = team.openDecisions
         if !open.isEmpty && !model.managed {
             section("Decisions for you", count: open.count) {
-                // Keyed by decision ID so a typed draft never moves to another question after a poll.
                 ForEach(open, id: \.["id"].string) { decision in
                     let asker = team.member(decision["memberId"].string).map { TeamRun.roleName($0["role"].string) } ?? "Team"
                     DecisionCard(decision: decision, caption: "\(asker) · revision \(decision["revision"].int) · \(teamDate(decision["createdAt"].string))",
@@ -184,7 +178,6 @@ struct TeamDetailView: View {
         }
     }
 
-    /// Provider permission prompts belong to the member's own session; the team never answers them.
     @ViewBuilder private var attention: some View {
         let ids = Set(team.activeMembers.map { $0["sessionId"].string })
         let waiting = app.sessions.filter { ids.contains($0.id) && $0.needsYou }
@@ -415,8 +408,6 @@ struct TeamDetailView: View {
     }
 }
 
-/// The one line that stands in for steering and owner controls on a run or session a mission's coordinator
-/// runs. With an opener it is a button that goes to the mission, where the owner talks to the coordinator.
 struct MissionManagedNote: View {
     let missionID: String
     var openMission: ((String) -> Void)? = nil
@@ -435,10 +426,8 @@ struct MissionManagedNote: View {
     }
 }
 
-/// A question a member or a mission coordinator asked, answered by its options or in words.
 struct DecisionCard: View {
     let decision: JSON
-    /// Who asked and when, above the question.
     let caption: String
     let disabled: Bool
     let answer: (String) -> Void
@@ -482,8 +471,6 @@ struct DecisionCard: View {
     private func submit() { let value = text; text = ""; answer(value) }
 }
 
-/// One line per task; expanding shows the agent's own report and the brief it worked from.
-/// A metered task carries what it cost; the owner can rate any task from here.
 struct TaskCard: View {
     let task: JSON
     let team: TeamRun
@@ -533,7 +520,6 @@ struct TaskCard: View {
             }
         }.padding(10).background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 8))
     }
-    /// What the task cost across every attempt, from the host's ledger.
     private func spend(_ usage: TaskUsage) -> some View {
         HStack(spacing: 6) {
             Text("Spent").font(.caption).foregroundStyle(.secondary)
@@ -573,8 +559,6 @@ private func agentLabel(_ task: JSON, _ team: TeamRun) -> String {
     return providerName(member?["provider"].string.isEmpty == false ? member!["provider"].string : team.provider)
 }
 
-/// The run as a pipeline: plan, the tasks in dependency columns, then integration, checks,
-/// review, and the person. Tapping a task opens its card below.
 struct RunDiagram: View {
     let team: TeamRun
     let select: (String) -> Void
@@ -634,7 +618,6 @@ struct StageNode: View {
     }
 }
 
-/// One number with where it came from, so host facts and agent claims never blur.
 struct SignalTile: View {
     let value: String
     let label: String
@@ -677,7 +660,6 @@ struct ReviewStepRow: View {
     }
 }
 
-/// Requested model settings are what the host asked for; provider policy may still override them.
 struct ProfileLine: View {
     let profile: JSON
     var body: some View {
@@ -706,7 +688,6 @@ struct LineupView: View {
     }
 }
 
-/// Starts a run: an outcome, a workspace with configured checks, and the agents to use.
 struct TeamCreateView: View {
     @ObservedObject var app: AppModel
     @Environment(\.dismiss) private var dismiss
@@ -718,6 +699,7 @@ struct TeamCreateView: View {
     @State private var busy = false
     @State private var error = ""
     @State private var clearPending = false
+    @State private var clearTarget: PendingClearTarget?
     private var providers: [String] { app.teamProviders }
     private var selectedProject: JSON? { app.projects.first { $0["id"].string == project } }
     private var projectReady: Bool { app.teamWorkspaceReady(project) }
@@ -762,7 +744,9 @@ struct TeamCreateView: View {
             if !useLineup && provider == "demo" { Text("Rehearsal uses a local test process. It does not call an AI model or implement a real feature.").font(.caption).foregroundStyle(.orange) }
             if pending {
                 Text("A team request is pending. Retry uses its original request identity. Check the team list before starting a different one.").font(.callout).foregroundStyle(.orange)
-                Button("Clear after checking teams…") { clearPending = true }.disabled(busy)
+                Button("Clear after checking teams…") {
+                    if let id = app.pendingTeamCreation.pendingID { clearTarget = PendingClearTarget(profileID: app.activeID, requestID: id); clearPending = true }
+                }.disabled(busy)
             }
             if !error.isEmpty { Text(error).foregroundStyle(.red).textSelection(.enabled) }
             HStack {
@@ -779,8 +763,11 @@ struct TeamCreateView: View {
             }
         }.padding(26).frame(width: 560)
         .alert("Clear the pending team request?", isPresented: $clearPending) {
-            Button("Keep pending", role: .cancel) {}
-            Button("I checked the teams") { app.clearTeamCreation() }
+            Button("Keep pending", role: .cancel) { clearTarget = nil }
+            Button("I checked the teams") {
+                app.clearTeamCreation(expectedProfileID: clearTarget?.profileID, expectedRequestID: clearTarget?.requestID)
+                clearTarget = nil
+            }
         } message: { Text("The server may already have started this team. Clearing does not stop it.") }
         .onAppear {
             project = app.defaultTeamWorkspace

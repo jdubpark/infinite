@@ -62,7 +62,12 @@ test("an integration entry is a host receipt with no scores", () => {
   const run = hostEntryRun();
   const entry = hostEntry(run, `integration:${hostEntryIds.implA}`, NOW);
   assert.ok(entry);
-  assert.deepEqual(entry.body, { taskId: "a", commit: COMMIT, changedPaths: { paths: ["a.txt"], truncated: false } });
+  assert.deepEqual(entry.body, {
+    memberId: hostEntryIds.implA,
+    taskId: "a",
+    commit: COMMIT,
+    changedPaths: { paths: ["a.txt"], truncated: false },
+  });
   assert.equal(entry.author, "host");
   assert.equal(entry.authority, "receipt");
   assert.equal(entry.taskId, "a");

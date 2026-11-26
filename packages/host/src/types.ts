@@ -137,12 +137,69 @@ export const sessionHeadlessSchema: z.ZodType<SessionHeadless> = z.discriminated
 ]);
 export type SessionPurpose = "work" | "duel" | "replay" | "gate";
 export const SESSION_PURPOSES: readonly SessionPurpose[] = ["work", "duel", "replay", "gate"];
-export const LEARNING_PURPOSES: readonly SessionPurpose[] = ["replay", "gate", "duel"];
-export function learningPurpose(purpose: SessionPurpose | undefined): boolean {
-  return purpose !== undefined && LEARNING_PURPOSES.includes(purpose);
+export type ExecutionIdentity = "production" | "eval";
+export const EXECUTION_IDENTITIES: readonly ExecutionIdentity[] = ["production", "eval"];
+const LEGACY_EVAL_PURPOSES: readonly SessionPurpose[] = ["replay", "gate", "duel"];
+export function sessionExecutionIdentity(
+  session: { executionIdentity?: ExecutionIdentity; purpose?: SessionPurpose } | undefined,
+): ExecutionIdentity {
+  if (session?.executionIdentity === "eval") return "eval";
+  if (session?.executionIdentity === "production") {
+    return session.purpose === "replay" || session.purpose === "gate" ? "eval" : "production";
+  }
+  return session?.purpose !== undefined && LEGACY_EVAL_PURPOSES.includes(session.purpose) ? "eval" : "production";
+}
+export function isEvalSession(
+  session: { executionIdentity?: ExecutionIdentity; purpose?: SessionPurpose } | undefined,
+): boolean {
+  return sessionExecutionIdentity(session) === "eval";
+}
+export function resolveLaunchExecutionIdentity(
+  header: { purpose?: SessionPurpose; executionIdentity?: ExecutionIdentity },
+): { ok: true; identity: ExecutionIdentity } | { ok: false; message: string } {
+  if (header.purpose !== undefined && !SESSION_PURPOSES.includes(header.purpose))
+    return { ok: false, message: "The session purpose is not recognized" };
+  if (header.executionIdentity !== undefined && !EXECUTION_IDENTITIES.includes(header.executionIdentity))
+    return { ok: false, message: "The session execution identity is not recognized" };
+  if (header.purpose === "replay" || header.purpose === "gate") {
+    if (header.executionIdentity === "production")
+      return { ok: false, message: "Replay and gate sessions must use the eval execution identity" };
+    return { ok: true, identity: "eval" };
+  }
+  if (header.purpose === "work") {
+    if (header.executionIdentity === "eval")
+      return { ok: false, message: "Work sessions must use the production execution identity" };
+    return { ok: true, identity: "production" };
+  }
+  if (header.purpose === "duel") {
+    if (header.executionIdentity === undefined)
+      return { ok: false, message: "Duel sessions must specify an explicit execution identity" };
+    return { ok: true, identity: header.executionIdentity };
+  }
+  return { ok: true, identity: header.executionIdentity ?? "production" };
+}
+export function resolveBootstrapExecutionIdentity(
+  bootstrap: Pick<Bootstrap, "session"> & { executionIdentity?: ExecutionIdentity },
+): ExecutionIdentity {
+  if (bootstrap.executionIdentity !== undefined && !EXECUTION_IDENTITIES.includes(bootstrap.executionIdentity))
+    throw new Error("Invalid session execution identity in worker bootstrap");
+  if (bootstrap.session.executionIdentity !== undefined && !EXECUTION_IDENTITIES.includes(bootstrap.session.executionIdentity))
+    throw new Error("Invalid session execution identity on session metadata");
+  if (bootstrap.executionIdentity !== undefined && bootstrap.session.executionIdentity !== undefined && bootstrap.executionIdentity !== bootstrap.session.executionIdentity)
+    throw new Error("Mismatched execution identity between worker bootstrap and session metadata");
+  const resolved = bootstrap.executionIdentity ?? bootstrap.session.executionIdentity;
+  if (resolved !== undefined) {
+    if (resolved === "production" && (bootstrap.session.purpose === "replay" || bootstrap.session.purpose === "gate"))
+      throw new Error("Replay and gate sessions cannot run under the production execution identity");
+    if (resolved === "eval" && bootstrap.session.purpose === "work")
+      throw new Error("Work sessions cannot run under the eval execution identity");
+    return resolved;
+  }
+  return sessionExecutionIdentity(bootstrap.session);
 }
 export interface Session {
   purpose?: SessionPurpose;
+  executionIdentity?: ExecutionIdentity;
   configId?: string;
   codeMode?: boolean;
   handoff?: { policy?: import("./handoff-types.js").HandoffPolicy; reason?: string };
@@ -166,6 +223,7 @@ export interface Session {
   archivedAt?: string;
   pid?: number;
   exitCode?: number;
+  outputTailIncomplete?: true;
   projectRoot?: string;
   contextSources?: import("./project-context.js").ContextSource[];
   contextLinksVersion?: number;
@@ -330,6 +388,7 @@ export interface WorkerState {
   socketPath?: string;
   permissionSocketPath?: string;
   exitCode?: number;
+  outputTailIncomplete?: true;
   seq: number;
   screen: string;
   attention: Attention;
@@ -580,6 +639,7 @@ export type WorkerRequest =
   | ({ op: "stop"; requestId: string } & InputControl);
 export interface Bootstrap {
   session: Session;
+  executionIdentity: ExecutionIdentity;
   profile: AgentProfile;
   stateDir: string;
   runDir: string;

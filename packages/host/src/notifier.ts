@@ -5,14 +5,14 @@ import type { FuseService, FuseInterrupt } from "./fuse/service.js";
 import type { MainCheckNotice, MainCheckService } from "./main-check.js";
 import type { PermissionDeliveryService } from "./permission-agent-types.js";
 import { INTERRUPT_CLASSES, type InterruptClass } from "./permission-policy.js";
-import { learningPurpose, type SessionPurpose } from "./types.js";
+import { isEvalSession, type ExecutionIdentity, type SessionPurpose } from "./types.js";
 import { createHash } from "node:crypto";
 
 const fuseSubject = (projectId: string | undefined) =>
   projectId === undefined ? "host" : projectId.length <= 40 ? projectId : createHash("sha256").update(projectId, "utf8").digest("hex").slice(0, 32);
 
 type Row = {
-  id: string; title: string; provider: Provider; attention: Attention; reading?: { now?: { text: string } }; purpose?: SessionPurpose;
+  id: string; title: string; provider: Provider; attention: Attention; reading?: { now?: { text: string } }; purpose?: SessionPurpose; executionIdentity?: ExecutionIdentity;
   permissionChannel?: { waiting?: { interruptClass: string }; notice?: { id: string; interruptClass?: string } };
   permissionNotice?: true;
 };
@@ -94,7 +94,7 @@ export class Notifier {
   async tick() {
     const due: Row[] = [];
     try {
-      const rows = ((await this.manager.list({ includeFullMessage: true })) as unknown as Row[]).filter(row => !learningPurpose(row.purpose));
+      const rows = ((await this.manager.list({ includeFullMessage: true })) as unknown as Row[]).filter(row => !isEvalSession(row));
       const now = Date.now();
       const redact = (row: Row): Row => ({ ...row, attention: publicAttention(row.attention) });
       for (const row of rows) {

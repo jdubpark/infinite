@@ -6,7 +6,7 @@ export type TerminalPage = {
   open?: TerminalOpen;
   events?: Event[]; cursor?: number; more?: boolean;
   cols?: number; rows?: number;
-  state?: Pick<WorkerState, "status" | "pid" | "exitCode" | "control" | "capabilities" | "runtime" | "nativeSession" | "terminalSize">;
+  state?: Pick<WorkerState, "status" | "pid" | "exitCode" | "outputTailIncomplete" | "control" | "capabilities" | "runtime" | "nativeSession" | "terminalSize">;
   snapshot?: TerminalSnapshot; receipt?: Receipt; error?: string;
   requestId?: string; control?: ControlLease | null;
   refusal?: { requestId?: string; code: string; error?: string };

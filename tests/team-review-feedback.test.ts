@@ -183,12 +183,12 @@ test("whichever record write a review's steer stops after, the restarted host st
       stops++;
       stop.restart();
       const left = f.readRecord<Saved>("team", f.run.id), intent = left.reviewIntake?.intents[0];
-      const expected = ([["pending", false], ["pending", false], ["pending", true], ["applied", true]] as const)[stopAt - 1];
+      const expected = ([["pending", false], ["pending", true], ["applied", true]] as const)[stopAt - 1];
       assert.deepEqual([intent?.state, Boolean(left.receipts[requestId(f)])], expected);
       const readsBefore = gh.commands().length, second = poller(f.openTeam());
       await second.start();
-      assert.equal(gh.commands().length - readsBefore, stopAt <= 2 ? 1 : 0,
-        stopAt === 3 ? "an intent whose steer took effect is acknowledged from its receipt without reading GitHub" : `after write ${stopAt} the drain reads GitHub only for an intent without a receipt`);
+      assert.equal(gh.commands().length - readsBefore, stopAt === 1 ? 1 : 0,
+        stopAt === 2 ? "an intent whose steer took effect is acknowledged from its receipt without reading GitHub" : `after write ${stopAt} the drain reads GitHub only for an intent without a receipt`);
       await second.poll();
       const saved = f.readRecord<Saved>("team", f.run.id);
       assert.equal(saved.run.revision, 2, `a stop after write ${stopAt} steers exactly once`);
@@ -198,7 +198,7 @@ test("whichever record write a review's steer stops after, the restarted host st
       assert.equal(events(saved).filter(text => text.startsWith("The owner requested changes on the pull request")).length, 1);
     } finally { f.close(); }
   }
-  assert.equal(stops, 4, "the intent, the steer's two writes and the acknowledgement");
+  assert.equal(stops, 3, "the intent, the steer and the acknowledgement; the steer's earlier save of an unchanged record writes nothing");
 });
 
 test("a review that GitHub supersedes while the owner's halt holds it starts nothing", async () => {

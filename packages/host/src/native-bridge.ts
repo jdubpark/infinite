@@ -37,7 +37,7 @@ export function connectNativeFrontends(server: Server, manager: Manager, authent
         if (!executor && device && missionManaged && await missionManaged(match[1])) { denyMissionManaged(); return; }
         if (!device || device.role !== "owner") { deny(); return; }
         manager.meta(match[1]);
-        const backend = await workerCall<{ url: string; token: string }>(manager.config.runDir, match[1], executor ? {
+        const backend = await workerCall<{ url: string; token: string }>(manager.socketTarget, match[1], executor ? {
           op: "executor-connect", token: executorToken as string,
         } : {
           op: "native-connect", actor: controlActor(device, clientId!), leaseId: leaseId!,

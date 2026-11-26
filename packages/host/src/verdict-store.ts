@@ -2,7 +2,7 @@ import { z } from "zod";
 import type { EventOutbox, EventProjector } from "./evidence/outbox.js";
 import type { EvidenceStore } from "./evidence/store.js";
 import type { EvidenceModule } from "./evidence/types.js";
-import { ID_RE } from "./objective-types.js";
+import { CRITERIA_ROWS_MAX, ID_RE } from "./schema-primitives.js";
 
 export const VERDICTS_MODULE = "objective-verdicts";
 export const VERDICT_RETENTION_DAYS = 730;
@@ -11,7 +11,7 @@ const TABLE = "objective_verdicts";
 const DAY_MS = 86_400_000;
 const DEFAULT_SWEEP_LIMIT = 100;
 
-const count = z.number().int().min(0).max(8);
+const count = z.number().int().min(0).max(CRITERIA_ROWS_MAX);
 const assessed = z.enum(["met", "not-met", "inconclusive"]);
 
 export const verdictEventDataSchema = z.strictObject({

@@ -28,6 +28,18 @@ test("hook server accepts authenticated JSON and rejects the rest", async () => 
   }
 });
 
+test("a permission hook names its provider run in the path, and no other route takes a run", async () => {
+  const received: unknown[] = [];
+  const server = await startHookServer({ token: "secret", onPayload: (route, _body, run) => { received.push([route, run]); }, onError: () => {} });
+  try {
+    const statuses: number[] = [];
+    for (const path of ["/permission-check/2", "/permission-request/12", "/permission-request", "/claude/2", "/permission-check/x", "/permission-check/2/3"])
+      statuses.push((await fetch(`${server.url}${path}`, { method: "POST", body: "{}", headers: { Authorization: "Bearer secret" } })).status);
+    assert.deepEqual(statuses, [204, 204, 204, 404, 404, 404]);
+    assert.deepEqual(received, [["permission-check", "2"], ["permission-request", "12"], ["permission-request", undefined]]);
+  } finally { server.close(); }
+});
+
 test("report acceptance is refused when validation or durable recording fails", async () => {
   let failure: "validation" | "storage" = "validation";
   const server = await startHookServer({

@@ -1,14 +1,17 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { isAbsolute, relative, resolve } from "node:path";
 import { z } from "zod";
 import { failureReason } from "./failure-reason.js";
+import { signalGroup, spawnGroup, watchLeader } from "./process-group.js";
 import { agentModelClientEnvironment } from "./egress.js";
 import type { Manager } from "./manager.js";
 import type { ChatMessage } from "./session-content.js";
 import type { Project, Session } from "./types.js";
 import type { BriefingUsage } from "./usage-api.js";
+
+const STOP_GRACE_MS = 3_000;
 
 export interface RepositoryBriefingConfig {
   command: string;
@@ -175,8 +178,9 @@ function renderBrief(brief: z.infer<typeof briefSchema>) {
 async function collectProcess(command: string, args: string[], options: { cwd: string; input?: string; timeoutMs: number; maxBytes: number; signal?: AbortSignal; env?: NodeJS.ProcessEnv }): Promise<string> {
   return new Promise((resolvePromise, rejectPromise) => {
     let child: ChildProcess;
-    try { child = spawn(command, args, { cwd: options.cwd, env: options.env, stdio: ["pipe", "pipe", "pipe"], detached: process.platform !== "win32" }); }
+    try { child = spawnGroup(command, args, { cwd: options.cwd, env: options.env, stdio: ["pipe", "pipe", "pipe"] }, STOP_GRACE_MS); }
     catch { rejectPromise(new Error("spawn")); return; }
+    const leader = watchLeader(child);
     let stdout = Buffer.alloc(0), stderrTail = Buffer.alloc(0), stopped: string | undefined;
     let closeCode: number | null | undefined, closeHandled = false, escalationDone = false;
     const finish = () => {
@@ -190,12 +194,12 @@ async function collectProcess(command: string, args: string[], options: { cwd: s
     const stop = (reason: string) => {
       if (stopped) return;
       stopped = reason;
-      try { if (child.pid && process.platform !== "win32") process.kill(-child.pid, "SIGTERM"); else child.kill("SIGTERM"); } catch {}
+      signalGroup(child, "SIGTERM");
       setTimeout(() => {
-        try { if (child.pid && process.platform !== "win32") process.kill(-child.pid, "SIGKILL"); else child.kill("SIGKILL"); } catch {}
+        signalGroup(child, "SIGKILL");
         escalationDone = true;
         finish();
-      }, 3000);
+      }, STOP_GRACE_MS);
     };
     const timer = setTimeout(() => stop("timeout"), options.timeoutMs);
     timer.unref();
@@ -209,6 +213,10 @@ async function collectProcess(command: string, args: string[], options: { cwd: s
     child.on("error", () => { stopped ??= "spawn"; escalationDone = true; });
     child.on("close", code => {
       closeCode = code;
+      if (leader.leftover && !stopped) {
+        stopped = "output-held";
+        escalationDone = true;
+      }
       if (!stopped) clearTimeout(timer);
       finish();
     });

@@ -2,6 +2,7 @@ import test, { after } from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
 import { BASELINE_FILE, readBaseline } from "../packages/host/src/fuse/baseline.js";
@@ -54,7 +55,7 @@ function trip(fuse: FuseService, projectId = "fixture") {
 const shortRunDirs: string[] = [];
 after(() => { for (const dir of shortRunDirs) rmSync(dir, { recursive: true, force: true }); });
 function shortRun(config: Fixture["config"]) {
-  const runDir = mkdtempSync("/tmp/fuse-run-");
+  const runDir = mkdtempSync(join(tmpdir(), "fuse-run-"));
   shortRunDirs.push(runDir);
   return { ...config, runDir };
 }

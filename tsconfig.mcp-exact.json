@@ -1,0 +1,16 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "exactOptionalPropertyTypes": true,
+    "noEmit": true
+  },
+  "include": [
+    "packages/host/src/wire-shape.ts",
+    "packages/host/src/team-role.ts",
+    "packages/host/src/evidence/entry-types.ts",
+    "packages/host/src/team-mcp-results.ts",
+    "tests/team-mcp-results-exact-types.test.ts"
+  ]
+}

@@ -5,18 +5,16 @@ import { dirname, join } from "node:path";
 import { recordDirectory, recordScope } from "../packages/host/src/main-check-ports.js";
 import type { MainCheckRecord } from "../packages/host/src/main-check-state.js";
 import { Notifier } from "../packages/host/src/notifier.js";
+import { bootId, type HostProcesses } from "../packages/host/src/process-census.js";
 import type { PushMessage, PushTicket } from "../packages/host/src/push.js";
 import type { TeamCommand } from "../packages/host/src/team-types.js";
 import { unseal } from "../packages/host/src/vault.js";
 import { inProcessHost, waitFor, type ApiResponse } from "./helpers.js";
-import { earlierProcesses } from "./main-check-earlier.js";
 import { git } from "./team-fixture.js";
 
 const PROJECT = "alpha";
 const WAIT_MS = 20_000;
 const CASE = { timeout: 60_000 };
-const UNINSPECTED = (await earlierProcesses()).size;
-const REMOVES_A_COPY = UNINSPECTED === 0 ? CASE : { ...CASE, skip: `this account has ${UNINSPECTED} process(es) the census cannot inspect, so a main check here removes no copy while they run (docs/teams.md, Main check, limits)` };
 const COMMIT = ["-c", "user.name=Example Developer", "-c", "user.email=dev@example.invalid", "commit", "-q", "-m"];
 const sh = (script: string): TeamCommand => ({ command: "sh", args: ["-c", script] });
 
@@ -29,7 +27,7 @@ function gone(pid: number): boolean {
   }
 }
 
-async function mainCheckHost(files: Record<string, string>, checks: (root: string) => TeamCommand[]) {
+async function mainCheckHost(files: Record<string, string>, checks: (root: string) => TeamCommand[], processCensus?: HostProcesses) {
   let source = "";
   let remote = "";
   const host = await inProcessHost({
@@ -54,6 +52,7 @@ async function mainCheckHost(files: Record<string, string>, checks: (root: strin
       config.teams = { workspaceDir: join(root, "teams"), storageFloor: { inodes: 0, bytes: 0 } };
       config.push = { enabled: true, endpoint: "https://push.example.invalid/send", detail: "minimal", events: ["main-check"] };
     },
+    ...(processCensus ? { appOptions: { processCensus } } : {}),
   });
   const root = host.root;
   const key = readFileSync(host.config.keyFile);
@@ -140,8 +139,17 @@ test("a failing command with no recognised failure line keeps a bounded tail in 
   }
 });
 
-test("a real Notifier tells the owner main is failing, then that it passes again, and a push that reached nobody changes nothing", REMOVES_A_COPY, async () => {
-  const h = await mainCheckHost({ "tracked.txt": "one\n", broken: "yes\n" }, () => [sh("if [ -f broken ]; then echo 'not ok 1 - the build is broken' >&2; exit 3; fi")]);
+test("a real Notifier tells the owner main is failing, then that it passes again, and a push that reached nobody changes nothing", CASE, async () => {
+  let censusCalls = 0;
+  const deterministicCensus: HostProcesses = {
+    table: async () => ({ boot: bootId(), rows: [] }),
+    start: async () => undefined,
+    census: async () => {
+      censusCalls += 1;
+      return { ok: true, findings: [] };
+    },
+  };
+  const h = await mainCheckHost({ "tracked.txt": "one\n", broken: "yes\n" }, () => [sh("if [ -f broken ]; then echo 'not ok 1 - the build is broken' >&2; exit 3; fi")], deterministicCensus);
   try {
     const registered = await h.host.fetchApi("/devices/push", "owner", { token: "ExponentPushToken[mainCheckDevice01]", platform: "ios" });
     assert.deepEqual([registered.status, registered.body], [200, { ok: true, push: true }]);
@@ -177,6 +185,7 @@ test("a real Notifier tells the owner main is failing, then that it passes again
     await notifier.tick();
     assert.equal(sent.length, 2, "the notice waits out its minute in flight instead of repeating on every tick");
     assert.equal(pushStore.list().length, 1, "a refused ticket that is not DeviceNotRegistered keeps the device");
+    assert.ok(censusCalls > 0, "createApp wires the injected processCensus into MainCheckService");
   } finally {
     await h.host.stop();
   }

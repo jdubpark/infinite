@@ -2,15 +2,19 @@ import test, { type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { randomBytes, randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import fs, { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type express from "express";
 import { spawn as ptySpawn } from "node-pty";
 import { CmuxSessions } from "../packages/host/src/cmux/index.js";
+import { sendSessionList } from "../packages/host/src/session-list.js";
 import { createApp } from "../packages/host/src/server.js";
 import { hashToken } from "../packages/host/src/config.js";
 import { captureWorkspace, readWorkspaceBlob } from "../packages/host/src/workspace-checkpoint.js";
-import { unseal } from "../packages/host/src/vault.js";
+import { readEvents, unseal } from "../packages/host/src/vault.js";
+import { journalTipSeq, readSignalIndexState, SIGNAL_INDEX_STATE_FILE } from "../packages/host/src/signal-index.js";
 import type { Config, ControlLease, Receipt } from "../packages/host/src/types.js";
 import { apiClient, claimControl, startHost, waitFor } from "./helpers.js";
 
@@ -37,8 +41,8 @@ else if(method==='feed.list') {
   if(state.feedChanges){state.feed=state.feedChanges;delete state.feedChanges;writeFileSync(file,JSON.stringify(state));}
   reply({items:state.feed});
 }
-else if(method==='surface.read_text') reply({text:state.screen??'> '});
-else if(method==='terminal.replay') reply({columns:80,rows:24,...(state.renderGrid?{render_grid:state.renderGrid}:{})});
+else if(method==='surface.read_text') { if(state.resizeAfterRead){state.columns=state.resizeAfterRead.columns;state.rows=state.resizeAfterRead.rows;delete state.resizeAfterRead;writeFileSync(file,JSON.stringify(state));} reply({text:state.screen??'> '}); }
+else if(method==='terminal.replay') { if(state.replayOffline) process.exit(2); reply({...(state.omitReplaySize?{}:{columns:state.columns??80,rows:state.rows??24}),...(state.renderGrid?{render_grid:state.renderGrid}:{})}); }
 else {
   appendFileSync(join(root,'mutations.jsonl'),JSON.stringify({method,params})+'\n');
   if(state.failAfter===method) process.exit(2);
@@ -497,7 +501,7 @@ test("a cmux session in the project holds a workspace sync, and cmux starts are 
   const f = await fixture(t);
   await f.sessions.close();
   const owner = randomBytes(32).toString("base64url");
-  const runDir = mkdtempSync("/tmp/inf-cmuxrun-");
+  const runDir = mkdtempSync(join(tmpdir(), "inf-cmuxrun-"));
   t.after(() => rmSync(runDir, { recursive: true, force: true }));
   const config: Config = { ...f.config, runDir, tokens: [{ id: "owner", label: "Owner", role: "owner", hash: hashToken(owner) }] };
   writeFileSync(config.keyFile, f.key, { mode: 0o600 });
@@ -536,4 +540,140 @@ test("a cmux session in the project holds a workspace sync, and cmux starts are 
   assert.equal(f.mutations().filter(row => row.method === "workspace.create").length, launches, "cmux was never asked to launch");
   answer(true);
   await assert.rejects(held, { code: "session-running" });
+});
+
+test("cmux session rows and sessionListVersion stay identical across creation order and differently ordered reloads", { timeout: 20000 }, async (t) => {
+  const f = await fixture(t);
+  const highId = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+  const midId = "88888888-8888-4888-8888-888888888888";
+  const lowId = "00000000-0000-4000-8000-000000000000";
+  for (const [id, title] of [[highId, "High"], [lowId, "Low"], [midId, "Mid"]] as const) {
+    await f.sessions.create({ requestId: id, provider: "claude", projectId: "project", title, prompt: "" });
+  }
+  const readVersion = async (since: string) => {
+    let payload: unknown;
+    let raw: string | undefined;
+    const res = { json: (value: unknown) => { payload = value; }, type: () => res, send: (value: string) => { raw = value; } };
+    await sendSessionList({ query: { since } } as unknown as express.Request, res as unknown as express.Response, () => f.sessions.list());
+    return (payload ?? JSON.parse(raw!)) as { version: string; unchanged?: true; sessions?: { id: string }[] };
+  };
+  const expectedIds = [f.id, highId, midId, lowId].sort((left, right) => (left < right ? -1 : left > right ? 1 : 0));
+  assert.deepEqual((await f.sessions.list()).map(row => row.id), expectedIds);
+  const before = await readVersion("");
+  assert.deepEqual(before.sessions?.map(row => row.id), expectedIds);
+
+  const cmuxDir = join(f.config.stateDir, "cmux");
+  const realReaddirSync = fs.readdirSync;
+  let reverseOrder = false;
+  fs.readdirSync = ((path: fs.PathLike, ...rest: unknown[]) => {
+    const entries = (realReaddirSync as (...args: unknown[]) => unknown[])(path, ...rest);
+    if (String(path) === cmuxDir && Array.isArray(entries)) {
+      const sorted = [...entries].sort((left, right) => (String(left) < String(right) ? -1 : String(left) > String(right) ? 1 : 0));
+      return reverseOrder ? sorted.reverse() : sorted;
+    }
+    return entries;
+  }) as typeof fs.readdirSync;
+  syncBuiltinESMExports();
+  t.after(() => {
+    fs.readdirSync = realReaddirSync;
+    syncBuiltinESMExports();
+  });
+
+  reverseOrder = false;
+  await f.restart();
+  assert.deepEqual((await f.sessions.list()).map(row => row.id), expectedIds);
+  assert.deepEqual(await readVersion(before.version), { version: before.version, unchanged: true });
+
+  reverseOrder = true;
+  await f.restart();
+  assert.deepEqual((await f.sessions.list()).map(row => row.id), expectedIds);
+  assert.deepEqual(await readVersion(before.version), { version: before.version, unchanged: true });
+});
+
+test("cmux journals resizes with unchanged screen text and omits stale dimensions when terminal.replay fails", { timeout: 15000 }, async (t) => {
+  const f = await fixture(t);
+  const initial = await f.sessions.get(f.id);
+  assert.deepEqual(initial.terminalSize, { cols: 80, rows: 24 });
+  const initialEvents = f.sessions.events(f.id, 0, 200).events;
+  const initialResize = initialEvents.find(event => event.type === "lifecycle" && event.data.event === "resize");
+  const initialOutput = initialEvents.find(event => event.type === "output");
+  assert.deepEqual([initialResize?.data.cols, initialResize?.data.rows], [80, 24]);
+  assert.deepEqual([initialOutput?.data.cols, initialOutput?.data.rows], [80, 24]);
+
+  const cursorAfterInitial = f.sessions.events(f.id, 0, 200).cursor;
+  f.setState({ columns: 132, rows: 40 });
+  const resized = await f.sessions.get(f.id);
+  assert.deepEqual(resized.terminalSize, { cols: 132, rows: 40 });
+  const afterResizeEvents = f.sessions.events(f.id, cursorAfterInitial, 200).events;
+  assert.equal(afterResizeEvents.filter(event => event.type === "output").length, 0, "unchanged text does not emit a duplicate output frame");
+  const resizeEvent = afterResizeEvents.find(event => event.type === "lifecycle" && event.data.event === "resize");
+  assert.ok(resizeEvent, "resizing with unchanged prompt text still journals a resize lifecycle event");
+  assert.deepEqual([resizeEvent.data.cols, resizeEvent.data.rows], [132, 40]);
+
+  const cursorBeforeOutage = f.sessions.events(f.id, 0, 200).cursor;
+  f.setState({ replayOffline: true, screen: "> updated while replay unavailable" });
+  await f.sessions.get(f.id);
+  const offlineOutput = f.sessions.events(f.id, cursorBeforeOutage, 200).events.find(event => event.type === "output");
+  assert.ok(offlineOutput);
+  assert.equal(offlineOutput.data.cols, undefined, "output must not inherit stale cached cols when terminal.replay fails");
+  assert.equal(offlineOutput.data.rows, undefined, "output must not inherit stale cached rows when terminal.replay fails");
+
+  const cursorBeforeMissing = f.sessions.events(f.id, 0, 200).cursor;
+  f.setState({ replayOffline: false, omitReplaySize: true, screen: "> updated without replay dimensions" });
+  await f.sessions.get(f.id);
+  const unsizedOutput = f.sessions.events(f.id, cursorBeforeMissing, 200).events.find(event => event.type === "output");
+  assert.ok(unsizedOutput);
+  assert.equal(unsizedOutput.data.cols, undefined);
+  assert.equal(unsizedOutput.data.rows, undefined);
+
+  const cursorBeforeMidResize = f.sessions.events(f.id, 0, 200).cursor;
+  f.setState({
+    omitReplaySize: false,
+    columns: 132,
+    rows: 40,
+    screen: "> text captured across resize",
+    resizeAfterRead: { columns: 140, rows: 42 },
+  });
+  const afterMidResize = await f.sessions.get(f.id);
+  assert.deepEqual(afterMidResize.terminalSize, { cols: 140, rows: 42 });
+  const midResizeEvents = f.sessions.events(f.id, cursorBeforeMidResize, 200).events;
+  const ambiguousOutput = midResizeEvents.find(event => event.type === "output");
+  const confirmedResize = midResizeEvents.find(event => event.type === "lifecycle" && event.data.event === "resize" && event.data.cols === 140 && event.data.rows === 42);
+  assert.ok(ambiguousOutput, "screen update is still recorded");
+  assert.equal(ambiguousOutput.data.cols, undefined, "output captured while geometry changed must not be tagged with post-resize cols");
+  assert.equal(ambiguousOutput.data.rows, undefined, "output captured while geometry changed must not be tagged with post-resize rows");
+  assert.ok(confirmedResize, "confirmed post-read geometry is journaled as a resize lifecycle event");
+  assert.ok(ambiguousOutput.seq < confirmedResize.seq, "confirmed post-read resize follows the ambiguous output event");
+});
+
+test("cmux close checkpoints trailing output so signal indexing survives restart with zero output decryptions", { timeout: 20000 }, async (t) => {
+  const f = await fixture(t);
+  const permission = { request_id: "perm-checkpoint", kind: "permission", source: "claude", session_id: f.nativeId, surface_id: "surface", status: "pending", title: "Run tool" };
+  f.setState({ feed: [permission], screen: "prompt-1" });
+  assert.equal((await f.sessions.get(f.id)).attention.state, "needs-you");
+  f.setState({ screen: "prompt-1-trailing-output" });
+  await f.sessions.get(f.id);
+  const sessionDir = join(f.config.stateDir, "cmux", f.id);
+  const eventsDir = join(sessionDir, "events");
+  const stateFile = join(sessionDir, SIGNAL_INDEX_STATE_FILE);
+  await f.restart();
+  const stateAfterClose = readSignalIndexState(stateFile, f.key, f.id);
+  assert.ok(stateAfterClose && !stateAfterClose.disabled);
+  assert.equal(stateAfterClose.coveredSeq, journalTipSeq(eventsDir));
+  f.setState({ feed: [], screen: "prompt-closed-trailing" });
+  await f.sessions.get(f.id);
+  await f.restart();
+  const stateAfterSecondClose = readSignalIndexState(stateFile, f.key, f.id);
+  assert.ok(stateAfterSecondClose && !stateAfterSecondClose.disabled);
+  assert.equal(stateAfterSecondClose.coveredSeq, journalTipSeq(eventsDir));
+  const seg0 = join(eventsDir, "0000000000.journal");
+  const lines = readFileSync(seg0, "utf8").split("\n");
+  const outputSeq = f.sessions.events(f.id, 0, 200).events.find(event => event.type === "output")?.seq;
+  assert.ok(outputSeq);
+  lines[outputSeq - 1] = JSON.stringify({ v: 1, n: "AAAAAAAAAAAAAAAA", c: "AAAA", t: "AAAAAAAAAAAAAAAAAAAAAA==" });
+  writeFileSync(seg0, lines.join("\n"));
+  assert.throws(() => readEvents(eventsDir, f.key, f.id, 0, 200, new Set(["signal"])));
+  const page = f.sessions.events(f.id, 0, 200, new Set(["signal"]));
+  assert.deepEqual(page.events.map(event => event.data.kind), ["prompt-open", "prompt-closed"]);
+  assert.equal(page.more, false);
 });

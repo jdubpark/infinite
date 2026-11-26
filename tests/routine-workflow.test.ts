@@ -29,6 +29,7 @@ test("queued goal admission rechecks routine authority and the full execution wi
       },
     });
     try {
+      Date.now = () => started;
       const routine = await routines.create({ requestId: randomUUID(), intervalMinutes: 5, maxOccurrences: 1,
         startsAt: new Date(started + 1000).toISOString(), expiresAt: new Date(started + 6 * 60000).toISOString(),
         goal: { projectId: "fixture", title: "Bounded task", objective: "Inspect the fixture", successCriteria: "Report inspected evidence",

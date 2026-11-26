@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ActivityIndicator, Pressable, RefreshControl, ScrollView, StyleSheet, Text, View } from "react-native";
 import { useRouter } from "expo-router";
 import { ago, api, connectionKey, type Connection } from "../../api/client";
@@ -10,15 +10,36 @@ import { theme } from "../../theme";
 import { Section, t } from "../teams/parts";
 import { logPath, verdictColors, verdictWords, type Candidate, type DecisionEntry, type LogFilter, type LogPage } from "./model";
 
+function olderErrorMessage(failure: unknown) {
+  const detail = failure instanceof Error ? failure.message.trim() : "";
+  return detail ? `Could not load older decisions: ${detail}` : "Could not load older decisions.";
+}
+
 export function PermissionLog({ connection }: { connection: Connection }) {
   const router = useRouter(), machine = connectionKey(connection);
   const [filter, setFilter] = useState<LogFilter>("all");
-  const log = usePoll(() => api<LogPage>(connection, logPath(filter)).then(page => ({ filter, page })), 15000, [connection, filter]);
-  const current = log.data?.filter === filter ? log.data.page : null;
+  const scope = `${machine}/${filter}`;
+  const log = usePoll(() => api<LogPage>(connection, logPath(filter)).then(page => ({ scope, page })), 15000, [connection, filter]);
+  const current = log.data?.scope === scope ? log.data.page : null;
   const candidates = usePoll(() => api<{ candidates: Candidate[] }>(connection, "/permissions/candidates?limit=20"), 30000, [connection]);
-  const [older, setOlder] = useState<{ filter: LogFilter; entries: DecisionEntry[]; next?: string } | null>(null);
-  const [loadingOlder, setLoadingOlder] = useState(false);
-  const extra = older?.filter === filter ? older : null;
+  const [trackedScope, setTrackedScope] = useState(scope);
+  const [older, setOlder] = useState<{ scope: string; entries: DecisionEntry[]; next?: string } | null>(null);
+  const [olderLoad, setOlderLoad] = useState<{ epoch: number; scope: string } | null>(null);
+  const [olderError, setOlderError] = useState<{ scope: string; message: string } | null>(null);
+  const olderEpoch = useRef(0);
+  if (trackedScope !== scope) {
+    setTrackedScope(scope);
+    setOlder(null);
+    setOlderLoad(null);
+    setOlderError(null);
+  }
+  useEffect(() => {
+    olderEpoch.current += 1;
+    return () => { olderEpoch.current += 1; };
+  }, [scope]);
+  const extra = older?.scope === scope ? older : null;
+  const loadingOlder = olderLoad?.scope === scope;
+  const paginationError = olderError?.scope === scope ? olderError.message : "";
   const next = extra ? extra.next : current?.next;
   const seen = new Set<string>();
   const rows = current ? [...current.entries, ...(extra?.entries ?? [])].filter(entry => !seen.has(entry.id) && Boolean(seen.add(entry.id))) : [];
@@ -27,12 +48,23 @@ export function PermissionLog({ connection }: { connection: Connection }) {
   function back() { if (router.canGoBack()) router.back(); else router.replace({ pathname: "/", params: { machine } }); }
   async function showOlder() {
     if (!next || loadingOlder) return;
-    setLoadingOlder(true);
+    const epoch = olderEpoch.current;
+    setOlderLoad({ epoch, scope });
+    setOlderError(null);
     try {
       const page = await api<LogPage>(connection, logPath(filter, next));
-      setOlder({ filter, entries: [...(extra?.entries ?? []), ...page.entries], next: page.next });
-    } catch { }
-    finally { setLoadingOlder(false); }
+      if (olderEpoch.current !== epoch) return;
+      setOlder(previous => ({
+        scope,
+        entries: [...(previous?.scope === scope ? previous.entries : []), ...page.entries],
+        next: page.next,
+      }));
+    } catch (failure) {
+      if (olderEpoch.current !== epoch) return;
+      setOlderError({ scope, message: olderErrorMessage(failure) });
+    } finally {
+      if (olderEpoch.current === epoch) setOlderLoad(null);
+    }
   }
   const top = <TopBar backLabel="Home" onBack={back} right={<LiveStatus online={log.online} loading={log.loading} seen={log.seen} stale={log.stale} />} />;
   return <View style={s.fill}>
@@ -58,7 +90,10 @@ export function PermissionLog({ connection }: { connection: Connection }) {
           detail={[entry.workspaceName ?? entry.workspaceId, ago(entry.at), entry.marks.length ? "marked wrong" : "", entry.rateFlagged ? "above usual rate" : ""].filter(Boolean).join(" · ")} />)}
         {!rows.length ? current ? <Text style={t.note}>{filter === "all" ? "The permission agent has recorded no decision yet." : "No decision matches this filter."}</Text>
           : log.stale ? <Text style={t.note}>The decision log is unavailable.</Text> : <ActivityIndicator color={theme.colors.forest} style={s.spinner} /> : null}
-        {next && current ? <View style={s.older}><Button compact secondary title={loadingOlder ? "Loading…" : "Show older decisions"} disabled={loadingOlder} onPress={() => void showOlder()} /></View> : null}
+        {next && current ? <View style={s.older}>
+          <Button compact secondary title={loadingOlder ? "Loading…" : "Show older decisions"} disabled={loadingOlder} onPress={() => void showOlder()} />
+          {paginationError ? <Text accessibilityRole="alert" accessibilityLiveRegion="polite" style={t.error}>{paginationError}</Text> : null}
+        </View> : null}
       </Section>
     </ScrollView>
   </View>;
@@ -89,6 +124,6 @@ const s = StyleSheet.create({
   action: { fontFamily: theme.mono, fontSize: 13, lineHeight: 18, color: theme.colors.ink },
   verdict: { fontSize: 12, lineHeight: 17, fontWeight: "600" },
   pressed: { opacity: 0.55 },
-  older: { alignItems: "flex-start", paddingTop: 6 },
+  older: { alignItems: "flex-start", gap: 6, paddingTop: 6 },
   spinner: { marginTop: 20 },
 });

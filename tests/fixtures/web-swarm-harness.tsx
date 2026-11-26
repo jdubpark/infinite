@@ -64,7 +64,9 @@ function Harness() {
     control.view = setView;
     control.poll = variant => { control.variant = { ...control.variant, ...variant }; const next = fixture(); setFeed({ sessions: next.sessions, teams: next.teams }); };
   }, []);
-  const me: Me = { role: "owner", environment: "cloud", providers: ["claude", "codex", "opencode"], projects: swarmFixture(NOW).projects,
+  const me: Me = { role: "owner", environment: "cloud", providers: ["claude", "codex", "opencode"],
+    providerCapabilities: { claude: { observesToolInputs: true }, codex: { observesToolInputs: true }, opencode: { observesToolInputs: false } },
+    projects: swarmFixture(NOW).projects,
     teams: { enabled: true }, missions: { enabled: true }, capabilities: { signals: true, answer: true, push: false, ...(control.context === "on" ? { swarmContext: 1 as const } : {}) } };
   return <div style={{ display: "flex", flexDirection: "column", height: "100vh" }}>
     <SwarmView me={me} sessions={feed.sessions} teams={feed.teams} fresh stale={false} seen={new Date(NOW).toISOString()} view={view} setView={setView}

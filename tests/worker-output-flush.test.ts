@@ -176,7 +176,9 @@ test("a child's last output, written while a journal sync blocks the worker just
   const worker = await start({ INFINITE_TEST_JOURNAL_SYNC_DELAY_MS: "700" });
   try {
     await worker.call<Receipt>({ op: "raw", requestId: randomUUID(), text: "exit\n" });
-    await waitFor(() => worker.call({ op: "state" }), state => state.status === "exited", 30_000);
+    const saved = await waitFor(async () => worker.saved(), state => state.exitCode !== undefined, 30_000);
+    assert.equal(saved.status, "exited");
+    assert.equal(saved.exitCode, 0);
     const text = worker.output().join("");
     const rows = [...text.matchAll(/ROW (\d+) /g)].map(match => Number(match[1]));
     assert.match(text, /BURST DONE/, "the child's last line is recorded");

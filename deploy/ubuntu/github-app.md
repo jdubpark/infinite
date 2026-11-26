@@ -171,8 +171,8 @@ receive an app token. It does not retry failed mutations using another identity.
 ## Review feedback
 
 Review feedback is off by default: `github.reviewFeedback.enabled` defaults to
-`false`, and turning it on needs `ownerLogin`, the owner's GitHub login. While it
-is on, the host runs only `gh pr view` for it:
+`false`, and turning it on needs `ownerLogin`, the owner's GitHub login. For
+review feedback the host runs only `gh pr view`:
 
 - **What.** The host runs
   `gh pr view NUMBER --json state,isCrossRepository,baseRefName,headRefName,headRefOid,reviews --repo OWNER/REPO`
@@ -187,16 +187,17 @@ is on, the host runs only `gh pr view` for it:
   retried a minute later. Each read times out after 60 seconds.
 - **Through what.** With the [GitHub credential proxy](github-proxy.md), each
   read carries a host-signed grant for that one repository with the `pr`
-  operation and no branch refs, valid for 15 minutes. The proxy admits
-  `gh pr view`, `list` and `checks` under such a grant; `create`, `ready` and
-  `comment` also need the pull request's head branch among the grant's refs, so
-  it refuses them. Without the proxy, the host passes no grant, and `gh` uses
-  the account's own GitHub CLI setup.
+  operation and no branch refs, valid for 15 minutes. Because the grant carries
+  no refs, the proxy admits only `gh pr view`, `list` and `checks` under it:
+  every writing command needs the pull request's head branch among the grant's
+  refs.
+  Without the proxy, the host passes no grant, and `gh` uses the account's own
+  GitHub CLI setup.
 
-Even with the switch off, the host makes the same kind of read under the same
-grant for a run whose pull request was recorded without its branch:
-`gh pr view NUMBER --json state,isCrossRepository,baseRefName,headRefName`, when
-that run is steered or reaches delivery again.
+Independently of this switch, the host also runs
+`gh pr view NUMBER --json state,isCrossRepository,baseRefName,headRefName --repo OWNER/REPO`
+through the same grant when a run whose pull request was recorded before the
+host kept its branch is steered or continues delivery.
 
 No new App permission is needed: **Pull requests: Read and write** in the table
 above already covers reading a pull request and its reviews.

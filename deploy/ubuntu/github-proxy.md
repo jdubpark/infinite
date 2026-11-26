@@ -29,6 +29,7 @@ and any grant format other than the current one (`v2`).
 | Host mirror fetch | the project's repository | fetch | none, 15-minute grant |
 | Host team head publication | the delivery repository | push | the one published ref, 15-minute grant |
 | Host pull request read (review feedback, recorded branch lookup) | the run's delivery repository | pr | none, 15-minute grant |
+| Host save of a member's unfinished work | the delivery repository, or the project's GitHub source | push | the one `-wip-MEMBER` branch it pushes, 15-minute grant |
 
 The project repository is the GitHub source of a GitHub-tracked project, or the
 team delivery repository otherwise. A project with neither gets no grant.
@@ -243,17 +244,19 @@ Verify in a new session:
 
 Rollback: delete the appended sections. Git then uses the cache directly again.
 
-## 6. Host Git operations through the team launcher
+## 6. Host Git and `gh` operations through the team launcher
 
-The host fetches each GitHub-tracked mirror and publishes team heads through
-`teams.commandPrefix`, which on the Ubuntu deployment is a root-owned launcher
-outside this repository. Each operation now carries a 15-minute host grant in
-`INFINITE_GITHUB_GRANT` for one repository (and, for a push, one exact ref).
-sudo drops the `GIT_CONFIG_*` variables the host also sets, so the launcher
-must:
+The host fetches each GitHub-tracked mirror, publishes team heads, saves
+members' unfinished work, and reads pull requests with `gh` (review feedback and
+the recorded branch lookup) through `teams.commandPrefix`, which on the Ubuntu
+deployment is a root-owned launcher outside this repository. Each operation now
+carries a 15-minute host grant in `INFINITE_GITHUB_GRANT` for one repository
+(and, for a push, one exact ref). sudo drops the `GIT_CONFIG_*` variables the
+host also sets, so the launcher must:
 
 1. keep `INFINITE_GITHUB_GRANT` and `INFINITE_GITHUB_PROXY` in the environment
-   it gives Git;
+   it gives Git and `gh`. Without the grant, the App client's `gh` falls back to
+   the token cache, which step 7 removes;
 2. rewrite GitHub to the proxy and answer the proxy with the grant, for example
    by adding these settings after its own credential settings:
 
@@ -270,7 +273,9 @@ with the grant. Record the launcher's new hash with the release.
 
 Verify: run a project source refresh and let a team run publish its head. The
 proxy journal shows `"sub":"host"` lines with `"sid":"source:…"` and
-`"sid":"publish:…"` and `"decision":"allow"`.
+`"sid":"publish:…"` and `"decision":"allow"`. With review feedback on, a run
+waiting for review also shows `"sid":"review:…"` lines with
+`"command":"pr view"`.
 
 Rollback: restore the previous launcher. It keeps working until step 7.
 

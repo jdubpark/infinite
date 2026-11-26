@@ -99,6 +99,7 @@ test("out-of-order Codex correlation reconciles mid-stream snapshots and preserv
   tail.push(output("direct_2", [{ type: "input_text", text: "result-two" }, { type: "input_image", image_url: "data:omitted" }], "function_call_output"));
   tail.push({ type: "event_msg", payload: { type: "item_completed", item: { id: "", call_id: "direct_2", type: "McpToolCall", result: { content: [{ type: "text", text: "y".repeat(40) }] } } } });
   tail.push({ type: "event_msg", payload: { type: "item_completed", item: { id: 123, call_id: "direct_2", type: "CommandExecution", aggregated_output: "ignored" } } });
+  tail.push({ type: "event_msg", payload: { type: "item_completed", item: { id: "item_distinct_2", call_id: "direct_2", type: "CommandExecution", aggregated_output: "prefer-call-id" } } });
   assert.deepEqual(tail.snapshot().insidePrograms, { shell: { calls: 1, chars: 10, maxChars: 10 } });
   assert.equal(tail.snapshot().unmatched, 1);
   assert.equal(tail.snapshot().images, 1);
@@ -106,7 +107,7 @@ test("out-of-order Codex correlation reconciles mid-stream snapshots and preserv
   tail.push(call("direct_2", "spawn_agent", "function_call"));
   tail.push(output("direct_1", "ok"));
   tail.push(item("prog_after", { type: "McpToolCall", result: { content: [{ type: "text", text: "m".repeat(7) }] } }));
-  tail.push(item("direct_3", { type: "FileChange", stdout: "abc", stderr: "de" }));
+  tail.push({ type: "event_msg", payload: { type: "item_completed", item: { id: "item_distinct_3", call_id: "direct_3", type: "FileChange", stdout: "abc", stderr: "de" } } });
   tail.push(output("direct_3", "done", "function_call_output"));
 
   const gauge = tail.snapshot();
@@ -162,6 +163,16 @@ test("out-of-order Codex correlation enforces bounded pending buffers without lo
     other: { calls: 1, chars: 2, maxChars: 2 },
   });
   assert.equal(dupOutputs.snapshot().unmatched, 1);
+
+  const evictedDirect = new ContextGaugeTail("codex");
+  evictedDirect.push(output("old_unmatched", "out", "function_call_output"));
+  for (let i = 0; i < 8200; i += 1) {
+    evictedDirect.push(call(`done_${i}`, "exec"));
+    evictedDirect.push(output(`done_${i}`, "x"));
+  }
+  evictedDirect.push(item("old_unmatched", { type: "CommandExecution", aggregated_output: "out" }));
+  assert.deepEqual(evictedDirect.snapshot().insidePrograms, {});
+  assert.equal(evictedDirect.snapshot().unmatched, 1);
 });
 
 test("Codex Extension items measure known payload shapes and stay safe on empty or hostile inputs", () => {
@@ -169,11 +180,24 @@ test("Codex Extension items measure known payload shapes and stay safe on empty 
     { type: "text_result", ref_id: "turn0search0", url: "https://example.com/result", future_field: { preserved: true } },
   ];
   const structuredResult = { title: "Docs", score: 2, tags: ["a", "b"] };
+  const structuredWithTextKey = { text: "ok", rows: [{ id: 1, label: "first" }, { id: 2, label: "second" }] };
+  const resourcePart = { type: "resource", resource: { uri: "file:///notes/summary.txt", mimeType: "text/plain", text: "resource body" } };
+  const mixedContentWithImage = [
+    { type: "image", data: "A".repeat(4096), mimeType: "image/png" },
+    resourcePart,
+  ];
+  const mixedContentWithTextAndImage = [
+    { type: "input_image", image_url: `data:image/png;base64,${"B".repeat(4096)}` },
+    { type: "text", text: "caption" },
+    resourcePart,
+    { type: "resource", resource: { uri: "file:///pic.png", mimeType: "image/png", blob: "C".repeat(4096) } },
+  ];
   const cases: { label: string; body: Record<string, unknown>; cls: "web" | "other"; chars: number }[] = [
     { label: "bare Extension", body: { type: "Extension" }, cls: "web", chars: 0 },
     { label: "web.search with structured results", body: { type: "Extension", kind: "web.search", query: "docs", action: { type: "search", query: "docs", queries: null }, results: webResults }, cls: "web", chars: JSON.stringify(webResults).length },
     { label: "web.search with null results ignores input query", body: { type: "Extension", kind: "web.search", query: "ignored query text", action: { type: "search", query: "ignored" }, results: null }, cls: "web", chars: 0 },
     { label: "web.search with empty results array", body: { type: "Extension", kind: "web.search", query: "docs", results: [] }, cls: "web", chars: 0 },
+    { label: "web.search results with text key stay opaque JSON", body: { type: "Extension", kind: "web.search", results: structuredWithTextKey }, cls: "web", chars: JSON.stringify(structuredWithTextKey).length },
     { label: "image_gen.generation with inline result", body: { type: "Extension", kind: "image_gen.generation", status: "completed", revisedPrompt: "A blue square", result: "cG5n" }, cls: "other", chars: 4 },
     { label: "image_gen.generation with fileId only", body: { type: "Extension", kind: "image_gen.generation", status: "completed", revisedPrompt: "A blue square", fileId: "file-1" }, cls: "other", chars: 0 },
     { label: "clock.sleep has no result payload", body: { type: "Extension", kind: "clock.sleep", durationMs: 1000 }, cls: "other", chars: 0 },
@@ -181,14 +205,18 @@ test("Codex Extension items measure known payload shapes and stay safe on empty 
     { label: "plain output string", body: { type: "Extension", output: "fetched body" }, cls: "web", chars: 12 },
     { label: "plain content string", body: { type: "Extension", content: "page text" }, cls: "web", chars: 9 },
     { label: "content-part array with image", body: { type: "Extension", content: [{ type: "output_text", text: "abc" }, { type: "input_image", image_url: "data:omitted" }, { type: "text", text: "de" }] }, cls: "web", chars: 5 },
+    { label: "mixed content array skips image data and measures resource part", body: { type: "Extension", result: { content: mixedContentWithImage } }, cls: "web", chars: JSON.stringify(resourcePart).length },
+    { label: "mixed content array counts text and non-image resource without image bytes", body: { type: "Extension", content: mixedContentWithTextAndImage }, cls: "web", chars: 7 + JSON.stringify(resourcePart).length },
     { label: "text-only part array without type", body: { type: "Extension", content: [{ text: "abc" }, { text: "defg" }] }, cls: "web", chars: 7 },
     { label: "nested MCP-style result.content", body: { type: "Extension", result: { content: [{ type: "text", text: "alpha" }, { type: "text", text: "beta" }], isError: false } }, cls: "web", chars: 9 },
     { label: "nested empty result.content", body: { type: "Extension", result: { content: [], isError: false } }, cls: "web", chars: 0 },
     { label: "nested result.structuredContent when content is empty", body: { type: "Extension", result: { content: [], structuredContent: structuredResult } }, cls: "web", chars: JSON.stringify(structuredResult).length },
+    { label: "nested result.structuredContent with text key stays opaque JSON", body: { type: "Extension", result: { content: [], structuredContent: structuredWithTextKey } }, cls: "web", chars: JSON.stringify(structuredWithTextKey).length },
     { label: "image-only content array", body: { type: "Extension", content: [{ type: "input_image", image_url: "data:omitted" }] }, cls: "web", chars: 0 },
     { label: "falls back from null results to output", body: { type: "Extension", kind: "web.search", results: null, output: "fallback" }, cls: "web", chars: 8 },
     { label: "nested result.output", body: { type: "Extension", result: { output: "nested-out" } }, cls: "web", chars: 10 },
-    { label: "string array results", body: { type: "Extension", results: ["one", "two", "three"] }, cls: "web", chars: 11 },
+    { label: "string array results stays opaque JSON", body: { type: "Extension", results: ["one", "two", "three"] }, cls: "web", chars: JSON.stringify(["one", "two", "three"]).length },
+    { label: "string array content sums string lengths", body: { type: "Extension", content: ["one", "two", "three"] }, cls: "web", chars: 11 },
     { label: "structured JSON result object", body: { type: "Extension", result: structuredResult }, cls: "web", chars: JSON.stringify(structuredResult).length },
     { label: "empty object and primitive payloads", body: { type: "Extension", result: {}, output: 42, content: true, text: null }, cls: "web", chars: 0 },
     { label: "non-serializable BigInt payload", body: { type: "Extension", result: { count: 1n } }, cls: "web", chars: 0 },
@@ -226,6 +254,34 @@ test("Codex Extension items measure known payload shapes and stay safe on empty 
   directExt.push(output("ws_direct", "search summary", "function_call_output"));
   assert.deepEqual(directExt.snapshot().insidePrograms, {});
   assert.deepEqual(directExt.snapshot().received, { other: { calls: 1, chars: 14, maxChars: 14 } });
+
+  const nativeCases: [string, unknown, unknown][] = [
+    [
+      "web_search_call by id",
+      { type: "response_item", payload: { type: "web_search_call", id: "ws_native_1", status: "completed", action: { type: "search", query: "docs" } } },
+      item("ws_native_1", { type: "Extension", kind: "web.search", query: "docs", results: webResults }),
+    ],
+    [
+      "image_generation_call by id",
+      { type: "response_item", payload: { type: "image_generation_call", id: "ig_native_1", status: "completed", revised_prompt: "A blue square", result: "cG5n" } },
+      item("ig_native_1", { type: "Extension", kind: "image_gen.generation", status: "completed", revisedPrompt: "A blue square", result: "cG5n" }),
+    ],
+    [
+      "web_search_call by call_id fallback",
+      { type: "response_item", payload: { type: "web_search_call", call_id: "ws_native_2", status: "completed" } },
+      { type: "event_msg", payload: { type: "item_completed", item: { id: "item_ws_2", call_id: "ws_native_2", type: "Extension", kind: "web.search", results: webResults } } },
+    ],
+  ];
+  for (const [label, responseRow, itemRow] of nativeCases) {
+    for (const [order, rows] of [["response -> item", [responseRow, itemRow]], ["item -> response", [itemRow, responseRow]]] as const) {
+      const tail = new ContextGaugeTail("codex");
+      for (const row of rows) tail.push(row);
+      const snap = tail.snapshot();
+      assert.deepEqual(snap.insidePrograms, {}, `${label} (${order})`);
+      assert.equal(snap.dropped, 0, `${label} (${order})`);
+      assert.equal(snap.unmatched, 0, `${label} (${order})`);
+    }
+  }
 });
 
 test("saturate clamps totals at safe and custom thresholds and handles invalid inputs", () => {

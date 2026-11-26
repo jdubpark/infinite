@@ -80,39 +80,58 @@ function serializedLength(value: unknown): number {
   }
 }
 
-function isContentPart(part: unknown): boolean {
-  const value = object(part);
-  if (!value) return false;
-  if (typeof value.type === "string") {
-    return value.type.includes("image") || (TEXT_PART_TYPES.has(value.type) && typeof value.text === "string");
-  }
-  return value.type === undefined && typeof value.text === "string" && Object.keys(value).length === 1;
+function isImageMime(record: Record<string, unknown>): boolean {
+  const mime = typeof record.mimeType === "string" ? record.mimeType : typeof record.mime_type === "string" ? record.mime_type : undefined;
+  return mime !== undefined && mime.toLowerCase().startsWith("image/");
 }
 
-function measureArray(items: unknown[]): number {
-  if (items.length === 0) return 0;
-  let allStrings = true;
-  let allParts = true;
-  let stringChars = 0;
+function isImagePart(value: Record<string, unknown>): boolean {
+  if (typeof value.type === "string" && value.type.toLowerCase().includes("image")) return true;
+  if (value.image_url !== undefined || value.imageUrl !== undefined) return true;
+  if (isImageMime(value)) return true;
+  const resource = object(value.resource);
+  return resource !== undefined && isImageMime(resource);
+}
+
+function measureOpaque(value: unknown): number {
+  if (typeof value === "string") return value.length;
+  if (value && typeof value === "object") return serializedLength(value);
+  return 0;
+}
+
+function measureContentArray(items: unknown[]): number {
+  let chars = 0;
   for (let i = 0; i < items.length; i += 1) {
     const part = items[i];
     if (typeof part === "string") {
-      stringChars = saturate(stringChars, part.length);
-      allParts = false;
-    } else {
-      allStrings = false;
-      if (!isContentPart(part)) allParts = false;
+      chars = saturate(chars, part.length);
+      continue;
     }
-    if (!allStrings && !allParts) break;
+    const value = object(part);
+    if (!value) {
+      if (part !== undefined && part !== null && typeof part === "object") chars = saturate(chars, serializedLength(part));
+      continue;
+    }
+    if (isImagePart(value)) continue;
+    if (typeof value.type === "string" && TEXT_PART_TYPES.has(value.type) && typeof value.text === "string") {
+      chars = saturate(chars, value.text.length);
+    } else if (value.type === undefined && typeof value.text === "string" && Object.keys(value).length === 1) {
+      chars = saturate(chars, value.text.length);
+    } else {
+      chars = saturate(chars, serializedLength(value));
+    }
   }
-  if (allStrings) return stringChars;
-  if (allParts) return measure(items, type => type.includes("image")).chars;
-  return serializedLength(items);
+  return chars;
+}
+
+function measureKey(key: (typeof EXTENSION_PAYLOAD_KEYS)[number], value: unknown, depth: number): number {
+  if (key === "results" || key === "structuredContent") return measureOpaque(value);
+  return measurePayload(value, depth);
 }
 
 function measurePayload(value: unknown, depth = 0): number {
   if (typeof value === "string") return value.length;
-  if (Array.isArray(value)) return measureArray(value);
+  if (Array.isArray(value)) return measureContentArray(value);
   const record = object(value);
   if (!record) return 0;
   if (depth < MAX_PAYLOAD_DEPTH) {
@@ -120,7 +139,7 @@ function measurePayload(value: unknown, depth = 0): number {
     for (const key of EXTENSION_PAYLOAD_KEYS) {
       if (!Object.hasOwn(record, key)) continue;
       matched = true;
-      const chars = measurePayload(record[key], depth + 1);
+      const chars = measureKey(key, record[key], depth + 1);
       if (chars > 0) return chars;
     }
     if (matched) return 0;
@@ -136,7 +155,7 @@ function extensionClass(item: Record<string, unknown>): ToolClass {
 function measureExtension(item: Record<string, unknown>): number {
   for (const key of EXTENSION_PAYLOAD_KEYS) {
     if (!Object.hasOwn(item, key)) continue;
-    const chars = measurePayload(item[key]);
+    const chars = measureKey(key, item[key], 0);
     if (chars > 0) return chars;
   }
   return 0;
@@ -286,8 +305,8 @@ export class ContextGaugeTail {
     } else if (row.type === "event_msg" && payload?.type === "item_completed") {
       const item = object(payload.item);
       if (!item) return;
-      const id = isId(item.id) ? item.id : isId(item.call_id) ? item.call_id : undefined;
-      if (id !== undefined && (this.calls.has(id) || this.directIds.has(id))) return;
+      const id = isId(item.call_id) ? item.call_id : isId(item.id) ? item.id : undefined;
+      if (id !== undefined && (this.calls.has(id) || this.directIds.has(id) || this.pendingOutputs.has(id))) return;
       const found = programItem(item);
       if (found) this.recordProgramItem(id, found.cls, found.chars);
     } else if (row.type === "response_item" && payload) {
@@ -299,6 +318,9 @@ export class ContextGaugeTail {
         const id = isId(callId) ? callId : undefined;
         if (id !== undefined) this.markDirect(id);
         this.output(id, payload.output, type => type.includes("image"));
+      } else if (payload.type === "web_search_call" || payload.type === "image_generation_call") {
+        const id = isId(payload.id) ? payload.id : isId(callId) ? callId : undefined;
+        if (id !== undefined) this.markDirect(id);
       }
     }
   }

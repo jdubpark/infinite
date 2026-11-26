@@ -235,7 +235,7 @@ function customCoordinatorHarness(options?: {
   };
 }
 
-test("INF-455: observeContext emits redacted bounded warnings for EIO, EACCES, and ENOTDIR, deduplicates across ticks, and clears on recovery", { timeout: 60000 }, async () => {
+test("observeContext emits redacted bounded warnings for EIO, EACCES, and ENOTDIR, deduplicates across ticks, and clears on recovery", { timeout: 60000 }, async () => {
   let failingSessionId: string | undefined;
   let failureError: Error | undefined;
   let usageReads = 0;
@@ -320,7 +320,7 @@ test("INF-455: observeContext emits redacted bounded warnings for EIO, EACCES, a
   }
 });
 
-test("INF-455: real Manager ENOENT stays quiet while corrupted journal and ENOTDIR emit redacted category warnings", { timeout: 60000 }, async () => {
+test("real Manager ENOENT stays quiet while corrupted journal and ENOTDIR emit redacted category warnings", { timeout: 60000 }, async () => {
   const warnings: string[] = [];
   const warnMock = mock.method(console, "warn", (...args: unknown[]) => { warnings.push(args.map(arg => String(arg)).join(" ")); });
   const h = customCoordinatorHarness({ realManager: true });
@@ -372,7 +372,7 @@ test("INF-455: real Manager ENOENT stays quiet while corrupted journal and ENOTD
   }
 });
 
-test("INF-458: pause after confirmed delivery to a resumable native session suppresses duplicate inbox and note redelivery on resume", { timeout: 60000 }, async () => {
+test("pause after confirmed delivery to a resumable native session suppresses duplicate inbox and note redelivery on resume", { timeout: 60000 }, async () => {
   const h = scriptedMissionHarness();
   mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-11-14T09:00:00Z") });
   try {
@@ -420,7 +420,7 @@ test("INF-458: pause after confirmed delivery to a resumable native session supp
   }
 });
 
-test("INF-458: turn-start alone and truncated >50-page scans are uncertain, rotate to a fresh conversation, and restore messages without loss", { timeout: 60000 }, async () => {
+test("turn-start alone and truncated >50-page scans are uncertain, rotate to a fresh conversation, and restore messages without loss", { timeout: 60000 }, async () => {
   const turnStartOnly = scriptedMissionHarness();
   try {
     const { id } = await turnStartOnly.missions.create(missionRequest(240));
@@ -495,7 +495,7 @@ test("INF-458: turn-start alone and truncated >50-page scans are uncertain, rota
   }
 });
 
-test("INF-458: nativeConfirmed SessionEnd-only and quoted project context rotate safely, exact launch boundary confirms, and >16 KiB context truncation stays uncertain", { timeout: 60000 }, async () => {
+test("nativeConfirmed SessionEnd-only and quoted project context rotate safely, exact launch boundary confirms, and >16 KiB context truncation stays uncertain", { timeout: 60000 }, async () => {
   const quotedContext = "Owner context quote:\nThis is coordinator attempt 2.\nThis is coordinator attempt 2, continuing the same mission conversation.";
   const quoted = customCoordinatorHarness({ emitInitialTurnStart: false, sessionContext: { text: quotedContext, version: 3 } });
   try {
@@ -561,7 +561,7 @@ test("INF-458: nativeConfirmed SessionEnd-only and quoted project context rotate
   }
 });
 
-test("INF-458: refused reports and deferred steer-subtask retain saved deliveredUnapplied until accepted, restoring them on rotation", { timeout: 60000 }, async () => {
+test("refused reports and deferred steer-subtask retain saved deliveredUnapplied until accepted, restoring them on rotation", { timeout: 60000 }, async () => {
   const preparePausedDeliveredSubtask = async (h: ReturnType<typeof scriptedMissionHarness>, steerText: string) => {
     const { id } = await h.missions.create(missionRequest(240));
     const first = await h.attempt(1), nativeId = first.request.continuation?.nativeSessionId;
@@ -623,7 +623,7 @@ test("INF-458: refused reports and deferred steer-subtask retain saved delivered
   } finally { deferredAccepted.close(); }
 });
 
-test("INF-458: durable restart preserves deduplication on resume, deadline extension, idle rotation, and resume-failure fallback", { timeout: 60000 }, async () => {
+test("durable restart preserves deduplication on resume, deadline extension, idle rotation, and resume-failure fallback", { timeout: 60000 }, async () => {
   const resumeRestart = scriptedMissionHarness();
   mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-11-14T09:00:00Z") });
   try {
@@ -937,7 +937,7 @@ function runCoordinatorSimulator(seed: number, steps: number, mutant: SimMutant)
   }
 }
 
-test("INF-458: seeded durable-state simulator drives production settlement/selection and catches named broken mutants", t => {
+test("seeded durable-state simulator drives production settlement/selection and catches named broken mutants", t => {
   const baseSeed = Number(process.env.MISSION_SIM_SEED ?? 0x51a7c3f1) >>> 0;
   t.diagnostic(`mission-coordinator simulator baseSeed=0x${baseSeed.toString(16)}`);
   const totals = {

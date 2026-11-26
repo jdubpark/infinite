@@ -173,7 +173,7 @@ const octet = "(?:25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)";
 const ipv4 = new RegExp(`(?<![\\d.])(?:${octet}\\.){3}${octet}(?!\\.?\\d)`, "g");
 
 export function outboundText(config: Config, value: string): string {
-  const directories = [config.stateDir, config.runDir, config.teams?.workspaceDir,
+  const directories = [config.stateDir, config.runDir, config.socketDir, config.teams?.workspaceDir,
     ...(config.projects ?? []).flatMap(project => [project.path, project.teamworkDir])]
     .filter((directory): directory is string => typeof directory === "string" && isAbsolute(directory))
     .map(directory => resolve(directory))

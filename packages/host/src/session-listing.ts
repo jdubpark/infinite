@@ -31,16 +31,17 @@ export const unavailableState = (at: string): WorkerState => ({
 });
 
 export function savedState(saved: WorkerState, at: string): WorkerState {
-  const status = saved.status === "exited" ? "exited" : "unavailable";
+  const { socketPath: _socketPath, permissionSocketPath: _permissionSocketPath, ...visible } = saved;
+  const status = visible.status === "exited" ? "exited" : "unavailable";
   return {
-    ...saved,
+    ...visible,
     status,
     screen: "",
-    attention: applyLifecycle(saved.attention ?? initialAttention(at, false), status, at),
+    attention: applyLifecycle(visible.attention ?? initialAttention(at, false), status, at),
   };
 }
 
-export type SavedStatus = { state: WorkerState; savedAt: string };
+export type SavedStatus = { state: WorkerState; savedAt: string; socketPath?: string; permissionSocketPath?: string };
 
 export function listedSavedState({ state, savedAt }: SavedStatus): WorkerState {
   const listed = savedState(state, savedAt);

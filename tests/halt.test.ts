@@ -67,7 +67,7 @@ function teamDecisionQueue(teams: TeamService, goals: GoalService) {
 const runDirs: string[] = [];
 after(() => { for (const dir of runDirs) rmSync(dir, { recursive: true, force: true }); });
 function shortRun(config: Fixture["config"]) {
-  const runDir = mkdtempSync("/tmp/halt-run-");
+  const runDir = mkdtempSync(join(tmpdir(), "halt-run-"));
   runDirs.push(runDir);
   return { ...config, runDir };
 }

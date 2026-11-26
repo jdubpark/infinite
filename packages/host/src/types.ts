@@ -18,6 +18,15 @@ export interface ControlLease {
   label: string;
   expiresAt: number;
 }
+export interface TerminalSize {
+  cols: number;
+  rows: number;
+}
+export interface TerminalOpen {
+  cursor: number;
+  cols?: number;
+  rows?: number;
+}
 export interface TerminalSnapshot {
   ansi: string;
   seq: number;
@@ -287,6 +296,7 @@ export interface Config {
   browserSessions?: boolean;
   stateDir: string;
   runDir: string;
+  socketDir?: string;
   keyFile: string;
   tokens: { id: string; label: string; role: Role; hash: string }[];
   projects: Project[];
@@ -317,6 +327,8 @@ export interface WorkerState {
   status: Status;
   pid?: number;
   workerPid?: number;
+  socketPath?: string;
+  permissionSocketPath?: string;
   exitCode?: number;
   seq: number;
   screen: string;
@@ -324,6 +336,8 @@ export interface WorkerState {
   capabilities?: { terminalSnapshot?: 1; inputControl?: 1; nativeUi?: "codex" | "opencode"; transcript?: 1 };
   control?: ControlLease | null;
   runtime?: SessionRuntime;
+  terminalSize?: TerminalSize;
+  sizeIndexCoveredSeq?: number;
   nativeSession?: { id: string; source: "hook" | "protocol" };
   execution?: ExecutionState;
   permissionChannel?: PermissionChannelView;
@@ -569,6 +583,7 @@ export interface Bootstrap {
   profile: AgentProfile;
   stateDir: string;
   runDir: string;
+  socketDir?: string;
   key: string;
   prompt: string;
   codeMode: boolean;

@@ -12,7 +12,7 @@ import {
   type Attention,
 } from "@infinite/attention";
 import { readEvents, unseal, writeSealed } from "./vault.js";
-import { socketPath, workerCall } from "./ipc.js";
+import { canonicalOrResolved, collectLivePermissionSockets, ensureSocketDir, existingWorkerSocket, readRecordedSocketPath, removeWorkerSockets, trustedWorkerSocket, workerCall, workerCallAt, type SocketTarget } from "./ipc.js";
 import { SealedFileCache, listedSavedState, listedSession, savedState, unavailableState, type ListedSession, type SavedStatus } from "./session-listing.js";
 import { assertRunnerDeployment } from "./deployment.js";
 import { DEFAULT_HOOKS } from "./config.js";
@@ -171,10 +171,12 @@ export class Manager {
   private readonly pendingCreates = new Set<string>();
   private createAdmission: Promise<unknown> = Promise.resolve();
   readonly hostLoad: HostLoadGate;
+  readonly socketDir: string; readonly socketTarget: Exclude<SocketTarget, string>;
+  private readonly staticSocketTarget: Exclude<SocketTarget, string>;
   private readonly handoffProjects = new Map<string, string>();
   private fuse?: FuseGate;
   private readonly listedMeta = new SealedFileCache<ListedSession>((id, raw) => listedSession(unseal<StoredSession>(this.key, `${id}:meta`, raw).session));
-  private readonly savedStatus = new SealedFileCache<SavedStatus>((id, raw, mtimeMs) => ({ state: unseal<WorkerState>(this.key, `${id}:status`, raw), savedAt: new Date(mtimeMs).toISOString() }));
+  private readonly savedStatus = new SealedFileCache<SavedStatus>((id, raw, mtimeMs) => { const state = unseal<WorkerState>(this.key, `${id}:status`, raw); return { state, savedAt: new Date(mtimeMs).toISOString(), ...(state.socketPath ? { socketPath: state.socketPath } : {}), ...(state.permissionSocketPath ? { permissionSocketPath: state.permissionSocketPath } : {}) }; });
   useFuse(fuse: FuseGate) { this.fuse = fuse; }
   private headlessChannel?: Pick<HeadlessPermissionChannel, "admit">;
   useHeadlessChannel(channel: Pick<HeadlessPermissionChannel, "admit">) { this.headlessChannel = channel; }
@@ -205,20 +207,23 @@ export class Manager {
       return state;
     }
     if (state.status !== "running") throw new ContentError("The source runtime has not confirmed a controllable state");
-    await workerCall(this.config.runDir, sessionId, { op: "handoff-stop", requestId }, 10000);
+    await workerCall(this.socketTarget, sessionId, { op: "handoff-stop", requestId }, 10000);
     return this.state(sessionId);
   }
   constructor(
     readonly config: Config,
     readonly key: Buffer,
     hostProbe: HostLoadProbe = readHostLoad,
+    options?: { socketDir?: string },
   ) {
     assertRunnerDeployment(config);
+    const configuredSocketDir = options?.socketDir ?? config.socketDir;
+    this.socketDir = ensureSocketDir(configuredSocketDir ?? config.runDir, configuredSocketDir !== undefined ? "socketDir" : "runDir");
+    const hostKey = canonicalOrResolved(config.runDir);
+    this.staticSocketTarget = { runDir: config.runDir, socketDir: this.socketDir, hostKey };
+    this.socketTarget = { ...this.staticSocketTarget, recordedSocket: id => readRecordedSocketPath(this.config.stateDir, this.key, id) };
     this.hostLoad = new HostLoadGate(config.hostLoad, hostProbe);
-    mkdirSync(join(config.stateDir, "sessions"), {
-      recursive: true,
-      mode: 0o700,
-    });
+    mkdirSync(join(config.stateDir, "sessions"), { recursive: true, mode: 0o700 });
     const deletedDir = join(config.stateDir, "deleted-sessions");
     mkdirSync(deletedDir, { recursive: true, mode: 0o700 });
     for (const name of readdirSync(deletedDir).filter(name => /^[a-f0-9-]{36}\.sealed$/i.test(name))) {
@@ -233,15 +238,8 @@ export class Manager {
       rmSync(join(config.stateDir, "sessions", id), { recursive: true, force: true });
     }
     mkdirSync(config.runDir, { recursive: true, mode: 0o700 });
-    if (
-      Buffer.byteLength(
-        join(config.runDir, "00000000-0000-0000-0000-000000000000.sock"),
-      ) > 100
-    )
-      throw new Error(
-        "runDir is too long for a Unix socket; choose a shorter path",
-      );
   }
+  activePermissionSockets(): string[] { return collectLivePermissionSockets(this.config.stateDir, this.key); }
   private deletedReceiptPath(id: string) { return join(this.config.stateDir, "deleted-sessions", `${id}.sealed`); }
   private sessionDirEntry(id: string): string | undefined {
     const lower = id.toLowerCase();
@@ -308,7 +306,7 @@ export class Manager {
       if (stored.session.team && !learningPurpose(stored.session.purpose)) throw new ContentError("Team sessions cannot be removed", 409);
 
       let workerStateReadFailed = false;
-      try { await workerCall(this.config.runDir, id, { op: "state" }); } catch { workerStateReadFailed = true; }
+      try { await workerCall(this.socketTarget, id, { op: "state" }); } catch { workerStateReadFailed = true; }
       if (!workerStateReadFailed)
         throw new ContentError("Only an exited session with unavailable worker state can be removed", 409);
 
@@ -323,10 +321,11 @@ export class Manager {
 
       writeSealed(this.deletedReceiptPath(id), this.key, `deleted:${id}`, { id, fingerprint: stored.fingerprint } satisfies DeletedSessionReceipt);
       rmSync(join(this.config.stateDir, "sessions", id), { recursive: true });
+      removeWorkerSockets(this.socketTarget, id, saved.socketPath);
     });
   }
   async state(id: string, screen = false): Promise<WorkerState> {
-    try { return withDefaultAttention(await workerCall(this.config.runDir, id, { op: "state", screen })); }
+    try { return withDefaultAttention(await workerCall(this.socketTarget, id, { op: "state", screen })); }
     catch {
       const now = new Date().toISOString();
       const file = join(this.config.stateDir, "sessions", id, "status.sealed");
@@ -334,18 +333,16 @@ export class Manager {
       return unavailableState(now);
     }
   }
-  private async listedState(id: string, createdAt: string): Promise<WorkerState> {
-    if (existsSync(socketPath(this.config.runDir, id))) {
-      try {
-        return withDefaultAttention(await workerCall(this.config.runDir, id, { op: "state", screen: false }));
-      } catch {
-      }
-    }
+  private async listedState(id: string, createdAt: string, dirTrustCache: Map<string, boolean>): Promise<WorkerState> {
+    const direct = existingWorkerSocket(this.staticSocketTarget, id, undefined, dirTrustCache);
+    if (direct) try { return withDefaultAttention(await workerCallAt(direct, { op: "state", screen: false })); } catch {}
     const saved = this.savedStatus.read(id, join(this.config.stateDir, "sessions", id, "status.sealed"), Date.now());
+    const recorded = saved?.socketPath ? trustedWorkerSocket(saved.socketPath, dirTrustCache) : undefined;
+    if (recorded) try { return withDefaultAttention(await workerCallAt(recorded, { op: "state", screen: false })); } catch {}
     return saved === undefined ? unavailableState(createdAt) : listedSavedState(saved);
   }
   async list(options: { includeFullMessage?: boolean } = {}) {
-    const now = Date.now();
+    const now = Date.now(), dirTrustCache = new Map<string, boolean>();
     const ids = readdirSync(join(this.config.stateDir, "sessions")).filter(
       (n) => /^[a-f0-9-]{36}$/i.test(n) && !existsSync(this.deletedReceiptPath(n)),
     );
@@ -356,7 +353,7 @@ export class Manager {
         if (existsSync(this.deletedReceiptPath(id))) throw new Error("Session not found");
         const summary = this.listedMeta.read(id, join(this.config.stateDir, "sessions", id, "meta.sealed"), now);
         if (summary === undefined) throw new Error("Session not found");
-        const { screen: _screen, ...state } = await this.listedState(id, summary.createdAt).catch(
+        const { screen: _screen, ...state } = await this.listedState(id, summary.createdAt, dirTrustCache).catch(
           () => unavailableState(summary.createdAt),
         );
         return {
@@ -453,7 +450,7 @@ export class Manager {
       this.meta(sessionId);
       if (request.action !== "release" && existsSync(join(this.config.stateDir, "sessions", sessionId, "retirement.sealed")))
         throw new TeamError(409, "runtime-retiring", "This runtime is being retired; its retained journal remains available read-only.");
-      return workerCall<ControlLease | null>(this.config.runDir, sessionId, request);
+      return workerCall<ControlLease | null>(this.socketTarget, sessionId, request);
     });
   }
   private async retireTeamRuntimeOnce(sessionId: string, requestId: string, team: TeamAssignment, identity: string): Promise<TeamRuntimeRetirement> {
@@ -517,7 +514,7 @@ export class Manager {
     const state = await this.state(sessionId);
     if (state.status === "exited") return state;
     if (state.status !== "running") throw new TeamStopRefused("The team member has not confirmed a controllable runtime");
-    await workerCall(this.config.runDir, sessionId, { op: "stop", requestId });
+    await workerCall(this.socketTarget, sessionId, { op: "stop", requestId });
     return this.state(sessionId);
   }
   expandTeamPermission(
@@ -617,7 +614,7 @@ export class Manager {
     const actor = { id: `team-permission-expand:${requestId}`, label: "Team permission display expansion" };
     let lease: ControlLease | undefined;
     try {
-      lease = await workerCall<ControlLease>(this.config.runDir, sessionId, {
+      lease = await workerCall<ControlLease>(this.socketTarget, sessionId, {
         op: "control", action: "claim", actor,
       });
       const controlled = await this.state(sessionId);
@@ -631,7 +628,7 @@ export class Manager {
       writeSealed(file, this.key, scope, ledger);
 
       try {
-        const result = await workerCall<Receipt>(this.config.runDir, sessionId, {
+        const result = await workerCall<Receipt>(this.socketTarget, sessionId, {
           op: "team-permission-expand", requestId, targetSessionId: sessionId, assignment: stored,
           expected: requestIdentity.expected, actor, leaseId: lease.id,
         }, 12000);
@@ -654,7 +651,7 @@ export class Manager {
       }
     } finally {
       if (lease) {
-        try { await workerCall(this.config.runDir, sessionId, { op: "control", action: "release", actor, leaseId: lease.id }); }
+        try { await workerCall(this.socketTarget, sessionId, { op: "control", action: "release", actor, leaseId: lease.id }); }
         catch { }
       }
     }
@@ -706,7 +703,7 @@ export class Manager {
     const actor = { id: `team-permission:${decision.id}`, label: "Team permission" };
     let lease: { id: string } | undefined;
     try {
-      const acquired = await workerCall<{ id: string }>(this.config.runDir, sessionId, {
+      const acquired = await workerCall<{ id: string }>(this.socketTarget, sessionId, {
         op: "control", action: "claim", actor,
       });
       lease = acquired;
@@ -717,7 +714,7 @@ export class Manager {
       if (decision.status !== "answering" || Date.parse(decision.expiresAt) <= Date.now() || (current && !current()))
         throw new ContentError("The permission decision was invalidated before the answer");
       try {
-        return await workerCall(this.config.runDir, sessionId, {
+        return await workerCall(this.socketTarget, sessionId, {
           op: "team-answer", requestId, decisionId: decision.id,
           coordinatorMemberId,
           targetSessionId: sessionId, assignment: stored, targetCwd: canonicalCwd,
@@ -732,7 +729,7 @@ export class Manager {
       }
     } finally {
       if (lease) {
-        try { await workerCall(this.config.runDir, sessionId, { op: "control", action: "release", actor, leaseId: lease.id }); }
+        try { await workerCall(this.socketTarget, sessionId, { op: "control", action: "release", actor, leaseId: lease.id }); }
         catch { }
       }
     }
@@ -758,14 +755,14 @@ export class Manager {
     const actor = { id: `session-permission:${input.decisionId}`, label: SESSION_PERMISSION_ACTOR_LABEL };
     let lease: ControlLease | undefined;
     try {
-      lease = await workerCall<ControlLease>(this.config.runDir, sessionId, { op: "control", action: "claim", actor });
+      lease = await workerCall<ControlLease>(this.socketTarget, sessionId, { op: "control", action: "claim", actor });
       const controlled = await this.state(sessionId);
       if (controlled.status !== "running" || controlled.control?.id !== lease.id)
         throw new ContentError("The session or its control lease changed before the answer", 409);
       if (input.current && !input.current())
         throw new ContentError("The permission answer was invalidated before the answer", 409);
       try {
-        return await workerCall(this.config.runDir, sessionId, {
+        return await workerCall(this.socketTarget, sessionId, {
           op: "session-permission-answer", requestId, decisionId: input.decisionId, targetSessionId: sessionId, targetCwd: cwd,
           promptId: input.promptId, promptHash: input.promptHash, evidenceHash: input.evidenceHash, option: input.option,
           ...(input.notice !== undefined ? { text: input.notice } : {}),
@@ -777,7 +774,7 @@ export class Manager {
       }
     } finally {
       if (lease) {
-        try { await workerCall(this.config.runDir, sessionId, { op: "control", action: "release", actor, leaseId: lease.id }); }
+        try { await workerCall(this.socketTarget, sessionId, { op: "control", action: "release", actor, leaseId: lease.id }); }
         catch { }
       }
     }
@@ -816,7 +813,7 @@ export class Manager {
     const actor = { id: `team-permission:${delivery.deliveryId}`, label: "Team permission" };
     let lease: { id: string } | undefined;
     try {
-      const acquired = await workerCall<{ id: string }>(this.config.runDir, sessionId, { op: "control", action: "claim", actor });
+      const acquired = await workerCall<{ id: string }>(this.socketTarget, sessionId, { op: "control", action: "claim", actor });
       lease = acquired;
       const controlled = await this.state(sessionId);
       if (controlled.status !== "running" || controlled.control?.id !== acquired.id || controlled.runtime?.nativeUi || session.runtime?.nativeUi)
@@ -824,7 +821,7 @@ export class Manager {
       if (!delivery.current() || Date.parse(delivery.expiresAt) <= Date.now())
         throw new ContentError("The permission delivery was invalidated before the answer");
       try {
-        return await workerCall(this.config.runDir, sessionId, {
+        return await workerCall(this.socketTarget, sessionId, {
           op: "team-answer", requestId: delivery.requestId, decisionId: delivery.deliveryId,
           ...(delivery.choice === "accept" ? { choice: "accept" as const } : { choice: "reject" as const, ...(delivery.notice ? { text: delivery.notice } : {}) }),
           targetSessionId: sessionId, assignment: { ...stored, role: stored.role }, targetCwd: canonicalCwd,
@@ -838,7 +835,7 @@ export class Manager {
       }
     } finally {
       if (lease) {
-        try { await workerCall(this.config.runDir, sessionId, { op: "control", action: "release", actor, leaseId: lease.id }); }
+        try { await workerCall(this.socketTarget, sessionId, { op: "control", action: "release", actor, leaseId: lease.id }); }
         catch { }
       }
     }
@@ -846,14 +843,14 @@ export class Manager {
   async invalidateSessionPermission(sessionId: string, decisionId: string): Promise<"invalidated" | "uncertain"> {
     try {
       if (this.meta(sessionId).session.team || !/^[A-Za-z0-9._:-]{1,100}$/.test(decisionId)) return "uncertain";
-      const result = await workerCall<{ invalidated: boolean }>(this.config.runDir, sessionId, { op: "session-permission-invalidate", decisionId }, 4000);
+      const result = await workerCall<{ invalidated: boolean }>(this.socketTarget, sessionId, { op: "session-permission-invalidate", decisionId }, 4000);
       return result.invalidated === true ? "invalidated" : "uncertain";
     } catch { return "uncertain"; }
   }
   async invalidateTeamPermission(sessionId: string, decisionId: string): Promise<"invalidated" | "uncertain"> {
     if (!this.meta(sessionId).session.team || !/^[a-f0-9-]{36}$/i.test(decisionId)) return "uncertain";
     try {
-      const result = await workerCall<{ invalidated: boolean }>(this.config.runDir, sessionId, { op: "team-answer-invalidate", decisionId }, 4000);
+      const result = await workerCall<{ invalidated: boolean }>(this.socketTarget, sessionId, { op: "team-answer-invalidate", decisionId }, 4000);
       return result.invalidated === true ? "invalidated" : "uncertain";
     } catch { return "uncertain"; }
   }
@@ -1092,7 +1089,7 @@ export class Manager {
           session,
           profile: launchProfile,
           stateDir: this.config.stateDir,
-          runDir: this.config.runDir,
+          runDir: this.config.runDir, ...(this.socketDir !== this.config.runDir ? { socketDir: this.socketDir } : {}),
           key: this.key.toString("base64"),
           prompt,
           codeMode: session.codeMode === true,

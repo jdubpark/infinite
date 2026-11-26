@@ -2,6 +2,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import type { EntryHead } from "./evidence/entry-types.js";
 import type { EntryPage } from "./evidence/blackboard.js";
 import type {
+  MissionProgressLinkedChild,
   MissionProgressMember,
   MissionProgressObservation,
   MissionProgressPage,
@@ -69,7 +70,15 @@ export type RunMissionWatchOptions = {
   onFrame?: (text: string) => void;
 };
 
+export type ResolvedWatchChild =
+  | { kind: "unavailable"; reason: string }
+  | { kind: "not-created" }
+  | { kind: "missing" }
+  | { kind: "mismatched"; reason: string }
+  | { kind: "linked"; child: MissionProgressLinkedChild; verifiedTeamId: string };
+
 const MAX_RETAINED_OBSERVATIONS = 40;
+const MAX_RETAINED_ENTRIES = 200;
 const MAX_ENTRY_PAGES = 10;
 const clean = (value: unknown) => String(value ?? "").replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
 const short = (value: unknown, max: number) => {
@@ -195,16 +204,68 @@ function parseProgressSequence(cursor: string | undefined): number {
   return match ? Number(match[1]) : 0;
 }
 
+export function resolveWatchChild(
+  mission: Pick<Mission, "id">,
+  subtask: Pick<Mission["subtasks"][number], "id" | "repoProjectId" | "teamId">,
+  snapshot: MissionProgressSnapshot | null,
+): ResolvedWatchChild {
+  if (!snapshot) {
+    return { kind: "unavailable", reason: "Mission progress snapshot is unavailable." };
+  }
+  if (snapshot.mission.id !== mission.id) {
+    return { kind: "unavailable", reason: "Progress snapshot belongs to a different mission." };
+  }
+  const progressSubtask = snapshot.subtasks.find(item => item.id === subtask.id);
+  if (!progressSubtask) {
+    if (snapshot.subtasksTruncated) {
+      return { kind: "unavailable", reason: "Subtask progress omitted because the progress snapshot is truncated." };
+    }
+    return { kind: "unavailable", reason: "Progress snapshot does not include this subtask yet." };
+  }
+  const { child } = progressSubtask;
+  if (child.kind === "not-created") {
+    if (subtask.teamId) {
+      return { kind: "unavailable", reason: "Mission records a subteam, but the latest progress snapshot has not observed it yet." };
+    }
+    return { kind: "not-created" };
+  }
+  if (child.kind === "missing") return { kind: "missing" };
+  if (child.kind === "mismatched") {
+    return { kind: "mismatched", reason: "Linked subteam does not match this mission or project." };
+  }
+  if (child.missionId !== mission.id || child.projectId !== subtask.repoProjectId || !child.runId) {
+    return { kind: "mismatched", reason: "Linked subteam progress does not match this mission or repository." };
+  }
+  if (!subtask.teamId || child.runId !== subtask.teamId) {
+    return { kind: "mismatched", reason: "Linked subteam run does not match the mission subtask record." };
+  }
+  return { kind: "linked", child, verifiedTeamId: child.runId };
+}
+
+const isConfirmedFinished = (member: Pick<MissionProgressMember, "recordedStatus" | "exitConfirmedAt">) =>
+  member.recordedStatus === "stopped" || (member.recordedStatus === "reported" && Boolean(member.exitConfirmedAt));
+
+const isAwaitingExit = (member: Pick<MissionProgressMember, "recordedStatus" | "exitConfirmedAt">) =>
+  member.recordedStatus === "reported" && !member.exitConfirmedAt;
+
 function compactMemberLines(assignments: readonly MissionProgressMember[], showFinished: boolean): string[] {
-  const active = assignments.filter(item => ["queued", "running", "waiting", "unavailable"].includes(item.recordedStatus));
-  const finished = assignments.filter(item => item.recordedStatus === "reported" || item.recordedStatus === "stopped");
+  const active = assignments.filter(item => !isConfirmedFinished(item));
+  const finished = assignments.filter(item => isConfirmedFinished(item));
   const lines: string[] = [];
   const latestActiveBySlot = new Map<string, MissionProgressMember>();
   for (const member of active) {
     if (!member.taskId) continue;
     const key = `${member.role}\0${member.taskId}`;
     const prev = latestActiveBySlot.get(key);
-    if (!prev || member.revision >= prev.revision) latestActiveBySlot.set(key, member);
+    if (!prev) {
+      latestActiveBySlot.set(key, member);
+      continue;
+    }
+    const prevAwaiting = isAwaitingExit(prev);
+    const curAwaiting = isAwaitingExit(member);
+    if ((prevAwaiting && !curAwaiting) || (prevAwaiting === curAwaiting && member.revision >= prev.revision)) {
+      latestActiveBySlot.set(key, member);
+    }
   }
   const linkedFinished = new Set<string>();
   const priorByActive = new Map<string, MissionProgressMember[]>();
@@ -219,8 +280,9 @@ function compactMemberLines(assignments: readonly MissionProgressMember[], showF
   }
   for (const member of active) {
     const task = member.taskId ? ` · ${short(member.taskId, 40)}` : "";
-    lines.push(`  ${clean(member.role)}${task}  recorded:${clean(member.recordedStatus)}  worker:${clean(member.workerStatus)}  r${member.revision}`);
-    for (const prior of priorByActive.get(member.memberId) ?? []) {
+    const recorded = isAwaitingExit(member) ? "reported (awaiting exit)" : clean(member.recordedStatus);
+    lines.push(`  ${clean(member.role)}${task}  recorded:${recorded}  worker:${clean(member.workerStatus)}  r${member.revision}`);
+    for (const prior of (priorByActive.get(member.memberId) ?? []).sort((a, b) => a.revision - b.revision)) {
       lines.push(`    earlier attempt: recorded:${clean(prior.recordedStatus)}  r${prior.revision}`);
     }
   }
@@ -288,30 +350,28 @@ export function missionWatchText(
   } else {
     subtasks.forEach((subtask, index) => {
       const marker = index === selectedIndex ? ">" : " ";
-      const child = progress?.snapshot.subtasks.find(item => item.id === subtask.id)?.child;
-      const childSummary = child
-        ? child.kind === "linked"
-          ? `${clean(child.status)} · ${child.assignments.length} assigned`
-          : clean(child.kind)
-        : subtask.teamStatus
-          ? clean(subtask.teamStatus)
-          : "not-created";
+      const resolved = resolveWatchChild(mission, subtask, progress?.snapshot ?? null);
+      const childSummary =
+        resolved.kind === "linked"
+          ? `${clean(resolved.child.status)} · ${resolved.child.assignments.length} assigned`
+          : resolved.kind === "unavailable"
+            ? "progress unavailable"
+            : clean(resolved.kind);
       lines.push(`${marker} ${index + 1}. ${short(subtask.title, 60)}  [${clean(subtask.status)}]  ${clean(subtask.repoProjectId)}  (${childSummary})`);
     });
   }
 
   const selected = subtasks[selectedIndex];
   if (selected) {
-    const child: MissionProgressSnapshot["subtasks"][number]["child"] =
-      progress?.snapshot.subtasks.find(item => item.id === selected.id)?.child
-      ?? (selected.teamId ? { kind: "missing" } : { kind: "not-created" });
-    const teamId = selected.teamId ?? (child.kind === "linked" ? child.runId : undefined);
+    const resolved = resolveWatchChild(mission, selected, progress?.snapshot ?? null);
+    const verifiedTeamId = resolved.kind === "linked" ? resolved.verifiedTeamId : undefined;
     lines.push("", `SELECTED SUBTASK  ${short(selected.title, 80)}  [${clean(selected.status)}]`);
-    lines.push(`  repo ${clean(selected.repoProjectId)}${teamId ? ` · team ${clean(teamId)}` : ""}`);
+    lines.push(`  repo ${clean(selected.repoProjectId)}${verifiedTeamId ? ` · team ${clean(verifiedTeamId)}` : ""}`);
     if (state.showDetail && selected.objective) {
       lines.push(`  objective: ${short(selected.objective, 400)}`);
     }
-    if (child.kind === "linked") {
+    if (resolved.kind === "linked") {
+      const { child } = resolved;
       lines.push(`  child status: ${clean(child.status)} · revision ${child.revision}`);
       const memberLines = compactMemberLines(child.assignments, state.showDetail);
       if (memberLines.length) lines.push(...memberLines);
@@ -325,16 +385,27 @@ export function missionWatchText(
         }
       }
     } else {
-      lines.push(`  child: ${clean(child.kind)}`);
+      const reasonSuffix = resolved.kind === "mismatched" || resolved.kind === "unavailable"
+        ? ` — ${short(resolved.reason, 200)}`
+        : "";
+      lines.push(`  child: ${clean(resolved.kind)}${reasonSuffix}`);
       if (selected.finalEvidence?.reason) lines.push(`  final reason: ${short(selected.finalEvidence.reason, 200)}`);
     }
 
     if (state.showEntries) {
       lines.push("", "CHILD BLACKBOARD ENTRIES");
-      if (!teamId) {
-        lines.push("  No child team is linked to this subtask.");
+      if (!verifiedTeamId) {
+        if (resolved.kind === "mismatched") {
+          lines.push(`  Blackboard entries suppressed: ${short(resolved.reason, 200)}`);
+        } else if (resolved.kind === "unavailable") {
+          lines.push(`  Blackboard entries unavailable: ${short(resolved.reason, 200)}`);
+        } else if (resolved.kind === "missing") {
+          lines.push("  Blackboard entries unavailable: linked subteam record is missing on the host.");
+        } else {
+          lines.push("  No child team is linked to this subtask.");
+        }
       } else {
-        const cache = state.entriesByTeam?.[teamId];
+        const cache = state.entriesByTeam?.[verifiedTeamId];
         if (!cache) {
           lines.push("  Loading child blackboard entries...");
         } else if (cache.error) {
@@ -343,13 +414,15 @@ export function missionWatchText(
           lines.push("  No blackboard entries recorded for this subteam.");
         } else {
           for (const entry of cache.entries.slice(-10)) {
+            const stateTag = entry.state !== "active" ? `  [${clean(entry.state)}]` : "";
             const taskPart = entry.taskId ? `  task:${clean(entry.taskId)}` : "";
-            lines.push(`  blackboard #${entry.seq}  ${clean(entry.kind)}  ${authorityLabel(entry.authority)}  ${clean(entry.authorRole ?? entry.author)}${taskPart}  ${short(entry.summary, 120)}`);
+            lines.push(`  blackboard #${entry.seq}  ${clean(entry.kind)}  ${authorityLabel(entry.authority)}${stateTag}  ${clean(entry.authorRole ?? entry.author)}${taskPart}  ${short(entry.summary, 120)}`);
           }
           if (cache.more) lines.push(`  More entries available (cursor ${cache.cursor}).`);
           if (state.showDetail) {
             if (cache.selectedEntry) {
-              lines.push("", `ENTRY DETAIL  blackboard #${cache.selectedEntry.head.seq}  ${clean(cache.selectedEntry.head.kind)}  ${authorityLabel(cache.selectedEntry.head.authority)}`);
+              const detailState = cache.selectedEntry.head.state !== "active" ? `  [${clean(cache.selectedEntry.head.state)}]` : "";
+              lines.push("", `ENTRY DETAIL  blackboard #${cache.selectedEntry.head.seq}  ${clean(cache.selectedEntry.head.kind)}  ${authorityLabel(cache.selectedEntry.head.authority)}${detailState}`);
               lines.push(`  ${short(JSON.stringify(cache.selectedEntry.body), 500)}`);
             } else if (cache.detailError) {
               lines.push("", "ENTRY DETAIL");
@@ -392,7 +465,7 @@ export async function runMissionWatch(
     else options.signal.addEventListener("abort", onExternalAbort, { once: true });
   }
   const json = Boolean(options.json);
-  const tty = options.tty ?? (Boolean(process.stdout.isTTY) && !json);
+  const tty = json ? false : (options.tty ?? Boolean(process.stdout.isTTY));
   const interactive = options.interactive ?? (tty && Boolean(process.stdin.isTTY && process.stdin.setRawMode));
   const pollIntervalMs = options.pollIntervalMs ?? 1800;
 
@@ -401,6 +474,7 @@ export async function runMissionWatch(
   let progress: MissionProgressPage | null = null;
   let progressCursor: string | undefined;
   let lastSequence = 0;
+  let activeEntriesTeamId: string | undefined;
   let previous: string | null = null;
   let offset = 0;
   let pageSize = 1;
@@ -432,10 +506,12 @@ export async function runMissionWatch(
     });
     if (json) {
       const selected = mission.subtasks[state.selectedSubtaskIndex];
+      const resolved = selected ? resolveWatchChild(mission, selected, progress?.snapshot ?? null) : null;
+      const verifiedTeamId = resolved?.kind === "linked" ? resolved.verifiedTeamId : undefined;
       const payload = JSON.stringify({
         mission,
         progress,
-        ...(selected?.teamId && state.entriesByTeam?.[selected.teamId] ? { entries: state.entriesByTeam[selected.teamId] } : {}),
+        ...(verifiedTeamId && state.entriesByTeam?.[verifiedTeamId] ? { entries: state.entriesByTeam[verifiedTeamId] } : {}),
       });
       if (payload !== previous) {
         if (options.onFrame) options.onFrame(payload);
@@ -563,37 +639,42 @@ export async function runMissionWatch(
         }
 
         const selected = mission.subtasks[state.selectedSubtaskIndex];
-        const child = selected ? nextProgress.snapshot.subtasks.find(item => item.id === selected.id)?.child : undefined;
-        const teamId = selected?.teamId ?? (child?.kind === "linked" ? child.runId : undefined);
-        if (state.showEntries && teamId && (state.follow || !state.entriesByTeam?.[teamId])) {
+        const resolvedSelected = selected ? resolveWatchChild(mission, selected, nextProgress.snapshot) : null;
+        const verifiedTeamId = resolvedSelected?.kind === "linked" ? resolvedSelected.verifiedTeamId : undefined;
+        if (activeEntriesTeamId !== undefined && verifiedTeamId !== activeEntriesTeamId) {
+          state = { ...state, entriesByTeam: {} };
+        }
+        activeEntriesTeamId = verifiedTeamId;
+
+        if (state.showEntries && verifiedTeamId && (state.follow || !state.entriesByTeam?.[verifiedTeamId])) {
+          const priorCache = state.entriesByTeam?.[verifiedTeamId];
           try {
-            const allEntries: EntryHead[] = [];
-            const seenIds = new Set<string>();
-            let nextSince: number | undefined;
-            let finalCursor = 0;
+            const mergedById = new Map<string, EntryHead>();
+            for (const existing of priorCache?.entries ?? []) mergedById.set(existing.entryId, existing);
+            let nextSince: number | undefined = priorCache && priorCache.cursor > 0 ? priorCache.cursor : undefined;
+            let finalCursor = priorCache?.cursor ?? 0;
             let hasMore = false;
             for (let pageIndex = 0; pageIndex < MAX_ENTRY_PAGES; pageIndex += 1) {
               const entryQuery = nextSince !== undefined ? `?since=${nextSince}` : "";
-              const page = await api.json<EntryPage>(`/teams/${encodeURIComponent(teamId)}/entries${entryQuery}`, undefined, abort.signal);
+              const page = await api.json<EntryPage>(`/teams/${encodeURIComponent(verifiedTeamId)}/entries${entryQuery}`, undefined, abort.signal);
               for (const head of page.entries) {
-                if (!seenIds.has(head.entryId)) {
-                  seenIds.add(head.entryId);
-                  allEntries.push(head);
-                }
+                mergedById.set(head.entryId, head);
               }
-              finalCursor = page.cursor;
+              if (page.cursor > finalCursor) finalCursor = page.cursor;
               hasMore = page.more;
               if (!page.more || page.entries.length === 0 || page.cursor <= (nextSince ?? 0)) break;
               nextSince = page.cursor;
             }
-            const priorCache = state.entriesByTeam?.[teamId];
+            const mergedEntries = [...mergedById.values()]
+              .sort((a, b) => a.seq - b.seq)
+              .slice(-MAX_RETAINED_ENTRIES);
             state = {
               ...state,
               entriesByTeam: {
                 ...state.entriesByTeam,
-                [teamId]: {
-                  teamId,
-                  entries: allEntries,
+                [verifiedTeamId]: {
+                  teamId: verifiedTeamId,
+                  entries: mergedEntries,
                   cursor: finalCursor,
                   more: hasMore,
                   selectedEntry: priorCache?.selectedEntry,
@@ -607,11 +688,13 @@ export async function runMissionWatch(
               ...state,
               entriesByTeam: {
                 ...state.entriesByTeam,
-                [teamId]: {
-                  teamId,
-                  entries: [],
-                  cursor: 0,
-                  more: false,
+                [verifiedTeamId]: {
+                  teamId: verifiedTeamId,
+                  entries: priorCache?.entries ?? [],
+                  cursor: priorCache?.cursor ?? 0,
+                  more: priorCache?.more ?? false,
+                  selectedEntry: priorCache?.selectedEntry,
+                  detailError: priorCache?.detailError,
                   error: clean((error as Error).message),
                 },
               },
@@ -619,13 +702,13 @@ export async function runMissionWatch(
           }
         }
 
-        if (state.showEntries && teamId && state.showDetail) {
-          const cached = state.entriesByTeam?.[teamId];
+        if (state.showEntries && verifiedTeamId && state.showDetail) {
+          const cached = state.entriesByTeam?.[verifiedTeamId];
           const latestHead = cached && !cached.error ? cached.entries[cached.entries.length - 1] : undefined;
           if (cached && latestHead && cached.selectedEntry?.head.entryId !== latestHead.entryId) {
             try {
               const selectedEntry = await api.json<{ head: EntryHead; body: unknown }>(
-                `/teams/${encodeURIComponent(teamId)}/entries/${encodeURIComponent(latestHead.entryId)}`,
+                `/teams/${encodeURIComponent(verifiedTeamId)}/entries/${encodeURIComponent(latestHead.entryId)}`,
                 undefined,
                 abort.signal,
               );
@@ -633,7 +716,7 @@ export async function runMissionWatch(
                 ...state,
                 entriesByTeam: {
                   ...state.entriesByTeam,
-                  [teamId]: {
+                  [verifiedTeamId]: {
                     ...cached,
                     selectedEntry,
                     detailError: undefined,
@@ -646,7 +729,7 @@ export async function runMissionWatch(
                 ...state,
                 entriesByTeam: {
                   ...state.entriesByTeam,
-                  [teamId]: {
+                  [verifiedTeamId]: {
                     ...cached,
                     selectedEntry: undefined,
                     detailError: clean((error as Error).message),
@@ -673,6 +756,8 @@ export async function runMissionWatch(
           }
         } else if (options.once) {
           throw error;
+        } else if (json) {
+          process.stderr.write(`${message}\n`);
         } else {
           const text = `${message}\n\n${interactive ? "q quit" : "Ctrl+C detaches"}`;
           if (options.onFrame) options.onFrame(text);

@@ -357,3 +357,87 @@ test("child projection rejects a run whose mission or project binding does not m
     assert.equal(JSON.stringify(projected).includes("output"), false);
   }
 });
+
+test("child projection retains bounded prior attempts for current tasks without crowding out current assignments", () => {
+  const priorMembers = Array.from({ length: 4 }, (_, index) => ({
+    runId: childId,
+    memberId: randomUUID(),
+    sessionId: randomUUID(),
+    revision: index < 2 ? 1 : 2,
+    role: "implementer" as const,
+    taskId: "task-api",
+    status: "stopped" as const,
+    exitConfirmedAt: at,
+  }));
+  const currentMember = {
+    runId: childId,
+    memberId,
+    sessionId: memberSession,
+    revision: 2,
+    role: "implementer" as const,
+    taskId: "task-api",
+    status: "running" as const,
+  };
+  const run = {
+    id: childId,
+    projectId: "api",
+    missionId,
+    revision: 2,
+    status: "implementing",
+    updatedAt: at,
+    tasks: [{ id: "task-api", revision: 2, memberId }],
+    members: [...priorMembers, currentMember],
+    checks: [],
+  } as unknown as TeamRun;
+
+  const projected = projectMissionChild(run, missionId, "api");
+  assert.equal(projected.kind, "linked");
+  if (projected.kind !== "linked") return;
+  assert.equal(projected.assignmentsTruncated, true);
+  assert.equal(projected.assignments[0]?.memberId, memberId);
+  assert.deepEqual(
+    projected.assignments.slice(1).map(item => item.memberId),
+    priorMembers.slice(-3).map(item => item.memberId),
+  );
+
+  const currentTwelve = Array.from({ length: 12 }, (_, index) => ({
+    runId: childId,
+    memberId: randomUUID(),
+    sessionId: randomUUID(),
+    revision: 2,
+    role: "implementer" as const,
+    taskId: `task-${index}`,
+    status: "stopped" as const,
+    exitConfirmedAt: at,
+  }));
+  const replacedFirst = {
+    runId: childId,
+    memberId: randomUUID(),
+    sessionId: randomUUID(),
+    revision: 2,
+    role: "implementer" as const,
+    taskId: "task-0",
+    status: "stopped" as const,
+    exitConfirmedAt: at,
+  };
+  const fullRun = {
+    id: childId,
+    projectId: "api",
+    missionId,
+    revision: 2,
+    status: "verifying",
+    updatedAt: at,
+    tasks: currentTwelve.map(item => ({ id: item.taskId, revision: 2, memberId: item.memberId })),
+    members: [replacedFirst, ...currentTwelve],
+    checks: [],
+  } as unknown as TeamRun;
+  const fullProjected = projectMissionChild(fullRun, missionId, "api");
+  assert.equal(fullProjected.kind, "linked");
+  if (fullProjected.kind !== "linked") return;
+  assert.equal(fullProjected.assignments.length, 12);
+  assert.equal(fullProjected.assignmentsTruncated, true);
+  assert.deepEqual(
+    fullProjected.assignments.map(item => item.memberId),
+    currentTwelve.map(item => item.memberId),
+  );
+});

@@ -9,6 +9,7 @@ import { z } from "zod";
 
 const MAX_SUBTASKS = 12;
 const MAX_ASSIGNMENTS_PER_CHILD = 12;
+const MAX_PRIOR_ATTEMPTS_PER_SLOT = 3;
 const MAX_CHECKS_PER_CHILD = 8;
 const MAX_MEMBER_LIVENESS_PER_CHILD = 5;
 const MAX_LIVENESS_READS = 64;
@@ -85,9 +86,39 @@ export function projectMissionChild(run: TeamRun, expectedMissionId: string, exp
     latestUnassignedRole.add(member.role);
     selected.set(member.memberId, member);
   }
-  const members = [...selected.values()];
+  const priorSelected = new Map<string, TeamMember>();
+  let priorTruncated = false;
+  const collectPrior = (role: TeamMember["role"], taskId: string, currentMemberId: string) => {
+    const candidates = recentMembers.filter(member =>
+      member.runId === run.id
+      && member.memberId !== currentMemberId
+      && !selected.has(member.memberId)
+      && member.role === role
+      && member.taskId === taskId
+      && member.revision <= run.revision,
+    );
+    if (candidates.length > MAX_PRIOR_ATTEMPTS_PER_SLOT) priorTruncated = true;
+    for (const candidate of candidates.slice(-MAX_PRIOR_ATTEMPTS_PER_SLOT)) {
+      priorSelected.set(candidate.memberId, candidate);
+    }
+  };
+  for (const task of currentTasks) {
+    const member = selected.get(task.memberId!);
+    if (member) collectPrior(member.role, task.id, member.memberId);
+  }
+  for (const task of currentScouts) {
+    const member = selected.get(task.memberId!);
+    if (member) collectPrior("scout", task.id, member.memberId);
+  }
+  const currentMembers = [...selected.values()];
+  const priorMembers = [...priorSelected.values()];
   const needsObservation = (member: TeamMember) => !member.exitConfirmedAt && (member.status === "queued" || statusAwaitingWorker.has(member.status));
-  const ordered = [...members.filter(needsObservation), ...members.filter(member => !needsObservation(member))];
+  const ordered = [
+    ...currentMembers.filter(needsObservation),
+    ...priorMembers.filter(needsObservation),
+    ...currentMembers.filter(member => !needsObservation(member)),
+    ...priorMembers.filter(member => !needsObservation(member)),
+  ];
   const assignments = ordered.slice(0, MAX_ASSIGNMENTS_PER_CHILD).map((member): MissionProgressMemberSource => ({
     runId: member.runId,
     memberId: member.memberId,
@@ -118,7 +149,7 @@ export function projectMissionChild(run: TeamRun, expectedMissionId: string, exp
     updatedAt: run.updatedAt,
     assignments,
     checks,
-    ...(ordered.length > assignments.length || missingCurrentAssignment ? { assignmentsTruncated: true as const } : {}),
+    ...(ordered.length > assignments.length || missingCurrentAssignment || priorTruncated ? { assignmentsTruncated: true as const } : {}),
     ...(currentChecks.length > checks.length ? { checksTruncated: true as const } : {}),
   };
 }

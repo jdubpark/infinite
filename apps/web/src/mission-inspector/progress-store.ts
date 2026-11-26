@@ -158,8 +158,71 @@ export type CompactAssignmentsResult = {
   finished: MissionProgressMember[];
 };
 
-const ACTIVE_MEMBER_STATUSES = new Set<MissionMemberRecordedStatus>(["queued", "running", "waiting", "unavailable"]);
-const FINISHED_MEMBER_STATUSES = new Set<MissionMemberRecordedStatus>(["reported", "stopped"]);
+export type ResolvedMissionChild =
+  | { kind: "loading"; reason: string }
+  | { kind: "unavailable"; reason: string }
+  | { kind: "not-created" }
+  | { kind: "missing" }
+  | { kind: "mismatched"; reason: string }
+  | { kind: "linked"; child: MissionProgressLinkedChild; verifiedTeamId: string };
+
+export function isConfirmedFinishedMember(
+  member: Pick<MissionProgressMember, "recordedStatus" | "exitConfirmedAt">,
+): boolean {
+  return member.recordedStatus === "stopped"
+    || (member.recordedStatus === "reported" && Boolean(member.exitConfirmedAt));
+}
+
+export function isAwaitingExitMember(
+  member: Pick<MissionProgressMember, "recordedStatus" | "exitConfirmedAt">,
+): boolean {
+  return member.recordedStatus === "reported" && !member.exitConfirmedAt;
+}
+
+export function resolveMissionChild(
+  mission: { id: string },
+  subtask: { id: string; repoProjectId: string; teamId?: string },
+  snapshot: MissionProgressSnapshot | null,
+  options: { progressError?: string; progressLoading?: boolean } = {},
+): ResolvedMissionChild {
+  if (!snapshot) {
+    if (options.progressError) {
+      return { kind: "unavailable", reason: `Mission progress is unavailable: ${options.progressError}` };
+    }
+    if (options.progressLoading) {
+      return { kind: "loading", reason: "Loading subteam progress from the host..." };
+    }
+    return { kind: "unavailable", reason: "Mission progress snapshot is unavailable." };
+  }
+  if (snapshot.mission.id !== mission.id) {
+    return { kind: "unavailable", reason: "Loaded progress snapshot belongs to a different mission." };
+  }
+  const progressSubtask = snapshot.subtasks.find(item => item.id === subtask.id);
+  if (!progressSubtask) {
+    if (snapshot.subtasksTruncated) {
+      return { kind: "unavailable", reason: "Subtask progress was omitted because the progress snapshot is truncated." };
+    }
+    return { kind: "unavailable", reason: "The latest progress snapshot does not include this subtask yet." };
+  }
+  const { child } = progressSubtask;
+  if (child.kind === "not-created") {
+    if (subtask.teamId) {
+      return { kind: "unavailable", reason: "Mission records a subteam, but the latest progress snapshot has not observed it yet." };
+    }
+    return { kind: "not-created" };
+  }
+  if (child.kind === "missing") return { kind: "missing" };
+  if (child.kind === "mismatched") {
+    return { kind: "mismatched", reason: "The linked subteam record does not match this mission or project." };
+  }
+  if (child.missionId !== mission.id || child.projectId !== subtask.repoProjectId || !child.runId) {
+    return { kind: "mismatched", reason: "The linked subteam progress record does not match this mission or repository." };
+  }
+  if (!subtask.teamId || child.runId !== subtask.teamId) {
+    return { kind: "mismatched", reason: "The linked subteam run does not match the mission subtask record." };
+  }
+  return { kind: "linked", child, verifiedTeamId: child.runId };
+}
 
 export function initialMissionProgressState(): MissionProgressState {
   return {
@@ -308,15 +371,22 @@ export function applyMissionProgressPage(state: MissionProgressState, page: Miss
 }
 
 export function compactAssignments(assignments: readonly MissionProgressMember[]): CompactAssignmentsResult {
-  const activeMembers = assignments.filter(member => ACTIVE_MEMBER_STATUSES.has(member.recordedStatus));
-  const finishedMembers = assignments.filter(member => FINISHED_MEMBER_STATUSES.has(member.recordedStatus));
+  const activeMembers = assignments.filter(member => !isConfirmedFinishedMember(member));
+  const finishedMembers = assignments.filter(member => isConfirmedFinishedMember(member));
 
   const latestActiveIndexBySlot = new Map<string, number>();
   activeMembers.forEach((member, index) => {
     if (member.taskId === undefined) return;
     const key = `${member.role}\0${member.taskId}`;
     const priorIndex = latestActiveIndexBySlot.get(key);
-    if (priorIndex === undefined || member.revision >= activeMembers[priorIndex]!.revision) {
+    if (priorIndex === undefined) {
+      latestActiveIndexBySlot.set(key, index);
+      return;
+    }
+    const prior = activeMembers[priorIndex]!;
+    const memberAwaitingExit = isAwaitingExitMember(member);
+    const priorAwaitingExit = isAwaitingExitMember(prior);
+    if ((priorAwaitingExit && !memberAwaitingExit) || (priorAwaitingExit === memberAwaitingExit && member.revision >= prior.revision)) {
       latestActiveIndexBySlot.set(key, index);
     }
   });

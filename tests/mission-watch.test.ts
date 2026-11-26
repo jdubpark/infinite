@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { randomUUID } from "node:crypto";
 import { handleBoardClientCommand } from "../packages/host/src/board-cli.js";
 import type { EntryHead } from "../packages/host/src/evidence/entry-types.js";
-import type { MissionProgressPage } from "../packages/host/src/mission-progress.js";
+import { MissionProgressService, projectMissionChild, type MissionProgressPage } from "../packages/host/src/mission-progress.js";
 import type { Mission } from "../packages/host/src/mission-types.js";
+import type { TeamRun } from "../packages/host/src/team-types.js";
 import {
   applyMissionWatchCommand,
   initialMissionWatchState,
@@ -416,4 +418,323 @@ test("runMissionWatch pages past entry 50 with since and surfaces detail errors 
   assert.equal(pagedPaths.includes(`/teams/${TEAM_1}/entries/e-51`), true);
   assert.match(pagedFrames[0]!, /Latest paged entry 51/);
   assert.match(pagedFrames[0]!, /Error loading entry detail: detail store timeout/);
+});
+
+test("mission watch suppresses blackboard fetches and notices mismatched or unavailable child links", async () => {
+  const mission = makeMission();
+  const mismatchedProgress = makeProgress({ required: true, reason: "initial" });
+  mismatchedProgress.snapshot.subtasks[0]!.child = { kind: "mismatched" };
+
+  const mismatchText = missionWatchText(
+    mission,
+    mismatchedProgress,
+    { ...initialMissionWatchState(), showEntries: true },
+  );
+  assert.match(mismatchText, /child: mismatched/);
+  assert.match(mismatchText, /Blackboard entries suppressed/);
+  assert.doesNotMatch(mismatchText, new RegExp(`team ${TEAM_1}`));
+
+  const unavailableText = missionWatchText(
+    mission,
+    null,
+    { ...initialMissionWatchState(), showEntries: true },
+  );
+  assert.match(unavailableText, /API changes.*\(progress unavailable\)/);
+  assert.match(unavailableText, /Web UI.*\(progress unavailable\)/);
+  assert.match(unavailableText, /child: unavailable/);
+  assert.doesNotMatch(unavailableText, /not-created/);
+
+  const requestedPaths: string[] = [];
+  const jsonFrames: string[] = [];
+  await runMissionWatch(
+    {
+      json: async <T>(path: string): Promise<T> => {
+        requestedPaths.push(path);
+        if (path === `/missions/${MISSION_ID}`) return mission as T;
+        return mismatchedProgress as T;
+      },
+    },
+    MISSION_ID,
+    {
+      json: true,
+      once: true,
+      initialState: { showEntries: true, showDetail: true },
+      onFrame: text => jsonFrames.push(text),
+    },
+  );
+  assert.equal(requestedPaths.some(path => path.includes("/entries")), false);
+  const parsed = JSON.parse(jsonFrames[0]!);
+  assert.equal(parsed.entries, undefined);
+});
+
+test("missionWatchText keeps reported workers without exitConfirmedAt visible and marks withdrawn/superseded entries", async () => {
+  const mission = makeMission();
+  const progress = makeProgress({ required: true, reason: "initial" });
+  const linked = progress.snapshot.subtasks[0]!.child;
+  assert.equal(linked.kind, "linked");
+  if (linked.kind !== "linked") return;
+  linked.assignments = [
+    {
+      runId: TEAM_1,
+      memberId: "m-reported-live",
+      sessionId: "s-reported-live",
+      revision: 2,
+      role: "implementer",
+      taskId: "t1",
+      recordedStatus: "reported",
+      workerStatus: "running",
+    },
+  ];
+
+  const liveText = missionWatchText(mission, progress, initialMissionWatchState());
+  assert.match(liveText, /recorded:reported \(awaiting exit\)\s+worker:running/);
+  assert.doesNotMatch(liveText, /Finished \(1\)/);
+  assert.doesNotMatch(liveText, /No current child assignments/);
+
+  linked.assignments[0]!.exitConfirmedAt = at;
+  const confirmedText = missionWatchText(mission, progress, initialMissionWatchState());
+  assert.match(confirmedText, /Finished \(1\)/);
+
+  const withdrawnEntry: EntryHead = { ...sampleEntries[0]!, entryId: "e-w", seq: 44, state: "withdrawn", summary: "Retracted check" };
+  const supersededEntry: EntryHead = { ...sampleEntries[1]!, entryId: "e-s", seq: 45, state: "superseded", summary: "Replaced finding" };
+  const markedText = missionWatchText(
+    mission,
+    progress,
+    {
+      ...initialMissionWatchState(),
+      showEntries: true,
+      showDetail: true,
+      entriesByTeam: {
+        [TEAM_1]: {
+          teamId: TEAM_1,
+          entries: [withdrawnEntry, supersededEntry],
+          cursor: 45,
+          more: false,
+          selectedEntry: { head: supersededEntry, body: { detail: "old" } },
+        },
+      },
+    },
+  );
+  assert.match(markedText, /blackboard #44\s+check\s+host receipt\s+\[withdrawn\]/);
+  assert.match(markedText, /blackboard #45\s+finding\s+agent claim\s+\[superseded\]/);
+  assert.match(markedText, /ENTRY DETAIL\s+blackboard #45\s+finding\s+agent claim\s+\[superseded\]/);
+});
+
+test("real projectMissionChild projection surfaces replaced implementer attempts in missionWatchText", async () => {
+  const mission = makeMission();
+  const replacedId = randomUUID();
+  const liveId = randomUUID();
+  const liveSession = randomUUID();
+  const run = {
+    id: TEAM_1,
+    projectId: "repo-api",
+    missionId: MISSION_ID,
+    revision: 2,
+    status: "implementing",
+    updatedAt: at,
+    tasks: [{ id: "t1", revision: 2, memberId: liveId }],
+    members: [
+      {
+        runId: TEAM_1,
+        memberId: replacedId,
+        sessionId: randomUUID(),
+        revision: 2,
+        role: "implementer",
+        taskId: "t1",
+        status: "stopped",
+        exitConfirmedAt: at,
+      },
+      {
+        runId: TEAM_1,
+        memberId: liveId,
+        sessionId: liveSession,
+        revision: 2,
+        role: "implementer",
+        taskId: "t1",
+        status: "running",
+      },
+    ],
+    checks: [],
+  } as unknown as TeamRun;
+
+  const service = new MissionProgressService({
+    missions: {
+      progressSource: () => ({
+        id: MISSION_ID,
+        title: mission.title,
+        status: mission.status,
+        revision: mission.revision,
+        updatedAt: at,
+        subtasks: [{ id: "api-task", title: "API changes", repoProjectId: "repo-api", status: "running", teamId: TEAM_1 }],
+      }),
+    },
+    teams: { missionProgressChild: () => projectMissionChild(run, MISSION_ID, "repo-api") },
+    manager: {
+      meta: sessionId => ({
+        session: {
+          team: sessionId === liveSession
+            ? { runId: TEAM_1, memberId: liveId, revision: 2, role: "implementer", taskId: "t1" }
+            : undefined,
+        },
+      }),
+      state: async () => ({ status: "running" }),
+    },
+  });
+
+  const page = await service.read(MISSION_ID);
+  const text = missionWatchText(mission, page, initialMissionWatchState());
+  assert.match(text, /implementer · t1\s+recorded:running\s+worker:running\s+r2/);
+  assert.match(text, /earlier attempt: recorded:stopped\s+r2/);
+});
+
+test("runMissionWatch advances blackboard cursor past 500 entries across follow polls and resets cursor on team switch", async () => {
+  const mission = makeMission();
+  mission.subtasks[1] = {
+    ...mission.subtasks[1]!,
+    status: "running",
+    teamId: TEAM_2,
+    teamStatus: "implementing",
+  };
+  const totalEntries = 550;
+  const allTeam1Entries: EntryHead[] = Array.from({ length: totalEntries }, (_, index) => ({
+    ...sampleEntries[0]!,
+    entryId: `e-${index + 1}`,
+    seq: index + 1,
+    summary: `Team1 entry ${index + 1}`,
+  }));
+  const team2Entry: EntryHead = {
+    ...sampleEntries[1]!,
+    runId: TEAM_2,
+    entryId: "t2-e-1",
+    seq: 7,
+    summary: "Team2 fresh entry",
+  };
+
+  const entryPaths: string[] = [];
+  const frames: string[] = [];
+  const abort = new AbortController();
+  let poll = 0;
+
+  await runMissionWatch(
+    {
+      json: async <T>(path: string): Promise<T> => {
+        if (path === `/missions/${MISSION_ID}`) {
+          poll += 1;
+          if (poll === 4) {
+            return { ...mission, subtasks: [mission.subtasks[1]!] } as T;
+          }
+          return mission as T;
+        }
+        if (path.startsWith(`/missions/${MISSION_ID}/progress`)) {
+          const page = makeProgress({ required: poll === 1, reason: "initial" }, GEN_1, poll);
+          if (poll === 4) {
+            page.snapshot.subtasks = [
+              {
+                id: "web-task",
+                title: "Web UI",
+                repoProjectId: "repo-web",
+                status: "running",
+                child: {
+                  kind: "linked",
+                  runId: TEAM_2,
+                  missionId: MISSION_ID,
+                  projectId: "repo-web",
+                  revision: 1,
+                  status: "implementing",
+                  assignments: [],
+                  checks: [],
+                },
+              },
+            ];
+            abort.abort();
+          }
+          return page as T;
+        }
+        if (path.startsWith(`/teams/${TEAM_1}/entries`)) {
+          entryPaths.push(path);
+          const match = /\?since=(\d+)/.exec(path);
+          const since = match ? Number(match[1]) : 0;
+          const slice = allTeam1Entries.filter(item => item.seq > since).slice(0, 50);
+          const cursor = slice.length ? slice[slice.length - 1]!.seq : since;
+          const more = allTeam1Entries.some(item => item.seq > cursor);
+          return { entries: slice, cursor, more } as T;
+        }
+        if (path.startsWith(`/teams/${TEAM_2}/entries`)) {
+          entryPaths.push(path);
+          return { entries: [team2Entry], cursor: 7, more: false } as T;
+        }
+        throw new Error(`Unexpected path: ${path}`);
+      },
+    },
+    MISSION_ID,
+    {
+      tty: false,
+      interactive: false,
+      pollIntervalMs: 1,
+      signal: abort.signal,
+      initialState: { showEntries: true, follow: true },
+      onFrame: text => frames.push(text),
+    },
+  );
+
+  assert.equal(entryPaths.includes(`/teams/${TEAM_1}/entries?since=500`), true);
+  assert.equal(entryPaths.includes(`/teams/${TEAM_1}/entries?since=550`), true);
+  assert.equal(entryPaths.includes(`/teams/${TEAM_2}/entries`), true);
+  assert.equal(entryPaths.some(path => path.startsWith(`/teams/${TEAM_2}/entries?since=`)), false);
+  assert.ok(frames.some(frame => frame.includes("Team1 entry 550")));
+  assert.ok(frames.some(frame => frame.includes("Team2 fresh entry")));
+});
+
+test("runMissionWatch --json keeps stdout valid NDJSON and routes transient poll errors to stderr", async () => {
+  const mission = makeMission();
+  const jsonFrames: string[] = [];
+  const stderrChunks: string[] = [];
+  const abort = new AbortController();
+  let poll = 0;
+
+  const originalStderrWrite = process.stderr.write.bind(process.stderr);
+  process.stderr.write = ((chunk: string | Uint8Array) => {
+    stderrChunks.push(String(chunk));
+    return true;
+  }) as typeof process.stderr.write;
+
+  try {
+    await runMissionWatch(
+      {
+        json: async <T>(path: string): Promise<T> => {
+          if (path === `/missions/${MISSION_ID}`) {
+            poll += 1;
+            if (poll === 2) throw new Error("upstream poll timeout");
+            if (poll === 3) {
+              abort.abort();
+              return { ...mission, revision: 5, status: "working" } as T;
+            }
+            return mission as T;
+          }
+          if (poll === 2) throw new Error("upstream poll timeout");
+          return makeProgress(
+            poll === 1 ? { required: true, reason: "initial" } : { required: false },
+            GEN_1,
+            poll === 1 ? 1 : 2,
+          ) as T;
+        },
+      },
+      MISSION_ID,
+      {
+        json: true,
+        pollIntervalMs: 1,
+        signal: abort.signal,
+        onFrame: text => jsonFrames.push(text),
+      },
+    );
+  } finally {
+    process.stderr.write = originalStderrWrite;
+  }
+
+  assert.equal(jsonFrames.length, 2);
+  const parsed = jsonFrames.map(line => JSON.parse(line));
+  assert.equal(parsed[0].mission.revision, 4);
+  assert.equal(parsed[1].mission.revision, 5);
+  assert.equal(jsonFrames.some(line => line.includes("Update failed") || line.includes("Ctrl+C")), false);
+  assert.match(stderrChunks.join(""), /Update failed: upstream poll timeout/);
 });

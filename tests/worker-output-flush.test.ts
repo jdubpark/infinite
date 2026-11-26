@@ -5,7 +5,7 @@ import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "nod
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { randomBytes, randomUUID } from "node:crypto";
-import { workerCall } from "../packages/host/src/ipc.js";
+import { workerCall, type WorkerError } from "../packages/host/src/ipc.js";
 import { readEvents } from "../packages/host/src/vault.js";
 import { waitFor } from "./helpers.js";
 import type { Bootstrap, ControlLease, Event, Receipt, WorkerRequest, WorkerState } from "../packages/host/src/types.js";
@@ -46,12 +46,15 @@ async function start(env: Record<string, string>) {
   };
   const worker = spawn(process.execPath, ["--import", "tsx", resolve("packages/host/src/worker.ts")], {
     stdio: ["pipe", "ignore", "pipe"],
-    env: { ...process.env, ...env, INFINITE_TEST_JOURNAL_SYNC_REPORT: report, NODE_OPTIONS: `--import=${pathToFileURL(resolve("tests/fixtures/journal-sync.mjs")).href}` },
+    env: {
+      ...process.env, ...env, INFINITE_TEST_JOURNAL_SYNC_REPORT: report,
+      NODE_OPTIONS: ["journal-sync.mjs", "terminal-drain.mjs"].map(file => `--import=${pathToFileURL(resolve("tests/fixtures", file)).href}`).join(" "),
+    },
   });
   let diagnostics = "";
   worker.stderr.on("data", data => { diagnostics += data; });
   worker.stdin.end(JSON.stringify(bootstrap));
-  const call = <T = WorkerState>(request: WorkerRequest) => workerCall<T>(runDir, id, request);
+  const call = <T = WorkerState>(request: WorkerRequest, timeout?: number) => workerCall<T>(runDir, id, request, timeout);
   const output = () => {
     const events: Event[] = [];
     for (let cursor = 0, more = true; more;) {
@@ -106,6 +109,42 @@ test("a 4 MiB output burst on a slow journal disk is synced in bounded flushes w
     assert.ok(chunks.join("").length > BURST, "the whole burst is recorded");
     assert.ok(chunks.every(text => text.length <= 8192), "output events keep their 8192-character chunks");
     assert.ok(worker.synced().largest <= 40, `one sync holds at most 256 KiB of output plus one read, not ${worker.synced().largest} events`);
+  } finally {
+    await worker.stop();
+  }
+});
+
+test("a full snapshot queue on a slow journal disk is released in order while state calls answer between its flushes", { timeout: 150_000 }, async () => {
+  const worker = await start({ INFINITE_TEST_JOURNAL_SYNC_DELAY_MS: "700", INFINITE_TEST_TERMINAL_DRAIN_DELAY_MS: "900" });
+  try {
+    await worker.burst(BURST);
+    const failures: string[] = [];
+    const until = Date.now() + 120_000;
+    let screen = "", refused = 0;
+    const running = () => !screen.includes("BURST DONE") && !failures.length && Date.now() < until;
+    await Promise.all([
+      (async () => {
+        while (running()) {
+          try { screen = (await worker.call({ op: "state", screen: true })).screen; }
+          catch (error) { failures.push(error instanceof Error ? error.message : String(error)); }
+          await new Promise(resolve => setTimeout(resolve, 100));
+        }
+      })(),
+      (async () => {
+        while (running()) {
+          try { await worker.call({ op: "snapshot" }, 60_000); }
+          catch (error) {
+            if ((error as WorkerError).code === "snapshot-unavailable") refused++;
+            else failures.push(error instanceof Error ? error.message : String(error));
+          }
+        }
+      })(),
+    ]);
+    assert.deepEqual(failures, []);
+    assert.ok(refused > 0, "a snapshot's output queue filled before the renderer drained");
+    await waitFor(async () => worker.output().join("").includes("BURST DONE"), Boolean);
+    const rows = [...worker.output().join("").matchAll(/ROW (\d+) /g)].map(match => Number(match[1]));
+    assert.ok(rows.length > 1000 && rows.every((row, index) => row === index + 1), "every row is recorded once, in order");
   } finally {
     await worker.stop();
   }

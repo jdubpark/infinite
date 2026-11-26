@@ -63,7 +63,7 @@ deploy/
 scripts/       Zero-dependency egress & GitHub proxies, GitHub App token refresher, Graphify builder,
                comment & file-size ratchets, macOS/CLI/Codex handoff builders, test runner
 docs/          System architecture, 6 SVG diagrams, subsystem guides, 22 ADRs (docs/adr/)
-tests/         443 test suites: unit, live PTY continuity, OS-boundary launchers, Playwright smoke,
+tests/         Unit tests, live PTY continuity, OS-boundary launchers, Playwright smoke,
                compile-time type tests, and seeded crash/fault/differential simulators
 verification/  Formal finite-state safety models (Understanding refresh fence) + TLA+/TLC exports
 ```
@@ -254,7 +254,7 @@ npm run export:ios -w @infinite/mobile
 1. **`npm run check:size`** (`scripts/check-file-size.mjs`): 1,000-line cap on new source files; downward-only baseline across 24 grandfathered files.
 2. **`npm run check:comments`** (`scripts/check-comments.mjs`): zero-comment policy across `.ts/.tsx/.js/.mjs/.swift/.py/.sh/.c/.h/.kt/.css/.service/.timer/.socket` (`scripts/comments-baseline.json` is at `0`).
 3. **`npm run typecheck`**: TypeScript strict check across all workspaces plus `tsconfig.mcp-exact.json` and `tsconfig.type-tests.json` (`@ts-expect-error` state-machine and wire-contract tests).
-4. **`npm test`** (`scripts/run-tests.mjs`): 443 test suites (440 parallel + 3 serial contention-sensitive suites; use `INFINITE_TEST_CONCURRENCY=1` on small runners), covering 12-PTY live API-restart continuity, vault/SQLite crypto, OS-boundary eval/grader launchers, Playwright browser smoke, and seeded crash/fault/differential simulators.
+4. **`npm test`** (`scripts/run-tests.mjs`) discovers the top-level `tests/*.test.ts` files in the captured checkout on every run. It runs three contention-sensitive files serially. Set `INFINITE_TEST_CONCURRENCY=1` on a small runner. The suite covers 12-PTY live API-restart continuity, vault and SQLite encryption, eval and grader process isolation, Playwright browser smoke, and seeded crash and differential simulations.
 5. **`npm run build`**: sequential build of `@infinite/attention -> @infinite/remote -> @infinite/host -> @infinite/web`.
 
 End-to-end browser verification against a disposable host uses `.agents/skills/verify-infinite/scripts/drive.mjs session --instance DIR`.

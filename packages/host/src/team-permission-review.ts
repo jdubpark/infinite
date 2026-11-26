@@ -562,7 +562,7 @@ export class TeamPermissionReview extends TeamPermissionRecovery {
       });
     }, member);
   }
-  private async permissionAnswerInvalidReason(stored: Stored, decision: TeamPermissionDecision, coordinator?: TeamMember) {
+  private async permissionAnswerInvalidReason(stored: Stored, decision: TeamPermissionDecision, coordinator?: TeamMember, signal?: AbortSignal) {
     const run = stored.run;
     if (!run.permissions || run.permissionsRevokedAt || stored.halt || ["paused", "cancelled", "blocked"].includes(run.status)) return "The team is paused, stopped, blocked, or its permission policy was revoked.";
     if (this.agentEligible(stored)) return coordinatorRetiredReason;
@@ -591,10 +591,10 @@ export class TeamPermissionReview extends TeamPermissionRecovery {
       this.host.assertRunPath(stored, canonicalCwd);
       if (target.role === "delivery") {
         this.host.assertDelivery(stored);
-        await assertMemberReadOnly(canonicalCwd, run.headCommit!, this.host.config.teams?.commandPrefix);
+        await assertMemberReadOnly(canonicalCwd, run.headCommit!, this.host.config.teams?.commandPrefix, signal);
       }
       if (decision.workspaceEvidenceHash) {
-        const changedPaths = await memberChangedPaths(canonicalCwd, target.baseCommit, this.host.config.teams?.commandPrefix);
+        const changedPaths = await memberChangedPaths(canonicalCwd, target.baseCommit, this.host.config.teams?.commandPrefix, signal);
         const evidence = collectPermissionEvidence({ prompt: decision.prompt, cwd: canonicalCwd, changedPaths, requestedPaths: decision.requestedPaths,
           approvedScratchRoots: target.scratchDirectory ? [target.scratchDirectory] : [] });
         if (decision.workspaceEvidenceHash !== digest({ changedPaths, evidence: evidence.digest }))
@@ -612,6 +612,7 @@ export class TeamPermissionReview extends TeamPermissionRecovery {
           permissionEvidenceHash(prompt) !== decision.evidenceHash || oneShotPermissionOption(prompt) !== decision.option)
         return "The target permission prompt or its one-shot option changed.";
     } catch (error) {
+      if (signal?.aborted) return "The team is paused, stopped, blocked, or its permission policy was revoked.";
       return error instanceof TeamError ? error.message : "The current target session could not be verified.";
     }
     return undefined;
@@ -685,7 +686,7 @@ export class TeamPermissionReview extends TeamPermissionRecovery {
         decision.reason = summary;
         this.host.save(stored);
       }
-      const reason = await this.permissionAnswerInvalidReason(stored, decision, coordinator);
+      const reason = await this.permissionAnswerInvalidReason(stored, decision, coordinator, signal);
       if (reason) return { status: "escalated" as const, reason };
       if (decision.authorityHash !== ownerAuthorityHash(run))
         return { status: "escalated" as const, reason: "The owner's steering or answers changed while the target session was being checked." };

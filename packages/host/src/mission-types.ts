@@ -1,9 +1,40 @@
 import type { ConnectorSource } from "./mcp-types.js";
 import { z } from "zod";
-import { blockerEvidenceSchema, storedUsageRollupSchema, type GithubReviewSource, type TeamLineup, type TeamStatus } from "./team-types.js";
+import { blockerEvidenceSchema, claudeTeamModelProfileSchema, storedUsageRollupSchema, teamLineupSchema, type GithubReviewSource, type TeamLineup, type TeamModelProfile, type TeamStatus } from "./team-types.js";
+import type { Provider } from "./types.js";
 import type { StoredRollup, UsageRollup } from "./team-usage.js";
 import { projectGroupIdSchema } from "./project-group-types.js";
 import { questionRecommendationSchema, refineQuestion, requiredQuestionRecommendationSchema, type DecisionRecommendation } from "./question-recommendation.js";
+
+export const missionCoordinatorProviderSchema = z.literal("claude");
+export type MissionCoordinatorProvider = z.infer<typeof missionCoordinatorProviderSchema>;
+export function parseMissionCoordinatorProvider(provider: Provider): MissionCoordinatorProvider {
+  if (provider !== "claude") throw new Error("Mission coordinators require Claude Code.");
+  return provider;
+}
+export const missionCoordinatorProfileSchema = claudeTeamModelProfileSchema.extend({
+  tier: z.literal("strong"),
+}).strict();
+export type MissionCoordinatorProfile = z.infer<typeof missionCoordinatorProfileSchema>;
+export type MissionLineup = Omit<TeamLineup, "coordinator" | "reviewer"> & {
+  coordinator: MissionCoordinatorProfile;
+  reviewer: TeamModelProfile & { tier: "strong" };
+};
+export const missionLineupSchema: z.ZodType<MissionLineup> = teamLineupSchema.superRefine((lineup, context) => {
+  if (lineup.coordinator.provider !== "claude") {
+    context.addIssue({
+      code: "custom",
+      path: ["coordinator", "provider"],
+      message: lineup.coordinator.provider === "codex"
+        ? "Mission coordinators require Claude Code; Codex merges inherited MCP server tables and cannot be restricted to reading and reporting."
+        : "Mission coordinators require Claude Code.",
+    });
+  }
+  if (lineup.coordinator.tier !== "strong")
+    context.addIssue({ code: "custom", path: ["coordinator", "tier"], message: "A mission coordinator must be a strong profile." });
+  if (lineup.reviewer.tier !== "strong")
+    context.addIssue({ code: "custom", path: ["reviewer", "tier"], message: "A mission reviewer must be a strong profile." });
+}) as unknown as z.ZodType<MissionLineup>;
 
 const subtaskId = z.string().regex(/^[a-z][a-z0-9-]{0,39}$/);
 const connectorSourceSchema = z.object({ kind: z.literal("connector"), id: z.string().min(1), name: z.string().min(1) }).strict();
@@ -318,7 +349,7 @@ export interface Mission {
   canAnswerPaused?: true;
   createdAt: string;
   updatedAt: string;
-  lineup: TeamLineup;
+  lineup: MissionLineup;
   coordinator?: { memberId: string; sessionId: string; status: "running" | "waiting" | "stopped" };
   dispatchSummary?: string;
   subtasks: MissionSubtask[];

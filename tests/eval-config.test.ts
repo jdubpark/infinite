@@ -16,7 +16,16 @@ import {
 } from "../packages/host/src/eval-config.js";
 import { OWNED_PATH_MAX_CHARS, ownedPathSchema } from "../packages/host/src/schema-primitives.js";
 import { teamProjectSchema } from "../packages/host/src/team-types.js";
-import { agentProfileSchema, learningPurpose, type AgentProfile } from "../packages/host/src/types.js";
+import {
+  EXECUTION_IDENTITIES,
+  agentProfileSchema,
+  isEvalSession,
+  resolveBootstrapExecutionIdentity,
+  resolveLaunchExecutionIdentity,
+  sessionExecutionIdentity,
+  type AgentProfile,
+  type ExecutionIdentity,
+} from "../packages/host/src/types.js";
 
 const base = { checks: [], establishChecks: true } as const;
 
@@ -154,11 +163,56 @@ test("the trial settings parse with their limits", () => {
   assert.deepEqual(evalCommandPrefix(parsed, "setup"), { command: "sudo", args: ["-n", "-u", "infinite-eval", "--", "/usr/local/libexec/infinite/eval-command", "setup", "--"] });
   assert.deepEqual(evalCommandPrefix(parsed, "exec")!.args.slice(-2), ["exec", "--"]);
 
-  assert.equal(learningPurpose("replay"), true);
-  assert.equal(learningPurpose("gate"), true);
-  assert.equal(learningPurpose("duel"), true);
-  assert.equal(learningPurpose("work"), false);
-  assert.equal(learningPurpose(undefined), false);
+  assert.deepEqual(EXECUTION_IDENTITIES, ["production", "eval"]);
+  const identityValue: AssertExact<ExecutionIdentity, "production" | "eval"> = true;
+  assert.equal(identityValue, true);
+
+  assert.equal(sessionExecutionIdentity({ purpose: "duel", executionIdentity: "production" }), "production");
+  assert.equal(isEvalSession({ purpose: "duel", executionIdentity: "production" }), false);
+  assert.equal(sessionExecutionIdentity({ purpose: "duel", executionIdentity: "eval" }), "eval");
+  assert.equal(isEvalSession({ purpose: "duel", executionIdentity: "eval" }), true);
+  assert.equal(sessionExecutionIdentity({ purpose: "replay", executionIdentity: "eval" }), "eval");
+  assert.equal(sessionExecutionIdentity({ purpose: "gate", executionIdentity: "eval" }), "eval");
+  assert.equal(sessionExecutionIdentity({ purpose: "replay", executionIdentity: "production" }), "eval");
+  assert.equal(sessionExecutionIdentity({ purpose: "gate", executionIdentity: "production" }), "eval");
+  assert.equal(sessionExecutionIdentity({ purpose: "work", executionIdentity: "production" }), "production");
+  assert.equal(sessionExecutionIdentity({ purpose: "replay" }), "eval");
+  assert.equal(sessionExecutionIdentity({ purpose: "gate" }), "eval");
+  assert.equal(sessionExecutionIdentity({ purpose: "duel" }), "eval");
+  assert.equal(sessionExecutionIdentity({ purpose: "work" }), "production");
+  assert.equal(sessionExecutionIdentity({}), "production");
+  assert.equal(sessionExecutionIdentity(undefined), "production");
+
+  assert.deepEqual(resolveLaunchExecutionIdentity({ purpose: "duel", executionIdentity: "production" }), { ok: true, identity: "production" });
+  assert.deepEqual(resolveLaunchExecutionIdentity({ purpose: "duel", executionIdentity: "eval" }), { ok: true, identity: "eval" });
+  assert.equal(resolveLaunchExecutionIdentity({ purpose: "duel" }).ok, false);
+  assert.deepEqual(resolveLaunchExecutionIdentity({ purpose: "replay", executionIdentity: "eval" }), { ok: true, identity: "eval" });
+  assert.deepEqual(resolveLaunchExecutionIdentity({ purpose: "replay" }), { ok: true, identity: "eval" });
+  assert.deepEqual(resolveLaunchExecutionIdentity({ purpose: "gate", executionIdentity: "eval" }), { ok: true, identity: "eval" });
+  assert.deepEqual(resolveLaunchExecutionIdentity({ purpose: "gate" }), { ok: true, identity: "eval" });
+  assert.equal(resolveLaunchExecutionIdentity({ purpose: "replay", executionIdentity: "production" }).ok, false);
+  assert.equal(resolveLaunchExecutionIdentity({ purpose: "gate", executionIdentity: "production" }).ok, false);
+  assert.deepEqual(resolveLaunchExecutionIdentity({ purpose: "work" }), { ok: true, identity: "production" });
+  assert.deepEqual(resolveLaunchExecutionIdentity({ purpose: "work", executionIdentity: "production" }), { ok: true, identity: "production" });
+  assert.equal(resolveLaunchExecutionIdentity({ purpose: "work", executionIdentity: "eval" }).ok, false);
+  assert.deepEqual(resolveLaunchExecutionIdentity({}), { ok: true, identity: "production" });
+  assert.deepEqual(resolveLaunchExecutionIdentity({ executionIdentity: "eval" }), { ok: true, identity: "eval" });
+  assert.equal(resolveLaunchExecutionIdentity({ executionIdentity: "other" as never }).ok, false);
+  assert.equal(resolveLaunchExecutionIdentity({ purpose: "other" as never }).ok, false);
+
+  const sessionOf = (over: { purpose?: "work" | "duel" | "replay" | "gate"; executionIdentity?: ExecutionIdentity }) => ({
+    id: "s-1", provider: "claude" as const, title: "T", projectId: "p", cwd: "/tmp",
+    createdAt: "2026-11-26T00:00:00.000Z", status: "starting" as const, contextVersion: 0, context: "", initialPrompt: "",
+    ...over,
+  });
+  assert.equal(resolveBootstrapExecutionIdentity({ executionIdentity: "production", session: sessionOf({ purpose: "duel", executionIdentity: "production" }) }), "production");
+  assert.equal(resolveBootstrapExecutionIdentity({ executionIdentity: "eval", session: sessionOf({ purpose: "duel", executionIdentity: "eval" }) }), "eval");
+  assert.equal(resolveBootstrapExecutionIdentity({ session: sessionOf({ purpose: "duel" }) }), "eval");
+  assert.equal(resolveBootstrapExecutionIdentity({ session: sessionOf({}) }), "production");
+  assert.throws(() => resolveBootstrapExecutionIdentity({ executionIdentity: "production", session: sessionOf({ purpose: "duel", executionIdentity: "eval" }) }), /Mismatched/);
+  assert.throws(() => resolveBootstrapExecutionIdentity({ executionIdentity: "production", session: sessionOf({ purpose: "replay" }) }), /Replay and gate/);
+  assert.throws(() => resolveBootstrapExecutionIdentity({ executionIdentity: "eval", session: sessionOf({ purpose: "work" }) }), /Work sessions/);
+  assert.throws(() => resolveBootstrapExecutionIdentity({ executionIdentity: "bad" as never, session: sessionOf({}) }), /Invalid/);
 });
 
 type AssertExact<A, B> = [A] extends [B] ? ([B] extends [A] ? true : never) : never;

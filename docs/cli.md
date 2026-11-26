@@ -22,6 +22,7 @@ infinite usage project PROJECT_ID
 infinite usage goal GOAL_ID
 infinite usage models [--role implementer]
 infinite usage outcomes [--run ID | --goal ID | --mission ID]
+infinite usage repairs [--project ID] [--days N] [--json]
 infinite usage --json
 infinite cost [--json]
 infinite cost plan ACCOUNT USD
@@ -48,7 +49,7 @@ infinite close SESSION_ID  # confirm before ending its provider process
 
 `close` requires an explicit session ID or unique prefix and an owner key. It shows the selected process and asks for confirmation; `--yes` confirms noninteractive use. Another client's active input lease blocks closing unless `--takeover` is explicitly supplied. A delivered receipt confirms the stop request reached the worker; check `list` for the resulting process status. An uncertain response is reported and never retried automatically. Closing ends the provider process; Ctrl+] only detaches the terminal client.
 
-`usage` prints the current and previous month, plan fees, account balances, and a 30-day bar chart in the local timezone. `projects`, `project`, `goal`, and `models` show the corresponding roll-up. Every form accepts `--json`; `models` accepts `--role ROLE`. Unpriced totals are marked `≥`. Balances are shown only when the provider returned one; otherwise the CLI prints `—`. Budgets are informational. See [Usage and budgets](teams.md#usage-and-budgets).
+`usage` prints the current and previous month, plan fees, account balances, and a 30-day bar chart in the local timezone. `projects`, `project`, `goal`, and `models` show the corresponding roll-up; `repairs` reports baseline repair-loop latency, measured token/USD medians (excluding unmeasured loops rather than zeroing them), and cold-replacement/failed-resume counts (`GET /api/usage/repair-loops`, accepting `--project` and `--days 1..366`). Every form accepts `--json`; `models` accepts `--role ROLE`. Unpriced totals are marked `≥`. Balances are shown only when the provider returned one; otherwise the CLI prints `—`. Budgets are informational. See [Usage and budgets](teams.md#usage-and-budgets).
 
 `evidence status` prints the state of the host's evidence store, the reason when it is unavailable, each module's state, the file and WAL sizes, and the event count. `--json` prints the host's full status. Any paired device can read it. See [Evidence store](architecture.md#evidence-store).
 
@@ -116,6 +117,7 @@ infinite projects primary PROJECT_ID CHECKOUT_ID
 infinite start [--project PROJECT_ID] "task"
 infinite mission status MISSION_ID [--json]
 infinite mission progress MISSION_ID [--after CURSOR] [--json]
+infinite mission watch MISSION_ID [--json]
 infinite mission answer MISSION_ID DECISION_ID "text"
 infinite mission steer MISSION_ID "text"
 infinite mission pause|resume|cancel MISSION_ID
@@ -139,8 +141,12 @@ mission on that checkout. Mission controls read the
 current revision before submitting an action. `board` refreshes every two
 seconds in a terminal: use Up/Down to select a row, Tab to change the composer
 target, Enter to open the selected row or submit a mission, `a` to answer its
-open decision, and `q` or Ctrl+C to exit. Missions open their decision and
-subtask summary; team rows use `infinite team watch`.
+open decision, and `q` or Ctrl+C to exit. In an interactive terminal, opening a
+mission row launches `infinite mission watch` (non-TTY prints its decision and
+subtask summary); `infinite mission watch MISSION_ID [--json]` follows live
+mission progress (`GET /api/missions/:id/progress`) and linked subteam
+blackboard entries (`j`/`k` or `↑`/`↓` subtask, `e` entries, `Enter` detail,
+`f` follow, `q` quit). Team rows use `infinite team watch`.
 
 ## Project signals
 
@@ -195,8 +201,7 @@ infinite team status
 infinite team status TEAM_ID
 infinite team status TEAM_ID --json
 infinite team status TEAM_ID --logs
-infinite team watch TEAM_ID
-infinite team watch TEAM_ID --logs
+infinite team watch TEAM_ID [--logs | --board]
 infinite team pull TEAM_ID [--json]
 infinite team steer TEAM_ID "Keep the change within the API package"
 infinite team answer TEAM_ID QUESTION_ID "Use the existing route"
@@ -218,12 +223,14 @@ Additional orchestration and evaluation command families follow the same paired 
 
 `infinite team status` without an ID lists each team. `infinite team status TEAM_ID`
 prints that team's open decisions and Jevcode summary. `infinite team watch
-TEAM_ID` keeps it full screen: `l` opens one agent's review log, `←` `→` or
-`n` `p` change agents, `s` or `b` returns to the summary, `↑` `↓`, `j` `k`,
-Space, and Page Up or Down scroll, `a` asks Jevcode when the summary is empty or
-failed, and `q` or Ctrl+C detaches. The bottom line always lists the keys for
-the current view. A non-interactive watch prints again only when the visible
-text changes. `--logs` starts in the review log, and
+TEAM_ID` keeps it full screen: `b` opens the blackboard entry board (`↑`/`↓`
+entry, `Enter` detail, `p` kind filter, `f` follow, `o` member logs), `l` opens
+one agent's review log, `←` `→` or `n` `p` change agents in log view, `s`
+returns to the summary, `↑` `↓`, `j` `k`, Space, and Page Up or Down scroll,
+`a` asks Jevcode when the summary is empty or failed, and `q` or Ctrl+C detaches.
+The bottom line always lists the keys for the current view. A non-interactive
+watch prints again only when the visible text changes. `--logs` starts in the
+review log, `--board` starts in the blackboard entry view, and
 `infinite team status TEAM_ID --logs` prints the current revision's logs once.
 `team processes-ended` states, as the owner, that the processes of a stopped
 setup or check command have ended, for a run whose process census cannot tell;

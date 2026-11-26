@@ -1,6 +1,37 @@
 import type { ProviderLimit } from "./provider-limits.js";
 import { MEMBER_STALL_REASON } from "./stall-recovery.js";
-import { ACTIVE_MEMBER_STATUSES, type TeamPermissionDecision, type TeamRun, type TeamView, type TeamWaitReason } from "./team-types.js";
+import { ACTIVE_MEMBER_STATUSES, type TeamPermissionDecision, type TeamRun, type TeamView, type TeamWaitReason, type TeamWaitReasonKind } from "./team-types.js";
+
+export const MAX_WAIT_REASON_SUMMARY = 240;
+
+const WAIT_REASON_ORDER: Record<TeamWaitReasonKind, number> = {
+  "owner-decision": 0,
+  "provider-prompt": 1,
+  stalled: 2,
+  "spinner-only": 3,
+  "provider-limit": 4,
+  "worker-slot": 5,
+  dependency: 6,
+  "integration-order": 7,
+  "linear-sync": 8,
+};
+
+function clipSummary(text: string): string {
+  const collapsed = text.replace(/\s+/g, " ").trim();
+  if (collapsed.length <= MAX_WAIT_REASON_SUMMARY) return collapsed;
+  return `${collapsed.slice(0, MAX_WAIT_REASON_SUMMARY - 3)}...`;
+}
+
+export function orderTeamWaitReasons<T extends { kind?: unknown }>(reasons: readonly T[]): T[] {
+  return reasons
+    .map((reason, index) => ({ reason, index }))
+    .sort((left, right) => {
+      const a = WAIT_REASON_ORDER[String(left.reason?.kind ?? "") as TeamWaitReasonKind] ?? 99;
+      const b = WAIT_REASON_ORDER[String(right.reason?.kind ?? "") as TeamWaitReasonKind] ?? 99;
+      return a - b || left.index - right.index;
+    })
+    .map(item => item.reason);
+}
 
 export const PROVIDER_INPUT_REASON = "A provider needs user input. Open the member session to respond; the team will not approve it.";
 export const PERMISSION_REVIEW_REASON = "The permission coordinator is reviewing a provider request.";
@@ -264,5 +295,8 @@ export function describeTeamWaitReasons(
     }
   }
 
-  return reasons;
+  return orderTeamWaitReasons(reasons).map(reason => ({
+    ...reason,
+    summary: clipSummary(reason.summary),
+  }));
 }

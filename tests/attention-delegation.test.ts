@@ -241,4 +241,12 @@ test("array truncation detection accepts untruncated 50-item arrays and rejects 
   assert.equal(oneShotPermissionOption(hookPrompt(collapsed)), undefined);
   assert.equal(hasTruncatedEvidence({ nested: { note: "abc … [+5 chars]" } }), true);
   assert.equal(hasTruncatedEvidence({ nested: "[truncated]" }), true);
+
+  const markerLikeObject = { metadata: { "[truncated]": true, omitted: 1 } };
+  assert.equal(hasTruncatedEvidence(markerLikeObject), false);
+  assert.equal(oneShotPermissionOption(hookPrompt(markerLikeObject)), 0);
+
+  const shortArrayWithMarkerObject = { items: [{ "[truncated]": true, omitted: 1 }] };
+  assert.equal(hasTruncatedEvidence(shortArrayWithMarkerObject), false);
+  assert.equal(oneShotPermissionOption(hookPrompt(shortArrayWithMarkerObject)), 0);
 });

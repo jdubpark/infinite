@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { mapClaudeHook, claudeAgent } from "../packages/attention/src/claude.js";
 import { mapCodexHook, mapCodexNotify, mapCodexOsc } from "../packages/attention/src/codex.js";
 import { cut, isTruncatedArrayMarker, MAX_ARRAY_ITEMS, truncateInput } from "../packages/attention/src/truncate.js";
+import { hasTruncatedEvidence } from "../packages/attention/src/delegation.js";
 
 const base = { session_id: "s", transcript_path: "/t", cwd: "/w", permission_mode: "default" };
 
@@ -123,6 +124,22 @@ test("truncateInput enforces the 16 KiB UTF-8 cap", () => {
   assert.ok(bytes(nested) <= 16384);
   const wide = truncateInput({ a: "日".repeat(4000), b: "日".repeat(4000), c: "日".repeat(4000) });
   assert.ok(bytes(wide) <= 16384, `multibyte case was ${bytes(wide)}`);
+
+  const manyTruncatedArrays = truncateInput(Object.fromEntries(
+    Array.from({ length: 140 }, (_, i) => [`k${String(i).padStart(3, "0")}`, Array.from({ length: 51 }, () => 0)]),
+  ));
+  assert.ok(Buffer.byteLength(JSON.stringify(manyTruncatedArrays), "utf8") <= 16_384);
+  assert.equal(hasTruncatedEvidence(manyTruncatedArrays), true);
+
+  const manyPrimitives = truncateInput(Object.fromEntries(
+    Array.from({ length: 2000 }, (_, i) => [`k${String(i).padStart(4, "0")}`, 1]),
+  ));
+  assert.ok(Buffer.byteLength(JSON.stringify(manyPrimitives), "utf8") <= 16_384);
+  assert.equal(hasTruncatedEvidence(manyPrimitives), true);
+
+  const hugeKey = truncateInput({ ["a".repeat(20_000)]: 1 });
+  assert.ok(Buffer.byteLength(JSON.stringify(hugeKey), "utf8") <= 16_384);
+  assert.equal(hasTruncatedEvidence(hugeKey), true);
 });
 
 test("truncateInput annotates dropped array items without altering 50-item arrays", () => {

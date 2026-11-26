@@ -180,7 +180,7 @@ function placeGroupsAndNonMembersOutside(
   return groupBoxes(diagram, nodes);
 }
 
-function deduplicateById<T extends { id: string }>(items: readonly T[]): T[] {
+export function deduplicateById<T extends { id: string }>(items: readonly T[]): T[] {
   const seen = new Set<string>();
   const unique: T[] = [];
   for (const item of items) {
@@ -189,6 +189,51 @@ function deduplicateById<T extends { id: string }>(items: readonly T[]): T[] {
     unique.push(item);
   }
   return unique;
+}
+
+export function normalizeDiagram<T extends Pick<Diagram, "nodes" | "groups" | "sequence">>(diagram: T): T {
+  const nodes = deduplicateById(diagram.nodes);
+  const groups = deduplicateById(diagram.groups);
+  const sequence = diagram.sequence
+    ? { ...diagram.sequence, participants: deduplicateById(diagram.sequence.participants) }
+    : undefined;
+  return {
+    ...diagram,
+    nodes,
+    groups,
+    ...(sequence ? { sequence } : {}),
+  } as T;
+}
+
+export function describeDiagram(diagram: Pick<Diagram, "title" | "nodes" | "edges" | "groups" | "sequence">): string {
+  const normalized = normalizeDiagram(diagram);
+  const changes = normalized.nodes.reduce((counts, node) => {
+    if (node.change) counts[node.change] += 1;
+    return counts;
+  }, { added: 0, modified: 0, removed: 0 });
+  const title = normalized.title || "Change map";
+  const count = normalized.sequence?.participants.length ?? normalized.nodes.length;
+  const relationships = normalized.sequence?.messages.length ?? normalized.edges.length;
+  return `${title}: ${count} components, ${changes.modified} modified, ${changes.added} added, ${changes.removed} removed; ${relationships} relationships`;
+}
+
+export function relatedDiagramGroups(
+  diagram: Pick<Diagram, "nodes" | "edges" | "groups" | "sequence">,
+  selectedId: string | undefined,
+): Set<string> {
+  const normalized = normalizeDiagram(diagram);
+  if (!selectedId) return new Set(normalized.groups.map(group => group.id));
+  const neighbors = new Set<string>([selectedId]);
+  const relationships = normalized.sequence?.messages ?? normalized.edges;
+  for (const edge of relationships) {
+    if (edge.from === selectedId) neighbors.add(edge.to);
+    if (edge.to === selectedId) neighbors.add(edge.from);
+  }
+  const related = new Set<string>();
+  for (const node of normalized.nodes) {
+    if (node.group && neighbors.has(node.id)) related.add(node.group);
+  }
+  return related;
 }
 
 function layoutSequence(sequence: NonNullable<Diagram["sequence"]>): DiagramLayout {
@@ -250,11 +295,10 @@ function layoutSequence(sequence: NonNullable<Diagram["sequence"]>): DiagramLayo
 }
 
 export function layoutDiagram(diagram: Pick<Diagram, "direction" | "nodes" | "edges" | "groups" | "sequence">): DiagramLayout {
-  if (diagram.sequence) return layoutSequence(diagram.sequence);
+  const normalized = normalizeDiagram(diagram);
+  if (normalized.sequence) return layoutSequence(normalized.sequence);
 
-  const uniqueNodes = deduplicateById(diagram.nodes);
-  const uniqueGroups = deduplicateById(diagram.groups);
-  const normalized = { ...diagram, nodes: uniqueNodes, groups: uniqueGroups };
+  const uniqueNodes = normalized.nodes;
   const ids = uniqueNodes.map(node => node.id);
   const indexById = new Map(ids.map((id, index) => [id, index]));
   const edges: EdgeRef[] = diagram.edges

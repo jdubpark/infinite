@@ -87,5 +87,43 @@ export function truncateInput(input: Record<string, unknown>): Record<string, un
     }
   };
   collapse(out, 0);
+  if (size() <= CAP_BYTES) return out;
+
+  const markerBytes = utf8Length(JSON.stringify("[truncated]"));
+  const topObjects = Object.keys(out)
+    .filter(key => out[key] && typeof out[key] === "object")
+    .map(key => ({ key, bytes: utf8Length(JSON.stringify(out[key])) }))
+    .sort((a, b) => b.bytes - a.bytes);
+  let current = size();
+  for (const entry of topObjects) {
+    if (current <= CAP_BYTES) break;
+    out[entry.key] = "[truncated]";
+    current -= entry.bytes - markerBytes;
+  }
+  if (size() <= CAP_BYTES) return out;
+
+  const topValues = Object.keys(out)
+    .map(key => ({ key, bytes: utf8Length(JSON.stringify(out[key])) }))
+    .filter(entry => entry.bytes > markerBytes)
+    .sort((a, b) => b.bytes - a.bytes);
+  current = size();
+  for (const entry of topValues) {
+    if (current <= CAP_BYTES) break;
+    out[entry.key] = "[truncated]";
+    current -= entry.bytes - markerBytes;
+  }
+  if (size() <= CAP_BYTES) return out;
+
+  const keys = Object.keys(out);
+  out["[truncated]"] = "[truncated]";
+  current = size();
+  for (let i = keys.length - 1; i >= 0 && current > CAP_BYTES; i--) {
+    const key = keys[i]!;
+    if (key === "[truncated]") continue;
+    const entryBytes = utf8Length(JSON.stringify(key)) + 1 + utf8Length(JSON.stringify(out[key])) + 1;
+    delete out[key];
+    current -= entryBytes;
+  }
+  if (size() > CAP_BYTES) return { "[truncated]": "[truncated]" };
   return out;
 }

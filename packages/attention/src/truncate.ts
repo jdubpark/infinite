@@ -1,6 +1,12 @@
 const SHORT_FIELDS = new Set(["content", "old_string", "new_string"]);
 const CAP_BYTES = 16 * 1024;
 const MIN_CHARS = 200;
+export const MAX_ARRAY_ITEMS = 50;
+
+export interface TruncatedArrayMarker {
+  "[truncated]": true;
+  omitted: number;
+}
 
 export function cut(text: string, max: number): string {
   return text.length <= max ? text : `${text.slice(0, max)} … [+${text.length - max} chars]`;
@@ -23,6 +29,13 @@ interface Slot { container: Record<string, unknown> | unknown[]; key: string | n
 const isObject = (v: unknown): v is Record<string, unknown> => !!v && typeof v === "object" && !Array.isArray(v);
 const set = (slot: Slot, value: string) => { (slot.container as Record<string | number, unknown>)[slot.key] = value; };
 
+export function isTruncatedArrayMarker(value: unknown): value is TruncatedArrayMarker {
+  if (!isObject(value)) return false;
+  const keys = Object.keys(value);
+  return keys.length === 2 && value["[truncated]"] === true &&
+    typeof value.omitted === "number" && Number.isInteger(value.omitted) && value.omitted > 0;
+}
+
 export function truncateInput(input: Record<string, unknown>): Record<string, unknown> {
   const slots: Slot[] = [];
 
@@ -33,7 +46,9 @@ export function truncateInput(input: Record<string, unknown>): Record<string, un
     }
     if (Array.isArray(value)) {
       const arr: unknown[] = [];
-      value.slice(0, 50).forEach((item, i) => { arr[i] = copyValue(arr, i, item, depth + 1, 4000); });
+      const kept = Math.min(value.length, MAX_ARRAY_ITEMS);
+      for (let i = 0; i < kept; i++) arr[i] = copyValue(arr, i, value[i], depth + 1, 4000);
+      if (value.length > MAX_ARRAY_ITEMS) arr.push({ "[truncated]": true, omitted: value.length - MAX_ARRAY_ITEMS } satisfies TruncatedArrayMarker);
       return arr;
     }
     if (isObject(value) && depth < 3) return copyObject(value, depth + 1);
@@ -72,5 +87,54 @@ export function truncateInput(input: Record<string, unknown>): Record<string, un
     }
   };
   collapse(out, 0);
+  if (size() <= CAP_BYTES) return out;
+
+  const markerBytes = utf8Length(JSON.stringify("[truncated]"));
+  const serializedBytes = (value: unknown): number | undefined => {
+    const serialized = JSON.stringify(value);
+    return serialized === undefined ? undefined : utf8Length(serialized);
+  };
+  const topObjects = Object.keys(out)
+    .flatMap(key => {
+      const value = out[key];
+      if (!value || typeof value !== "object") return [];
+      const bytes = serializedBytes(value);
+      return bytes !== undefined && bytes > markerBytes ? [{ key, bytes }] : [];
+    })
+    .sort((a, b) => b.bytes - a.bytes);
+  let current = size();
+  for (const entry of topObjects) {
+    if (current <= CAP_BYTES) break;
+    out[entry.key] = "[truncated]";
+    current -= entry.bytes - markerBytes;
+  }
+  if (size() <= CAP_BYTES) return out;
+
+  const topValues = Object.keys(out)
+    .flatMap(key => {
+      const bytes = serializedBytes(out[key]);
+      return bytes !== undefined && bytes > markerBytes ? [{ key, bytes }] : [];
+    })
+    .sort((a, b) => b.bytes - a.bytes);
+  current = size();
+  for (const entry of topValues) {
+    if (current <= CAP_BYTES) break;
+    out[entry.key] = "[truncated]";
+    current -= entry.bytes - markerBytes;
+  }
+  if (size() <= CAP_BYTES) return out;
+
+  const keys = Object.keys(out);
+  out["[truncated]"] = "[truncated]";
+  current = size();
+  for (let i = keys.length - 1; i >= 0 && current > CAP_BYTES; i--) {
+    const key = keys[i]!;
+    if (key === "[truncated]") continue;
+    const valueBytes = serializedBytes(out[key]);
+    delete out[key];
+    if (valueBytes === undefined) continue;
+    current -= utf8Length(JSON.stringify(key)) + 1 + valueBytes + 1;
+  }
+  if (size() > CAP_BYTES) return { "[truncated]": "[truncated]" };
   return out;
 }

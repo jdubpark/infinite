@@ -1,3 +1,4 @@
+import { isAbsolute } from "node:path";
 import type { Attention } from "@infinite/attention";
 import { z } from "zod";
 export type Role = "owner" | "controller" | "viewer";
@@ -237,14 +238,15 @@ export interface Project {
   source?: import("./team-types.js").ProjectSource;
   autonomy?: import("./autonomy.js").AutonomyMode;
 }
-export interface AgentProfile {
-  command: string;
-  args: string[];
-  appServerCommand?: string;
-  appServerArgs?: string[];
-  workspaceDir?: string;
-  sharedWorkspace?: boolean;
-}
+export const agentProfileSchema = z.object({
+  command: z.string(),
+  args: z.array(z.string()),
+  appServerCommand: z.string().optional(),
+  appServerArgs: z.array(z.string()).optional(),
+  workspaceDir: z.string().refine(isAbsolute, "Workspace directory must be absolute").optional(),
+  sharedWorkspace: z.boolean().optional(),
+});
+export type AgentProfile = z.infer<typeof agentProfileSchema>;
 export interface Config {
   linear?: { apiKeyFile: string; endpoint?: string; reportName?: string };
   hostLoad?: { minAvailableMemoryGiB: number; maxLoadPerCpu: number };
@@ -282,6 +284,7 @@ export interface Config {
   repositoryGraphs?: { command: string; args: string[]; graphifyCommand: string; cacheDir: string; projectIds?: string[]; timeoutMs: number; debounceMs: number; intervalMs: number };
   port: number;
   origin: string;
+  browserSessions?: boolean;
   stateDir: string;
   runDir: string;
   keyFile: string;

@@ -12,7 +12,7 @@ interface StoredMessage {
 }
 
 const bindingKey = (channelId: string, threadTs: string) => `${channelId}:${threadTs}`;
-const FORM_METHODS = new Set(["auth.test", "conversations.replies", "apps.connections.open", "chat.getPermalink"]);
+const FORM_METHODS = new Set(["auth.test", "conversations.info", "conversations.replies", "apps.connections.open", "chat.getPermalink"]);
 const toMicros = (ts: string) => {
   const [seconds, fraction = ""] = ts.split(".");
   return Number(seconds) * 1_000_000 + Number(fraction.padEnd(6, "0").slice(0, 6));
@@ -33,6 +33,8 @@ export async function startSlackServer(options: { teamId?: string; botUserId?: s
   const nextTs = () => fromMicros(++latest);
   const observe = (ts: string) => { latest = Math.max(latest, toMicros(ts)); };
   const threads = new Map<string, StoredMessage[]>();
+  const conversationOverrides = new Map<string, Record<string, unknown>>();
+  const conversationErrors = new Map<string, string>();
   const hidden = new Set<string>();
   const posts: StoredMessage[] = [];
   const postPayloads: Record<string, any>[] = [];
@@ -76,6 +78,20 @@ export async function startSlackServer(options: { teamId?: string; botUserId?: s
           reply(200, { ok: true, team_id: teamId, user_id: botUserId, bot_id: botId }); return;
         case "apps.connections.open":
           reply(200, { ok: true, url: socketAddress ?? `ws://127.0.0.1:${port}/socket` }); return;
+        case "conversations.info": {
+          const channelId = body.channel;
+          if (typeof channelId !== "string") { reply(200, { ok: false, error: "invalid_arguments" }); return; }
+          const error = conversationErrors.get(channelId);
+          if (error) { reply(200, { ok: false, error }); return; }
+          reply(200, { ok: true, channel: {
+            id: channelId, is_channel: channelId.startsWith("C"), is_group: channelId.startsWith("G"),
+            is_im: false, is_mpim: false, is_private: channelId.startsWith("G"),
+            is_shared: false, is_org_shared: false, is_pending_ext_shared: false,
+            context_team_id: teamId, is_ext_shared: false, shared_team_ids: [teamId],
+            pending_connected_team_ids: [], pending_shared: [], is_member: true,
+            ...conversationOverrides.get(channelId),
+          } }); return;
+        }
         case "conversations.replies": {
           const key = bindingKey(body.channel, body.ts);
           if (hidden.has(body.channel)) { reply(200, { ok: false, error: "not_in_channel" }); return; }
@@ -162,6 +178,11 @@ export async function startSlackServer(options: { teamId?: string; botUserId?: s
         });
       }
       threads.set(key, list);
+    },
+    setConversationInfo(channelId: string, info: Record<string, unknown>) { conversationOverrides.set(channelId, info); },
+    setConversationError(channelId: string, error?: string) {
+      if (error === undefined) conversationErrors.delete(channelId);
+      else conversationErrors.set(channelId, error);
     },
     hide(channelId: string) { hidden.add(channelId); },
     posts(binding: IntakeThread) {

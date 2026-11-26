@@ -39,6 +39,7 @@ import { MAX_OUTBOX_EVENTS, appendRunEvent as runEvent, pathField, planDigest, p
 import { taskFeatures } from "./task-features.js";
 import { teamUsage } from "./team-usage.js";
 import { teamListItem, type TeamListItem } from "./team-list.js";
+import { teamLastActivityAt, TeamSaveTracker } from "./team-activity.js";
 import { ProviderLimits, switchesMember, type LimitObservation } from "./provider-limits.js";
 import type { LinearService } from "./linear.js";
 import type { Readings } from "./readings.js";
@@ -250,6 +251,7 @@ const quietFor = (member: TeamMember) => Date.now() - Date.parse(member.lastActi
 
 export class TeamService {
   private readonly records = new Map<string, Stored>();
+  private readonly activity = new TeamSaveTracker();
   private readonly retiredRunIds = new Set<string>();
   private readonly queues = new KeyedQueue();
   private readonly pendingCreates = new PendingCreates();
@@ -309,7 +311,7 @@ export class TeamService {
       const id = file.slice(0, -7);
       const stored = unseal<Stored>(key, `team:${id}`, readFileSync(join(this.directory, file), "utf8"));
       if (stored.run.id !== id) throw new TeamError(409, "invalid-team-record", "A team record cannot be authenticated.");
-      this.records.set(id, stored);
+      this.records.set(id, stored); this.activity.seed(stored);
       if (stored.run.blackboard?.tools === true) for (const member of stored.run.members) if (member.entryTools === true) this.entryQueue.add(stored.run.id, member.memberId);
       if (this.options?.events && stored.ledgerStatus === undefined) stored.ledgerStatus = stored.run.status;
       for (const request of stored.run.permissionRecovery?.requests ?? []) if (request.status === "expanding" &&
@@ -577,7 +579,7 @@ export class TeamService {
     const tracking = this.linear?.updateTeam(stored.run, stored.run.linearTracking === true, this.canResume(stored));
     run.linear = this.linear?.getTeam(run.id) ?? tracking ?? run.linear;
     const safeRun = {
-      ...run,
+      ...run, lastActivityAt: teamLastActivityAt(stored.run),
       checks: run.checks.map(({ scan: _scan, ...check }) => check),
       ...(this.trackingHold(stored, run.linear) ? { reason: `New work waits for Linear tracking: ${run.linear!.reason ?? "Linear has not confirmed current requirements."}` } : {}),
       resumable: this.canResume(stored, run.linear?.status),
@@ -604,17 +606,13 @@ export class TeamService {
   }
   private save(stored: Stored) {
     const retention = this.retentionState(stored);
-    if (retention.status !== stored.run.status) {
-      retention.status = stored.run.status;
-      retention.statusAt = this.retentionNow();
-    }
+    if (retention.status !== stored.run.status) { retention.status = stored.run.status; retention.statusAt = this.retentionNow(); }
     if (this.options?.events) this.emitStatusEvents(stored, retention.statusAt);
     this.endPermissionTask(stored);
     this.objectiveTests.mark(stored);
-    stored.run.updatedAt = timestamp();
-    writeSealed(join(this.directory, `${stored.run.id}.sealed`), this.key, `team:${stored.run.id}`, stored);
-    if (this.options?.events) this.flushOutbox(stored);
-    this.mirrorEntries(stored.run);
+    const wrote = this.activity.commit(stored, () => writeSealed(join(this.directory, `${stored.run.id}.sealed`), this.key, `team:${stored.run.id}`, stored), timestamp, this.records);
+    if (this.options?.events && (wrote || stored.outbox?.length)) this.flushOutbox(stored);
+    if (wrote || this.entryBacklog.has(stored.run.id) && this.options?.entries?.retryable()) this.mirrorEntries(stored.run);
   }
   private mirrorEntries(run: TeamRun) {
     const entries = this.options?.entries;
@@ -1057,7 +1055,7 @@ export class TeamService {
         const initialParallelism = internal?.missionId ? parsed.parallelism : ceiling;
         if (initialParallelism > ceiling)
           throw new TeamError(409, "team-parallelism-limit", "The initial worker limit exceeds this run's capacity ceiling.");
-        const run: TeamRun = { linearTracking: internal ? linearTracking : Boolean(project.linear), id: parsed.requestId, projectId: parsed.projectId, provider: parsed.provider, ...(lineup ? { lineup } : {}), ...(project.team.permissions ? { permissions: currentPermissions(structuredClone(project.team.permissions)), permissionDecisions: [] } : {}), ...(goal ? { goal } : {}), ...(internal?.missionId ? { missionId: internal.missionId } : {}), ...(internal?.requestSource ? { requestSource: internal.requestSource } : {}), ...(internal?.handoff ? { handoff: structuredClone(internal.handoff) } : {}), ...(titleSource ? { titleSource } : {}), title: parsed.title, objective: parsed.objective, parallelismCeiling: ceiling, parallelism: initialParallelism, revision: 1, status: "planning", createdAt: at, updatedAt: at, workspace: teamWorkspacePath(root, directoryName), branch, baseCommit: "", tasks: [], members: [], decisions: [], checks: [], steering: [], events: [], round: 0 };
+        const run: TeamRun = { linearTracking: internal ? linearTracking : Boolean(project.linear), id: parsed.requestId, projectId: parsed.projectId, provider: parsed.provider, ...(lineup ? { lineup } : {}), ...(project.team.permissions ? { permissions: currentPermissions(structuredClone(project.team.permissions)), permissionDecisions: [] } : {}), ...(goal ? { goal } : {}), ...(internal?.missionId ? { missionId: internal.missionId } : {}), ...(internal?.requestSource ? { requestSource: internal.requestSource } : {}), ...(internal?.handoff ? { handoff: structuredClone(internal.handoff) } : {}), ...(titleSource ? { titleSource } : {}), title: parsed.title, objective: parsed.objective, parallelismCeiling: ceiling, parallelism: initialParallelism, revision: 1, status: "planning", createdAt: at, updatedAt: at, lastActivityAt: at, workspace: teamWorkspacePath(root, directoryName), branch, baseCommit: "", tasks: [], members: [], decisions: [], checks: [], steering: [], events: [], round: 0 };
         const start = startMode(project, lineup); run.autonomy = goal ? autonomyOf(internal) : start.mode;
         const routing = this.router?.pin(project.team.routing, run.autonomy, lineup, run.projectId);
         if (routing) run.routing = routing;
@@ -2032,7 +2030,7 @@ export class TeamService {
         for (const member of run.members.filter(item => item.revision === run.revision && item.status === "running" && !item.report)) {
           const state = await this.manager.state(member.sessionId);
           if (state.status !== "running") member.status = "unavailable";
-          member.lastActivityAt = state.attention.lastActivityAt;
+          if (!["unavailable", "recording-error"].includes(state.status)) member.lastActivityAt = state.attention.lastActivityAt;
           member.pendingLimit = Boolean(state.attention.limit);
         }
         this.save(stored);
@@ -2135,7 +2133,7 @@ export class TeamService {
           }
           if (!member.report) {
             const state = await this.manager.state(member.sessionId);
-            member.lastActivityAt = state.attention.lastActivityAt;
+            if (!["unavailable", "recording-error"].includes(state.status)) member.lastActivityAt = state.attention.lastActivityAt;
             member.pendingLimit = Boolean(state.attention.limit);
             const journalDrained = !page.more && member.cursor >= state.seq;
             if (state.status === "exited" && (page.more || member.cursor < state.seq)) { this.save(stored); continue; }

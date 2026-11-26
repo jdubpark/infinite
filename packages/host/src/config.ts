@@ -2,7 +2,7 @@ import { readFileSync, realpathSync, statSync } from "node:fs";
 import { resolve, relative, isAbsolute } from "node:path";
 import { createHash } from "node:crypto";
 import { z } from "zod";
-import type { Config } from "./types.js";
+import { agentProfileSchema, type Config } from "./types.js";
 import { assertRunnerDeployment, parseDeployment, runtimeSecurity } from "./deployment.js";
 import { machineIdentity } from "./machine.js";
 import { autonomyModeSchema } from "./autonomy.js";
@@ -119,6 +119,7 @@ const schema = z
     }).strict().optional(),
     port: z.number().int().min(0).max(65535),
     origin: z.url(),
+    browserSessions: z.boolean().default(true),
     stateDir: z.string(),
     runDir: z.string(),
     keyFile: z.string(),
@@ -150,8 +151,7 @@ const schema = z
     agents: z
       .partialRecord(
         z.enum(["claude", "codex", "grok", "opencode", "demo"]),
-        z.object({ command: z.string(), args: z.array(z.string()), appServerCommand: z.string().optional(), appServerArgs: z.array(z.string()).optional(),
-          workspaceDir: z.string().refine(isAbsolute, "Workspace directory must be absolute").optional(), sharedWorkspace: z.boolean().optional() }),
+        agentProfileSchema,
       )
       .default({}),
     attention: z

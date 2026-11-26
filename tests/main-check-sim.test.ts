@@ -1,9 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import type { MainCheckNotice, MainCheckService } from "../packages/host/src/main-check.js";
+import { anchorOf } from "../packages/host/src/main-check-anchors.js";
 import type { MainCheckPorts } from "../packages/host/src/main-check-ports.js";
 import { checksDigest, outcomeOf, type CheckSummary, type MainCheckRecord, type Retiring } from "../packages/host/src/main-check-state.js";
-import type { CensusResult } from "../packages/host/src/process-census.js";
+import type { CensusResult, EarlierProcesses } from "../packages/host/src/process-census.js";
 import type { Config } from "../packages/host/src/types.js";
 import type { Counts } from "./outcome-sim-script.js";
 import { simulate, type Variant, Violation } from "./fixtures/main-check-sim.js";
@@ -41,6 +42,7 @@ const FLOORS: Readonly<Record<string, number>> = {
   "checks:changed-at-measured-head": 28, "command:from-earlier-checks": 3, "command:drained": 277,
   "census:run:clean": 1097, "census:run:finds": 700, "census:run:fail": 45, "census:root:fail": 121,
   "removal:fail": 17, "waiting:cleanup": 5, "waiting:processes": 296, "retire:removed:earlier": 219,
+  "ambient:started": 851, "escaper:new-pid": 64, "escaper:reused-pid": 77, "census:run:excused": 899, "census:run:excused:after-boot": 56,
   "waiting:another-check": 248, "waiting:attempts": 99, "waiting:execution-identity": 13, "waiting:census-unavailable": 29,
   "waiting:host-load": 22, "waiting:storage": 17,
   "outcome:passed": 174, "outcome:failed": 88, "outcome:error:copy-changed": 77, "outcome:error:workspace": 90,
@@ -71,6 +73,7 @@ type Private = {
   slots: Map<string, Slot>;
   retirement: Map<string, string>;
   listed: boolean;
+  load(projectId: string): void;
   phase: { kind: string; active?: unknown };
   unwritten: Set<unknown>;
   hostBusy(projectId: string): string | undefined;
@@ -86,6 +89,13 @@ type Private = {
 };
 const internals = (service: MainCheckService) => service as unknown as Private;
 const patch = (change: (host: Private) => void): Variant => ({ patch: service => change(internals(service)) });
+
+async function anchorNow(host: Private, projectId: string, entry: Retiring) {
+  const boot = host.ports.bootId();
+  const census = await host.ports.processes.census({ boot, processes: [], sessions: [], groups: [] }, entry.root, host.config.teams?.commandPrefix);
+  const anchor = await anchorOf(boot, census, pid => host.ports.processes.start(pid));
+  if (anchor) host.ports.anchors.write(projectId, entry.directory, anchor);
+}
 
 type Mutation = { name: string; invariant: string; variant: Variant };
 
@@ -126,6 +136,22 @@ const MUTATIONS: readonly Mutation[] = [
     variant: patch(host => {
       const removable = host.removable.bind(host);
       host.removable = (projectId, entry, result) => result.ok && removable(projectId, entry, { ok: true, findings: [] });
+    }) },
+  { name: "recovery takes an anchor for the entries an earlier host process left", invariant: "I4",
+    variant: patch(host => {
+      const load = host.load.bind(host);
+      host.load = projectId => {
+        load(projectId);
+        const record = host.slots.get(projectId)?.record;
+        for (const entry of [...(record?.retiring ?? []), ...(record?.running ? [record.running] : [])]) void anchorNow(host, projectId, entry).catch(() => undefined);
+      };
+    }) },
+  { name: "an anchored process is matched by its pid only", invariant: "I4",
+    variant: patch(host => {
+      const processes = host.ports.processes;
+      const byPid = async (earlier: EarlierProcesses | undefined) => earlier === undefined || earlier === "all" ? earlier
+        : Promise.all(earlier.map(async item => ({ pid: item.pid, start: await processes.start(item.pid) ?? item.start })));
+      host.ports.processes = { ...processes, census: async (witness, directory, prefix, earlier) => processes.census(witness, directory, prefix, await byPid(earlier)) };
     }) },
   { name: "an offered notice counts as told", invariant: "I5",
     variant: patch(host => {

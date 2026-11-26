@@ -168,7 +168,7 @@ const LASTING = new Set(["permission", "cross-device", "special-file", "missing-
 async function refusal(response: Response): Promise<never> {
   const reply = await response.json().catch(() => ({})) as { error?: unknown; code?: unknown; category?: unknown };
   const reason = typeof reply.error === "string" ? reply.error : `HTTP ${response.status}`;
-  if (response.status === 404 && reply.code === undefined) throw new MissingRouteError(`Host refused sync (${response.status}): ${reason}`);
+  if (response.status === 404 && (reply.code === undefined || reply.code === "route-not-found")) throw new MissingRouteError(`Host refused sync (${response.status}): ${reason}`);
   if ([401, 403, 404, 413].includes(response.status)) throw new FatalSyncError(`Host refused sync (${response.status}): ${reason}`);
   throw new SyncRequestError(reason, response.status, typeof reply.code === "string" ? reply.code : undefined, typeof reply.category === "string" ? reply.category : undefined);
 }

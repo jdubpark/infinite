@@ -42,7 +42,7 @@ type Stored = {
   attempted: boolean; issue?: Issue; baseline?: string; checkedAt?: string;
   blocked?: string; error?: string; failures: number; retryAt: number;
   terminal: boolean; comments: Record<string, Comment>;
-  label?: "add" | "added" | "remove"; labelFailures?: number; labelRetryAt?: number;
+  label?: "add" | "added" | "remove"; labelVersion?: number; labelFailures?: number; labelRetryAt?: number; labelProviderRetryAt?: number;
   retitle?: string; retitleFailures?: number; retitleRetryAt?: number;
   retitleWanted?: string;
   retitleSent?: { id: string; title: string }[];
@@ -225,8 +225,8 @@ export class LinearService {
       const status = (name: string) => `${name} feature execution\n\nStatus: ${run.status}\n${flag}Agent attempts: ${run.members.length}\nChecks passed: ${checks.filter(check => check.status === "passed").length}/${checks.length}\nIndependent review: ${run.review?.verdict ?? "not recorded"}\n\nChecks and review describe code readiness. They do not establish a product outcome or change Linear's workflow status.`;
       this.comment(stored, `status:${run.revision}:${run.status}`, status(reportName(this.config)), status(DEFAULT_REPORT_NAME));
     }
-    if (!run.missionId && run.status === "blocked" && stored.label !== "added" && stored.label !== "add") { stored.label = "add"; stored.labelFailures = 0; stored.labelRetryAt = 0; }
-    else if ((run.missionId || run.status !== "blocked") && (stored.label === "added" || stored.label === "add")) { stored.label = "remove"; stored.labelFailures = 0; stored.labelRetryAt = 0; }
+    if (!run.missionId && run.status === "blocked" && stored.label !== "added" && stored.label !== "add") { stored.label = "add"; stored.labelVersion = (stored.labelVersion ?? 0) + 1; stored.labelFailures = 0; stored.labelRetryAt = 0; }
+    else if ((run.missionId || run.status !== "blocked") && (stored.label === "added" || stored.label === "add")) { stored.label = "remove"; stored.labelVersion = (stored.labelVersion ?? 0) + 1; stored.labelFailures = 0; stored.labelRetryAt = 0; }
     this.save(stored); return this.view(stored);
   }
   getGoal(id: string) { return this.get("goal", id); }
@@ -258,7 +258,7 @@ export class LinearService {
     return Boolean(stored.issue && stored.checkedAt && Date.now() - Date.parse(stored.checkedAt) < windowMs && clock.verified === clock.requested);
   }
   private pendingComments(stored: Stored) { return Object.values(stored.comments).some(comment => !comment.delivered); }
-  private pendingLabel(stored: Stored) { return (stored.label === "add" || stored.label === "remove") && (stored.labelRetryAt ?? 0) <= Date.now(); }
+  private pendingLabel(stored: Stored) { return (stored.label === "add" || stored.label === "remove") && (stored.labelRetryAt ?? 0) <= Date.now() && (stored.labelProviderRetryAt ?? 0) <= Date.now(); }
   private pendingRetitle(stored: Stored) { return Boolean(stored.retitle && (stored.retitleRetryAt ?? 0) <= Date.now() && (stored.retitleSent?.length ?? 0) < RETITLE_SENT_LIMIT); }
   private view(stored: Stored, relaxed = false): LinearTrackingView {
     this.configuration(stored);
@@ -406,9 +406,16 @@ export class LinearService {
         this.success(stored);
       } catch (error) { this.failure(stored, error); continue; }
       if (this.pendingLabel(stored) && this.open()) {
-        try { await this.applyLabel(stored); }
+        const intent = stored.label;
+        if (intent !== "add" && intent !== "remove") continue;
+        const version = stored.labelVersion ?? 0;
+        try { await this.applyLabel(stored, intent, version); }
         catch (error) {
           if (this.closed) return;
+          const retryAt = error instanceof LinearFailure && error.retryAfterMs > 0 ? Date.now() + error.retryAfterMs : 0;
+          const providerDeferred = retryAt > (stored.labelProviderRetryAt ?? 0);
+          if (providerDeferred) stored.labelProviderRetryAt = retryAt;
+          if (stored.label !== intent || (stored.labelVersion ?? 0) !== version) { if (providerDeferred) this.save(stored); continue; }
           stored.labelFailures = (stored.labelFailures ?? 0) + 1;
           const backoff = Math.min(30 * 60000, 30000 * 2 ** Math.min(stored.labelFailures - 1, 6));
           stored.labelRetryAt = Date.now() + Math.max(backoff, error instanceof LinearFailure ? error.retryAfterMs : 0); this.save(stored);
@@ -457,27 +464,33 @@ export class LinearService {
     this.accept(stored, updated, generation);
     stored.retitleSent = stored.retitleSent?.filter(value => value.id !== attempt.id); this.save(stored);
   }
-  private async applyLabel(stored: Stored) {
-    const adding = stored.label === "add", teamId = stored.issue!.team.id, cached = this.labels.has(teamId);
+  private async applyLabel(stored: Stored, intent: "add" | "remove", version: number) {
+    const adding = intent === "add", teamId = stored.issue!.team.id, cached = this.labels.has(teamId);
+    const current = () => stored.label === intent && (stored.labelVersion ?? 0) === version;
     const change = async (labelId: string) => {
       const mutation = adding ? "issueAddLabel" : "issueRemoveLabel", operation = adding ? "InfiniteLinearIssueAddLabel" : "InfiniteLinearIssueRemoveLabel";
       const data = await this.graphql(operation, `mutation ${operation}($id: String!, $labelId: String!) { ${mutation}(id: $id, labelId: $labelId) { success } }`, { id: stored.issue!.id, labelId }, false);
       z.object({ success: z.literal(true) }).parse(data[mutation]);
     };
     let labelId = await this.blockedLabel(teamId, adding);
-    if (this.closed) return;
+    if (this.closed || !current()) return;
     if (labelId) {
       try { await change(labelId); }
       catch (error) {
         if (error instanceof LinearFailure && error.retryAfterMs > 0) throw error;
+        if (!current()) return;
         this.labels.delete(teamId);
         if (!cached || this.closed) throw error;
         labelId = await this.blockedLabel(teamId, adding);
+        if (this.closed || !current()) return;
         if (labelId) await change(labelId);
       }
-      if (this.closed) return;
+      if (this.closed || !current()) return;
     }
-    stored.label = adding ? "added" : undefined; stored.labelFailures = 0; stored.labelRetryAt = 0; this.save(stored);
+    if (!current()) return;
+    stored.label = adding ? "added" : undefined; stored.labelFailures = 0; stored.labelRetryAt = 0;
+    if ((stored.labelProviderRetryAt ?? 0) <= Date.now()) stored.labelProviderRetryAt = undefined;
+    this.save(stored);
   }
   private async blockedLabel(teamId: string, create: boolean) {
     const cached = this.labels.get(teamId);

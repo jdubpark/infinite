@@ -8,6 +8,7 @@ import { commandScope, EXIT_DRAIN_MS, STOP_GRACE_MS, STOP_SETTLE_MS, TeamError, 
 
 const CASE = { timeout: 20_000, skip: process.platform === "win32" && "process groups are POSIX" };
 const WAIT_MS = 10_000;
+const realSetTimeout = globalThis.setTimeout;
 type Command = { command: string; args: string[] };
 const leaves = (leader: string, left: string): Command => ({ command: "sh", args: ["-c", `echo $$ > '${leader}'; sleep 30 & echo $! > '${left}'; exit 3`] });
 const waits = (leader: string, left: string): Command => ({ command: "sh", args: ["-c", `echo $$ > '${leader}'; sleep 30 & echo $! > '${left}'; wait`] });
@@ -43,7 +44,7 @@ async function until(what: string, ready: () => boolean) {
   const deadline = Date.now() + WAIT_MS;
   while (!ready()) {
     if (Date.now() > deadline) assert.fail(`${what} within ${WAIT_MS} ms`);
-    await new Promise(resolve => setTimeout(resolve, 10));
+    await new Promise(resolve => realSetTimeout(resolve, 10));
   }
 }
 
@@ -58,6 +59,23 @@ class Run {
   readonly leftFile = join(this.base, "left");
   readonly controller = new AbortController();
   settledAt?: number;
+  private drainTimers?: TestContext["mock"]["timers"];
+
+  holdDrain(t: TestContext) {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    this.drainTimers = t.mock.timers;
+  }
+
+  releaseDrain(tickMs = 0) {
+    if (!this.drainTimers) return;
+    const timers = this.drainTimers;
+    this.drainTimers = undefined;
+    try {
+      if (tickMs > 0) timers.tick(tickMs);
+    } finally {
+      timers.reset();
+    }
+  }
 
   start(command: (leader: string, left: string) => Command, scope?: CommandScope): Promise<CommandResult> {
     const run = () => teamCommand(command(this.leaderFile, this.leftFile), this.base, this.controller.signal, 60_000);
@@ -73,13 +91,8 @@ class Run {
     await until("the leader is reaped", () => { const leader = pidIn(this.leaderFile); return leader !== undefined && gone(leader); });
   }
 
-  drainEnded(t: TestContext): boolean {
-    if (this.settledAt === undefined) return false;
-    t.skip("the command settled at the end of the drain before the test could stop it inside the drain");
-    return true;
-  }
-
   dispose() {
+    this.releaseDrain();
     const left = pidIn(this.leftFile);
     if (left !== undefined && Number.isSafeInteger(left) && left > 1 && !gone(left)) process.kill(left, "SIGKILL");
     rmSync(this.base, { recursive: true, force: true });
@@ -128,13 +141,15 @@ test("a command whose leader exited while its group holds the output settles a d
 test("a leftover that left the leader's group and session is neither waited for nor signalled", CASE, async t => {
   const run = new Run();
   try {
+    run.holdDrain(t);
     const result = run.start(escapes);
     const child = await run.left();
     await run.leaderExited();
-    if (run.drainEnded(t)) return;
+    assert.equal(run.settledAt, undefined, "the command stays in its drain until stopped");
     const stoppedAt = performance.now();
     run.controller.abort();
     const settled = await result;
+    run.releaseDrain(500);
     const waited = run.settledAt! - stoppedAt;
     assert.ok(waited >= 0 && waited < 250, `settled ${waited.toFixed(0)} ms after the stop`);
     assert.equal(settled.exitCode, 0);
@@ -150,13 +165,15 @@ test("a leftover that left the leader's group and session is neither waited for 
 test("a stop inside the drain settles at once and signals nothing", CASE, async t => {
   const run = new Run();
   try {
+    run.holdDrain(t);
     const result = run.start(leaves);
     const sleep = await run.left();
     await run.leaderExited();
-    if (run.drainEnded(t)) return;
+    assert.equal(run.settledAt, undefined, "the command stays in its drain until stopped");
     const stoppedAt = performance.now();
     run.controller.abort();
     const settled = await result;
+    run.releaseDrain(500);
     const waited = run.settledAt! - stoppedAt;
     assert.ok(waited >= 0 && waited < 250, `settled ${waited.toFixed(0)} ms after the stop`);
     assert.equal(settled.exitCode, 3);
@@ -190,13 +207,15 @@ test("a command inside a scope that records it ends with its leader the same way
   const run = new Run();
   let recorded: number | undefined;
   try {
+    run.holdDrain(t);
     const result = run.start(leaves, { starting: () => undefined, started: pid => { recorded = pid; } });
     const sleep = await run.left();
     await run.leaderExited();
     assert.equal(recorded, pidIn(run.leaderFile), "the scope recorded the leader");
-    if (run.drainEnded(t)) return;
+    assert.equal(run.settledAt, undefined, "the command stays in its drain until stopped");
     run.controller.abort();
     const settled = await result;
+    run.releaseDrain(500);
     assert.equal(settled.interrupted, false);
     assert.equal(settled.leftover, true);
     await new Promise(resolve => setTimeout(resolve, 500));

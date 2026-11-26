@@ -1,7 +1,8 @@
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { createServer } from "node:net";
-import { existsSync, mkdtempSync, mkdirSync, writeFileSync, readdirSync, readFileSync, rmSync, realpathSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { accessSync, chmodSync, constants as fsConstants, existsSync, lstatSync, mkdtempSync, mkdirSync, writeFileSync, readdirSync, readFileSync, rmSync, realpathSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { randomBytes, randomUUID } from "node:crypto";
 import { hashToken } from "../packages/host/src/config.js";
 import { createApp } from "../packages/host/src/server.js";
@@ -14,9 +15,9 @@ export const waitFor = async <T>(
   accepts: (value: T) => boolean,
   timeout = 10000,
 ): Promise<T> => {
-  const until = Date.now() + timeout;
+  const until = performance.now() + timeout;
   let last: T | undefined;
-  while (Date.now() < until) {
+  while (performance.now() < until) {
     last = await fn();
     if (accepts(last)) return last;
     await new Promise((r) => setTimeout(r, 100));
@@ -240,7 +241,7 @@ export async function claimControl(
   return { lease, headers: { "X-Infinite-Client": clientId, "X-Infinite-Control": lease.id } };
 }
 
-export async function inProcessHost(options?: { configure?: (config: Config) => void }) {
+export async function inProcessHost(options?: { configure?: (config: Config) => void; appOptions?: Parameters<typeof createApp>[2] }) {
   const root = realpathSync(mkdtempSync("/tmp/inf-psync-guard-"));
   const workspace = join(root, "workspace"); mkdirSync(workspace);
   const key = randomBytes(32);
@@ -254,7 +255,7 @@ export async function inProcessHost(options?: { configure?: (config: Config) => 
     tokens: roles.map(role => ({ id: role, label: role, role, hash: hashToken(tokens[role]) })),
   };
   options?.configure?.(config);
-  const host = createApp(config, key);
+  const host = createApp(config, key, options?.appOptions);
   await new Promise<void>(resolve => host.server.listen(0, "127.0.0.1", resolve));
   config.port = (host.server.address() as { port: number }).port;
   const origin = `http://127.0.0.1:${config.port}`;
@@ -274,4 +275,44 @@ export async function inProcessHost(options?: { configure?: (config: Config) => 
       }
     },
   };
+}
+
+function hasSecureAncestors(directory: string, trustedUid: number): boolean {
+  let current = directory;
+  for (; ; current = dirname(current)) {
+    let info;
+    try { info = lstatSync(current); } catch { return false; }
+    if (info.isSymbolicLink() || !info.isDirectory()) return false;
+    if ((info.uid !== 0 && info.uid !== trustedUid) || (info.mode & 0o022) !== 0) return false;
+    if (current === "/") return true;
+  }
+}
+
+function isOutsideDirectory(candidate: string, boundary: string): boolean {
+  const rel = relative(boundary, candidate);
+  return rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel);
+}
+
+export function mkdtempSecure(prefix: string): string {
+  const uid = process.getuid!();
+  let home: string | undefined;
+  try { home = realpathSync(homedir()); } catch { }
+  const candidates = [
+    process.env.INFINITE_TEST_STAGING_ROOT,
+    process.env.XDG_RUNTIME_DIR,
+    process.platform === "linux" ? `/run/user/${uid}` : undefined,
+    tmpdir(),
+  ].filter((value): value is string => Boolean(value));
+  for (const candidate of candidates) {
+    try {
+      const canonical = realpathSync(candidate);
+      if (home && !isOutsideDirectory(canonical, home)) continue;
+      accessSync(canonical, fsConstants.W_OK | fsConstants.X_OK);
+      if (!hasSecureAncestors(canonical, uid)) continue;
+      const root = realpathSync(mkdtempSync(join(canonical, prefix)));
+      chmodSync(root, 0o700);
+      return root;
+    } catch { }
+  }
+  throw new Error("No writable non-home directory with secure ancestors is available; set INFINITE_TEST_STAGING_ROOT or XDG_RUNTIME_DIR.");
 }

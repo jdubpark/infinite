@@ -4,6 +4,7 @@ import { realpathSync } from "node:fs";
 import { isAbsolute, relative, resolve } from "node:path";
 import { z } from "zod";
 import { failureReason } from "./failure-reason.js";
+import { signalGroup, watchLeader } from "./process-group.js";
 import { agentModelClientEnvironment } from "./egress.js";
 import type { Manager } from "./manager.js";
 import type { ChatMessage } from "./session-content.js";
@@ -177,6 +178,7 @@ async function collectProcess(command: string, args: string[], options: { cwd: s
     let child: ChildProcess;
     try { child = spawn(command, args, { cwd: options.cwd, env: options.env, stdio: ["pipe", "pipe", "pipe"], detached: process.platform !== "win32" }); }
     catch { rejectPromise(new Error("spawn")); return; }
+    const leader = watchLeader(child);
     let stdout = Buffer.alloc(0), stderrTail = Buffer.alloc(0), stopped: string | undefined;
     let closeCode: number | null | undefined, closeHandled = false, escalationDone = false;
     const finish = () => {
@@ -190,9 +192,9 @@ async function collectProcess(command: string, args: string[], options: { cwd: s
     const stop = (reason: string) => {
       if (stopped) return;
       stopped = reason;
-      try { if (child.pid && process.platform !== "win32") process.kill(-child.pid, "SIGTERM"); else child.kill("SIGTERM"); } catch {}
+      signalGroup(child, "SIGTERM");
       setTimeout(() => {
-        try { if (child.pid && process.platform !== "win32") process.kill(-child.pid, "SIGKILL"); else child.kill("SIGKILL"); } catch {}
+        signalGroup(child, "SIGKILL");
         escalationDone = true;
         finish();
       }, 3000);
@@ -209,6 +211,10 @@ async function collectProcess(command: string, args: string[], options: { cwd: s
     child.on("error", () => { stopped ??= "spawn"; escalationDone = true; });
     child.on("close", code => {
       closeCode = code;
+      if (leader.leftover && !stopped) {
+        stopped = "output-held";
+        escalationDone = true;
+      }
       if (!stopped) clearTimeout(timer);
       finish();
     });

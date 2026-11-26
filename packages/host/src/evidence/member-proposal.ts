@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { bytes, boundedJson } from "../intent-report.js";
-import { ID_RE } from "../objective-types.js";
+import { ID_RE } from "../schema-primitives.js";
 
 export const PROPOSAL_FIELD_LIMITS = { statementBytes: 500, refutedByBytes: 500, testBytes: 1_024 } as const;
 

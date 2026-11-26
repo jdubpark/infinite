@@ -77,7 +77,10 @@ test("subscription plan updates are owner-only, validated, and reset to config",
 test("the encrypted channel carries the phone cost screen and owner plan edits", { timeout: 60000 }, async () => {
   const host = await startHost({ config: {
     machine: { id: randomUUID(), label: "Test machine" }, remote: { enabled: true },
-    usage: { prices: {}, budgets: {}, accounts: { claude: { kind: "subscription", match: [], planUsd: 20 } } },
+    usage: { prices: {}, budgets: {}, accounts: {
+      claude: { kind: "subscription", match: [], planUsd: 20 },
+      "claude+work@example.com": { kind: "subscription", match: [], planUsd: 25 },
+    } },
   } });
   const owner = createRemoteClient({ url: host.origin, token: host.tokens.owner });
   try {
@@ -86,7 +89,15 @@ test("the encrypted channel carries the phone cost screen and owner plan edits",
     const result = await owner.request<{ accounts: { id: string; planUsd?: number; planSource?: string }[] }>("/usage/accounts/claude/plan", { method: "PUT", body: { planUsd: 9.99 } });
     assert.equal(result.accounts.find(account => account.id === "claude")?.planUsd, 9.99);
     assert.equal(result.accounts.find(account => account.id === "claude")?.planSource, "owner");
-    await assert.rejects(owner.request("/usage/accounts/cl%61ude/plan", { method: "PUT", body: { planUsd: 1 } }), "encoded route segments stay refused");
+    const encoded = await owner.request<{ accounts: { id: string; planUsd?: number; planSource?: string }[] }>(
+      `/usage/accounts/${encodeURIComponent("claude+work@example.com")}/plan`,
+      { method: "PUT", body: { planUsd: 14.5 } },
+    );
+    assert.equal(encoded.accounts.find(account => account.id === "claude+work@example.com")?.planUsd, 14.5);
+    assert.equal(encoded.accounts.find(account => account.id === "claude+work@example.com")?.planSource, "owner");
+    for (const denied of ["/usage/accounts/claude/%70lan", "/usage/accounts/%2e%2e/plan", "/usage/accounts/a%2fb/plan", "/usage/accounts/%252e%252e/plan"]) {
+      await assert.rejects(owner.request(denied, { method: "PUT", body: { planUsd: 1 } }), `${denied} stays refused`);
+    }
   } finally { owner.close(); await host.stop(); }
 });
 

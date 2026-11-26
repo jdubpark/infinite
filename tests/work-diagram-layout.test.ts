@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { LAYER_GAP, NODE_H, NODE_W, layoutDiagram } from "../packages/remote/src/work-diagram-layout.js";
+import { LAYER_GAP, NODE_H, NODE_W, describeDiagram, layoutDiagram, normalizeDiagram, relatedDiagramGroups } from "../packages/remote/src/work-diagram-layout.js";
 import type { Diagram } from "../packages/remote/src/understanding-work.js";
 
 function flow(direction: Diagram["direction"], ids: string[], pairs: [string, string][]): Pick<Diagram, "direction" | "nodes" | "edges" | "groups" | "sequence"> {
@@ -80,4 +80,128 @@ test("sequence layout gives lanes and ordered message rows", () => {
   assert.deepEqual(l.lanes?.map(lane => lane.x), [0, NODE_W + LAYER_GAP]);
   assert.equal(l.edges[0]!.points[0]![1], NODE_H + 36);
   assert.equal(l.edges[1]!.points[0]![1], NODE_H + 72);
+});
+
+test("duplicate node IDs deduplicate first-wins without corrupting topological layering or groups", () => {
+  const d: Pick<Diagram, "direction" | "nodes" | "edges" | "groups" | "sequence"> = {
+    direction: "LR",
+    nodes: [
+      { id: "A", label: "First A", shape: "box", group: "G1" },
+      { id: "A", label: "Second A", shape: "box", group: "G2" },
+      { id: "B", label: "B", shape: "box" },
+      { id: "C", label: "C", shape: "box" },
+      { id: "Y", label: "Y", shape: "box" },
+      { id: "X", label: "X", shape: "box" },
+    ],
+    edges: [
+      { from: "A", to: "B", style: "solid" },
+      { from: "Y", to: "X", style: "solid" },
+      { from: "X", to: "B", style: "solid" },
+      { from: "B", to: "C", style: "solid" },
+    ],
+    groups: [
+      { id: "G1", label: "Group 1" },
+      { id: "G1", label: "Group 1 duplicate" },
+      { id: "G2", label: "Group 2" },
+    ],
+  };
+  const l = layoutDiagram(d);
+  assert.deepEqual(l.nodes.map(node => node.id), ["A", "B", "C", "Y", "X"]);
+  assert.deepEqual(l.nodes.find(node => node.id === "A")!.lines, ["First A"]);
+  assert.deepEqual(l.groups.map(group => ({ id: group.id, label: group.label })), [{ id: "G1", label: "Group 1" }]);
+  const x = Object.fromEntries(l.nodes.map(node => [node.id, node.x]));
+  assert.ok(x.A < x.B && x.Y < x.X && x.X < x.B && x.B < x.C);
+  const a = l.nodes.find(node => node.id === "A")!;
+  const g1 = l.groups[0]!;
+  assert.ok(a.x >= g1.x && a.y >= g1.y && a.x + a.w <= g1.x + g1.w && a.y + a.h <= g1.y + g1.h);
+  assert.deepEqual(l, layoutDiagram(d));
+});
+
+test("duplicate node IDs in cycles and sequence participants remain unique and deterministic", () => {
+  const cyclic = flow("LR", ["A", "B", "A", "C"], [["A", "B"], ["B", "A"], ["B", "C"], ["A", "A"]]);
+  const l = layoutDiagram(cyclic);
+  assert.deepEqual(l.nodes.map(node => node.id), ["A", "B", "C"]);
+  assert.equal(l.edges.length, 4);
+  assert.ok(l.width > 0 && l.height > 0);
+  assert.deepEqual(l, layoutDiagram(cyclic));
+
+  const seq = layoutDiagram({
+    direction: "LR",
+    nodes: [],
+    edges: [],
+    groups: [],
+    sequence: {
+      participants: [
+        { id: "A", label: "First API" },
+        { id: "B", label: "Worker" },
+        { id: "A", label: "Second API" },
+      ],
+      messages: [
+        { from: "A", to: "B", text: "req", style: "solid" },
+        { from: "B", to: "A", text: "rep", style: "dashed" },
+      ],
+    },
+  });
+  assert.deepEqual(seq.lanes?.map(lane => ({ id: lane.id, label: lane.label, x: lane.x })), [
+    { id: "A", label: "First API", x: 0 },
+    { id: "B", label: "Worker", x: NODE_W + LAYER_GAP },
+  ]);
+  assert.deepEqual(seq.nodes.map(node => ({ id: node.id, lines: node.lines })), [
+    { id: "A", lines: ["First API"] },
+    { id: "B", lines: ["Worker"] },
+  ]);
+  assert.equal(seq.edges.length, 2);
+});
+
+test("describeDiagram, normalizeDiagram, and relatedDiagramGroups agree on first-wins entries for duplicate IDs", () => {
+  const raw = {
+    title: "Service map",
+    direction: "LR" as const,
+    nodes: [
+      { id: "A", label: "First A", shape: "box" as const, change: "modified" as const, group: "G1" },
+      { id: "A", label: "Second A", shape: "box" as const, change: "added" as const, group: "G2" },
+      { id: "B", label: "B", shape: "box" as const, change: "added" as const, group: "G2" },
+    ],
+    edges: [{ from: "A", to: "C", style: "solid" as const }],
+    groups: [
+      { id: "G1", label: "Group 1" },
+      { id: "G1", label: "Group 1 duplicate" },
+      { id: "G2", label: "Group 2" },
+    ],
+  };
+
+  const normalized = normalizeDiagram(raw);
+  assert.deepEqual(normalized.nodes.map(node => ({ id: node.id, label: node.label, group: node.group })), [
+    { id: "A", label: "First A", group: "G1" },
+    { id: "B", label: "B", group: "G2" },
+  ]);
+  assert.deepEqual(normalized.groups, [
+    { id: "G1", label: "Group 1" },
+    { id: "G2", label: "Group 2" },
+  ]);
+  assert.equal(describeDiagram(raw), "Service map: 2 components, 1 modified, 1 added, 0 removed; 1 relationships");
+  assert.deepEqual([...relatedDiagramGroups(raw, "A")], ["G1"]);
+  assert.deepEqual([...relatedDiagramGroups(raw, "B")], ["G2"]);
+
+  const rawSequence = {
+    title: "Auth flow",
+    nodes: [],
+    edges: [],
+    groups: [],
+    sequence: {
+      participants: [
+        { id: "A", label: "API" },
+        { id: "A", label: "Duplicate API" },
+        { id: "B", label: "Worker" },
+      ],
+      messages: [
+        { from: "A", to: "B", text: "req", style: "solid" as const },
+      ],
+    },
+  };
+  assert.equal(describeDiagram(rawSequence), "Auth flow: 2 components, 0 modified, 0 added, 0 removed; 1 relationships");
+  assert.deepEqual(normalizeDiagram(rawSequence).sequence?.participants, [
+    { id: "A", label: "API" },
+    { id: "B", label: "Worker" },
+  ]);
 });

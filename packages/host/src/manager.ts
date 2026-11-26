@@ -660,12 +660,9 @@ export class Manager {
     }
   }
   async answerTeamPermission(
-    sessionId: string,
-    requestId: string,
-    team: TeamAssignment,
-    decision: TeamPermissionDecision,
-    current?: () => boolean,
-  ): Promise<import("./types.js").Receipt & { result?: import("@infinite/attention").AnswerResult }> {
+    sessionId: string, requestId: string, team: TeamAssignment,
+    decision: TeamPermissionDecision, current?: () => boolean, sourceCoordinatorMemberId?: string,
+  ): Promise<Receipt & { result?: import("@infinite/attention").AnswerResult }> {
     const session = this.meta(sessionId).session;
     const stored = session.team;
     const validAssignment = (value: unknown): value is TeamMemberAssignment => {
@@ -683,10 +680,13 @@ export class Manager {
         decision.targetMemberId !== stored.memberId || decision.targetSessionId !== sessionId ||
         requestId !== decision.answerRequestId)
       throw new ContentError("This permission decision does not match the assigned team member", 403);
+    const coordinatorMemberId = decision.coordinatorMemberId
+      ? (sourceCoordinatorMemberId === undefined || sourceCoordinatorMemberId === decision.coordinatorMemberId ? decision.coordinatorMemberId : undefined)
+      : (decision.reusedFromDecisionId && /^[a-f0-9-]{36}$/i.test(decision.reusedFromDecisionId) ? sourceCoordinatorMemberId : undefined);
     if (decision.status !== "answering" || !/^[a-f0-9-]{36}$/i.test(decision.id) ||
         !/^[a-f0-9-]{36}$/i.test(decision.answerRequestId) ||
-        !/^[a-f0-9]{64}$/i.test(decision.policyHash) || !decision.coordinatorMemberId ||
-        !/^[a-f0-9-]{36}$/i.test(decision.coordinatorMemberId) ||
+        !/^[a-f0-9]{64}$/i.test(decision.policyHash) || !coordinatorMemberId ||
+        !/^[a-f0-9-]{36}$/i.test(coordinatorMemberId) ||
         !Number.isInteger(decision.promptId) || decision.promptId < 1 || decision.prompt.id !== decision.promptId ||
         !/^[a-f0-9]{64}$/i.test(decision.promptHash) || !/^[a-f0-9]{64}$/i.test(decision.evidenceHash) ||
         decision.prompt.hash !== decision.promptHash || permissionEvidenceHash(decision.prompt) !== decision.evidenceHash ||
@@ -719,7 +719,7 @@ export class Manager {
       try {
         return await workerCall(this.config.runDir, sessionId, {
           op: "team-answer", requestId, decisionId: decision.id,
-          coordinatorMemberId: decision.coordinatorMemberId,
+          coordinatorMemberId,
           targetSessionId: sessionId, assignment: stored, targetCwd: canonicalCwd,
           expiresAt: decision.expiresAt, policyHash: decision.policyHash,
           promptId: decision.promptId, promptHash: decision.promptHash,
@@ -894,9 +894,9 @@ export class Manager {
       return result;
     };
     if (session.team) throw new ContentError("Resume this member from its team so its assignment stays consistent");
+    const state = await this.state(sessionId);
     if (session.headless?.channel && deferredCallOpen((after, limit) => this.events(sessionId, after, limit, new Set(["lifecycle"]))))
       throw new ContentError("This session ended while a call waited for the owner's answer. Start a new session instead of resuming it.", 409);
-    const state = await this.state(sessionId);
     if (state.status === "running" || state.status === "starting") return remember({ ...session, ...state });
     const native = state.nativeSession ?? session.resumeNativeSession;
     if (state.status !== "exited") throw new ContentError("The previous process has not confirmed exit. Reconnect before resuming.");

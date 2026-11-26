@@ -80,7 +80,7 @@ export class TeamReplay {
     return {
       id: input.trialId, projectId: input.projectId, provider: profile.provider, title: "Eval trial", objective: capsule.objective,
       lineup: { coordinator: profile, integrator: profile, reviewer: profile, implementers: [profile] },
-      parallelism: 1, revision: 1, status: "implementing", createdAt: at, updatedAt: at,
+      parallelism: 1, revision: 1, status: "implementing", createdAt: at, updatedAt: at, lastActivityAt: at,
       workspace: this.workspace(input.workspace), branch: `replay/${input.trialId}`, baseCommit: input.baseCommit, headCommit: input.baseCommit,
       tasks: [{ id: task.id, title: task.title, instructions: task.instructions, agentProfileId: profile.id, paths: [...task.paths], dependsOn: [], revision: 1, status: "pending" }],
       members: [], decisions, checks: [], events: [], round: 0,
@@ -100,7 +100,7 @@ export class TeamReplay {
     return {
       id: input.trialId, projectId: input.projectId, provider: profile.provider, title: "Judgement", objective: "Judgement",
       lineup: { coordinator: profile, integrator: profile, reviewer: profile, implementers: [profile] },
-      parallelism: 1, revision: 1, status: "implementing", createdAt: at, updatedAt: at,
+      parallelism: 1, revision: 1, status: "implementing", createdAt: at, updatedAt: at, lastActivityAt: at,
       workspace: this.workspace(input.workspace), branch: `replay/${input.trialId}`, baseCommit: input.baseCommit, headCommit: input.baseCommit,
       tasks: [], members: [], decisions, checks: [], events: [], round: 0,
       steering: input.steering.map(text => ({ text, revision: 1, at, source: "coordinator" as const })),

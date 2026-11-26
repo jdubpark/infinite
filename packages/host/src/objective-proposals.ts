@@ -14,7 +14,7 @@ export const PROPOSAL_LIMITS = {
   log: { entries: 300, bytes: 160 * 1024 },
   cappedBytes: 24 * 1024,
   assumptions: 16,
-  addedPerEntry: 4,
+  addedPerEntry: OBJECTIVE_LIMITS.newAssumptionsPerAttempt,
   attachedPerEntry: 16,
 } as const;
 

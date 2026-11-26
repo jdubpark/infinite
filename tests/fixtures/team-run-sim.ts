@@ -247,12 +247,14 @@ class Host {
     this.life = life;
     let previous = this.bytes();
     const entries = { retryable: () => false, held: () => false, unread: () => false, mirror: () => {
+      const current = this.bytes();
+      if (current.equals(previous)) return true;
       this.writes.push(this.read());
       if (this.stopAt > 0 && this.writes.length === this.stopAt) {
         life.stopped = true; life.label = this.label; this.before = previous;
         this.atStop = files(this.f.config.stateDir, this.skip);
         this.unblock = this.f.blockRecordWrites("team", this.f.run.id);
-      } else previous = this.bytes();
+      } else previous = current;
       return true;
     } };
     const given = this.guard(life, { now: () => T0, start: (_project: string, start: () => unknown) => start() });

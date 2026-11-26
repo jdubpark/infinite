@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync
 import { tmpdir } from "node:os";
 import { join, resolve, normalize } from "node:path";
 import { classify, classRulesDigest, EMBEDDED_COMMAND_LIMITS, raise } from "../packages/host/src/permission-classes.js";
-import { detectPrompt, type Prompt } from "@infinite/attention";
+import { detectPrompt, truncateInput, type Prompt } from "@infinite/attention";
 import { familyOf } from "../packages/host/src/permission-families.js";
 import { readShell, realHostPath } from "../packages/host/src/permission-shell.js";
 import { INTERRUPT_CLASSES, PERMISSION_POLICY_TEXT } from "../packages/host/src/permission-policy.js";
@@ -749,4 +749,25 @@ test("one reading resolves each path once, so the class rules and the raise rule
   assert.equal(rules.match, undefined);
   assert.ok(rules.raised.includes("raise:outside-root"));
   assert.ok(!rules.raised.includes("raise:reject-history"));
+});
+
+test("permissionRequestShape treats untruncated 50-item arrays as complete evidence and rejects truncated 51-item arrays", () => {
+  const makePrompt = (input: Record<string, unknown>): Prompt => ({
+    id: 1,
+    kind: "permission",
+    title: "Permission needed",
+    source: "hook",
+    hash: "b".repeat(64),
+    acceptsText: false,
+    options: [
+      { index: 0, label: "Allow always", role: "accept-always" },
+      { index: 1, label: "No", role: "reject" },
+    ],
+    tool: { name: "MultiEdit", input, inputComplete: true },
+  });
+
+  const exact50 = truncateInput({ edits: Array.from({ length: 50 }, (_, i) => i) });
+  const truncated51 = truncateInput({ edits: Array.from({ length: 51 }, (_, i) => i) });
+  assert.equal(permissionRequestShape(makePrompt(exact50)).completeEvidence, true);
+  assert.equal(permissionRequestShape(makePrompt(truncated51)).completeEvidence, false);
 });

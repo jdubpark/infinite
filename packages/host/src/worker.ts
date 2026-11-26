@@ -153,8 +153,11 @@ const persist = () =>
     workerPid: process.pid,
   });
 function append(type: Event["type"], data: Event["data"]): Event {
+  return appendAll(type, [data])[0];
+}
+function appendAll(type: Event["type"], items: Event["data"][]): Event[] {
   try {
-    return journal.append(type, data);
+    return journal.appendAll(type, items);
   } catch (error) {
     recordingFailure();
     throw error;
@@ -163,11 +166,10 @@ function append(type: Event["type"], data: Event["data"]): Event {
 function flush() {
   clearTimeout(flushTimer);
   flushTimer = undefined;
-  while (pending.length) {
-    const data = pending.slice(0, 8192);
-    pending = pending.slice(8192);
-    append("output", { text: data });
-  }
+  const chunks: Event["data"][] = [];
+  for (let at = 0; at < pending.length; at += 8192) chunks.push({ text: pending.slice(at, at + 8192) });
+  pending = "";
+  appendAll("output", chunks);
 }
 
 async function snapshot(): Promise<TerminalSnapshot> {
@@ -1633,6 +1635,7 @@ server.listen(socketPath(runDir, session.id), async () => {
       }
       lastOutputAt = Date.now();
       outputSinceCheck = true;
+      if (pending.length >= 256 * 1024) try { flush(); } catch {}
       if (!flushTimer)
         flushTimer = setTimeout(() => {
           try {

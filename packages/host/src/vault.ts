@@ -102,25 +102,38 @@ export class Journal {
     }
   }
   append(type: Event["type"], data: Event["data"]): Event {
-    const seq = this.seq + 1;
-    const event: Event = { seq, at: new Date().toISOString(), type, data };
-    const file = join(
-      this.directory,
-      `${String(Math.floor((seq - 1) / SEGMENT_SIZE)).padStart(10, "0")}.journal`,
+    return this.appendAll(type, [data])[0];
+  }
+  appendAll(type: Event["type"], items: Event["data"][]): Event[] {
+    const at = new Date().toISOString();
+    const events = items.map(
+      (data, index): Event => ({ seq: this.seq + index + 1, at, type, data }),
     );
-    const bytes = Buffer.from(
-      seal(this.key, `${this.sessionId}:${seq}`, event) + "\n",
-    );
-    const fd = openSync(file, "a", 0o600);
-    try {
-      let offset = 0;
-      while (offset < bytes.length) offset += writeSync(fd, bytes, offset);
-      fsyncSync(fd);
-    } finally {
-      closeSync(fd);
+    for (let start = 0; start < events.length; ) {
+      const segment = Math.floor((events[start].seq - 1) / SEGMENT_SIZE);
+      const end = Math.min(events.length, (segment + 1) * SEGMENT_SIZE - this.seq);
+      const bytes = Buffer.from(
+        events
+          .slice(start, end)
+          .map((event) => seal(this.key, `${this.sessionId}:${event.seq}`, event) + "\n")
+          .join(""),
+      );
+      const fd = openSync(
+        join(this.directory, `${String(segment).padStart(10, "0")}.journal`),
+        "a",
+        0o600,
+      );
+      try {
+        let offset = 0;
+        while (offset < bytes.length) offset += writeSync(fd, bytes, offset);
+        fsyncSync(fd);
+      } finally {
+        closeSync(fd);
+      }
+      start = end;
     }
-    this.seq = seq;
-    return event;
+    this.seq += events.length;
+    return events;
   }
 }
 

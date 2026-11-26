@@ -18,7 +18,7 @@ import type { TeamService } from "../packages/host/src/teams.js";
 import type { Mission, MissionReport, MissionSubtaskPlan } from "../packages/host/src/mission-types.js";
 import type { TeamPublication } from "../packages/host/src/team-types.js";
 import { slackClientForFixture as slackClient, startSlackServer, testIntakeAudience } from "./fixtures/slack-server.js";
-import { BINDING, BOT, OTHER, OWNER, PROJECT_PATH, TEST_AUDIENCE_ID, TEST_PROJECTS, TEST_SCOPE, surfaceFor, wrapSlackClient,
+import { BINDING, BOT, OTHER, THIRD, OWNER, PROJECT_PATH, TEST_AUDIENCE_ID, TEST_PROJECTS, TEST_SCOPE, surfaceFor, wrapSlackClient,
   type Services } from "./fixtures/intake-slack-surface.js";
 
 const delay = (ms: number) => new Promise(done => setTimeout(done, ms));
@@ -29,8 +29,8 @@ const ACK = 'Started on TEST-1 "Export fails on empty rows". I\'ll post question
 const QUEUED = 'Queued TEST-1 "Export fails on empty rows". It starts when a running request finishes. I\'ll post questions and the result here.';
 const FINISHED = "This request has finished. File a follow-up with Linear's agent in this thread.";
 const ALREADY = "That question was already answered.";
-const CANCEL_REASON = "Cancelled by the owner. Subteam workspaces remain available for inspection.";
-const CANCELLED = `Cancelled: ${CANCEL_REASON}\nFile a follow-up with Linear's agent in this thread.`;
+const cancellation = (actor: "Owner" | "the owner", next = "File a follow-up with Linear's agent in this thread.") =>
+  `Cancelled: Cancelled by ${actor}. Subteam workspaces remain available for inspection.\n${next}`;
 
 type Harness = ReturnType<typeof harness>;
 
@@ -306,7 +306,7 @@ test("status, pause, resume, and cancel are mission actions, in any case", { tim
     await until(() => sh.get(id), mission => mission.status !== "paused");
     await s.slack.emit(mention("CANCEL"));
     await until(() => sh.get(id), mission => mission.status === "cancelled");
-    await waitFor(async () => s.texts(), list => list.at(-1) === CANCELLED);
+    await waitFor(async () => s.texts(), list => list.at(-1) === cancellation("Owner"));
   } finally { await close(); }
 });
 
@@ -532,7 +532,7 @@ test("a cancelled mission and an intake pause each post their status and the nex
     s.store.create(intakeRecord(pausedIssue, "started", { thread: OTHER, missionId: paused.id, identifier: "TEST-2" }));
     await s.surface.start(); await s.connected();
     await services.missions.cancel(cancelled.id, { requestId: randomUUID(), revision: cancelled.revision });
-    await waitFor(async () => s.texts(), list => list.at(-1) === CANCELLED);
+    await waitFor(async () => s.texts(), list => list.at(-1) === cancellation("the owner"));
     const reason = "The Linear issue was closed.";
     s.store.update(pausedIssue, record => { record.closure = { reason, at: NOW }; });
     await services.missions.pause(paused.id, { requestId: randomUUID(), revision: paused.revision }, reason);
@@ -797,12 +797,9 @@ test("two records in one thread keep their Slack receipts apart", { timeout: 900
     await s.surface.start();
     await waitFor(async () => s.texts(), list => list.length === 1);
     const second = randomUUID();
+    s.slack.loseNextPostResponse();
     s.store.create(intakeRecord(second, "started", { thread: BINDING, missionId: secondMission.id, identifier: "TEST-2", title: "Second request" }));
-    s.slack.unavailable(true);
-    s.store.update(second, record => { record.updatedAt = new Date().toISOString(); });
-    await waitFor(async () => s.store.get(second)!.messages[0]?.uncertain, uncertain => uncertain === true, 15000);
-    s.slack.unavailable(false);
-    await waitFor(async () => s.texts(), list => list.length === 2, 20000);
+    await waitFor(async () => s.store.get(second)?.messages[0]?.status, status => status === "sent", 20000);
     const posts = s.slack.posts(BINDING);
     assert.match(posts[0].text, /^Started on TEST-1 /);
     assert.match(posts[1].text, /^Started on TEST-2 /);
@@ -1413,7 +1410,7 @@ test("status and cancel work on a running answer, and a held answer names the qu
     await s.slack.emit(mention("cancel"));
     await waitFor(async () => sh.missions.peek(id)?.status, status => status === "cancelled", 60000);
     await waitFor(async () => s.texts(), list => list.some(text => text.startsWith("Cancelled: ")), 30000);
-    assert.ok(s.texts().includes(`Cancelled: ${CANCEL_REASON}\nMention me in this thread to file a follow-up.`));
+    assert.ok(s.texts().includes(cancellation("Owner", "Mention me in this thread to file a follow-up.")));
     noIssueTraces(s.texts());
   } finally { await close(); }
 });

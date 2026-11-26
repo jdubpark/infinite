@@ -15,6 +15,8 @@ export async function startLinearServer() {
   const issues = new Map<string, FixtureIssue>(), comments = new Map<string, FixtureComment>();
   const labels = new Map<string, { id: string; name: string; team: { id: string } | null }>(), issueLabels = new Map<string, Set<string>>();
   let failLabels = false, rateLimitLabels = false, rateLimitLabelChanges = false;
+  let heldLabelAck: { apply: (value: { operation: string; issueId: string; labelId: string }) => void; result: Promise<boolean>; finish: (failed: boolean) => void } | undefined;
+  let heldLabelRateLimit: { request: (value: { operation: string; issueId: string }) => void; result: Promise<void>; release: () => void } | undefined;
   let extraHeaders: Record<string, string> = {}, limitedReads: Record<string, string> | undefined, readDelayMs = 0;
   const readSpans: { start: number; end?: number }[] = [];
   const calls: { operation: string; variables: Record<string, any> }[] = [];
@@ -112,11 +114,22 @@ export async function startLinearServer() {
         case "InfiniteLinearIssueAddLabel":
         case "InfiniteLinearIssueRemoveLabel": {
           if (!issues.has(variables.id)) throw new Error("Label change needs a known issue");
-          if (rateLimitLabelChanges) { response.writeHead(200, { "Content-Type": "application/json", "retry-after": "120" }).end(JSON.stringify({ errors: [{ message: "Rate limited", extensions: { code: "RATELIMITED" } }] })); return; }
+          if (rateLimitLabelChanges) {
+            if (heldLabelRateLimit) {
+              const held = heldLabelRateLimit; heldLabelRateLimit = undefined;
+              held.request({ operation, issueId: variables.id }); await held.result;
+            }
+            response.writeHead(200, { "Content-Type": "application/json", "retry-after": "120" }).end(JSON.stringify({ errors: [{ message: "Rate limited", extensions: { code: "RATELIMITED" } }] })); return;
+          }
           if (!labels.has(variables.labelId)) { reply(200, { errors: [{ message: "Entity not found: IssueLabel" }] }); return; }
           const applied = issueLabels.get(variables.id) ?? new Set<string>(), adding = operation === "InfiniteLinearIssueAddLabel";
           if (adding) applied.add(variables.labelId); else applied.delete(variables.labelId);
           issueLabels.set(variables.id, applied);
+          if (heldLabelAck) {
+            const held = heldLabelAck; heldLabelAck = undefined;
+            held.apply({ operation, issueId: variables.id, labelId: variables.labelId });
+            if (await held.result) { reply(200, { errors: [{ message: "Fixture rejected the label acknowledgement" }] }); return; }
+          }
           data = { [adding ? "issueAddLabel" : "issueRemoveLabel"]: { success: true } }; break;
         }
         default: throw new Error(`Unexpected GraphQL operation: ${operation}`);
@@ -140,6 +153,24 @@ export async function startLinearServer() {
     failLabelLookups(value: boolean) { failLabels = value; },
     rateLimitLabelLookups(value: boolean) { rateLimitLabels = value; },
     rateLimitLabelChanges(value: boolean) { rateLimitLabelChanges = value; },
+    holdNextLabelRateLimit() {
+      if (heldLabelRateLimit) throw new Error("A label rate-limit response is already held");
+      let request!: (value: { operation: string; issueId: string }) => void;
+      let release!: () => void;
+      const requested = new Promise<{ operation: string; issueId: string }>(resolve => { request = resolve; });
+      const result = new Promise<void>(resolve => { release = resolve; });
+      heldLabelRateLimit = { request, result, release };
+      return { requested, release: () => release() };
+    },
+    holdNextLabelChangeAcknowledgement() {
+      if (heldLabelAck) throw new Error("A label acknowledgement is already held");
+      let apply!: (value: { operation: string; issueId: string; labelId: string }) => void;
+      let finish!: (failed: boolean) => void;
+      const applied = new Promise<{ operation: string; issueId: string; labelId: string }>(resolve => { apply = resolve; });
+      const result = new Promise<boolean>(resolve => { finish = resolve; });
+      heldLabelAck = { apply, result, finish };
+      return { applied, acknowledge: () => finish(false), fail: () => finish(true) };
+    },
     responseHeaders(headers: Record<string, string>) { extraHeaders = headers; },
     rateLimitReads(headers: Record<string, string> | undefined) { limitedReads = headers; },
     delayReads(ms: number) { readDelayMs = ms; },

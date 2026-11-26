@@ -1,7 +1,6 @@
 import XCTest
 @testable import InfiniteCore
 
-/// The halt banners read `GET /api/halt` directly; these pin how its three shapes decode.
 final class HaltViewTests: XCTestCase {
     private func parse(_ text: String) throws -> HaltView { HaltView(try JSON.parse(Data(text.utf8))) }
 
@@ -20,7 +19,6 @@ final class HaltViewTests: XCTestCase {
         XCTAssertEqual(halt.host?.reason, "Database migration")
         XCTAssertEqual(halt.host?.by, "Owner laptop")
         XCTAssertEqual(halt.projects.map(\.projectID), ["storefront-api", "notes"])
-        // An absent or blank reason shows no reason line.
         XCTAssertEqual(halt.projects.map(\.reason), [nil, nil])
         XCTAssertEqual(halt.projects(covering: ["notes", "other"]).map(\.haltID), ["p2"])
         XCTAssertEqual(halt.projects(covering: []), [])
@@ -32,12 +30,13 @@ final class HaltViewTests: XCTestCase {
         XCTAssertFalse(projectOnly.holdsHost)
         XCTAssertEqual(projectOnly.projects.count, 1)
 
-        let unreadable = try parse(#"{"readable":false,"projects":[]}"#)
+        let unreadable = try parse(#"{"readable":false,"host":{"haltId":"stale","at":"2026-11-15T00:00:00.000Z","by":"Old"},"projects":[{"projectId":"notes","haltId":"p2","at":"2026-11-15T08:10:00.000Z","by":"Owner laptop"}]}"#)
+        XCTAssertEqual(unreadable.state, .unreadable)
         XCTAssertFalse(unreadable.readable)
         XCTAssertNil(unreadable.host)
+        XCTAssertEqual(unreadable.projects, [])
         XCTAssertTrue(unreadable.holdsHost)
 
-        // Before the first report, and for a host without the route, nothing is held.
         XCTAssertFalse(HaltView.clear.holdsHost)
         XCTAssertEqual(try parse(#"{"readable":true,"projects":[]}"#), .clear)
     }

@@ -173,7 +173,7 @@ const octet = "(?:25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)";
 const ipv4 = new RegExp(`(?<![\\d.])(?:${octet}\\.){3}${octet}(?!\\.?\\d)`, "g");
 
 export function outboundText(config: Config, value: string): string {
-  const directories = [config.stateDir, config.runDir, config.teams?.workspaceDir,
+  const directories = [config.stateDir, config.runDir, config.socketDir, config.teams?.workspaceDir,
     ...(config.projects ?? []).flatMap(project => [project.path, project.teamworkDir])]
     .filter((directory): directory is string => typeof directory === "string" && isAbsolute(directory))
     .map(directory => resolve(directory))
@@ -222,11 +222,22 @@ export class IntakeService {
   private timer?: NodeJS.Timeout;
   private unsubscribe?: () => void;
   private closed = false;
+  private reopenScan = false;
   private inFlight?: Promise<void>;
   private lastError?: { at: string; step: string; message: string };
   private readonly log: (line: string, error: unknown) => void;
   private readonly pollMs: number;
   private readonly pendingMentions = new Map<string, string>();
+  private async organizationSourceAllowed(thread: IntakeThread | undefined): Promise<boolean> {
+    if (!thread || !this.config.intake?.slack?.organizationScope) return true;
+    const check = this.options.threads?.organizationChannelAllowed;
+    return check ? check.call(this.options.threads, thread.channelId) : false;
+  }
+
+  private async requireOrganizationSource(thread: IntakeThread | undefined): Promise<void> {
+    if (!await this.organizationSourceAllowed(thread)) throw new SlackError("organization_scope_denied", false);
+  }
+
   private externalAdmission?: (record: IntakeRecord) => ConnectorSource;
 
   constructor(
@@ -252,6 +263,7 @@ export class IntakeService {
 
   start(): void {
     if (!this.enabled() || this.timer || this.closed) return;
+    this.reopenScan = this.config.github?.reviewFeedback?.enabled === true;
     this.unsubscribe = this.missions.onChange(mission => this.observe(mission));
     this.timer = setInterval(() => void this.poll(), this.pollMs);
     this.timer.unref();
@@ -326,8 +338,10 @@ export class IntakeService {
     await this.attempt("route", () => this.route());
     await this.attempt("file", () => this.file());
     await this.attempt("start", () => this.startQueued());
+    const reopening = this.reopenScan;
+    this.reopenScan = false;
     for (const record of this.store.list())
-      if (record.state === "started") {
+      if (record.state === "started" || reopening && record.state === "finished") {
         const mission = this.missions.peek(record.missionId);
         if (mission) this.observe(mission);
       }
@@ -374,7 +388,10 @@ export class IntakeService {
     for (const record of this.store.list().filter(item => item.state === "queued" && item.direct && !item.request
       && (item.direct.route !== undefined || !item.direct.routable))) {
       if (this.closed) return;
-      try { await (isAnswerRecord(record) ? this.prepareAnswer(record) : this.fileRecord(record)); }
+      try {
+        await this.requireOrganizationSource(record.thread);
+        await (isAnswerRecord(record) ? this.prepareAnswer(record) : this.fileRecord(record));
+      }
       catch (error) {
         const summary = error instanceof MissingLabelError || error instanceof OwnerMismatch ? error.message : failureSummary(error);
         this.fail("file", error, undefined, summary);
@@ -389,16 +406,24 @@ export class IntakeService {
     const slack = this.config.intake?.slack;
     const router = slack?.answerQuestions && slack.classify ? this.options.router : undefined;
     const pending = this.store.list().filter(item => item.direct?.routable === true && !item.request && !item.direct.route);
-    const decided = await Promise.all(pending.map(async record => {
-      const text = record.direct!.text.trim().slice(0, ROUTE_INPUT_LIMIT);
-      const reading = router && text !== "" ? await this.reading(router, text) : undefined;
-      return { record, route: decideRoute(undefined, reading) };
-    }));
-    for (const { record, route } of decided) {
+    for (const record of pending) {
       if (this.closed) return;
-      this.attemptSync("route", () => this.store.update(record.issueId, next => {
-        if (next.direct && !next.direct.route && !next.request) next.direct.route = { ...route, at: new Date().toISOString() };
-      }));
+      try {
+        await this.requireOrganizationSource(record.thread);
+        const text = record.direct!.text.trim().slice(0, ROUTE_INPUT_LIMIT);
+        const reading = router && text !== "" ? await this.reading(router, text) : undefined;
+        await this.requireOrganizationSource(record.thread);
+        const route = decideRoute(undefined, reading);
+        this.store.update(record.issueId, next => {
+          if (next.direct && !next.direct.route && !next.request) {
+            next.direct.route = { ...route, at: new Date().toISOString() };
+            delete next.holdReason;
+          }
+        });
+      } catch (error) {
+        this.fail("route", error, record.identifier);
+        this.attemptSync("route", () => this.hold(record.issueId, "Slack routing is waiting for verified source access."), record.identifier);
+      }
     }
   }
 
@@ -416,6 +441,7 @@ export class IntakeService {
     const intake = this.config.intake!;
     const direct = record.direct!, thread = record.thread!;
     if (!this.options.threads) throw new Error("No Slack thread reader is configured.");
+    await this.requireOrganizationSource(thread);
     const read = await this.options.threads.thread(thread);
     const messages = read === "unreadable" ? undefined : read;
     const request: CreateMission = {
@@ -427,6 +453,7 @@ export class IntakeService {
       maxSubtasks: 1,
       maxMinutes: Math.min(intake.mission.maxMinutes, ANSWER_MAX_MINUTES),
     };
+    await this.requireOrganizationSource(thread);
     this.store.update(record.issueId, next => {
       if (next.state !== "queued") return;
       next.direct = { ...next.direct!, filedAt: new Date().toISOString() };
@@ -457,6 +484,7 @@ export class IntakeService {
     const intake = this.config.intake!;
     const direct = record.direct!, thread = record.thread!;
     if (!this.options.threads) throw new Error("No Slack thread reader is configured.");
+    await this.requireOrganizationSource(thread);
     const read = await this.options.threads.thread(thread);
     const messages = read === "unreadable" ? undefined : read;
     let description = record.description;
@@ -464,8 +492,10 @@ export class IntakeService {
       const link = await this.options.threads.permalink?.(thread, direct.ts);
       if (link) description = `${description}${description ? "\n\n" : ""}Filed from Slack by the owner: ${link}`;
     } catch {}
+    await this.requireOrganizationSource(thread);
     const teamId = intake.linear.teamIds[0];
-    const issue = await this.linear.createIssue({ id: record.issueId, teamId, title: record.title, description, label: intake.linear.label });
+    const issue = await this.linear.createIssue({ id: record.issueId, teamId, title: record.title, description, label: intake.linear.label },
+      () => this.requireOrganizationSource(thread));
     if (issue.creatorId !== intake.linear.creatorId || issue.teamId !== teamId) throw new OwnerMismatch();
     const request: CreateMission = {
       requestId: missionRequestId(record.issueId),
@@ -475,6 +505,7 @@ export class IntakeService {
       maxSubtasks: intake.mission.maxSubtasks,
       maxMinutes: intake.mission.maxMinutes,
     };
+    await this.requireOrganizationSource(thread);
     this.store.update(record.issueId, next => {
       if (next.state !== "queued") return;
       Object.assign(next, this.facts(issue), { title: record.title, description });
@@ -498,6 +529,7 @@ export class IntakeService {
   private async admitIssue(issue: IntakeIssue): Promise<void> {
     const intake = this.config.intake!;
     if (issue.creatorId !== intake.linear.creatorId) return this.skip(issue, "creator-mismatch");
+    await this.requireOrganizationSource(issue.thread);
     let messages: SlackThreadMessage[] | undefined;
     if (intake.requireSlackThread) {
       if (!issue.thread) return this.skip(issue, "no-slack-thread");
@@ -511,8 +543,10 @@ export class IntakeService {
       messages = read;
     } else if (issue.thread && this.options.threads) {
       messages = await this.readBackground(issue.thread);
+      if (intake.slack?.organizationScope && messages === undefined) return;
     }
     const thread = messages !== undefined ? issue.thread : undefined;
+    await this.requireOrganizationSource(thread);
     const rule = [
       `label "${intake.linear.label}"`,
       "owner creator",
@@ -568,6 +602,7 @@ export class IntakeService {
       const answer = isAnswerRecord(record);
       if (!answer && slots <= 0) { this.hold(record.issueId, "max-active"); continue; }
       try {
+        await this.requireOrganizationSource(record.thread);
         const source = record.external ? this.admitExternal(record) : undefined;
         const origin: MissionOrigin = { kind: "intake", issueId: record.issueId, identifier: record.identifier, url: record.url, rule: record.rule, ...(source ? { source } : {}) };
         const mission = await this.createMission(record.request, origin, record.external ? () => { this.admitExternal(this.store.get(record.issueId)!); } : undefined);
@@ -616,6 +651,10 @@ export class IntakeService {
 
   private observe(mission: Mission): void {
     if (this.closed) return;
+    if (liveStatuses.has(mission.status)) {
+      this.reopen(mission);
+      return;
+    }
     const stopped = deadlineStopped(mission);
     if (!stopped && !finishedStatuses.has(mission.status)) return;
     const record = this.store.forMission(mission.id);
@@ -629,6 +668,13 @@ export class IntakeService {
       next.state = "finished";
       if (!isAnswerRecord(next) && !this.mirrors(next)) next.comments.outcome = { id: randomUUID(), body: outcomeBody(this.config, mission, Boolean(next.direct || next.external)), delivered: false, attempts: 0 };
     }), record.identifier);
+  }
+
+  private reopen(mission: Mission): void {
+    const record = this.store.forMission(mission.id);
+    if (record?.state !== "finished") return;
+    try { this.store.update(record.issueId, next => { next.state = "started"; }); }
+    catch (error) { this.reopenScan = true; this.fail("observe", error, record.identifier); }
   }
 
   private observeDeadline(record: IntakeRecord, mission: Mission): void {
@@ -693,6 +739,12 @@ export class IntakeService {
         const pending = record.comments[kind];
         if (!pending || pending.delivered) continue;
         try {
+          if (record.thread && this.config.intake!.slack?.organizationScope) {
+            if (!await this.organizationSourceAllowed(record.thread)) continue;
+            const current = (await this.linear.states([record.issueId])).get(record.issueId);
+            if (!current || current === "deleted" || !this.config.intake!.linear.teamIds.includes(current.teamId)) continue;
+            if (!await this.organizationSourceAllowed(record.thread)) continue;
+          }
           await this.linear.comment(record.issueId, { id: pending.id, body: pending.body });
         } catch (error) {
           const message = error instanceof TeamError ? error.message : failureSummary(error);

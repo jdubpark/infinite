@@ -1,13 +1,18 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import type { Prompt } from "@infinite/attention";
 import type { Blackboard } from "../packages/host/src/evidence/blackboard.js";
 import type { FuseGate } from "../packages/host/src/fuse/types.js";
-import { PULL_REQUEST_FIELDS, type ReviewIntake, reviewRequestId } from "../packages/host/src/review-feedback.js";
+import { PULL_REQUEST_BRANCH_FIELDS, PULL_REQUEST_FIELDS, type ReviewIntake, reviewRequestId } from "../packages/host/src/review-feedback.js";
 import type { TeamReviewFeedback } from "../packages/host/src/team-review-feedback.js";
+import { permissionAuthorityHash, permissionEvidenceHash } from "../packages/host/src/team-permissions.js";
 import type { TeamRun } from "../packages/host/src/team-types.js";
+import { MissionReview, type MissionReviewRecord, type ReviewForwardOp } from "../packages/host/src/mission-review.js";
+import type { Mission, MissionSubtask } from "../packages/host/src/mission-types.js";
+import type { MissionMessage } from "../packages/host/src/team-prompts.js";
 import type { Manager } from "../packages/host/src/manager.js";
 import { TeamService, type TeamServiceOptions } from "../packages/host/src/teams.js";
 import { schedulerFixture } from "./fixtures/team-scheduler.js";
@@ -20,6 +25,7 @@ const owner = "owner-login", repository = "example-org/example-repo", branch = "
 const pullRequestUrl = `https://github.com/${repository}/pull/7`;
 const requested = "Rename the flag to --strict and keep the old name as an alias.";
 const ghRead = ["gh", "pr", "view", "7", "--json", PULL_REQUEST_FIELDS, "--repo", repository];
+const ghBranchRead = ["gh", "pr", "view", "7", "--json", PULL_REQUEST_BRANCH_FIELDS, "--repo", repository];
 const fakeGh = `const fs = require("node:fs"); const [dir, command, ...args] = process.argv.slice(1);
 fs.appendFileSync(dir + "/commands.log", JSON.stringify([command, ...args]) + "\\n");
 if (command !== "gh") process.exit(3);
@@ -64,6 +70,18 @@ function hostStop(f: Fixture, stopAt: number) {
     return true;
   } };
   return { entries: entries as unknown as Blackboard, arm: () => { armed = true; }, stopped: () => restore !== undefined, restart: () => restore?.() };
+}
+
+function approvedDecision(f: Fixture) {
+  const member = f.run.members[0]!, permissions = { mode: "coordinator" as const, scope: "Approve one-time runs of accepted checks.", maxDecisions: 3 };
+  const prompt: Prompt = { id: 1, kind: "permission", source: "screen", hash: "a".repeat(64), pinned: true, acceptsText: false,
+    title: "Would you like to run the following command?", detail: "Environment: local\n$ npm run check",
+    options: [{ index: 0, label: "Yes, proceed (y)", role: "accept" }, { index: 1, label: "No (esc)", role: "reject" }] };
+  f.run.permissions = permissions;
+  f.run.permissionDecisions = [{ id: randomUUID(), revision: 1, targetMemberId: member.memberId, targetSessionId: member.sessionId, targetCwd: member.cwd,
+    policyHash: createHash("sha256").update(JSON.stringify(permissions)).digest("hex"), promptId: prompt.id, promptHash: prompt.hash!,
+    evidenceHash: permissionEvidenceHash(prompt), prompt, option: 0, authorityHash: permissionAuthorityHash(permissions, []),
+    expiresAt: new Date(Date.now() + 5 * 60000).toISOString(), answerRequestId: randomUUID(), coordinatorMemberId: randomUUID(), status: "approved" }];
 }
 
 test("one changes-requested review by the owner starts exactly one follow-up, and a repeat of that review starts none", async () => {
@@ -144,6 +162,139 @@ test("with the switch off the host reads no pull request and writes nothing", as
   } finally { f.close(); }
 });
 
+test("a mission run's review goes to its mission's coordinator instead of steering the run, and only while the switch is on", async () => {
+  for (const enabled of [false, true]) {
+    const f = schedulerFixture();
+    try {
+      f.run.missionId = "mission-1";
+      const gh = delivered(f, enabled);
+      gh.show([gh.review("PRR_1", owner, "CHANGES_REQUESTED")]);
+      const before = f.readRecord<Saved>("team", f.run.id), directed: unknown[] = [], receipts = new Set<string>();
+      let answer: "waiting" | "applied" = "waiting";
+      const teams = f.openTeam(), feedback = poller(teams);
+      await feedback.start();
+      await feedback.poll();
+      assert.deepEqual(gh.commands(), [], "a mission run is not read before its missions are connected");
+      const port = teams.useMissionReviews({ target: () => ({ missionId: "mission-1", subtaskId: "a" }), applied: (_mission, requestId) => receipts.has(requestId),
+        direct: async (missionId, direction) => {
+          directed.push([missionId, direction]);
+          if (answer === "applied") receipts.add(direction.requestId);
+          return answer;
+        } });
+      await feedback.poll();
+      if (!enabled) {
+        assert.deepEqual([gh.commands(), directed], [[], []], "with the switch off a mission run is not read and its mission hears nothing");
+        assert.deepEqual(f.readRecord<Saved>("team", f.run.id), before);
+        continue;
+      }
+      const direction = { requestId: reviewRequestId(f.run.id, "PRR_1"), runId: f.run.id, subtaskId: "a", reviewId: "PRR_1", pullRequestUrl, text: requested, revision: 1, headCommit: gh.head };
+      assert.deepEqual(directed, [["mission-1", direction]]);
+      assert.deepEqual(f.readRecord<Saved>("team", f.run.id).reviewIntake?.intents.map(intent => intent.state), ["pending"], "a paused mission leaves the review waiting");
+
+      answer = "applied";
+      await feedback.poll();
+      const saved = f.readRecord<Saved>("team", f.run.id);
+      assert.deepEqual(directed, [["mission-1", direction], ["mission-1", direction]]);
+      assert.deepEqual([saved.reviewIntake?.intents.map(intent => intent.state), saved.run.reviewFeedback?.map(entry => entry.outcome)], [["applied"], ["applied"]]);
+      assert.deepEqual([saved.run.revision, saved.run.status, saved.run.steering], [1, "ready-for-review", []], "the run waits for its coordinator's forward");
+      assert.equal(events(saved).some(text => text.startsWith("The owner requested changes on the pull request")), false);
+
+      assert.equal(await port.stillCurrent(f.run.id, "PRR_1"), true);
+      gh.show([gh.review("PRR_1", owner, "CHANGES_REQUESTED"), gh.review("PRR_2", owner, "APPROVED", "", new Date(Date.now() + 120_000).toISOString())]);
+      assert.equal(await port.stillCurrent(f.run.id, "PRR_1"), false, "an approval after the review makes it stale for the forward");
+      gh.show([gh.review("PRR_1", owner, "CHANGES_REQUESTED")]);
+      f.config.github!.reviewFeedback!.enabled = false;
+      assert.equal(await port.stillCurrent(f.run.id, "PRR_1"), false, "with the switch off no forward goes ahead");
+    } finally { f.close(); }
+  }
+});
+
+test("a mission run that no mission lists is neither steered nor sent to a mission", async () => {
+  const f = schedulerFixture();
+  try {
+    f.run.missionId = "mission-1";
+    const gh = delivered(f);
+    gh.show([gh.review("PRR_1", owner, "CHANGES_REQUESTED")]);
+    const teams = f.openTeam(), feedback = poller(teams), directed: unknown[] = [];
+    teams.useMissionReviews({ target: () => undefined, applied: () => false, direct: async (missionId, direction) => {
+      directed.push([missionId, direction]);
+      return "applied";
+    } });
+    await feedback.start();
+    await feedback.poll();
+    const saved = f.readRecord<Saved>("team", f.run.id);
+    assert.deepEqual([saved.run.revision, saved.run.steering, saved.reviewIntake?.intents ?? [], directed], [1, [], [], []]);
+  } finally { f.close(); }
+});
+
+test("a restarted host acknowledges a mission run's review from its mission's receipt without reading GitHub", async () => {
+  const f = schedulerFixture();
+  try {
+    f.run.missionId = "mission-1";
+    const gh = delivered(f);
+    gh.show([gh.review("PRR_1", owner, "CHANGES_REQUESTED")]);
+    const receipts = new Set<string>(), directed: string[] = [];
+    const destination = { target: () => ({ missionId: "mission-1", subtaskId: "a" }), applied: (_mission: string, requestId: string) => receipts.has(requestId),
+      direct: async (_mission: string, direction: { requestId: string }) => {
+        directed.push(direction.requestId);
+        receipts.add(direction.requestId);
+        return "waiting" as const;
+      } };
+    const first = f.openTeam();
+    first.useMissionReviews(destination);
+    await poller(first).start();
+    await poller(first).poll();
+    assert.deepEqual(f.readRecord<Saved>("team", f.run.id).reviewIntake?.intents.map(intent => intent.state), ["pending"], "the mission's reply was lost");
+    const reads = gh.commands().length, second = f.openTeam();
+    second.useMissionReviews(destination);
+    await poller(second).start();
+    const saved = f.readRecord<Saved>("team", f.run.id);
+    assert.deepEqual([saved.reviewIntake?.intents.map(intent => intent.state), gh.commands().length - reads, directed.length], [["applied"], 0, 1]);
+  } finally { f.close(); }
+});
+
+test("a coordinator's forward of a mission run's review reads GitHub once more and steers the run once, also when the mission's save was lost", async () => {
+  const f = schedulerFixture();
+  try {
+    f.run.missionId = "mission-1";
+    const gh = delivered(f), forwarded = "The owner asks for --strict with the old name kept as an alias.";
+    gh.show([gh.review("PRR_1", owner, "CHANGES_REQUESTED")]);
+    const subtask = { id: "a", title: "Subtask a", objective: "Do a", repoProjectId: f.run.projectId, size: "solo", parallelism: 1, dependsOn: [], status: "done", teamId: f.run.id } as unknown as MissionSubtask;
+    const stored = { mission: { id: "mission-1", status: "working", revision: 1, maxMinutes: 30, steering: [], subtasks: [subtask] } as unknown as Mission,
+      receipts: {} as Record<string, string>, inbox: [] as MissionMessage[], notes: [] as MissionMessage[], notified: [] as string[], ops: [] as ReviewForwardOp[], refusals: 0, reviews: undefined as MissionReviewRecord[] | undefined };
+    const connect = (teams: TeamService, record: typeof stored) => {
+      const review = new MissionReview({ records: new Map([["mission-1", record]]), teams, enqueue: async (_id, task) => task(), save: () => {}, event: () => {},
+        follow: () => {}, held: () => false, steeringFull: () => false });
+      review.connect(teams.useMissionReviews(review));
+      return review;
+    };
+    const settle = async (review: MissionReview<typeof stored>, record: typeof stored) => {
+      for (let passes = 0; await review.applyForward(record, record.ops[0]!); passes++) {
+        assert.ok(passes < 250, "the forward settles within 5 s");
+        await new Promise(resolve => setTimeout(resolve, 20));
+      }
+    };
+    const teams = f.openTeam(), review = connect(teams, stored), feedback = poller(teams);
+    await feedback.start();
+    await feedback.poll();
+    assert.deepEqual(stored.inbox.splice(0).map(message => message.type), ["review-direction"]);
+    assert.deepEqual(review.queueForward(stored, subtask, forwarded, true), { kind: "queued" });
+    const lost = structuredClone(stored), reads = gh.commands().length;
+    await settle(review, stored);
+    let saved = f.readRecord<Saved>("team", f.run.id);
+    assert.equal(gh.commands().length - reads, 1, "GitHub is read once more before the steer");
+    assert.deepEqual([saved.run.revision, saved.run.steering.map(item => [item.text, item.source])], [2, [[forwarded, "coordinator"]]]);
+    assert.deepEqual(stored.reviews?.map(item => item.state), ["forwarded"]);
+
+    const restarted = f.openTeam();
+    await settle(connect(restarted, lost), lost);
+    saved = f.readRecord<Saved>("team", f.run.id);
+    assert.equal(saved.run.revision, 2, "the restarted mission finds the run's receipt and steers nothing more");
+    assert.deepEqual(lost.reviews?.map(item => item.state), ["forwarded"]);
+    assert.equal(gh.commands().length - reads, 1);
+  } finally { f.close(); }
+});
+
 test("a review submitted before the switch was last turned on starts nothing", async () => {
   const f = schedulerFixture();
   try {
@@ -183,12 +334,12 @@ test("whichever record write a review's steer stops after, the restarted host st
       stops++;
       stop.restart();
       const left = f.readRecord<Saved>("team", f.run.id), intent = left.reviewIntake?.intents[0];
-      const expected = ([["pending", false], ["pending", false], ["pending", true], ["applied", true]] as const)[stopAt - 1];
+      const expected = ([["pending", false], ["pending", true], ["applied", true]] as const)[stopAt - 1];
       assert.deepEqual([intent?.state, Boolean(left.receipts[requestId(f)])], expected);
       const readsBefore = gh.commands().length, second = poller(f.openTeam());
       await second.start();
-      assert.equal(gh.commands().length - readsBefore, stopAt <= 2 ? 1 : 0,
-        stopAt === 3 ? "an intent whose steer took effect is acknowledged from its receipt without reading GitHub" : `after write ${stopAt} the drain reads GitHub only for an intent without a receipt`);
+      assert.equal(gh.commands().length - readsBefore, stopAt === 1 ? 1 : 0,
+        stopAt === 2 ? "an intent whose steer took effect is acknowledged from its receipt without reading GitHub" : `after write ${stopAt} the drain reads GitHub only for an intent without a receipt`);
       await second.poll();
       const saved = f.readRecord<Saved>("team", f.run.id);
       assert.equal(saved.run.revision, 2, `a stop after write ${stopAt} steers exactly once`);
@@ -198,8 +349,42 @@ test("whichever record write a review's steer stops after, the restarted host st
       assert.equal(events(saved).filter(text => text.startsWith("The owner requested changes on the pull request")).length, 1);
     } finally { f.close(); }
   }
-  assert.equal(stops, 4, "the intent, the steer's two writes and the acknowledgement");
+  assert.equal(stops, 3, "the intent, the steer and the acknowledgement; the steer's earlier save of an unchanged record writes nothing");
 });
+
+for (const superseded of [false, true]) {
+  test(superseded ? "a review that GitHub supersedes while the host is stopped between its steer's permission withdrawal and the steer's write starts nothing, and the decision stays withdrawn with a true reason"
+    : "a host stop between a review steer's permission withdrawal and the steer's write leaves the decision withdrawn, and the restarted host steers exactly once", async () => {
+    const f = schedulerFixture();
+    try {
+      approvedDecision(f);
+      const gh = delivered(f), changes = gh.review("PRR_1", owner, "CHANGES_REQUESTED"), withdrawn = [["stale", "A steer started before the permission request could be answered."]];
+      const decisions = (saved: Saved) => saved.run.permissionDecisions?.map(decision => [decision.status, decision.reason]);
+      gh.show([changes]);
+      const stop = hostStop(f, 2), first = poller(f.openTeam({ entries: stop.entries }));
+      await first.start();
+      stop.arm();
+      await first.poll();
+      assert.ok(stop.stopped(), "the review's intent and its steer's permission withdrawal are two record writes");
+      stop.restart();
+      const left = f.readRecord<Saved>("team", f.run.id);
+      assert.deepEqual([left.run.revision, left.reviewIntake?.intents.map(intent => intent.state), left.receipts[reviewRequestId(f.run.id, "PRR_1")]], [1, ["pending"], undefined],
+        "the host stopped after the withdrawal and before the steer's own write");
+      assert.deepEqual(decisions(left), withdrawn);
+      if (superseded) gh.show([changes, gh.review("PRR_2", owner, "APPROVED", "Looks good.", new Date(Date.now() + 120_000).toISOString())]);
+      const reads = gh.commands().length, second = poller(f.openTeam());
+      await second.start();
+      assert.equal(gh.commands().length - reads, 1, "the restarted host reads GitHub once before it acts on an intent without a receipt");
+      await second.poll();
+      const saved = f.readRecord<Saved>("team", f.run.id);
+      assert.equal(saved.run.revision, superseded ? 1 : 2, superseded ? "a superseded review starts nothing" : "the restarted host steers exactly once");
+      assert.deepEqual(saved.run.steering.map(item => item.text), superseded ? [] : [requested]);
+      assert.deepEqual(saved.reviewIntake?.intents.map(intent => intent.state), [superseded ? "superseded" : "applied"]);
+      assert.deepEqual(decisions(saved), withdrawn, "the host does not restore the withdrawn decision, and its reason does not say the revision changed");
+      assert.equal(f.permissionAnswers(), 0, "no provider answer is sent for the withdrawn decision");
+    } finally { f.close(); }
+  });
+}
 
 test("a review that GitHub supersedes while the owner's halt holds it starts nothing", async () => {
   const f = schedulerFixture();
@@ -381,4 +566,65 @@ test("close settles within its bound while a process the host cannot stop holds 
     assert.ok(Date.now() - started < 12_000, `close took ${Date.now() - started} ms`);
     await teams.idle();
   } finally { gh.release(); f.close(); }
+});
+
+test("steering a legacy pull request without a branch resolves and persists the branch on demand even with review feedback off, then reuses it", async () => {
+  const f = schedulerFixture();
+  try {
+    const gh = delivered(f, false);
+    delete f.run.pullRequest!.branch;
+    f.run.publication = { repository, branch, commit: gh.head, publishedAt: new Date().toISOString() };
+    f.writeTeam();
+    gh.show([]);
+    const teams = f.openTeam();
+
+    const first = await teams.steer(f.run.id, { requestId: randomUUID(), revision: 1, text: "Keep the old flag name as an alias." });
+    assert.equal(first.revision, 2);
+    assert.equal(first.pullRequest?.branch, branch);
+    assert.deepEqual(gh.commands(), [ghBranchRead], "one read-only gh pr view resolves the missing branch");
+    let saved = f.readRecord<Saved>("team", f.run.id);
+    assert.equal(saved.run.pullRequest?.branch, branch);
+    assert.equal(saved.run.revision, 2);
+
+    const second = await teams.steer(f.run.id, { requestId: randomUUID(), revision: 2, text: "Document the alias in help output." });
+    assert.equal(second.revision, 3);
+    assert.equal(second.pullRequest?.branch, branch);
+    assert.deepEqual(gh.commands(), [ghBranchRead], "subsequent steering reuses the persisted branch without calling gh again");
+    saved = f.readRecord<Saved>("team", f.run.id);
+    assert.equal(saved.run.revision, 3);
+  } finally { f.close(); }
+});
+
+test("on-demand legacy pull request branch lookup fails cleanly without corrupting the run", async () => {
+  type FailureCase = { name: string; setup: (f: Fixture, gh: ReturnType<typeof delivered>) => void; expectedCommands: number; match: RegExp };
+  const cases: FailureCase[] = [
+    { name: "gh lookup failure", setup: () => {}, expectedCommands: 1, match: /failed/ },
+    { name: "invalid branch name", setup: (_f, gh) => gh.show([], { headRefName: "../escape" }), expectedCommands: 1, match: /invalid head branch/ },
+    { name: "fork pull request", setup: (_f, gh) => gh.show([], { isCrossRepository: true }), expectedCommands: 1, match: /comes from a fork/ },
+    { name: "closed pull request", setup: (_f, gh) => gh.show([], { state: "CLOSED" }), expectedCommands: 1, match: /was closed/ },
+    { name: "unowned head branch", setup: (_f, gh) => gh.show([], { headRefName: "someone-elses-branch" }), expectedCommands: 1, match: /not on the branch this run delivered to/ },
+    { name: "cross-repo pull request URL", setup: (f, gh) => { f.run.pullRequest!.pullRequestUrl = "https://github.com/other-org/example-repo/pull/7"; gh.show([]); }, expectedCommands: 0, match: /does not match the pinned delivery repository/ },
+  ];
+  for (const item of cases) {
+    const f = schedulerFixture();
+    try {
+      const gh = delivered(f, false);
+      delete f.run.pullRequest!.branch;
+      f.run.publication = { repository, branch, commit: gh.head, publishedAt: new Date().toISOString() };
+      item.setup(f, gh);
+      f.writeTeam();
+      const before = f.readRecord<Saved>("team", f.run.id);
+      const teams = f.openTeam();
+      const requestId = randomUUID();
+      await assert.rejects(
+        teams.steer(f.run.id, { requestId, revision: 1, text: "Keep the alias." }),
+        error => error instanceof Error && (error as { code?: string }).code === "delivery-branch-unknown" && item.match.test(error.message),
+        item.name,
+      );
+      assert.equal(gh.commands().length, item.expectedCommands, item.name);
+      const after = f.readRecord<Saved>("team", f.run.id);
+      assert.deepEqual(after, before, `${item.name}: run stays uncorrupted on disk`);
+      assert.equal(after.receipts[requestId], undefined, `${item.name}: no steer receipt recorded`);
+    } finally { f.close(); }
+  }
 });

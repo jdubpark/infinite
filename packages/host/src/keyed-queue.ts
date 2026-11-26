@@ -12,6 +12,10 @@ export class KeyedQueue {
     return next;
   }
 
+  get size(): number {
+    return this.queues.size;
+  }
+
   settle(): Promise<void> {
     return Promise.allSettled([...this.queues.values()]).then(() => undefined);
   }

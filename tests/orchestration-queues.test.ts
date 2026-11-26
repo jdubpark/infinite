@@ -117,17 +117,23 @@ test("GoalService processes independent goals concurrently, serializes same-goal
     const steerA = goals.steer(gA.id, { requestId: randomUUID(), revision: gA.revision, text: "Queued behind extend" });
     let steerASettled = false;
     void steerA.then(() => { steerASettled = true; }, () => { steerASettled = true; });
+    let idleDone = false;
+    const idling = goals.idle().then(() => { idleDone = true; });
 
     const steeredB = await goals.steer(gB.id, { requestId: randomUUID(), revision: gB.revision, text: "Goal B direction" });
     assert.equal(steeredB.steering.length, 1);
     const pausedB = await goals.pause(gB.id, { requestId: randomUUID(), revision: steeredB.revision });
     assert.equal(pausedB.status, "paused");
     assert.equal(steerASettled, false);
+    assert.equal(idleDone, false);
 
     extendGate.resolve();
     const extendedA = await extendA;
     assert.ok(Date.parse(extendedA.deadlineAt) >= Date.parse(gA.deadlineAt));
     await assert.rejects(steerA, { code: "stale-goal-revision" });
+    await idling;
+    assert.equal(idleDone, true);
+    assert.equal(steerASettled, true);
 
     const storedB = (goals as unknown as { records: Map<string, { goal: ProductGoal }> }).records.get(gB.id)!;
     storedB.goal.activeTeamId = randomUUID();
@@ -146,12 +152,85 @@ test("GoalService processes independent goals concurrently, serializes same-goal
     await closing;
     assert.equal(closedDone, true);
   } finally {
+    extendGate.resolve();
+    secondGate.resolve();
     await goals.close();
     f.close();
   }
 });
 
-test("RoutineService ticks and mutates independent routines concurrently and drains on close", async () => {
+test("GoalService.idle waits for all multi-goal tick workers even when a failed goal's save throws", async () => {
+  const f = schedulerFixture();
+  const siblingGate = deferred();
+  const firstEntered = deferred();
+  let siblingsEntered = 0;
+  const createdIds = new Set<string>();
+  let failingId = "";
+  let restoreWrite: (() => void) | undefined;
+  const fakeTeams = {
+    goalIdOf: () => undefined,
+    get: () => { throw new TeamError(404, "team-not-found", "missing"); },
+    createForGoal: async (request: { requestId: string; title: string }, context: { id: string }) => {
+      if (request.title.startsWith("Failing goal")) {
+        restoreWrite = f.blockRecordWrites("goal", failingId);
+        firstEntered.resolve();
+        throw new Error("create failed");
+      }
+      siblingsEntered++;
+      await siblingGate.promise;
+      createdIds.add(context.id);
+      return {
+        id: request.requestId, status: "running", createdAt: new Date().toISOString(), members: [],
+        usage: { total: { cost: 0, tokens: 0, messages: 0, pricing: { catalog: 0, unknown: 0 } }, byProfile: {}, byProvider: {}, unmeasuredMembers: 0 },
+      };
+    },
+  } as unknown as TeamService;
+  const config = {
+    ...f.config,
+    teams: { ...f.config.teams, lineup },
+    projects: [{ id: "fixture", name: "Fixture", path: f.workspace, team: { checks: [{ command: process.execPath, args: ["-e", "0"] }] } }],
+  } as Config;
+  const goals = new GoalService(config, f.key, fakeTeams);
+  try {
+    const failing = await goals.create({
+      requestId: randomUUID(), projectId: "fixture", title: "Failing goal", objective: "Fail on launch",
+      successCriteria: "Checks pass", nonGoals: ["No unrelated edits"], allowedPaths: ["src"],
+      evidence: ["Spec"], maxRuns: 1, maxMinutes: 10, maxMembers: 4,
+    });
+    failingId = failing.id;
+    const siblings: string[] = [];
+    for (let i = 0; i < 9; i++) {
+      const created = await goals.create({
+        requestId: randomUUID(), projectId: "fixture", title: `Sibling goal ${i}`, objective: `Work ${i}`,
+        successCriteria: "Checks pass", nonGoals: ["No unrelated edits"], allowedPaths: ["src"],
+        evidence: ["Spec"], maxRuns: 1, maxMinutes: 10, maxMembers: 4,
+      });
+      siblings.push(created.id);
+    }
+    goals.start();
+    let idleDone = false;
+    const idling = goals.idle().then(() => { idleDone = true; });
+    await firstEntered.promise;
+    for (let i = 0; i < 50 && siblingsEntered < 8; i++) {
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    assert.equal(siblingsEntered, 8);
+    assert.equal(idleDone, false, "idle waits while sibling workers remain in flight after a save failure");
+    siblingGate.resolve();
+    await idling;
+    assert.equal(idleDone, true);
+    assert.equal(createdIds.size, 9);
+    for (const id of siblings) assert.ok(goals.get(id).activeTeamId, `sibling ${id} launched`);
+  } finally {
+    siblingGate.resolve();
+    restoreWrite?.();
+    await goals.close();
+    f.close();
+  }
+});
+
+test("RoutineService ticks and mutates independent routines concurrently and drains on close", async t => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
   const root = realpathSync(mkdtempSync(join(tmpdir(), "routine-conc-")));
   const stateDir = join(root, "state");
   mkdirSync(stateDir, { recursive: true });
@@ -201,7 +280,7 @@ test("RoutineService ticks and mutates independent routines concurrently and dra
   try {
     const rA = await routines.create(makeRoutine("Routine A", "demo-a"));
     const rB = await routines.create(makeRoutine("Routine B", "demo-b"));
-    await new Promise(resolve => setTimeout(resolve, 20));
+    t.mock.timers.tick(20);
 
     const ticking = routines.tick();
     await new Promise(resolve => setTimeout(resolve, 20));
@@ -224,7 +303,7 @@ test("RoutineService ticks and mutates independent routines concurrently and dra
     assert.deepEqual(launched, ["Routine B", "Routine A"]);
 
     const rC = await routines.create(makeRoutine("Routine C", "demo-c"));
-    await new Promise(resolve => setTimeout(resolve, 20));
+    t.mock.timers.tick(20);
     holdClose = true;
     const closeTick = routines.tick();
     await new Promise(resolve => setTimeout(resolve, 15));
@@ -294,6 +373,7 @@ test("MissionService steps independent missions concurrently, serializes same-mi
   } as unknown as Manager;
   const fakeTeams = {
     useMissionReservations() {},
+    useMissionReviews() {},
     ensureMissionCapacityCeiling() { return undefined; },
     isActiveRun() { return false; },
     activeForProject() { return false; },
@@ -438,7 +518,8 @@ test("TeamService isolates per-run queues, serializes same-run actions, and drai
   }
 });
 
-test("RoutineService same-project race defers losing routine cleanly and preserves pending wakes", async () => {
+test("RoutineService same-project race defers losing routine cleanly and preserves pending wakes", async t => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
   const root = realpathSync(mkdtempSync(join(tmpdir(), "routine-project-race-")));
   const stateDir = join(root, "state");
   mkdirSync(stateDir, { recursive: true });
@@ -502,7 +583,7 @@ test("RoutineService same-project race defers losing routine cleanly and preserv
       summary: "Urgent check", detail: {}, at: new Date().toISOString(),
     };
     signalsList.push(wakeSignal);
-    await new Promise(resolve => setTimeout(resolve, 35));
+    t.mock.timers.tick(35);
 
     const ticking = routines.tick();
     await startEntered.promise;
@@ -526,7 +607,7 @@ test("RoutineService same-project race defers losing routine cleanly and preserv
       summary: "Retry signal", detail: {}, at: new Date().toISOString(),
     };
     signalsList.push(secondWake);
-    await new Promise(resolve => setTimeout(resolve, 35));
+    t.mock.timers.tick(35);
     projectBusy = false;
     forceConflictOnNext = true;
     await routines.tick();
@@ -694,6 +775,7 @@ test("HaltService.engage drains held Goal, Routine, and Mission creates and clos
     get: () => { throw new TeamError(404, "team-not-found", "missing"); },
     useGoalRecords() {},
     useMissionReservations() {},
+    useMissionReviews() {},
     ensureMissionCapacityCeiling() { return undefined; },
     isActiveRun() { return false; },
     activeForProject() { return false; },
@@ -798,6 +880,7 @@ test("MissionService.pendingProjectIds covers default checkouts of un-overridden
 
   const fakeTeams = {
     useMissionReservations() {},
+    useMissionReviews() {},
     ensureMissionCapacityCeiling() { return undefined; },
     isActiveRun() { return false; },
     activeForProject() { return false; },

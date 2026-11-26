@@ -88,6 +88,7 @@ sudo install -d -o "infinite-$NAME-host" -g "infinite-$NAME-host" -m 0700 \
   "/srv/infinite-data/instances/$NAME/control-home"
 sudo install -d -o "infinite-$NAME-agent" -g "infinite-$NAME-agent" -m 0700 \
   "/srv/infinite-data/instances/$NAME/agent-home" \
+  "/srv/infinite-data/instances/$NAME/repository-graphs" \
   "/srv/infinite-data/instances/$NAME/tmp/agent"
 sudo install -d -o "infinite-$NAME-host" -g "infinite-$NAME-host" -m 0700 \
   "/srv/infinite-data/instances/$NAME/tmp/control"
@@ -179,12 +180,10 @@ NAME=work
 node scripts/render-instance.mjs --out ".local/instance-$NAME" --instance "$NAME"
 ```
 
-Review the rendered config and paths. After selecting an unused HTTPS listener
-port as described below, set `origin` to
-`https://HOST.YOUR-TAILNET.ts.net:HTTPS_PORT` in place of the skeleton's
-placeholder. Confirm that the hostname resolves only inside the owner's
-tailnet. Keep the API bound to loopback; do not create a public inbound rule
-for its port.
+Review the rendered config and paths. Keep the API bound to loopback. Set
+`origin` to the instance's own private HTTPS origin before enabling browser
+access. Cloud configuration requires an HTTPS origin even when only the CLI
+uses the instance. [Port, origin, and relay registration](#port-origin-and-relay-registration)
 
 Validate and install the sudoers policy before restarting either service:
 
@@ -213,10 +212,12 @@ permits, and without it the instance's sudo sessions report
 `0755`; the rendered sudoers permits it, and without it the instance cannot
 check for processes left by an earlier API process.
 
-The rendered sudoers permits no `jevcode` or `repository-graph` wrapper,
-because the tracked ones name the first instance's paths. The instance runs
-without repository briefings and the code graph until instance wrappers for
-them exist.
+The rendered sudoers also permits the instance's `jevcode` and
+`repository-graph` wrappers under `/usr/local/libexec/infinite-NAME/`. Each
+rendered wrapper confines paths strictly to `/srv/infinite-data/instances/NAME/`
+and refuses paths under the first instance or any sibling instance. Install them
+beside the provider wrappers; both features remain disabled until explicitly
+configured in `/etc/infinite-NAME/config.json`.
 
 ```sh
 sudo install -o root -g root -m 0644 ".local/instance-$NAME/infinite-$NAME.service" \
@@ -238,6 +239,10 @@ for provider in claude codex grok opencode; do
   sudo install -o root -g root -m 0755 ".local/instance-$NAME/agent-wrapper.sh" \
     "/usr/local/libexec/infinite-$NAME/$provider"
 done
+sudo install -o root -g root -m 0755 ".local/instance-$NAME/jevcode-wrapper.sh" \
+  "/usr/local/libexec/infinite-$NAME/jevcode"
+sudo install -o root -g root -m 0755 ".local/instance-$NAME/repository-graph-wrapper.py" \
+  "/usr/local/libexec/infinite-$NAME/repository-graph"
 sudo install -o root -g root -m 0755 ".local/instance-$NAME/transcript-drain.sh" \
   "/usr/local/libexec/infinite-$NAME/transcript-drain"
 sudo install -o root -g root -m 0755 ".local/instance-$NAME/process-census.sh" \
@@ -274,26 +279,57 @@ tools.
 
 ## Port, origin, and relay registration
 
-Use a distinct loopback port for the second API. The default is `4781`; the
-first instance continues to use its configured port. Check
-`tailscale serve status` and choose an unused HTTPS listener port for the
-second instance. Tailscale Serve accepts HTTPS listeners only on ports 443,
-8443, and 10000, so a host that already uses two of them has one left.
-Publish only through Tailscale Serve, with the HTTPS hostname and port equal
-to `origin`:
+Give each API its own loopback port and each browser-facing instance its own
+private HTTPS hostname. Infinite sets the same host-only `infinite` cookie at
+`/api` on every instance. A browser sends that cookie to matching paths on
+every HTTPS port of the hostname, and signing in on one port can replace the
+cookie for the other. [Host login handler](../../packages/host/src/server.ts)
+and [RFC 6265 §8.5](https://www.rfc-editor.org/rfc/rfc6265.html#section-8.5)
+
+If the tailnet uses Tailscale Services, have its administrator define a
+dedicated service on `tcp:443` and restrict access to the intended clients.
+From a tagged service host, advertise the instance's loopback API. The
+example uses the default instance port of `4781`.
+[Tailscale Services](https://tailscale.com/docs/features/tailscale-services)
 
 ```sh
-sudo tailscale serve --bg --https=HTTPS_PORT http://127.0.0.1:4781
-tailscale serve status
+sudo tailscale serve --service="svc:infinite-$NAME" --https=443 http://127.0.0.1:4781
+tailscale serve status --json
 ```
 
-Confirm with `tailscale serve status` that the first instance's listener is
-unchanged. A tailnet that uses Tailscale Services can instead publish the
-instance under its own service name.
+Once the service host's advertisement is approved, match `origin` to the
+service's MagicDNS HTTPS origin. Confirm its certificate,
+loopback target, and access grants, and compare the first instance's route
+with its pre-change configuration. The three-port limit (443, 8443, and
+10000) applies to public Funnel listeners. Keep organization services private.
+[Serve](https://tailscale.com/docs/reference/tailscale-cli/serve) and
+[Funnel](https://tailscale.com/docs/reference/tailscale-cli/funnel)
 
-The host firewall is shared with the first instance. Do not change it: the
-instance's API stays on loopback and is published only through Tailscale Serve.
-Confirm that the firewall is unchanged:
+Until a distinct browser hostname is provisioned, leave the service
+unpublished. For CLI access, bind an SSH local forward to loopback and use
+the instance's API port at both ends so the HTTP `Host` header matches.
+Pair the bearer-authenticated CLI in a second shell with this instance's
+device key and a separate client config. Reserve browser login for the
+dedicated HTTPS hostname. [OpenSSH local forwarding](https://man.openbsd.org/ssh.1#L)
+and [Infinite CLI pairing](../../packages/host/src/client.ts)
+
+If a legacy service must remain on a shared hostname, set
+`"browserSessions": false` in its private config and restart it. Browser login
+then stops before body parsing, existing cookies are ignored, and the web
+entry returns a static unavailable page. Paired bearer APIs, event streams,
+native sockets, and machine access remain enabled. The in-memory cookie
+sessions end when the service restarts. Keep browser sessions disabled until
+the service has its own private HTTPS hostname.
+
+```sh
+ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:4781:127.0.0.1:4781 SSH_HOST
+```
+
+```sh
+infinite pair http://127.0.0.1:4781 --token-file INSTANCE_DEVICE_KEY_FILE --client-config PRIVATE_CLIENT_CONFIG
+```
+
+Check that the host firewall still matches its pre-change configuration.
 
 ```sh
 sudo ufw status verbose
@@ -539,19 +575,45 @@ unchanged.
 Run these five checks before enabling private mission work. Record the results
 without recording credentials.
 
-1. **The instances cannot read each other's private data.** Test both
-   directions for the agent home, control state, workspaces, and config file.
+1. **Verify filesystem access for the named accounts and protected roots.**
+   Prepare a private JSON manifest with an `instances` array. For each
+   instance list its `name`, its host and agent accounts in `users`, and its
+   absolute protected file and directory names in `paths`. Include control
+   state, provider homes, workspaces, writable queue and output directories,
+   and individual config and key files. Use specific roots for the first
+   instance since the common encrypted mount also contains its peers.
+   Run the read-only verifier as root on the Linux host.
 
    ```sh
-   sudo -H -u "infinite-$NAME-agent" test ! -x /srv/infinite-data/agent-home
-   sudo -H -u "infinite-$NAME-agent" test ! -x /srv/infinite-data/control
-   sudo -H -u "infinite-$NAME-agent" test ! -x /srv/infinite-data/workspaces
-   sudo -H -u "infinite-$NAME-agent" test ! -r /etc/infinite/config.json
-   sudo -H -u infinite-agent test ! -x "/srv/infinite-data/instances/$NAME/agent-home"
-   sudo -H -u infinite-agent test ! -x "/srv/infinite-data/instances/$NAME/control"
-   sudo -H -u infinite-agent test ! -x "/srv/infinite-data/instances/$NAME/team-workspaces"
-   sudo -H -u infinite-agent test ! -r "/etc/infinite-$NAME/config.json"
+   sudo python3 deploy/ubuntu/verify-instance-boundaries.py --manifest FILE
    ```
+
+   A pass confirms distinct non-root account IDs and checks the declared
+   roots for overlapping paths, inodes and bind-mount mappings. An account
+   in the owning instance must be able to read each listed file or read and
+   traverse each listed directory. For every peer, the kernel must deny
+   read, write and execute or traverse access to each listed root. Keep the
+   count-only success receipt with the private inventory. The shared kernel
+   and privileged operators remain trusted. Verify key uniqueness, browser
+   sessions, provider and API credentials, source audiences and destinations
+   separately.
+   [Boundary verifier](verify-instance-boundaries.py)
+
+   Install the root-owned verifier at `/usr/local/libexec/infinite-verify-instance-boundaries`
+   and the root-owned mode `0600` inventory at
+   `/etc/infinite-instance-boundaries/instances.json`. Install the service
+   and timer, run `systemctl daemon-reload`, then run
+   `systemctl enable --now infinite-instance-boundaries.timer`. The first run
+   is due two minutes after boot, then every five minutes. Monitor the service
+   with `systemctl show infinite-instance-boundaries.service -p Result -p ExecMainExitTimestamp`.
+   [Service](infinite-instance-boundaries.service) and [timer](infinite-instance-boundaries.timer)
+
+   To gate startup of a newly commissioned unit, add
+   `Requires=infinite-instance-boundaries.service` and
+   `After=infinite-instance-boundaries.service` under its `[Unit]` section,
+   then reload systemd. Use persistent roots available before startup in
+   this inventory. Check runtime-created files with a separate manifest once
+   their service has created them. [systemd unit dependencies](https://www.freedesktop.org/software/systemd/man/latest/systemd.unit.html#Requires=)
 
 2. **The unit has the intended resource priority.** Confirm the weights and
    OOM score, and inspect every process belonging to the new accounts in the
@@ -638,15 +700,48 @@ app and the owner's account, including `intake.slack.linearAgentUserId` for
 Linear's Slack agent. The intake binding must post only into the issue's
 recorded Slack thread.
 
-Direct requests need no new scope: the bot already reads the thread and posts in
-it. Set `intake.slack.directRequests` to `true` to let the owner's mention of the
+For an organization-isolated instance, set `intake.slack.organizationScope`
+and populate its `channelIds` array only with channels the owner has bound to
+this instance, its repositories and the people allowed to see their results.
+An empty array denies every channel. Omitting `channelIds` from the object
+applies the metadata check to every otherwise eligible channel. The host uses
+`conversations.info` to check membership and a single workspace, and rejects
+shared channels, pending shares and DMs. A workspace match can still include
+guests or other audiences. Record the owner's audience decision separately.
+[Slack client](../../packages/host/src/slack-client.ts) and
+[Slack Connect channel semantics](https://docs.slack.dev/apis/slack-connect/)
+
+Set `organizationScope.workspaces` to the exact checkouts in the intake
+mission's group. Each entry names a `projectId`, its canonical absolute
+`path`, and its GitHub `repository` as `owner/repo`. For a local answer
+workspace, set `repository` to `null` and supply its Git `rootCommit`.
+Missing workspace pins keep scoped intake closed. Check the live checkout
+against its source before enrolling it. A host-managed GitHub checkout
+without a remote needs a HEAD matching its recorded applied commit.
+Review the pins when a group gains a checkout, a repository changes, or a
+workspace moves. Existing authorized missions can finish inside the instance.
+The paired owner's `GET /api/intake/workspace-scope` request reports
+`verified`, `blocked` or `unconfigured` for the current checkout bindings.
+Slack independently checks channel membership and sharing before delivery.
+
+Grant the bot `channels:read` for public channel metadata and `groups:read`
+for private channel metadata. Have a workspace administrator reinstall the
+app to grant the added scopes on an existing installation. If the owner explicitly
+asks to keep existing intake running, retain its existing configuration and
+approved use while the grant is pending. Before admitting private work, use
+an owner-approved test item to check the intended channel, repository and
+reply destination. Confirm an unbound channel creates no work or reply.
+[Slack method scopes](https://docs.slack.dev/reference/methods/conversations.info/)
+and [Slack app reinstallation](https://docs.slack.dev/app-management/distribution/)
+
+Set `intake.slack.directRequests` to `true` to let the owner's mention of the
 bot file the Linear issue and start the mission. The first test issue through
 Linear's Slack agent (pre-build check 1) is then optional for direct requests.
 Until that attribution check has passed, set `intake.linear.admitIssues` to
 `false`, so that only the owner's direct requests start work and no issue filed
 through Linear's Slack agent is admitted.
 
-For requests from a single member in every channel the bot joins, enable
+For requests from a single member in eligible channels the bot joins, enable
 `intake.slack.ownerOnlyInJoinedChannels` and `directRequests`. Set
 `ownerUserId` to the permitted member's Slack ID. Slack delivers public
 channel messages through `message.channels` and private channel messages
@@ -660,7 +755,7 @@ reinstall the Slack app to apply the added scope. The owner can then sponsor
 a teammate's proposal by replying with `work:` and instructions.
 See [Slack request channels](../../docs/intake.md#slack-request-channels).
 
-Questions need no new scope either. Set `intake.slack.answerQuestions` to `true`
+Set `intake.slack.answerQuestions` to `true`
 (it needs `directRequests`) to let a mention that asks a question, or starts with
 `ask:`, be answered read-only in the thread with no Linear issue; a mention that
 starts with `work:` always files a request. Set `intake.slack.classify` to `true`
@@ -677,6 +772,22 @@ connector calls within the owner's approved task; it does not authorize a
 connector write. The delegated-permission scope for the workspace's
 repositories adds read-only connector calls made for the accepted objective.
 Sends, writes, and new credentials still escalate to the owner.
+
+Record each approved source in the private enrollment inventory with its
+organization, permitted repositories, audience, sending identity and output
+destinations. Apply the same rule to mailboxes, tracker projects and KPI
+sources. A mailbox address, email domain, repository name or channel ID alone
+cannot establish permission. Leave a mixed mailbox disconnected if its
+connector cannot enforce an approved subset. Deny reads, queued work and
+publication for sources with missing, ambiguous or revoked grants. Give each
+instance separate provider logins and homes, connector credentials, queues,
+caches, retrieval indexes, KPI stores and reports, and output destinations.
+
+Freeze legacy mixed history in its original store with its existing audit
+records. Keep it out of new missions, retries, search, reports and KPI totals.
+Start fresh instance-owned queues and indexes for newly admitted work. Any
+later transfer needs an owner decision covering those records and their
+destination audience.
 
 ## Pre-build checks
 
@@ -713,7 +824,46 @@ issue text, account IDs, or credentials in this repository.
    perform answer-only work. This is an instance-wide lineup choice, not a
    per-subtask override.
 
-Keep intake disabled until these three outcomes, the host acceptance checks,
-the owner identity, allowed Linear teams and label, Slack app, and credentials
-have been configured. Do not configure teammate identities or a public
-callback endpoint.
+Before enabling intake on a new instance, record the applicable outcomes,
+pass the host acceptance checks, and configure its owner identity, allowed
+Linear teams and label, Slack app and credentials. Do not configure teammate
+identities or a public callback endpoint.
+
+## Retired native session custody
+
+A project halt stops autonomous work. Native sessions have their own direct API
+and transcript routes. To retire positively identified sessions from those
+routes, an operator can move their complete directories into offline custody.
+The move keeps the original ciphertext and directory identities on the same
+filesystem.
+
+Stop admission and establish that the selected sessions have no live workers,
+open files or sockets. Fence writers while applying or restoring the selection.
+Create separate root-owned directories for the private receipt and for custody.
+Give the custody directory and its empty `sessions` child mode `0700`. Put the
+approved UUIDs in a root-owned mode `0400` receipt using the following format.
+
+```json
+{"version":1,"sessionIds":["00000000-0000-4000-8000-000000000001"]}
+```
+
+Run the utility as root. Include each service-accessible project, runtime and
+provider root with a separate `--service-root` argument. Keep the receipt,
+custody and executable outside those roots. Install the reviewed
+`verify-instance-boundaries.py` beside the utility for its mount checks.
+
+```sh
+python3 deploy/ubuntu/quarantine-session-state.py plan \
+  --selection "$RECEIPT" --state-root "$STATE" --custody-root "$CUSTODY" \
+  --service-root "$RUNTIME" --service-root "$WORKSPACES" --service-root "$PROVIDER_HOME"
+```
+
+Use `apply` with the same arguments for the move. After an interruption, repeat
+the same operation. Use `restore` during a fenced maintenance window to return
+the original directories. Keep the receipt and custody checkpoint together for
+recovery. After restarting the API, verify the inventory, a direct session
+read, a transcript read and continuity of unrelated workers.
+
+The utility covers host-native session directories. Team, goal and mission
+records, provider homes, shared evidence, client caches and backups have
+separate retention and access boundaries.

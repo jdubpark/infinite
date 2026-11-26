@@ -1,4 +1,4 @@
-import type { TeamRole } from "../team-types.js";
+import type { TeamRole } from "../team-role.js";
 
 export const ENTRY_KINDS = ["contract", "finding", "blocker", "handoff", "report", "integration", "check", "direction"] as const;
 export type EntryKind = typeof ENTRY_KINDS[number];
@@ -49,3 +49,6 @@ export type MemberEntryKind = typeof MEMBER_ENTRY_KINDS[number];
 
 export type MemberHead = Pick<EntryHead, "entryId" | "seq" | "at" | "kind" | "author" | "authority" | "authorRole"
   | "taskId" | "paths" | "summary" | "bodyBytes" | "supersedes" | "state">;
+export type PendingEntry = { entryId: string; state: "pending" };
+export type MemberList = { notice: string; heads: MemberHead[]; more: boolean; cursor?: number; unreadable: number };
+export type MemberEntry = { notice: string; head: MemberHead; body: unknown };

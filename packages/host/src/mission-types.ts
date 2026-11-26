@@ -1,6 +1,6 @@
 import type { ConnectorSource } from "./mcp-types.js";
 import { z } from "zod";
-import { blockerEvidenceSchema, storedUsageRollupSchema, type TeamLineup, type TeamStatus } from "./team-types.js";
+import { blockerEvidenceSchema, storedUsageRollupSchema, type GithubReviewSource, type TeamLineup, type TeamStatus } from "./team-types.js";
 import type { StoredRollup, UsageRollup } from "./team-usage.js";
 import { projectGroupIdSchema } from "./project-group-types.js";
 import { questionRecommendationSchema, refineQuestion, requiredQuestionRecommendationSchema, type DecisionRecommendation } from "./question-recommendation.js";
@@ -322,9 +322,10 @@ export interface Mission {
   dispatchSummary?: string;
   subtasks: MissionSubtask[];
   decisions: MissionDecision[];
-  steering: { text: string; revision: number; at: string; source?: MissionInputSource }[];
+  steering: { text: string; revision: number; at: string; source?: MissionInputSource | GithubReviewSource }[];
   events: { at: string; text: string }[];
   result?: { summary: string; revision: number; at: string };
+  earlierResults?: { summary: string; revision: number; at: string }[];
   followUps?: RecordedMissionFollowUp[];
   usage?: UsageRollup;
 }
@@ -339,7 +340,7 @@ export interface BoardAttempt {
 interface BoardItemBase {
   id: string;
   title: string;
-  groupId?: string;
+  groupId: string;
   projectName: string;
   column: BoardColumn;
   status: string;
@@ -368,7 +369,7 @@ const boardAttemptSchema = z.object({
 const boardItemBaseShape = {
   id: z.string().min(1),
   title: z.string().min(1),
-  groupId: z.string().min(1).optional(),
+  groupId: z.string().min(1),
   projectName: z.string().min(1),
   column: z.enum(["needs-input", "working", "review", "ended"]),
   status: z.string().min(1),

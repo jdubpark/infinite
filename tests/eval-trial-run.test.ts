@@ -5,7 +5,7 @@ import { existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { EvalHost } from "../packages/host/src/eval-host.js";
 import { type EvalIdentity } from "../packages/host/src/eval-identity.js";
-import { learningPurpose } from "../packages/host/src/types.js";
+import { isEvalSession } from "../packages/host/src/types.js";
 import { insertTrial } from "../packages/host/src/eval-trial-store.js";
 import { TRIAL_HARNESS_VERSION } from "../packages/host/src/eval-trial-rules.js";
 import type { EvalJobView } from "../packages/host/src/eval-types.js";
@@ -44,9 +44,10 @@ test("a fixture task is resolved by a member that applies the reference", { time
     assert.deepEqual(readdirSync(join(s.evalRoot, "trials")), [], "the trials root is empty after the job");
     assert.equal(served.service.list().some(view => view.id === rows[0].trial_id), false, "the run is not listed");
     const sessions = await served.manager.list();
-    const learning = sessions.filter(row => learningPurpose(row.purpose));
-    assert.ok(learning.length > 0, "the replay session exists");
-    assert.equal(sessions.filter(row => !learningPurpose(row.purpose)).length, sessions.length - learning.length);
+    const evalSessions = sessions.filter(row => isEvalSession(row));
+    assert.ok(evalSessions.length > 0, "the replay session exists");
+    assert.ok(evalSessions.every(row => row.executionIdentity === "eval"), "the replay session records eval execution identity");
+    assert.equal(sessions.filter(row => !isEvalSession(row)).length, sessions.length - evalSessions.length);
     assert.equal(served.service.replayIds().length, 0, "the graded trial leaves no run record");
   } finally {
     h.close();

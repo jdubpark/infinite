@@ -137,6 +137,13 @@ order. When `resync.required` is true, replace the local view with the returned
 Observations are sampled on reads. A transition between reads may appear only
 in the underlying team record.
 
+`infinite mission watch ID [--json]` keeps that live progress feed full screen
+alongside linked subteam blackboard entries (`j`/`k` or `↑`/`↓` select subtask,
+`e` toggle entries, `Enter` toggle detail, `f` toggle follow, `q` or Ctrl+C
+detach). The web client (`apps/web/src/mission-inspector/`) and phone app
+(`MissionProgressSection`) render the same `GET /api/missions/:id/progress`
+snapshot and cursor stream.
+
 `POST /api/missions` (owner) creates a mission for a group. A retry with the
 same `requestId` returns the recorded mission before any admission check, so it
 succeeds even after the group was edited or deleted or a handoff started. The host launches
@@ -278,9 +285,8 @@ recommendation. It is evidence for the coordinator's own choice between
 coordinator's `question` report requires its own recommendation through the
 report tool. A forwarded question without `answerMode` takes the subteam
 decision's mode, so the host checks the options and the recommendation against
-that final mode: one option unless the mode is `multiple`. A question from a
-coordinator started before this rule is still read, with no recommendation,
-and its reporter falls back the same way a team member's does.
+that final mode: one option unless the mode is `multiple`. A question recorded
+by a coordinator before this rule is still read, with no recommendation.
 When the owner, a connector, or the coordinator's `answer-child` answers a
 mission decision, the host records `matched`, `different`, or `other` on its
 recommendation, as for team decisions. A connector reads the recommendation

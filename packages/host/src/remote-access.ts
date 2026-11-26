@@ -28,6 +28,7 @@ const DECISION_ID = /^[A-Za-z0-9_.:-]{1,200}$/;
 const COMPONENT_ID = /^[A-Za-z0-9_-]{1,160}$/;
 const DIAGRAM_ID = /^[A-Za-z0-9_:.-]{1,200}$/;
 const BEHAVIOR_ID = /^[A-Za-z][A-Za-z0-9_.:-]{0,79}$/;
+const WORK_ID = /^(team|mission|goal):[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 function parsePathSegments(path: string): { rawPathname: string; raw: string[]; decoded: string[] } | undefined {
   if (path.length > 8192 || !path.startsWith("/api/") || path.includes("\\") || path.includes("#") || /[\x00-\x20\x7f]/.test(path)) return undefined;
@@ -74,6 +75,10 @@ function allowedPath(method: RemoteMethod, path: string): boolean {
       if (raw.length === 5 && method === "GET" && ["catalog", "components", "briefs", "planned", "work", "generated", "brief"].includes(raw[4])) return true;
       if (raw.length === 6 && method === "GET" && raw[4] === "components" && COMPONENT_ID.test(decoded[5])) return true;
       if (raw.length === 6 && method === "GET" && raw[4] === "diagrams" && DIAGRAM_ID.test(decoded[5])) return true;
+      if (raw[4] === "work" && raw.length >= 6 && WORK_ID.test(decoded[5])) {
+        if (raw.length === 6) return method === "GET";
+        return raw.length === 7 && raw[6] === "refresh" && method === "POST";
+      }
       if (raw[4] === "behaviors") {
         if (raw.length === 5) return method === "GET" || method === "POST";
         if (raw.length === 6 && BEHAVIOR_ID.test(decoded[5])) return method === "GET";

@@ -291,3 +291,28 @@ test("describeTeamWaitReasons handles spinner-only, stalled, blocked gating, and
   assert.equal(deferredReasons.filter((r) => r.kind === "worker-slot").length, 1);
   assert.equal(deferredReasons[0]?.memberId, "m-cap");
 });
+
+test("describeTeamWaitReasons orders urgent reasons first and clips long interpolated text", () => {
+  const stalled = member({ memberId: "m-stall", taskId: "task-1", stalledAt: "2026-11-26T00:08:00.000Z" });
+  const run = baseRun({
+    parallelism: 1,
+    linearTracking: true,
+    linear: { status: "pending", reason: `Linear\n  backoff   ${"z".repeat(400)}` },
+    members: [stalled],
+    tasks: [
+      task("task-1", { status: "running", memberId: "m-stall" }),
+      task("task-2", { status: "pending", dependsOn: [] }),
+    ],
+    decisions: [
+      { id: "d-long", memberId: "m-stall", revision: 1, question: `Should\n\nwe   ${"q".repeat(4000)}`, options: ["Yes"], createdAt: T0 },
+    ],
+  });
+  const reasons = describeTeamWaitReasons(run, [], NOW_MS);
+  assert.deepEqual(reasons.map((r) => r.kind), ["owner-decision", "stalled", "worker-slot", "linear-sync"]);
+  for (const reason of reasons) {
+    assert.ok(reason.summary.length <= 240);
+    assert.ok(!/[\r\n]/.test(reason.summary));
+  }
+  assert.ok(reasons[0]!.summary.endsWith("..."));
+  assert.ok(reasons[3]!.summary.endsWith("..."));
+});

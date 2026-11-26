@@ -220,12 +220,15 @@ test("a judge session uses the eval identity", { timeout: 120000 }, async () => 
     const { duelId } = await context.start("prefer-a");
     await context.ended(duelId);
     assert.equal(launches.length, 1);
-    const header = launches[0]![6] as { purpose?: string };
+    const header = launches[0]![6] as { purpose?: string; executionIdentity?: string };
     assert.equal(header.purpose, "duel");
+    assert.equal(header.executionIdentity, "eval");
     assert.equal(launches[0]![7], undefined, "a judge gets no GitHub grant scope");
-    assert.equal((await context.getManager().list()).some(row => row.purpose === "duel"), true);
-    assert.equal(sessionAgentProfile(context.f.host.config, "claude", "duel"), context.f.host.config.eval!.member!.agents!.claude);
-    assert.equal(sessionEgressIdentity("rehearsal", "session", "duel").project, "_eval");
+    assert.equal((await context.getManager().list()).some(row => row.purpose === "duel" && row.executionIdentity === "eval"), true);
+    assert.equal(sessionAgentProfile(context.f.host.config, "claude", "eval"), context.f.host.config.eval!.member!.agents!.claude);
+    assert.equal(sessionAgentProfile(context.f.host.config, "claude", "production"), context.f.host.config.agents.claude);
+    assert.equal(sessionEgressIdentity("rehearsal", "session", "eval").project, "_eval");
+    assert.equal(sessionEgressIdentity("rehearsal", "session", "production").project, "rehearsal");
     const commands = existsSync(context.record) ? readFileSync(context.record, "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line) as { argv: string[] }) : [];
     assert.ok(commands.some(command => command.argv.includes("exec")), "the judge's commands ran through the eval launcher");
   } finally {

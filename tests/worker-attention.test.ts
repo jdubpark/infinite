@@ -6,6 +6,7 @@ import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { initialAttention } from "@infinite/attention";
 import { publicAttention, withDefaultAttention } from "../packages/host/src/manager.js";
+import { socketPath } from "../packages/host/src/ipc.js";
 import type { QueueDecision } from "../packages/host/src/decision-queue.js";
 import { claimControl, startHost, waitFor, type Host } from "./helpers.js";
 import { fixture } from "./team-fixture.js";
@@ -430,7 +431,7 @@ test("a plain session says what it is doing; one unreadable status never hides t
     assert.equal(thinking.body.attention.state, "working");
 
     await host.fetchApi(`/sessions/${broken}/stop`, "owner", { requestId: randomUUID() });
-    await waitFor(async () => existsSync(join(host.config.runDir, `${broken}.sock`)), (exists) => !exists, 10000);
+    await waitFor(async () => existsSync(socketPath(host.config, broken)), (exists) => !exists, 10000);
     writeFileSync(join(host.config.stateDir, "sessions", broken, "status.sealed"), "not a sealed status");
     const list = await host.fetchApi("/sessions");
     assert.equal(list.status, 200);

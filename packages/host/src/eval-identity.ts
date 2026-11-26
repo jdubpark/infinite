@@ -166,7 +166,7 @@ export async function stopEvalIdentity(identity: EvalIdentity, uid: number, inve
 }
 
 export function evalCanaries(config: Config, source: Pick<ProjectSourceService, "mirrorPath">): string[] {
-  const paths = [evidenceDatabasePath(config.stateDir), config.keyFile, config.stateDir, config.runDir];
+  const paths = [evidenceDatabasePath(config.stateDir), config.keyFile, config.stateDir, config.runDir, ...(config.socketDir ? [config.socketDir] : [])];
   if (config.teams?.workspaceDir) paths.push(config.teams.workspaceDir);
   for (const project of config.projects) {
     if (project.source?.mode === "github") paths.push(source.mirrorPath(project.id));

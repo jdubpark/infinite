@@ -363,7 +363,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
     try { return permissionAgent.pipeline && permissionDelivery.active() && permissionCore.readiness().ready ? "active" as const : "inactive" as const; }
     catch { return "inactive" as const; }
   };
-  const headlessChannel = new HeadlessPermissionChannel({ key, runDir: config.runDir, sessions: manager, services: permissionAgent,
+  const headlessChannel = new HeadlessPermissionChannel({ key, runDir: manager.socketDir, sessions: manager, services: permissionAgent,
     teamLive: session => teams.permissionAgentLive(session), teamTask: session => teams.permissionAgentTask(session) });
   permissionAgent.headless = headlessChannel;
   manager.useHeadlessChannel(headlessChannel);
@@ -1684,7 +1684,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
     if (!res.locals.bearer) return res.status(403).json({ error: "Pair an owner CLI to use the native frontend" });
     const sessionId = id.parse(req.params.id);
     if (!manager.meta(sessionId).session.runtime?.nativeUi) return res.status(409).json({ error: "This session uses its original terminal transport" });
-    res.json(await workerCall(config.runDir, sessionId, { op: "native-info" }));
+    res.json(await workerCall(manager.socketTarget, sessionId, { op: "native-info" }));
   });
   app.post("/api/sessions/:id/workspace-export", requireRole(["owner"]), async (req, res) => {
     if (!res.locals.bearer || req.headers.origin) return void res.status(403).json({ error: "Workspace recovery requires a paired owner CLI" });
@@ -1693,13 +1693,13 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
     const request = z.object({ method: z.enum(["sync/export", "sync/blob"]), hash: z.string().regex(/^[a-f0-9]{64}$/).optional() }).strict().parse(req.body);
     if (request.method === "sync/blob" && !request.hash) return void res.status(400).json({ error: "A content hash is required" });
     if (request.method === "sync/export" && request.hash) return void res.status(400).json({ error: "sync/export does not accept a content hash" });
-    res.json(await workerCall(config.runDir, sessionId, request.method === "sync/blob" ? { op: "workspace-export", method: "sync/blob", hash: request.hash! } : { op: "workspace-export", method: "sync/export" }, 300000));
+    res.json(await workerCall(manager.socketTarget, sessionId, request.method === "sync/blob" ? { op: "workspace-export", method: "sync/blob", hash: request.hash! } : { op: "workspace-export", method: "sync/export" }, 300000));
   });
   app.all(/^\/api\/sessions\/([a-f\d-]{36})\/opencode(\/.*)?$/, refuseMissionManaged, requireRole(["owner"]), async (req, res) => {
     if (!res.locals.bearer || req.headers.origin || !res.locals.leaseId) return void res.status(403).json({ error: "Native access requires an owner CLI and current control" });
     const sessionId = id.parse(req.params[0]);
     if (manager.meta(sessionId).session.runtime?.nativeUi !== "opencode") return void res.status(409).json({ error: "This session does not use an OpenCode server" });
-    const backend = await workerCall<{ url: string; token: string }>(config.runDir, sessionId, { op: "native-connect", actor: res.locals.actor, leaseId: res.locals.leaseId });
+    const backend = await workerCall<{ url: string; token: string }>(manager.socketTarget, sessionId, { op: "native-connect", actor: res.locals.actor, leaseId: res.locals.leaseId });
     if (!/^http:\/\/127\.0\.0\.1:\d+$/.test(backend.url)) throw new Error("Invalid native endpoint");
     const path = new URL(req.originalUrl, origin).pathname.slice(`/api/sessions/${sessionId}/opencode`.length) || "/";
     const query = new URL(req.originalUrl, origin).search;
@@ -1757,7 +1757,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
     const sessionId = id.parse(req.params.id);
     manager.meta(sessionId);
     const body = z.object({ requestId: id, text: z.string().min(1).max(8192) }).strict().parse(req.body);
-    res.json(await workerCall<Receipt>(config.runDir, sessionId, { op: "raw", ...body, ...await inputAuthority(sessionId, res) }));
+    res.json(await workerCall<Receipt>(manager.socketTarget, sessionId, { op: "raw", ...body, ...await inputAuthority(sessionId, res) }));
   });
   app.get("/api/sessions/:id/stream", async (req, res) => {
     const sessionId = id.parse(req.params.id);
@@ -1792,7 +1792,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
       const body = inputSchema.parse(req.body);
       try {
         res.json(
-          await workerCall<Receipt>(config.runDir, sessionId, {
+          await workerCall<Receipt>(manager.socketTarget, sessionId, {
             op: "input",
             ...body,
             ...await inputAuthority(sessionId, res),
@@ -1819,7 +1819,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
       try {
         res.json(
           await workerCall(
-            config.runDir,
+            manager.socketTarget,
             sessionId,
             { op: "answer", ...body, ...authority },
             12000,
@@ -1851,7 +1851,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
         .strict()
         .parse(req.body);
       res.json(
-        await workerCall(config.runDir, sessionId, { op: "key", ...body, ...await inputAuthority(sessionId, res) }),
+        await workerCall(manager.socketTarget, sessionId, { op: "key", ...body, ...await inputAuthority(sessionId, res) }),
       );
     },
   );
@@ -1864,7 +1864,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
       manager.meta(sessionId);
       const body = z.object({ requestId: id }).strict().parse(req.body);
       res.json(
-        await workerCall(config.runDir, sessionId, { op: "stop", ...body, ...await inputAuthority(sessionId, res) }),
+        await workerCall(manager.socketTarget, sessionId, { op: "stop", ...body, ...await inputAuthority(sessionId, res) }),
       );
     },
   );
@@ -1882,7 +1882,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
         .strict()
         .parse(req.body);
       res.json(
-        await workerCall(config.runDir, sessionId, { op: "resize", ...body, ...await inputAuthority(sessionId, res) }),
+        await workerCall(manager.socketTarget, sessionId, { op: "resize", ...body, ...await inputAuthority(sessionId, res) }),
       );
     },
   );

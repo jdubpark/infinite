@@ -37,7 +37,7 @@ export async function* terminalPages(
       state ??= await manager.state(sessionId);
       if (state.capabilities?.terminalSnapshot === 1) {
         try {
-          const screen = await workerCall<TerminalSnapshot>(manager.config.runDir, sessionId, { op: "snapshot" });
+          const screen = await workerCall<TerminalSnapshot>(manager.socketTarget, sessionId, { op: "snapshot" });
           snapshotSize = terminalSizeOf(screen);
           if (screen.seq >= cursor) {
             cursor = screen.seq;
@@ -260,7 +260,7 @@ export function connectTerminals(server: Server, manager: Manager, authenticate:
           ...(state.capabilities?.inputControl ? { ...input, actor, leaseId: suppliedLease } : legacyInput),
           ...(input.op === "input" ? { force: true } : {}),
         };
-        const receipt = await workerCall<Receipt>(manager.config.runDir, match[1], request);
+        const receipt = await workerCall<Receipt>(manager.socketTarget, match[1], request);
         if (input.op !== "resize" && active()) await send({ receipt });
       };
       const drain = () => {

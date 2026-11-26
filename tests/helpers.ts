@@ -108,11 +108,11 @@ export async function stopSessionWorkers(config: Config) {
   for (const id of ids)
     try {
       const actor = { id: "test-cleanup", label: "Test cleanup" };
-      const state = await workerCall<{ capabilities?: { inputControl?: number } }>(config.runDir, id, { op: "state" });
+      const state = await workerCall<{ capabilities?: { inputControl?: number } }>(config, id, { op: "state" });
       answered++;
       const lease = state.capabilities?.inputControl
-        ? await workerCall<ControlLease>(config.runDir, id, { op: "control", action: "claim", actor, takeover: true }) : undefined;
-      await workerCall(config.runDir, id, { op: "stop", requestId: randomUUID(), ...(lease ? { actor, leaseId: lease.id } : {}) });
+        ? await workerCall<ControlLease>(config, id, { op: "control", action: "claim", actor, takeover: true }) : undefined;
+      await workerCall(config, id, { op: "stop", requestId: randomUUID(), ...(lease ? { actor, leaseId: lease.id } : {}) });
     } catch {
     }
   return answered;
@@ -136,7 +136,7 @@ export async function endSessionWorkers(config: Config, started?: readonly numbe
 }
 
 export async function startHost(options: { agents?: Config["agents"]; config?: Partial<Config>; env?: NodeJS.ProcessEnv } = {}): Promise<Host> {
-  const root = mkdtempSync("/tmp/inf-test-");
+  const root = mkdtempSync(join(tmpdir(), "inf-"));
   const port = await freePort();
   const origin = `http://127.0.0.1:${port}`;
   const tokens: Record<Role, string> = {
@@ -242,7 +242,7 @@ export async function claimControl(
 }
 
 export async function inProcessHost(options?: { configure?: (config: Config) => void; appOptions?: Parameters<typeof createApp>[2] }) {
-  const root = realpathSync(mkdtempSync("/tmp/inf-psync-guard-"));
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "inf-")));
   const workspace = join(root, "workspace"); mkdirSync(workspace);
   const key = randomBytes(32);
   const keyFile = join(root, "key"); writeFileSync(keyFile, key, { mode: 0o600 });

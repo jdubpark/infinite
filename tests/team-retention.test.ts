@@ -8,7 +8,7 @@ import { TeamError, TeamService } from "../packages/host/src/teams.js";
 import { DEFAULT_TEAM_RETENTION, hostClosedBlockedReason, type TeamMember, type TeamRun } from "../packages/host/src/team-types.js";
 import type { VolumeUsage } from "../packages/host/src/storage.js";
 import { commandScope, removeMemberWorkspace, removeTeamWorkspace, teamCommand } from "../packages/host/src/team-workspace.js";
-import { newWitness, type CensusResult, type HostProcesses } from "../packages/host/src/process-census.js";
+import { hostProcesses, newWitness, type CensusResult, type HostProcesses } from "../packages/host/src/process-census.js";
 import { unseal } from "../packages/host/src/vault.js";
 import { schedulerFixture } from "./fixtures/team-scheduler.js";
 
@@ -19,7 +19,7 @@ function scriptedProcesses(census: () => CensusResult): HostProcesses {
 }
 
 function savedRecord(f: ReturnType<typeof schedulerFixture>) {
-  return unseal<{ pending?: { recording?: true; witness?: { processes: { pid: number; start: string }[]; sessions: number[]; groups: number[] } } }>(
+  return unseal<{ run: { status: string }; pending?: { recording?: true; failure?: object; witness?: { processes: { pid: number; start: string }[]; sessions: number[]; groups: number[] } } }>(
     f.key, `team:${f.run.id}`, readFileSync(join(f.config.stateDir, "teams", `${f.run.id}.sealed`), "utf8"));
 }
 
@@ -363,6 +363,61 @@ test("a blocked run whose intent was still recording when the host stopped stays
     await waitFor(() => teams.get(f.run.id).status === "cancelled", "after a reboot the run should close once the host sees no process");
     assert.equal(existsSync(runDirectory(f.run)), false);
   } finally { await close(f, teams); }
+});
+
+test("a host stop after a failed operation was saved while the start token of its ended command was still being read holds the run's workspace no longer than the command's processes (INF-505)", async () => {
+  type Internals = { records: Map<string, { run: TeamRun; pending?: { witness?: { groups: number[] } }; census?: { state: string; detail?: string } }>;
+    save: (stored: unknown) => void; operation: (stored: unknown, kind: string, perform: (signal: AbortSignal) => Promise<unknown>, complete: () => void) => void };
+  const stops: [string, (saved: ReturnType<typeof savedRecord>) => boolean][] = [
+    ["after the save of the start token", saved => saved.pending?.failure !== undefined && saved.pending.recording === undefined],
+    ["after the failure's save", saved => saved.pending?.failure !== undefined],
+    ["after the save that blocked the run", saved => saved.run.status === "blocked"],
+  ];
+  const outcomes: string[] = [];
+  for (const [stop, stopsHere] of stops) {
+    const f = schedulerFixture();
+    f.run.members.forEach(member => { member.status = "stopped"; });
+    retention(f, { blockedHours: 1 }); f.writeTeam();
+    let release!: () => void;
+    const reading = new Promise<void>(resolve => { release = resolve; });
+    const first = openTeam(f, { processes: { ...hostProcesses, start: async pid => { const start = await hostProcesses.start(pid); await reading; return start; } } });
+    let restarted: TeamService | undefined, restore: (() => void) | undefined, running = true;
+    try {
+      const internals = first as unknown as Internals, save = internals.save;
+      internals.save = function (this: unknown, stored: unknown) {
+        save.call(this, stored);
+        if (!restore && stopsHere(savedRecord(f))) restore = f.blockRecordWrites("team", f.run.id);
+      };
+      const stored = internals.records.get(f.run.id)!;
+      internals.operation(stored, "check", signal => teamCommand({ command: process.execPath, args: ["-e", ""] }, f.run.workspace, signal).then(() => {
+        throw new TeamError(409, "workspace-operation-failed", "The check failed.");
+      }), () => {});
+      const pid = stored.pending!.witness!.groups[0]!;
+      await waitFor(() => stored.run.status === "blocked", `${stop}: the failed check should block the run`);
+      release();
+      await waitFor(() => restore !== undefined, `${stop}: the host should stop at that write`);
+      running = false;
+      await first.close();
+      restore!();
+      const saved = savedRecord(f).pending;
+      assert.ok(saved?.failure && saved.witness?.groups.includes(pid) && saved.witness.sessions.includes(pid), `${stop}: the saved failure holds command ${pid} as a group and a session`);
+      assert.throws(() => process.kill(pid, 0), { code: "ESRCH" }, `${stop}: command ${pid} has ended`);
+      let now = Date.now();
+      restarted = openTeam(f, { now: () => now });
+      restarted.start(); await restarted.idle();
+      now += 3_600_001;
+      const deadline = Date.now() + 10_000;
+      while (restarted.get(f.run.id).status !== "cancelled" && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 25));
+      const census = (restarted as unknown as Internals).records.get(f.run.id)!.census;
+      outcomes.push(`${stop}: workspace ${existsSync(runDirectory(f.run)) ? "kept" : "removed"}, run ${restarted.get(f.run.id).status}, processes ${census?.state}${census?.detail ? ` (${census.detail})` : ""}`);
+    } finally {
+      release();
+      if (running) await first.close();
+      if (restarted) await restarted.close();
+      f.close();
+    }
+  }
+  assert.deepEqual(outcomes, stops.map(([stop]) => `${stop}: workspace removed, run cancelled, processes ended`));
 });
 
 test("a blocked run of an ended goal, with its workspace already removed, closes on the first sweep", async () => {

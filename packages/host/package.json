@@ -7,8 +7,8 @@
     "infinite": "dist/cli.js"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
-    "typecheck": "tsc --noEmit -p tsconfig.json"
+    "build": "sh ../../scripts/cloud-npm.sh 'tsc -p tsconfig.json'",
+    "typecheck": "sh ../../scripts/cloud-npm.sh 'tsc --noEmit -p tsconfig.json'"
   },
   "dependencies": {
     "@infinite/attention": "0.1.0",

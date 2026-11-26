@@ -179,7 +179,7 @@ async function readSse(reader: ReadableStreamDefaultReader<Uint8Array>) {
   }
 }
 
-test("HTTP live events require authentication, send heartbeats, and resume session cursors", { timeout: 45000 }, async t => {
+test("HTTP live events require authentication and resume session cursors", { timeout: 45000 }, async () => {
   const host = await inProcessHost();
   let stream: ReadableStreamDefaultReader<Uint8Array> | undefined;
   try {
@@ -208,24 +208,22 @@ test("HTTP live events require authentication, send heartbeats, and resume sessi
     const cursor = first.update.data.events.cursor as number;
     await reader.cancel();
 
+    const input = await host.fetchApi(`/sessions/${id}/input`, "owner", { requestId: randomUUID(), text: "while disconnected", submit: true }, control.headers);
+    assert.equal(input.status, 200);
+    const next = await waitFor(async () => {
+      const journal = await host.fetchApi(`/sessions/${id}/events?after=${cursor}&limit=1`);
+      return (journal.body.events as { seq: number }[])[0];
+    }, event => event !== undefined);
+    assert.ok(next && next.seq > cursor);
+
     const resumed = await fetch(`${host.origin}/api/events?topics=session%2F${id}&after=${cursor}`, { headers: { Authorization: `Bearer ${host.tokens.owner}` } });
     const resumedReader = resumed.body!.getReader();
     const replay = await readSse(resumedReader);
-    assert.equal(replay.update.data.events.events.length, 0, "the received cursor resumes without replaying an event");
+    const resumedSeqs = (replay.update.data.events.events as { seq: number }[]).map(event => event.seq);
+    assert.equal(resumedSeqs[0], next.seq, "resume starts at the first journal event after the cursor");
+    assert.ok(resumedSeqs.every(seq => seq > cursor), "resume does not repeat an earlier event");
     await resumedReader.cancel();
-
-    t.mock.timers.enable({ apis: ["setInterval"] });
-    const heartbeatResponse = await fetch(`${host.origin}/api/events?topics=teams`, { headers: { Authorization: `Bearer ${host.tokens.owner}` } });
-    const heartbeatReader = heartbeatResponse.body!.getReader();
-    await readSse(heartbeatReader);
-    const waiting = heartbeatReader.read();
-    t.mock.timers.tick(15000);
-    const heartbeat = await waiting;
-    assert.match(new TextDecoder().decode(heartbeat.value), /: heartbeat/);
-    t.mock.timers.reset();
-    await heartbeatReader.cancel();
   } finally {
-    t.mock.timers.reset();
     stream?.cancel().catch(() => {});
     await host.stop();
   }
@@ -381,6 +379,9 @@ test("HTTP live heartbeats recheck revoked owner and device credentials and expi
       const reader = response.body!.getReader(); await readSse(reader); return reader;
     }
     const ownerReader = await stream({ Authorization: `Bearer ${host.tokens.owner}` });
+    const heartbeat = ownerReader.read();
+    t.mock.timers.tick(15000);
+    assert.match(new TextDecoder().decode((await heartbeat).value), /: heartbeat/);
     const ownerWaiting = ownerReader.read();
     host.config.tokens = host.config.tokens.filter(token => token.id !== "owner");
     t.mock.timers.tick(15000);

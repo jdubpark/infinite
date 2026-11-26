@@ -4,9 +4,9 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "vite --host 127.0.0.1",
-    "build": "vite build",
-    "typecheck": "tsc --noEmit"
+    "dev": "sh ../../scripts/cloud-npm.sh 'vite --host 127.0.0.1'",
+    "build": "sh ../../scripts/cloud-npm.sh 'vite build'",
+    "typecheck": "sh ../../scripts/cloud-npm.sh 'tsc --noEmit'"
   },
   "dependencies": {
     "react": "19.2.3",

@@ -1,12 +1,10 @@
 import { after, before, describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { build, type Plugin } from "esbuild";
 import { chromium, type Browser, type Page } from "playwright";
 
 const executablePath = process.env.PLAYWRIGHT_CHROMIUM_PATH || chromium.executablePath();
-const skip = existsSync(executablePath) ? false : "Chromium for Playwright is not installed; run `npx playwright install chromium`";
 const harness = fileURLToPath(new URL("./fixtures/mobile-dictation-harness.tsx", import.meta.url));
 const standInPath = fileURLToPath(new URL("./fixtures/mobile-dictation-native.ts", import.meta.url));
 const ORIGIN = "http://127.0.0.1/mobile-dictation";
@@ -20,7 +18,7 @@ const standIns: Plugin = {
 
 type Native = { starts: number; aborts: number; holdEnds: boolean; cleanups: { text: string; resolve(value: { model: string; text: string }): void }[]; say(text: string): void; releaseEnds(): void };
 
-describe("phone dictation lifecycle", { skip }, () => {
+describe("phone dictation lifecycle", () => {
   let browser: Browser;
   let script: string;
   before(async () => {

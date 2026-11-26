@@ -421,7 +421,10 @@ test("an older poll result cannot replace a newer ineligible row", async () => {
 
 test("501 failed turn readings stay suppressed after the display LRU would have evicted entries", async () => {
   let calls = 0;
-  const failing = { systemOne: async () => { calls++; throw new Error("provider unavailable"); } } as unknown as JevTransport;
+  const failing = { systemOne: async () => {
+    calls++;
+    throw new Error("provider unavailable");
+  } } as unknown as JevTransport;
   const f = setup({ transport: failing });
   const rows: ReadingRow[] = Array.from({ length: 501 }, (_, index) => {
     const id = `session-${index}`;
@@ -436,12 +439,12 @@ test("501 failed turn readings stay suppressed after the display LRU would have 
       const batch = rows.slice(offset, offset + 25);
       f.readings.merge(batch);
       const expected = offset + batch.length;
-      await eventually(() => calls === expected);
-      await new Promise(resolve => setTimeout(resolve, 0));
+      await new Promise<void>(resolve => setImmediate(resolve));
+      assert.equal(calls, expected, "every eligible reading reaches the provider before the batch settles");
     }
     f.manager.list = async () => rows;
     await f.readings.tick();
-    await new Promise(resolve => setTimeout(resolve, 30));
+    await new Promise<void>(resolve => setImmediate(resolve));
     assert.equal(calls, 501, "a full scan does not retry failures merely because the display cache is bounded");
 
     f.manager.list = async () => rows.slice(0, 1);

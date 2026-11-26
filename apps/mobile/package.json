@@ -29,13 +29,13 @@
     "typescript": "~6.0.3"
   },
   "scripts": {
-    "start": "expo start",
-    "android": "expo run:android",
-    "ios": "expo run:ios",
-    "typecheck": "tsc --noEmit",
-    "export:android": "expo export --platform android",
-    "export:ios": "expo export --platform ios",
-    "lint": "expo lint"
+    "start": "sh ../../scripts/cloud-npm.sh 'expo start'",
+    "android": "sh ../../scripts/cloud-npm.sh 'expo run:android'",
+    "ios": "sh ../../scripts/cloud-npm.sh 'expo run:ios'",
+    "typecheck": "sh ../../scripts/cloud-npm.sh 'tsc --noEmit'",
+    "export:android": "sh ../../scripts/cloud-npm.sh 'expo export --platform android'",
+    "export:ios": "sh ../../scripts/cloud-npm.sh 'expo export --platform ios'",
+    "lint": "sh ../../scripts/cloud-npm.sh 'expo lint'"
   },
   "private": true
 }

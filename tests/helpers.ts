@@ -10,10 +10,12 @@ import { readRecordedSocketPath, workerCall, type SocketTarget } from "../packag
 import { unseal } from "../packages/host/src/vault.js";
 import type { Config, Role, ControlLease } from "../packages/host/src/types.js";
 
+const HOST_STARTUP_TIMEOUT_MS = 20_000;
+
 export const waitFor = async <T>(
   fn: () => Promise<T>,
   accepts: (value: T) => boolean,
-  timeout = 10000,
+  timeout = 10_000,
 ): Promise<T> => {
   const until = performance.now() + timeout;
   let last: T | undefined;
@@ -89,9 +91,10 @@ export interface Host {
   stop: () => Promise<void>;
 }
 
-export function apiClient(origin: string, tokens: Record<Role, string>): Host["fetchApi"] {
+export function apiClient(origin: string, tokens: Record<Role, string>, signal?: AbortSignal): Host["fetchApi"] {
   return async (path, role = "owner", body, headers = {}, method) => {
     const response = await fetch(origin + "/api" + path, {
+      signal,
       method: method ?? (body ? "POST" : "GET"),
       headers: {
         connection: "close",
@@ -143,7 +146,13 @@ export async function endSessionWorkers(config: Config, started?: readonly numbe
   }
 }
 
-export async function startHost(options: { agents?: Config["agents"]; config?: Partial<Config>; env?: NodeJS.ProcessEnv } = {}): Promise<Host> {
+type HostOptions = { agents?: Config["agents"]; config?: Partial<Config>; env?: NodeJS.ProcessEnv };
+
+export function startHost(options: HostOptions = {}): Promise<Host> {
+  return startHostWithPort(options, 3);
+}
+
+async function startHostWithPort(options: HostOptions, attemptsLeft: number): Promise<Host> {
   const root = mkdtempSync(join(tmpdir(), "inf-"));
   const port = await freePort();
   const origin = `http://127.0.0.1:${port}`;
@@ -193,18 +202,20 @@ export async function startHost(options: { agents?: Config["agents"]; config?: P
     api.stderr!.on("data", (chunk) => {
       diagnostics += chunk;
     });
-    await waitFor(
-      async () => {
-        try {
-          return (await fetchApi("/me")).status;
-        } catch {
-          if (api.exitCode !== null) throw new Error(diagnostics);
-          return 0;
-        }
-      },
-      (status) => status === 200,
-      20000,
-    );
+    const exited = new AbortController();
+    const abortProbe = () => exited.abort();
+    api.once("exit", abortProbe);
+    const signal = AbortSignal.any([exited.signal, AbortSignal.timeout(HOST_STARTUP_TIMEOUT_MS)]);
+    const probe = apiClient(origin, tokens, signal);
+    try {
+      await waitFor(async () => {
+        const response = await probe("/me").catch(() => undefined);
+        if (api.exitCode !== null || api.signalCode !== null) throw new Error(diagnostics);
+        return response?.status ?? 0;
+      }, status => status === 200, HOST_STARTUP_TIMEOUT_MS);
+    } finally {
+      api.off("exit", abortProbe);
+    }
   };
   const stop = async () => {
     const floor = new Promise((resolve) => setTimeout(resolve, 1700));
@@ -227,6 +238,10 @@ export async function startHost(options: { agents?: Config["agents"]; config?: P
     await start();
   } catch (error) {
     await stop();
+    const collision = `listen EADDRINUSE: address already in use 127.0.0.1:${port}`;
+    if (attemptsLeft > 1 && options.config?.port === undefined && error instanceof Error && error.message.includes(collision)) {
+      return startHostWithPort(options, attemptsLeft - 1);
+    }
     throw error;
   }
   return { origin, root, config, tokens, fetchApi, start, stopApi, stop };

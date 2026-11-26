@@ -162,6 +162,8 @@ test("measures resolved review-repair loop with duration, tokens, and USD", () =
   assert.equal(report.windowDays, 30);
   assert.deepEqual(report.totals, {
     runsExamined: 1,
+    eventCoverage: "complete",
+    incompleteRuns: 0,
     loopsTotal: 1,
     resolved: 1,
     unresolved: 0,
@@ -171,6 +173,7 @@ test("measures resolved review-repair loop with duration, tokens, and USD", () =
     failedResumes: 0,
     measuredLoops: 1,
     unmeasuredLoops: 0,
+    unfinishedLoops: 0,
     unmeasuredMembers: 0,
     medianMinutes: 6,
     p90Minutes: 6,
@@ -729,12 +732,15 @@ test("keeps unfinished loops and active or non-exited sessions out of final repa
     assert.equal(body.totals.inProgress, 2);
     assert.equal(body.totals.unresolved, 1);
     assert.equal(body.totals.measuredLoops, 1);
-    assert.equal(body.totals.unmeasuredLoops, 3);
+    assert.equal(body.totals.unmeasuredLoops, 0);
+    assert.equal(body.totals.unfinishedLoops, 3);
+    assert.equal(body.totals.unmeasuredMembers, 0);
     assert.equal(body.totals.medianTokens, 2000);
     assert.equal(body.totals.medianUsd, 0.2);
     for (const id of ["run-live-opencode", "run-live-verifying", "run-cancel-active"]) {
       const sample = body.loops.find(loop => loop.runId === id)!;
       assert.equal(sample.measured, false);
+      assert.equal(sample.unfinished, true);
       assert.equal(sample.tokens, undefined);
       assert.equal(sample.usd, undefined);
     }
@@ -953,7 +959,7 @@ test("CLI formatter and handleUsageRepairsCommand format summary, unmeasured war
   const sampleReport: RepairLoopReport = {
     windowDays: 14,
     projectId: "proj-a",
-    totals: { runsExamined: 3, loopsTotal: 2, resolved: 1, unresolved: 1, inProgress: 0, byCause: { review: 1, check: 1, delivery: 0 }, coldReplacements: 1, failedResumes: 1, measuredLoops: 1, unmeasuredLoops: 1, unmeasuredMembers: 1, medianMinutes: 4.5, p90Minutes: 4.5, medianTokens: 1200, medianUsd: 0.05 },
+    totals: { runsExamined: 3, eventCoverage: "complete", incompleteRuns: 0, loopsTotal: 2, resolved: 1, unresolved: 1, inProgress: 0, byCause: { review: 1, check: 1, delivery: 0 }, coldReplacements: 1, failedResumes: 1, measuredLoops: 1, unmeasuredLoops: 1, unfinishedLoops: 0, unmeasuredMembers: 1, medianMinutes: 4.5, p90Minutes: 4.5, medianTokens: 1200, medianUsd: 0.05 },
     loops: [
       { runId: "run-12345678", projectId: "proj-a", revision: 1, cause: "review", outcome: "resolved", rounds: 1, attempts: 3, coldReplacements: 0, failedResumes: 0, startedAt: "2026-11-25T10:00:00.000Z", finishedAt: "2026-11-25T10:04:30.000Z", durationMs: 270_000, failedCommit: COMMIT_A, passingCommit: COMMIT_B, measured: true, tokens: 1200, usd: 0.05 },
       { runId: "run-87654321", projectId: "proj-a", revision: 2, cause: "check", outcome: "blocked", rounds: 2, attempts: 4, coldReplacements: 1, failedResumes: 1, startedAt: "2026-11-25T11:00:00.000Z", failedCommit: COMMIT_C, measured: false },

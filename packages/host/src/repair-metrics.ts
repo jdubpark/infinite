@@ -5,6 +5,7 @@ import type { UsageTotals } from "./usage.js";
 
 export type RepairLoopCause = "review" | "check" | "delivery";
 export type RepairLoopOutcome = "resolved" | "blocked" | "cancelled" | "superseded" | "unresolved" | "in-progress";
+export type RepairEventCoverage = "complete" | "incomplete";
 
 export interface RepairRunEvent {
   seq?: number;
@@ -35,6 +36,7 @@ export type RepairMetricsRun = Pick<
   TeamRun,
   "id" | "projectId" | "provider" | "replay" | "revision" | "status" | "createdAt" | "updatedAt" | "brief"
 > & {
+  round?: number;
   continuations?: readonly Pick<TeamContinuation, "revision" | "brief">[];
   members: readonly RepairMetricsMember[];
   checks: readonly RepairMetricsCheck[];
@@ -56,12 +58,15 @@ export interface RepairLoopSample {
   failedCommit?: string;
   passingCommit?: string;
   measured: boolean;
+  unfinished?: true;
   tokens?: number;
   usd?: number;
 }
 
 export interface RepairLoopTotals {
   runsExamined: number;
+  eventCoverage: RepairEventCoverage;
+  incompleteRuns: number;
   loopsTotal: number;
   resolved: number;
   unresolved: number;
@@ -71,6 +76,7 @@ export interface RepairLoopTotals {
   failedResumes: number;
   measuredLoops: number;
   unmeasuredLoops: number;
+  unfinishedLoops: number;
   unmeasuredMembers: number;
   medianMinutes: number | null;
   p90Minutes: number | null;
@@ -142,6 +148,7 @@ interface OpenLoop {
   members: RepairMetricsMember[];
   checkBatches: CheckBatch[];
   coldReplacements: number;
+  sawUnrecordedApproval?: true;
 }
 
 interface ExtractedLoop {
@@ -222,6 +229,7 @@ export function snapshotRepairRun(run: TeamRun): RepairMetricsRun {
     projectId: run.projectId,
     provider: run.provider,
     revision: run.revision,
+    round: run.round,
     status: run.status,
     createdAt: run.createdAt,
     updatedAt: run.updatedAt,
@@ -490,18 +498,17 @@ function finalizeLoop(
   memberUsage: (member: RepairMetricsMember, fallbackProvider: Provider) => UsageTotals | undefined,
 ): { sample: RepairLoopSample; unmeasuredMembers: number } {
   const { revision, loop, outcome, finishedAt, passingCommit } = extracted;
-  const finished = outcome !== "in-progress" && loop.members.every(member => member.status === "stopped");
+  const unfinished = outcome === "in-progress" || loop.members.some(member => member.status !== "stopped");
   let failedResumes = 0;
   let unmeasuredMembers = 0;
   let memberLaunchAttempts = 0;
-  let allMeasured = finished && loop.members.length > 0;
+  let allMeasured = !unfinished && loop.members.length > 0;
   let tokens = 0;
   let microUsd = 0;
   for (const member of loop.members) {
     memberLaunchAttempts += memberAttempts(member);
     if (hasFailedResume(member)) failedResumes += 1;
     if (member.status !== "stopped") {
-      unmeasuredMembers += 1;
       allMeasured = false;
       continue;
     }
@@ -509,7 +516,7 @@ function finalizeLoop(
     if (!usage || usage.pricing.unknown > 0) {
       unmeasuredMembers += 1;
       allMeasured = false;
-    } else if (finished) {
+    } else if (!unfinished) {
       tokens += usageTokensSum(usage);
       microUsd += Math.round(usage.cost * 1_000_000);
     }
@@ -533,21 +540,64 @@ function finalizeLoop(
     ...(loop.failedCommit ? { failedCommit: loop.failedCommit } : {}),
     ...(outcome === "resolved" && passingCommit ? { passingCommit } : {}),
     measured: allMeasured,
+    ...(unfinished ? { unfinished: true as const } : {}),
     ...(allMeasured ? { tokens, usd: microUsd / 1_000_000 } : {}),
   };
   return { sample, unmeasuredMembers };
+}
+
+function revisionOverlapsWindow(
+  run: RepairMetricsRun,
+  revision: number,
+  events: readonly RepairRunEvent[],
+  cutoffMs: number,
+  runActivityMs: number | undefined,
+): boolean {
+  if (revision === run.revision && runActivityMs !== undefined && runActivityMs >= cutoffMs) return true;
+  for (const member of run.members) {
+    if (member.revision !== revision || !LOOP_ROLES.has(member.role)) continue;
+    const ms = parseTime(member.reportedAt)
+      ?? parseTime(member.startedAt)
+      ?? parseTime(member.turns?.[0]?.startedAt)
+      ?? parseTime(member.stalledAt);
+    if (ms !== undefined && ms >= cutoffMs) return true;
+  }
+  for (const check of run.checks) {
+    if (check.revision !== revision) continue;
+    const ms = parseTime(check.finishedAt) ?? parseTime(check.startedAt);
+    if (ms !== undefined && ms >= cutoffMs) return true;
+  }
+  for (const event of events) {
+    if (event.revision !== revision) continue;
+    const ms = parseTime(event.at);
+    if (ms !== undefined && ms >= cutoffMs) return true;
+  }
+  return false;
 }
 
 function extractRevisionLoops(
   run: RepairMetricsRun,
   revision: number,
   events: readonly RepairRunEvent[],
-): ExtractedLoop[] {
+): { loops: ExtractedLoop[]; incomplete: boolean } {
   const timeline = buildTimeline(run, revision);
   const extracted: ExtractedLoop[] = [];
   const brief = briefForRevision(run, revision);
   const { reviewByMember, repairs } = parseRevisionEvents(events, revision);
   const repairByTrigger = bindRepairsToTimeline(timeline, reviewByMember, repairs, brief);
+  const repairRounds = new Set(repairs.map(item => item.round));
+  let incomplete = repairByTrigger.size < repairs.length;
+  if (revision === run.revision && (run.round ?? 0) >= 1) {
+    for (let round = 1; round <= run.round!; round++) {
+      if (!repairRounds.has(round)) incomplete = true;
+    }
+  }
+  for (const check of run.checks) {
+    if (check.revision === revision && check.round !== undefined && check.round >= 1 && !repairRounds.has(check.round)) {
+      incomplete = true;
+    }
+  }
+  let sawRepairTriggerSignal = false;
   let active: OpenLoop | null = null;
 
   for (let index = 0; index < timeline.length; index++) {
@@ -555,6 +605,7 @@ function extractRevisionLoops(
     const boundRepair = repairByTrigger.get(item);
 
     if (item.kind === "check") {
+      if (item.status === "failed") sawRepairTriggerSignal = true;
       if (active) {
         active.checkBatches.push(item);
         active.latestCheck = item;
@@ -583,7 +634,10 @@ function extractRevisionLoops(
 
     const { member } = item;
     if (member.role === "integrator") {
-      if (!active) continue;
+      if (!active) {
+        if (sawRepairTriggerSignal) incomplete = true;
+        continue;
+      }
       active.members.push(member);
       active.latestCheck = null;
       if (active.awaitingNewRound) {
@@ -599,6 +653,9 @@ function extractRevisionLoops(
     }
 
     if (member.role === "reviewer") {
+      if (member.report?.kind === "review" && member.report.verdict === "changes-requested") {
+        sawRepairTriggerSignal = true;
+      }
       const recorded = reviewByMember.get(member.memberId);
       if (!active) {
         if (boundRepair) {
@@ -639,6 +696,8 @@ function extractRevisionLoops(
           const passingCommit = active.latestCheck!.headCommit ?? member.baseCommit;
           extracted.push({ revision, loop: active, outcome: "resolved", finishedAt, passingCommit });
           active = null;
+        } else if (checkReady && !approvedByHost && evidenceProblems.length === 0 && !replacedSameCommit) {
+          active.sawUnrecordedApproval = true;
         }
       } else if (boundRepair) {
         active.rounds += 1;
@@ -656,7 +715,9 @@ function extractRevisionLoops(
       continue;
     }
 
-    if (member.role === "delivery" && boundRepair) {
+    if (member.role === "delivery") {
+      if (member.report?.kind === "delivery-repair") sawRepairTriggerSignal = true;
+      if (!boundRepair) continue;
       if (!active) {
         active = {
           cause: "delivery",
@@ -678,8 +739,13 @@ function extractRevisionLoops(
     }
   }
 
-  if (active) extracted.push({ revision, loop: active, outcome: endOutcome(run, revision) });
-  return extracted;
+  if (active) {
+    if (active.sawUnrecordedApproval && revision === run.revision && (run.status === "ready-for-review" || run.status === "merged")) {
+      incomplete = true;
+    }
+    extracted.push({ revision, loop: active, outcome: endOutcome(run, revision) });
+  }
+  return { loops: extracted, incomplete };
 }
 
 function median(values: readonly number[]): number | null {
@@ -707,25 +773,39 @@ export function computeRepairLoopMetrics(
   const filter: RepairRunFilter = { ...(projectId === undefined ? {} : { projectId }), cutoffMs };
 
   let runsExamined = 0;
+  let incompleteRuns = 0;
   let unmeasuredMembers = 0;
   const allSamples: RepairLoopSample[] = [];
 
   for (const run of runs) {
     if (!runMayOverlapWindow(run, filter)) continue;
     const events = options?.runEvents ? options.runEvents(run.id) : [];
+    const runActivityMs = parseTime(run.updatedAt) ?? parseTime(run.createdAt);
+    const hasLedgerGap = events.some(event => event.kind === "ledger.gap");
     const revisions = [...new Set([
+      run.revision,
       ...run.members.map(m => m.revision),
       ...run.checks.map(c => c.revision),
       ...events.map(e => e.revision),
     ])].sort((a, b) => a - b);
-    const extractedLoops = revisions.flatMap(revision => extractRevisionLoops(run, revision, events));
+    const extractedLoops: ExtractedLoop[] = [];
+    let runIncomplete = hasLedgerGap;
+    for (const revision of revisions) {
+      const result = extractRevisionLoops(run, revision, events);
+      extractedLoops.push(...result.loops);
+      if (result.incomplete && revisionOverlapsWindow(run, revision, events, cutoffMs, runActivityMs)) {
+        runIncomplete = true;
+      }
+    }
     const inWindowExtracted = extractedLoops.filter(item => {
       const startMs = parseTime(item.loop.startedAt);
       return startMs !== undefined && startMs >= cutoffMs;
     });
-    const runActivityMs = parseTime(run.updatedAt) ?? parseTime(run.createdAt);
     const runInWindow = (runActivityMs !== undefined && runActivityMs >= cutoffMs) || inWindowExtracted.length > 0;
-    if (runInWindow) runsExamined += 1;
+    if (runInWindow) {
+      runsExamined += 1;
+      if (runIncomplete) incompleteRuns += 1;
+    }
     for (const extracted of inWindowExtracted) {
       const item = finalizeLoop(run, extracted, memberUsage);
       allSamples.push(item.sample);
@@ -743,6 +823,7 @@ export function computeRepairLoopMetrics(
   let failedResumes = 0;
   let measuredLoops = 0;
   let unmeasuredLoops = 0;
+  let unfinishedLoops = 0;
   const resolvedMinutes: number[] = [];
   const measuredTokens: number[] = [];
   const measuredUsd: number[] = [];
@@ -763,6 +844,8 @@ export function computeRepairLoopMetrics(
       measuredLoops += 1;
       measuredTokens.push(sample.tokens);
       measuredUsd.push(sample.usd);
+    } else if (sample.unfinished) {
+      unfinishedLoops += 1;
     } else {
       unmeasuredLoops += 1;
     }
@@ -778,6 +861,8 @@ export function computeRepairLoopMetrics(
     ...(projectId === undefined ? {} : { projectId }),
     totals: {
       runsExamined,
+      eventCoverage: incompleteRuns > 0 ? "incomplete" : "complete",
+      incompleteRuns,
       loopsTotal: allSamples.length,
       resolved,
       unresolved,
@@ -787,6 +872,7 @@ export function computeRepairLoopMetrics(
       failedResumes,
       measuredLoops,
       unmeasuredLoops,
+      unfinishedLoops,
       unmeasuredMembers,
       medianMinutes: medianMin === null ? null : roundTo(medianMin, 100),
       p90Minutes: p90Min === null ? null : roundTo(p90Min, 100),

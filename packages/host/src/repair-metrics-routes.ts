@@ -14,7 +14,7 @@ import type { UsageTotals } from "./usage.js";
 import type { SessionUsage, UnmeasuredUsage } from "./usage-service.js";
 
 const DAY_MS = 86_400_000;
-const EVENT_KINDS = ["review.recorded", "repair.started"];
+const EVENT_KINDS = ["review.recorded", "repair.started", "ledger.gap"];
 const EVENT_PAGE_LIMIT = 500;
 
 const repairLoopsQuerySchema = z.object({

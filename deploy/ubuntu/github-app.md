@@ -168,6 +168,45 @@ The GitHub CLI wrapper selects the repository from explicit arguments or the
 checkout's GitHub origin. Conflicting targets and non-GitHub destinations cannot
 receive an app token. It does not retry failed mutations using another identity.
 
+## Review feedback
+
+Review feedback is off by default: `github.reviewFeedback.enabled` defaults to
+`false`, and turning it on needs `ownerLogin`, the owner's GitHub login. For
+review feedback the host runs only `gh pr view`:
+
+- **What.** The host runs
+  `gh pr view NUMBER --json state,isCrossRepository,baseRefName,headRefName,headRefOid,reviews --repo OWNER/REPO`
+  for each run delivered in `pr` mode that waits at `ready-for-review` with that
+  delivery as its current revision, a mission's subteam run included. It skips
+  goal, handoff and replay runs, runs whose workspace was removed, runs whose
+  review intake has ended, and pull requests outside the run's delivery
+  repository.
+- **How often.** Once per watched run every `pollMinutes` (default 5, from 1 to
+  1440). There is one more read before the host applies a review, and one before
+  a mission coordinator's forward steers the subteam. A failed forward read is
+  retried a minute later. Each read times out after 60 seconds. While the run
+  refuses the steer because a stopped command of the run may still be running,
+  the review or forward waits and reads at most once a minute: a forward keeps
+  its last read for 60 seconds after that read completed and reads again before
+  the next steer after that, and a review is read again only at the next
+  `pollMinutes` pass.
+- **Through what.** With the [GitHub credential proxy](github-proxy.md), each
+  read carries a host-signed grant for that one repository with the `pr`
+  operation and no branch refs, valid for 15 minutes. Because the grant carries
+  no refs, the proxy admits only `gh pr view`, `list` and `checks` under it:
+  every writing command needs the pull request's head branch among the grant's
+  refs.
+  Without the proxy, the host passes no grant, and `gh` uses the account's own
+  GitHub CLI setup.
+
+Independently of this switch, the host also runs
+`gh pr view NUMBER --json state,isCrossRepository,baseRefName,headRefName --repo OWNER/REPO`
+through the same grant when a run whose pull request was recorded before the
+host kept its branch is steered or continues delivery.
+
+No new App permission is needed: **Pull requests: Read and write** in the table
+above already covers reading a pull request and its reviews.
+
 ## Verify and operate
 
 Run the status command as the agent account. It reports expiry without exposing

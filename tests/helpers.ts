@@ -6,7 +6,7 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { randomBytes, randomUUID } from "node:crypto";
 import { hashToken } from "../packages/host/src/config.js";
 import { createApp } from "../packages/host/src/server.js";
-import { workerCall } from "../packages/host/src/ipc.js";
+import { readRecordedSocketPath, workerCall, type SocketTarget } from "../packages/host/src/ipc.js";
 import { unseal } from "../packages/host/src/vault.js";
 import type { Config, Role, ControlLease } from "../packages/host/src/types.js";
 
@@ -100,19 +100,21 @@ export function apiClient(origin: string, tokens: Record<Role, string>): Host["f
 }
 
 export async function stopSessionWorkers(config: Config) {
-  let ids: string[] = [], answered = 0;
+  let ids: string[] = [], answered = 0, key: Buffer | undefined;
   try {
     ids = readdirSync(join(config.stateDir, "sessions")).filter((n) => /^[a-f0-9-]{36}$/i.test(n));
   } catch {
   }
+  try { key = readFileSync(config.keyFile); } catch { }
+  const target: SocketTarget = key ? { runDir: config.runDir, socketDir: config.socketDir, recordedSocket: id => readRecordedSocketPath(config.stateDir, key!, id) } : config;
   for (const id of ids)
     try {
       const actor = { id: "test-cleanup", label: "Test cleanup" };
-      const state = await workerCall<{ capabilities?: { inputControl?: number } }>(config.runDir, id, { op: "state" });
+      const state = await workerCall<{ capabilities?: { inputControl?: number } }>(target, id, { op: "state" });
       answered++;
       const lease = state.capabilities?.inputControl
-        ? await workerCall<ControlLease>(config.runDir, id, { op: "control", action: "claim", actor, takeover: true }) : undefined;
-      await workerCall(config.runDir, id, { op: "stop", requestId: randomUUID(), ...(lease ? { actor, leaseId: lease.id } : {}) });
+        ? await workerCall<ControlLease>(target, id, { op: "control", action: "claim", actor, takeover: true }) : undefined;
+      await workerCall(target, id, { op: "stop", requestId: randomUUID(), ...(lease ? { actor, leaseId: lease.id } : {}) });
     } catch {
     }
   return answered;
@@ -136,7 +138,7 @@ export async function endSessionWorkers(config: Config, started?: readonly numbe
 }
 
 export async function startHost(options: { agents?: Config["agents"]; config?: Partial<Config>; env?: NodeJS.ProcessEnv } = {}): Promise<Host> {
-  const root = mkdtempSync("/tmp/inf-test-");
+  const root = mkdtempSync(join(tmpdir(), "inf-"));
   const port = await freePort();
   const origin = `http://127.0.0.1:${port}`;
   const tokens: Record<Role, string> = {
@@ -242,7 +244,7 @@ export async function claimControl(
 }
 
 export async function inProcessHost(options?: { configure?: (config: Config) => void; appOptions?: Parameters<typeof createApp>[2] }) {
-  const root = realpathSync(mkdtempSync("/tmp/inf-psync-guard-"));
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "inf-")));
   const workspace = join(root, "workspace"); mkdirSync(workspace);
   const key = randomBytes(32);
   const keyFile = join(root, "key"); writeFileSync(keyFile, key, { mode: 0o600 });

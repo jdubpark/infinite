@@ -500,7 +500,7 @@ test("a cmux session in the project holds a workspace sync, and cmux starts are 
   const f = await fixture(t);
   await f.sessions.close();
   const owner = randomBytes(32).toString("base64url");
-  const runDir = mkdtempSync("/tmp/inf-cmuxrun-");
+  const runDir = mkdtempSync(join(tmpdir(), "inf-cmuxrun-"));
   t.after(() => rmSync(runDir, { recursive: true, force: true }));
   const config: Config = { ...f.config, runDir, tokens: [{ id: "owner", label: "Owner", role: "owner", hash: hashToken(owner) }] };
   writeFileSync(config.keyFile, f.key, { mode: 0o600 });

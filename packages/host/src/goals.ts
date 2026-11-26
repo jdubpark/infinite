@@ -762,7 +762,7 @@ export class GoalService {
             this.block(stored, reason); this.event(stored, reason);
           } else { this.save(stored); return; }
         }
-        if (team.members.every(member => ["stopped", "waiting"].includes(member.status))) goal.activeTeamId = undefined;
+        if (team.members.every(member => ["stopped", "waiting"].includes(member.status)) && !team.publishing) goal.activeTeamId = undefined;
         if (goal.standing) { if (!goal.activeTeamId) this.settleCycle(stored, goal.cycles.find(value => value.teamId === team!.id)!, team); }
         else if (["running", "needs-input"].includes(goal.status) && !classified) {
           stored.endedAs = { teamId: team.id, status: team.status, headCommit: team.headCommit };

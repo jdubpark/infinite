@@ -73,7 +73,7 @@ async function mixedRun(autonomy: "autonomous" | "supervised", blockDatabase = f
   const limits = (teams as unknown as { limits: { observe(limit: object): void } }).limits;
   const recorder = new RoutingRecorder({ store, log: line => logs.push(line) }), start = recorder.recordStart.bind(recorder);
   recorder.recordStart = input => {
-    if (input.task.id === "b") limits.observe({ provider: "opencode", detectedAt: new Date().toISOString(), sessionId: "routing-run-test", confidence: "corroborated" });
+    if (input.task.id === "b") limits.observe({ provider: "grok", detectedAt: new Date().toISOString(), sessionId: "routing-run-test", confidence: "corroborated" });
     limitedSeen.push({ taskId: input.task.id, limited: input.limited as Set<string>, objectiveDigest: input.objectiveDigest });
     start(input);
   };
@@ -130,7 +130,7 @@ test("a shadow run records each first implementer and runs the coordinator's pro
     }
     const firstA = limitedSeen.find(item => item.taskId === "a")!, lastB = limitedSeen.filter(item => item.taskId === "b").at(-1)!;
     assert.deepEqual([...firstA.limited], [], "task a's first start precedes the observed limit");
-    assert.deepEqual([...lastB.limited], ["opencode"], "task b's last start receives the observed opencode limit");
+    assert.deepEqual([...lastB.limited], ["grok"], "task b's last start receives the observed grok limit");
   } finally {
     store.close();
     await f.close();

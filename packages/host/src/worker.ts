@@ -2,7 +2,7 @@ import { stopHandoffProcesses } from "./handoff-processes.js";
 import { handoffEnvelopeSchema, handoffObjective } from "./handoff-types.js";
 import { cleanTeamCheckpoint } from "./team-workspace.js";
 import { createServer } from "node:net";
-import { chmodSync, mkdirSync, realpathSync, unlinkSync } from "node:fs";
+import { chmodSync, realpathSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
@@ -36,7 +36,7 @@ import {
   detectLimit,
 } from "@infinite/attention";
 import { Journal, writeSealed } from "./vault.js";
-import { socketPath } from "./ipc.js";
+import { ensureSocketDir, socketPath } from "./ipc.js";
 import { startHookServer, HookPayloadError, type HookAnswer, type HookReply, type HookRoute } from "./hooks.js";
 import { EvidenceReader } from "./evidence/reader.js";
 import { evidenceDatabasePath } from "./evidence/store.js";
@@ -83,7 +83,8 @@ for await (const chunk of process.stdin) {
 }
 const config = JSON.parse(bootstrap) as Bootstrap;
 bootstrap = "";
-const { session, profile, stateDir, runDir } = config;
+const { session, profile, stateDir, runDir, socketDir } = config;
+const workerSocket = socketPath({ runDir, socketDir: ensureSocketDir(socketDir ?? runDir, socketDir !== undefined ? "socketDir" : "runDir") }, session.id);
 const provider = session.provider;
 const key = Buffer.from(config.key, "base64");
 config.key = "";
@@ -150,7 +151,7 @@ const persist = () => {
     ...(covered !== undefined ? { sizeIndexCoveredSeq: covered } : {}),
     screen: "",
     seq: journal.seq,
-    workerPid: process.pid,
+    workerPid: process.pid, socketPath: workerSocket, ...(config.permissionChannel?.socket ? { permissionSocketPath: config.permissionChannel.socket } : {}),
   });
 };
 function append(type: Event["type"], data: Event["data"]): Event {
@@ -1432,16 +1433,15 @@ async function exitWorker(code: number) {
   evidenceReader?.close();
   await workspaceClosing?.catch(() => {});
   try {
-    unlinkSync(socketPath(runDir, session.id));
+    unlinkSync(workerSocket);
   } catch {
   }
   process.exit(code);
 }
 
-mkdirSync(runDir, { recursive: true, mode: 0o700 });
 server.on("error", () => process.exit(1));
-server.listen(socketPath(runDir, session.id), async () => {
-  chmodSync(socketPath(runDir, session.id), 0o600);
+server.listen(workerSocket, async () => {
+  chmodSync(workerSocket, 0o600);
   try {
     journal.append("lifecycle", {
       status: "starting",

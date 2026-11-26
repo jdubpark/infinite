@@ -2,7 +2,6 @@ import XCTest
 import InfiniteCore
 @testable import InfiniteDesktop
 
-/// A mission-managed session opens its terminal fallback only while its provider prompt waits for the owner.
 final class ManagedSessionInputTests: XCTestCase {
     private func session(_ text: String) throws -> AgentSession {
         AgentSession(value: try JSON.parse(Data(text.utf8)))
@@ -13,7 +12,6 @@ final class ManagedSessionInputTests: XCTestCase {
         XCTAssertTrue(waiting.terminalOpen)
         let working = try session(#"{"id":"s-1","status":"running","managedBy":{"kind":"mission","missionId":"m-1"},"attention":{"state":"turn-finished"}}"#)
         XCTAssertFalse(working.terminalOpen)
-        // A session that has stopped needs nothing from the owner, so its terminal stays closed even with a stale attention state.
         let stopped = try session(#"{"id":"s-1","status":"exited","managedBy":{"kind":"mission","missionId":"m-1"},"attention":{"state":"needs-you"}}"#)
         XCTAssertFalse(stopped.terminalOpen)
     }

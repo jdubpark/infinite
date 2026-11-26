@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { isAbsolute } from "node:path";
+import { isAbsolute, resolve } from "node:path";
 import { z } from "zod";
 import type { CreateMission } from "./mission-types.js";
 import { projectGroupIdSchema } from "./project-group-types.js";
@@ -25,6 +25,23 @@ export const intakeConfigSchema = z.object({
     answerQuestions: z.boolean().default(false),
     requestChannelIds: z.array(z.string().regex(/^[CG][A-Z0-9]{2,20}$/)).max(20)
       .refine(ids => new Set(ids).size === ids.length, "requestChannelIds must be unique").optional(),
+    organizationScope: z.object({
+      channelIds: z.array(z.string().regex(/^[CG][A-Z0-9]{2,20}$/)).max(20)
+        .refine(ids => new Set(ids).size === ids.length, "organizationScope.channelIds must be unique").optional(),
+      workspaces: z.array(z.object({
+        projectId: z.string().regex(/^[a-z0-9-]{1,80}$/),
+        path: z.string().refine(value => isAbsolute(value) && resolve(value) === value, "Workspace paths must be absolute canonical paths"),
+        repository: z.string().regex(/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?\/[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/).nullable(),
+        rootCommit: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i).optional(),
+      }).strict().superRefine((workspace, context) => {
+        if (workspace.repository === null && !workspace.rootCommit)
+          context.addIssue({ code: "custom", path: ["rootCommit"], message: "Local-only workspaces must pin their Git root commit" });
+        if (workspace.repository !== null && workspace.rootCommit !== undefined)
+          context.addIssue({ code: "custom", path: ["rootCommit"], message: "GitHub workspaces must not set rootCommit" });
+      })).max(64)
+        .refine(workspaces => new Set(workspaces.map(value => value.projectId)).size === workspaces.length, "organizationScope.workspaces projectIds must be unique")
+        .refine(workspaces => new Set(workspaces.map(value => value.path)).size === workspaces.length, "organizationScope.workspaces paths must be unique").optional(),
+    }).strict().optional(),
     classify: z.boolean().default(false),
     endpoint: z.url().optional(),
   }).strict().optional(),
@@ -38,6 +55,10 @@ export const intakeConfigSchema = z.object({
   requireSlackThread: z.boolean().default(true),
 }).strict();
 export type IntakeConfig = z.infer<typeof intakeConfigSchema>;
+export interface SlackOrganizationScope {
+  channelIds?: string[];
+  workspaces?: { projectId: string; path: string; repository: string | null; rootCommit?: string }[];
+}
 
 export type IntakeState = "queued" | "started" | "finished" | "skipped";
 export type IntakeSkipReason = "creator-mismatch" | "no-slack-thread" | "thread-unreadable" | "no-owner-mention";
@@ -153,6 +174,7 @@ export interface SlackThreadMessage { ts: string; user?: string; botId?: string;
 
 export interface IntakeThreadReader {
   thread(binding: IntakeThread): Promise<SlackThreadMessage[] | "unreadable">;
+  organizationChannelAllowed?(channelId: string): Promise<boolean>;
   permalink?(binding: IntakeThread, ts: string): Promise<string>;
 }
 

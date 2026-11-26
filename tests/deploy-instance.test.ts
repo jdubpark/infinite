@@ -118,14 +118,15 @@ test("the instance census wrapper runs the instance's census, and the instance s
     /^infinite-work-host ALL=\(infinite-work-agent\) NOPASSWD: \/usr\/local\/libexec\/infinite-work\/process-census ""$/m);
 });
 
-test("every tracked deploy file that names a first-instance path is rendered for an instance or kept for the first instance only", () => {
-  const firstInstanceOnly = new Map([
+test("every deploy file with a first-instance path has a per-instance template or an explicit host-level owner", () => {
+  const hostLevelFiles = new Map([
     ["README.md", "the first instance's install guide; a second instance follows instances.md"],
     ["ceilings.md", "the machine's one set of provider ceilings; its deny rules cover every instance's secret paths by pattern"],
     ["ceilings/managed-settings.json", "one file for the whole machine; its deny rules cover every instance's secret paths by pattern"],
     ["backup.py", "the machine's one backup job, which reads the whole data volume"],
     ["backups.md", "documents that one backup job"],
     ["infinite-backup.service", "runs that one backup job"],
+    ["infinite-instance-boundaries.service", "one machine-wide verifier compares the accounts and roots of all enrolled instances"],
     ["commissioning.md", "the record of commissioning the machine and its first instance"],
     ["github-app.md", "the first instance's GitHub App setup; instances.md gives an instance's own"],
     ["github-proxy.md", "the first instance's GitHub credential proxy; a second instance needs its own key, account, port, unit, and token directory"],
@@ -141,9 +142,9 @@ test("every tracked deploy file that names a first-instance path is rendered for
   ]);
   const firstPath = /\/opt\/infinite\/|\/opt\/infinite-agents|\/srv\/infinite-data|\/usr\/local\/libexec\/infinite\//;
   const tracked = deployFiles();
-  for (const name of firstInstanceOnly.keys()) assert.ok(tracked.includes(name), `${name} is listed but not tracked`);
+  for (const name of hostLevelFiles.keys()) assert.ok(tracked.includes(name), `${name} is listed but not tracked`);
   const templated = new Set(readdirSync(render()));
-  const unlisted = tracked.filter(name => firstPath.test(readFileSync(join("deploy/ubuntu", name), "utf8")) && !templated.has(name) && !firstInstanceOnly.has(name));
+  const unlisted = tracked.filter(name => firstPath.test(readFileSync(join("deploy/ubuntu", name), "utf8")) && !templated.has(name) && !hostLevelFiles.has(name));
   assert.deepEqual(unlisted, []);
 });
 

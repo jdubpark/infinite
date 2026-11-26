@@ -123,14 +123,13 @@ extension SessionModel {
     }
 
     func send(retry: Bool = false) async {
-        guard ready, !busy else { return }
-        let generation = attachGeneration
-        busy = true; sending = true
-        defer { if generation == attachGeneration { busy = false; sending = false } }
+        guard ready, !busy, let generation = streamState.generation else { return }
+        sending = true
+        defer { if generation == streamState.generation { sending = false } }
         if !draftLoaded {
             await draftLoadTask?.value
             if !draftLoaded { await loadInitialDraft() }
-            guard generation == attachGeneration, ready, draftLoaded else { return }
+            guard generation == streamState.generation, ready, draftLoaded else { return }
         }
         let retryTarget: PendingSend?
         if retry {
@@ -142,7 +141,7 @@ extension SessionModel {
         }
         let sendToken = UUID()
         activeSendToken = sendToken
-        guard await ensureControl(), generation == attachGeneration, hasControl, attached else { return }
+        guard await ensureControl(), generation == streamState.generation, hasControl, attached else { return }
         if retry, draft.pending != retryTarget { return }
         let leaseID = lease["id"].string, control = controlGeneration
         guard !leaseID.isEmpty else { return }
@@ -158,27 +157,27 @@ extension SessionModel {
         do {
             try await persistDraft(throwing: true, expectedPendingID: id)
         } catch {
-            if activeSendToken == sendToken, generation == attachGeneration, !retry, draft.pending?.id == id {
+            if activeSendToken == sendToken, generation == streamState.generation, !retry, draft.pending?.id == id {
                 draft.pending = previousPending
                 draftVersion += 1
             }
-            if generation == attachGeneration { notice = error.localizedDescription }
+            if generation == streamState.generation { notice = error.localizedDescription }
             return
         }
-        guard generation == attachGeneration, control == controlGeneration, ready, hasControl, lease["id"].string == leaseID else {
-            if activeSendToken == sendToken, generation == attachGeneration, !retry, draft.pending?.id == id {
+        guard generation == streamState.generation, control == controlGeneration, ready, hasControl, lease["id"].string == leaseID else {
+            if activeSendToken == sendToken, generation == streamState.generation, !retry, draft.pending?.id == id {
                 draft.pending = previousPending
                 draftVersion += 1
                 try? await persistDraft(flush: true)
             }
-            if generation == attachGeneration {
+            if generation == streamState.generation {
                 notice = "Control changed before sending input. Refresh and try again."
             }
             return
         }
         do {
             let receipt = try await deps.sendRequest(client, "/sessions/\(session.id)/input", .object(["requestId": .string(id), "text": .string(text), "submit": .bool(true)]), leaseID)
-            guard generation == attachGeneration else { return }
+            guard generation == streamState.generation else { return }
             guard receipt["state"].string == "delivered" || receipt["receipt"]["state"].string == "delivered" else {
                 throw DesktopError("Delivery is uncertain. Inspect the terminal before retrying.", code: "delivery-unknown")
             }
@@ -190,7 +189,7 @@ extension SessionModel {
             }
             notice = "Delivered to the terminal."
         } catch {
-            if generation == attachGeneration { notice = error.localizedDescription }
+            if generation == streamState.generation { notice = error.localizedDescription }
         }
     }
 

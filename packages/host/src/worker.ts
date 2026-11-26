@@ -59,7 +59,7 @@ import { TerminalSnapshots } from "./terminal-snapshot.js";
 import { DEFAULT_TERMINAL_SIZE, isPtyTerminalSize, TERMINAL_SIZE_INDEX_FILE, TerminalBarrier, TerminalSizeIndex } from "./terminal-size.js";
 import { ptyTails } from "./pty-tail.js";
 import { SignalIndex } from "./signal-index.js";
-import { startNativeCodex, validateNativeCodexArgs } from "./native-codex.js";
+import { CODEX_ENVIRONMENT_STATE_FILE, nativeCodexObserverArgs, prepareCodexWorkerExecution, startNativeCodex } from "./native-codex.js";
 import { startNativeOpenCode, validateNativeOpenCodeArgs } from "./native-opencode.js";
 import { createExecutorTunnel, type ExecutorTunnel } from "./executor-tunnel.js";
 import { JsonLineAssembler, toolFromRunLine, usageFromRunLine } from "./opencode-usage.js";
@@ -126,6 +126,7 @@ let state: WorkerState = {
 };
 let child: ReturnType<typeof spawn> | undefined;
 let native: Awaited<ReturnType<typeof startNativeCodex>> | Awaited<ReturnType<typeof startNativeOpenCode>> | undefined;
+let nativeRestartHold = false;
 let executor: ExecutorTunnel | undefined;
 let hybrid: Awaited<ReturnType<typeof createHybridWorkspace>> | undefined;
 terminal.onData((data) => {
@@ -610,6 +611,7 @@ function deliver(
   checkControl(request);
   if (handoffReceipt && request.op !== "stop") throw new Error("This session yielded to a team; further input is disabled");
   if (permissionChannel?.waiting() && request.op !== "stop") throw new Refusal("prompt-open");
+  if (nativeRestartHold && request.op !== "stop") throw new Refusal("unsupported");
   if (state.status !== "running" || !child)
     throw new Error("Session is not running");
   if (
@@ -638,6 +640,7 @@ function deliver(
   };
   receipts.set(request.requestId, receipt);
   let retireWaiting = false;
+  let endFencedNative = false;
   if (request.op === "input") {
     child.write(
       terminal.modes.bracketedPasteMode
@@ -658,7 +661,10 @@ function deliver(
       }[request.key],
     );
   } else if (permissionChannel?.waiting()) retireWaiting = true;
-  else {
+  else if (nativeRestartHold) {
+    transcriptWatch.stopRequested();
+    endFencedNative = true;
+  } else {
     transcriptWatch.stopRequested();
     child.kill("SIGTERM");
   }
@@ -671,6 +677,7 @@ function deliver(
   receipt.seq = result.seq;
   refreshControl(request);
   if (retireWaiting) permissionChannel!.retire("stopped");
+  if (endFencedNative) endSession?.();
   return publicReceipt(receipt);
 }
 
@@ -1453,8 +1460,11 @@ server.listen(workerSocket, async () => {
       config.codeMode,
       session.runtime?.nativeUi ? 0 : session.nativeArgs?.length,
     );
+    let restartNativeObserver: ((restoredThreadId: string) => void) | undefined;
     if (session.runtime?.nativeUi === "codex") {
+      let codexRecovery: ReturnType<typeof prepareCodexWorkerExecution> | undefined;
       if (session.workspace) {
+        codexRecovery = prepareCodexWorkerExecution({ file: join(dir, CODEX_ENVIRONMENT_STATE_FILE), key, scope: `${session.id}:codex-environments`, workspace: session.workspace, resumeThreadId: session.resumeNativeSession?.id });
         hybrid = await createHybridWorkspace({
           workspace: session.workspace, directory: join(dir, "workspace"), sharedPoolDirectory: join(stateDir, "workspace-pool"),
           command: profile.command, commandArgs: profile.args, egress: egress.env,
@@ -1471,11 +1481,9 @@ server.listen(workerSocket, async () => {
           },
         });
         executor = await createExecutorTunnel({
-          cwd: session.workspace.cwd,
-          onConnection: online => hybrid?.connection(online),
-          onControl: (method, params) => hybrid!.control(method, params),
-          onActivity: activity => hybrid?.activity(activity),
-          record: data => { append("lifecycle", { executor: data }); },
+          cwd: session.workspace.cwd, ...(codexRecovery.environmentId ? { environmentId: codexRecovery.environmentId } : {}),
+          onConnection: online => hybrid?.connection(online), onControl: (method, params) => hybrid!.control(method, params),
+          onActivity: activity => hybrid?.activity(activity), record: data => { append("lifecycle", { executor: data }); },
         });
         persist();
         let timeout: ReturnType<typeof setTimeout> | undefined;
@@ -1487,8 +1495,22 @@ server.listen(workerSocket, async () => {
       }
       native = await startNativeCodex({
         profile, cwd: session.cwd, env,
-        ...(executor && session.workspace ? { execution: { ...executor.environment, roots: session.workspace.roots } } : {}),
+        ...(executor && session.workspace && codexRecovery ? { execution: { ...executor.environment, roots: session.workspace.roots }, environmentState: codexRecovery.environmentState, ...(codexRecovery.resumeThreadId ? { resumeThreadId: codexRecovery.resumeThreadId } : {}) } : {}),
         onExecutionUnavailable: () => hybrid?.providerReady(false),
+        onProviderRestart: (phase, restoredThreadId) => {
+          if (phase === "restarting") {
+            nativeRestartHold = true;
+          } else if (phase === "restored" && restoredThreadId) {
+            hybrid?.providerReady(native && "supportsExecutionSelection" in native ? native.supportsExecutionSelection : false);
+            restartNativeObserver?.(restoredThreadId);
+            nativeRestartHold = false;
+          } else {
+            nativeRestartHold = true;
+            hybrid?.providerReady(false);
+            append("lifecycle", { providerRestarted: true, fenced: true });
+            persist();
+          }
+        },
         noAltScreen: (session.nativeArgs ?? []).includes("--no-alt-screen"),
         checkControl: (authority) => {
           if (state.status !== "running" || !authority.actor || !authority.leaseId) throw new Refusal("control-lost");
@@ -1508,7 +1530,7 @@ server.listen(workerSocket, async () => {
       hybrid?.providerReady(native.supportsExecutionSelection);
       env.INFINITE_NATIVE_TOKEN = native.observerToken;
       launch = { command: profile.command, args: [...profile.args, "--remote", native.url,
-        "--remote-auth-token-env", "INFINITE_NATIVE_TOKEN", ...validateNativeCodexArgs(session.nativeArgs ?? [], config.prompt, Boolean(session.workspace))] };
+        "--remote-auth-token-env", "INFINITE_NATIVE_TOKEN", ...nativeCodexObserverArgs(session.nativeArgs ?? [], config.prompt, Boolean(session.workspace), native.info().sessionId)] };
     }
     if (session.runtime?.nativeUi === "opencode") {
       const settings = validateNativeOpenCodeArgs(session.nativeArgs ?? [], config.prompt);
@@ -1626,8 +1648,28 @@ server.listen(workerSocket, async () => {
         setTimeout(finish, 1500);
       })();
     };
-    const onExit = ({ exitCode }: { exitCode: number }) => terminalBarrier.dispatch(() => exited(exitCode));
-    child.onExit(onExit);
+    const bindExit = (pty: typeof child) => ({ exitCode }: { exitCode: number }) => {
+      if (pty !== child || nativeRestartHold) return;
+      terminalBarrier.dispatch(() => exited(exitCode));
+    };
+    const initialPty = child;
+    child.onExit(bindExit(initialPty));
+    restartNativeObserver = restoredThreadId => {
+      if (!native) return;
+      const previous = child;
+      const args = [...profile.args, "--remote", native.url, "--remote-auth-token-env", "INFINITE_NATIVE_TOKEN",
+        ...nativeCodexObserverArgs(session.nativeArgs ?? [], config.prompt, Boolean(session.workspace), restoredThreadId)];
+      const pty = spawn(profile.command, args, { cwd: session.cwd, env, cols: terminal.cols, rows: terminal.rows, name: "xterm-256color" });
+      child = pty;
+      previous?.kill("SIGTERM");
+      state = { ...state, status: "running", pid: pty.pid };
+      const restartedEvent = append("lifecycle", { status: "running", pid: pty.pid, cols: terminal.cols, rows: terminal.rows, providerRestarted: true });
+      sizeIndex.append(restartedEvent.seq, { cols: terminal.cols, rows: terminal.rows });
+      persist();
+      pty.onData(onData);
+      tails.track(pty);
+      pty.onExit(bindExit(pty));
+    };
     resumeProvider = nativeSessionId => {
       const next = buildLaunch(
         provider, headlessResumeProfile(profile, nativeSessionId), "",
@@ -1644,9 +1686,9 @@ server.listen(workerSocket, async () => {
       persist();
       pty.onData(onData);
       tails.track(pty);
-      pty.onExit(onExit);
+      pty.onExit(bindExit(pty));
     };
-    endSession = () => terminalBarrier.dispatch(() => exited(0, true));
+    endSession = () => { nativeRestartHold = false; terminalBarrier.dispatch(() => exited(0, true)); };
   } catch (error) {
     state = { ...state, status: "exited", exitCode: 1 };
     publish(applyLifecycle(attention, "exited", new Date().toISOString()));

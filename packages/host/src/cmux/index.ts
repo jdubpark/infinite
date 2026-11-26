@@ -7,7 +7,8 @@ import { basename, isAbsolute, join, relative } from "node:path";
 import { applyLifecycle, initialAttention, type Attention, type Prompt } from "@infinite/attention";
 import { projectCwd, type CreateSession } from "../manager.js";
 import type { Config, ControlActor, ControlLease, Event, InputControl, Receipt, Session, WorkerRequest, WorkerState } from "../types.js";
-import { Journal, readEvents, unseal, writeSealed } from "../vault.js";
+import { Journal, unseal, writeSealed } from "../vault.js";
+import { readIndexedEvents, SignalIndex } from "../signal-index.js";
 import { CmuxClient, CmuxError, array, string, type Json, type Surface } from "./client.js";
 import { foregroundAgent, LAUNCH_ENV, processAlive, readHooks, type CmuxProvider, type HookSession } from "./discovery.js";
 import { digest, feedReply, matchingFeed, pendingPrompt, type PendingPrompt } from "./prompts.js";
@@ -75,7 +76,7 @@ export class CmuxSessions {
         const stored = unseal<Stored>(key, `cmux:${id}:meta`, readFileSync(join(this.directory, id, "meta.sealed"), "utf8"));
         if (stored.session.id !== id) continue;
         this.records.set(id, stored);
-        try { this.journals.set(id, new Journal(join(this.directory, id, "events"), key, id)); }
+        try { this.openJournal(id); }
         catch { stored.recordingError = true; }
       } catch { this.unreadable.add(id); }
     }
@@ -131,14 +132,23 @@ export class CmuxSessions {
     catch (error) { record.recordingError = true; throw error; }
   }
 
+  private openJournal(id: string): Journal {
+    const sessionDir = join(this.directory, id);
+    let signalIndex: SignalIndex | undefined;
+    const journal = new Journal(join(sessionDir, "events"), this.key, id, {
+      onAppend: (event) => {
+        signalIndex?.observe(event);
+      },
+    });
+    signalIndex = new SignalIndex(sessionDir, this.key, id, journal.seq);
+    this.journals.set(id, journal);
+    return journal;
+  }
+
   private append(record: Stored, type: Event["type"], data: Event["data"]): Event {
     if (record.recordingError) throw new CmuxError("recording-error");
     try {
-      let journal = this.journals.get(record.session.id);
-      if (!journal) {
-        journal = new Journal(join(this.directory, record.session.id, "events"), this.key, record.session.id);
-        this.journals.set(record.session.id, journal);
-      }
+      const journal = this.journals.get(record.session.id) ?? this.openJournal(record.session.id);
       return journal.append(type, data);
     } catch (error) { record.recordingError = true; throw error; }
   }
@@ -443,7 +453,7 @@ export class CmuxSessions {
 
   events(id: string, after = 0, limit = 200, types?: Set<string>) {
     this.stored(id);
-    return readEvents(join(this.directory, id, "events"), this.key, id, after, limit, types);
+    return readIndexedEvents(join(this.directory, id), this.key, id, after, limit, types);
   }
 
   messages(id: string, after?: string, limit = 200) {

@@ -77,13 +77,15 @@ export function writeSealed(
   }
 }
 
-const SEGMENT_SIZE = 256;
+export const SEGMENT_SIZE = 256;
+export const MAX_EVENT_PAGE_BYTES = 512 * 1024;
 export class Journal {
   seq = 0;
   constructor(
     readonly directory: string,
     readonly key: Buffer,
     readonly sessionId: string,
+    private readonly options?: { onAppend?: (event: Event) => void },
   ) {
     mkdirSync(directory, { recursive: true, mode: 0o700 });
     const segments = readdirSync(directory)
@@ -120,6 +122,7 @@ export class Journal {
       closeSync(fd);
     }
     this.seq = seq;
+    this.options?.onAppend?.(event);
     return event;
   }
 }
@@ -147,7 +150,7 @@ export function readEvents(
     for (let i = 0; i < lines.length; i++) {
       const seq = segment * SEGMENT_SIZE + i + 1;
       if (seq <= after) continue;
-      if (events.length >= limit || totalBytes >= 512 * 1024)
+      if (events.length >= limit || totalBytes >= MAX_EVENT_PAGE_BYTES)
         return { events, cursor: scanned, more: true };
       const event = unseal<Event>(key, `${sessionId}:${seq}`, lines[i]);
       if (event.seq !== seq) throw new Error("Journal sequence mismatch");

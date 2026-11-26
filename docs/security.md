@@ -347,7 +347,11 @@ paths for the web [Swarm view](swarm.md): a project's directory-level code map
 session (`/api/teams/:id/context`, `/api/sessions/:id/context`). They carry
 directory names, repository-relative file paths, and counts, which is the
 class of data the file listing and session events already serve, and no source
-text. The allowlist also admits `GET /api/decision-queue` as a read; global API
+text. A team view also carries `leftoverProcesses` while a run records a
+process that an earlier command left holding its output: a state (`unchecked`,
+`running`, `in-use` or `unknown`) and two times, with no process ids, paths or
+census details. Run removal, with the owner's `processesEnded` statement, is not
+on the allowlist. The allowlist also admits `GET /api/decision-queue` as a read; global API
 authentication still applies, and the route adds no role guard. The read answers
 nothing. Like `GET /api/sessions`, it first shows the listed dialogs to the session
 permission service, which may then start its review of a dialog the owner delegated

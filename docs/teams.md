@@ -467,13 +467,51 @@ mission is no longer active. `DELETE /api/teams/:id` and `infinite team delete I
 cancelled, merged, or no-change run (clones and record) immediately. A run that
 still holds an unresolved operation with a process record is removed only when a
 look taken at that moment finds no process of that operation and none using the
-run directory; otherwise the request receives `team-operation-running`. A live
+run directory, or, when that look cannot tell, on the owner's statement described
+below; otherwise the request receives `team-operation-running`. A live
 goal, mission, or handoff that still uses the run as its source receives
 `team-retained`; `team-in-use` means another run has a pending preparation that
 clones from this workspace. Both removals can be retried once the reference
 settles. Deleted request IDs are kept in the sealed `retired.sealed` tombstone,
 up to 2,000 IDs with the oldest dropped. Replaying one returns `team-deleted`;
 start another run with a new request ID.
+
+A run whose command exited while a process it started still held its output
+(see the leader rule under checks) keeps a record of that command's processes:
+the ids, groups and sessions its operation recorded, whether the operation then
+succeeded or failed. Later operations of the run, a passing check among them,
+do not clear the record. While it stands, nothing removes the run's directories:
+not retention of a merged, no-change, ready-for-review, cancelled or blocked
+run, and not the owner's removal. Until the run is cancelled, merged,
+no-change, ready for review or blocked, the host also keeps its integrated
+member clones and takes no look for the record; the clones go with the run
+directory later. When a removal falls due, the host looks
+for processes that match the record and for processes that use the run
+directory, as described above, at most every ten minutes; the owner's removal
+takes a look of its own. When the run also holds an unresolved operation with a
+process record, one look covers both records, and each record's counts include
+the processes of both. A look that finds neither kind clears the record, and
+the removal proceeds. The run's events record each change in what the host saw.
+The team view carries `leftoverProcesses` while the record stands:
+`{ since, state: "unchecked" }` before the first look, then
+`{ since, state, checkedAt }` with `state` set to `running`, `in-use` or
+`unknown`. It names no process ids or paths.
+
+The owner's removal of such a run answers `team-leftover-running` (409) while a
+look finds a process, and `team-leftover-unknown` (409) while the look cannot
+tell. `unknown` keeps the directories, and the only way out is the owner's
+statement that the processes ended: `DELETE /api/teams/:id` with the body
+`{ "processesEnded": true }`, or `infinite team delete ID --processes-ended`.
+The host accepts the statement only when the look taken for that request
+reports `unknown`, and refuses it while a look finds a process. It records the
+statement as a run event that names what the look reported, then removes the
+run. The statement lifts an unresolved operation's record for removal in the
+same way. The body accepts no other field, and a removal without a body behaves
+as before. Run removal is not on the relay allowlist.
+
+The record covers only the case above. A process that a command leaves behind
+without holding the command's output is never noted, so the host takes no look
+for it, and the run's directory may be removed while that process runs.
 
 Retention marks a workspace removal as started in the run record, then removes
 the tree outside the serialized team mutation queue. At most two background
@@ -2926,11 +2964,13 @@ for that output to close, so such a check ran into `teams.checkMinutes` and
 blocked the run. The host records the case in the run's events with one fixed
 line, "A configured command exited while a process it started still held its
 output. The host judged the command by its exit code and neither waited for that
-process nor stopped it." That process keeps running, in the verification copy
-for a check, until it ends. After an operation that succeeded, nothing looks for
-it, and the run's directory may be removed while it runs. A failed operation
-keeps its record: the census still finds the process by its recorded group, and
-retention holds the run's directories until the process ends. Most Git reads
+process nor stopped it. It keeps this run's directories until a process census
+finds none of that command's processes." That process keeps running, in the
+verification copy for a check, until it ends. The run keeps the record of that
+command's processes, whether the operation succeeded or failed, and no removal
+of the run's directories proceeds until a look finds none of them or, when a
+look cannot tell, the owner states that they ended (see retention above). A process that a command leaves behind without holding its
+output is not noted and holds nothing. Most Git reads
 refuse a result whose output stayed open past that second, as they refuse any
 incomplete read; the few that decide by Git's exit code alone read only output
 that is complete when Git exits. A stop that arrives within the second ends the

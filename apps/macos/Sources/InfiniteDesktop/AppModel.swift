@@ -583,7 +583,7 @@ enum HostConnectionState: Equatable {
             }
         }
         if let row = board.items.first(where: { $0.kind == .team && $0.id == id }) {
-            return TeamSeed(id: id, title: row.title, status: row.status)
+            return TeamSeed(id: id, title: row.title, status: row.status, column: row.column.rawValue)
         }
         return TeamSeed(id: id, missionID: missionID ?? "")
     }

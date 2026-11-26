@@ -69,7 +69,8 @@ struct StatusGlyph: View {
     init(teamSeed: TeamSeed, size: CGFloat = 14) {
         self.size = size
         switch teamSeed.typedStatus {
-        case .unknown(let raw) where raw.isEmpty: kind = .todo
+        case .unknown(let raw) where raw.isEmpty:
+            kind = teamSeed.column == BoardColumn.needsInput.rawValue ? .attention : .todo
         case .cancelled: kind = .cancelled
         case .noChange: kind = .stopped
         case .merged: kind = .done
@@ -78,7 +79,7 @@ struct StatusGlyph: View {
         case .needsInput: kind = .attention
         case .readyForReview: kind = .review
         case .planning, .discovering, .implementing, .integrating, .verifying, .reviewing, .delivering, .unknown:
-            kind = .progress(teamSeed.progressFraction)
+            kind = teamSeed.column == BoardColumn.needsInput.rawValue ? .attention : .progress(teamSeed.progressFraction)
         }
     }
     init(teamLoadState: TeamLoadState, size: CGFloat = 14) {

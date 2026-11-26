@@ -123,12 +123,19 @@ enum MissionLoadState: Equatable, Sendable {
         case failed(String)
     }
 
+    private enum PollMode {
+        case background
+        case manual
+        case forced
+    }
+
     @Published private(set) var loadState: MissionLoadState
     @Published var direction = ""
     @Published private(set) var mutationState: MutationState = .idle
     @Published private(set) var notice = ""
     @Published private(set) var noticeIsError = false
     @Published private(set) var fresh = false
+    @Published private(set) var isRetrying = false
 
     var busy: Bool { mutationState.isSending }
     var pending: TeamMutation? { mutationState.pending }
@@ -141,7 +148,7 @@ enum MissionLoadState: Equatable, Sendable {
     private var displayVisible = false
     private var pollGeneration = UUID()
     private var latestPollAttempt: UInt64 = 0
-    private var inFlightPoll: (attempt: UInt64, task: Task<PollOutcome, Never>)?
+    private var inFlightPoll: (attempt: UInt64, manual: Bool, task: Task<PollOutcome, Never>)?
 
     init(
         seed: MissionSeed,
@@ -206,6 +213,7 @@ enum MissionLoadState: Equatable, Sendable {
             latestPollAttempt &+= 1
             inFlightPoll?.task.cancel()
             inFlightPoll = nil
+            if isRetrying { isRetrying = false }
         }
         updatePolling()
     }
@@ -216,6 +224,7 @@ enum MissionLoadState: Equatable, Sendable {
             latestPollAttempt &+= 1
             inFlightPoll?.task.cancel()
             inFlightPoll = nil
+            if isRetrying { isRetrying = false }
             pollTask?.cancel()
             pollTask = nil
             return
@@ -235,29 +244,43 @@ enum MissionLoadState: Equatable, Sendable {
     }
 
     func poll() async {
-        _ = await runPoll(pollGeneration, coalesce: false)
+        _ = await runPoll(pollGeneration, mode: .forced)
+    }
+
+    func retryLoad() async {
+        _ = await runPoll(pollGeneration, mode: .manual)
     }
 
     private func poll(_ generation: UUID) async {
-        _ = await runPoll(generation, coalesce: true)
+        _ = await runPoll(generation, mode: .background)
     }
 
-    private func runPoll(_ generation: UUID, coalesce: Bool) async -> PollOutcome {
+    private func runPoll(_ generation: UUID, mode: PollMode) async -> PollOutcome {
         guard displayVisible, generation == pollGeneration else { return .skipped }
-        if coalesce, let active = inFlightPoll {
-            return await active.task.value
+        if let active = inFlightPoll {
+            switch mode {
+            case .background:
+                return await active.task.value
+            case .manual where active.manual:
+                return await active.task.value
+            case .manual, .forced:
+                break
+            }
         }
         latestPollAttempt &+= 1
         let attempt = latestPollAttempt
+        let isManual = mode == .manual
         inFlightPoll?.task.cancel()
+        if isRetrying != isManual { isRetrying = isManual }
         let task = Task<PollOutcome, Never> { [weak self] in
             guard let self else { return .skipped }
             return await self.executePoll(generation: generation, attempt: attempt)
         }
-        inFlightPoll = (attempt, task)
+        inFlightPoll = (attempt, isManual, task)
         let outcome = await task.value
         if inFlightPoll?.attempt == attempt {
             inFlightPoll = nil
+            if isRetrying { isRetrying = false }
         }
         return outcome
     }
@@ -347,7 +370,7 @@ enum MissionLoadState: Equatable, Sendable {
             notice = "Delivery unconfirmed. Retry sends this exact request."
             noticeIsError = true
         } catch let error as DesktopError where (400...499).contains(error.status) {
-            let outcome = await runPoll(pollGeneration, coalesce: false)
+            let outcome = await runPoll(pollGeneration, mode: .forced)
             mutationState = .idle
             switch outcome {
             case .updated:

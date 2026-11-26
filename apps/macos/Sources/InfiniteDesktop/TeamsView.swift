@@ -25,9 +25,10 @@ func teamColor(_ seed: TeamSeed) -> Color {
     case .paused: return Palette.paused
     case .merged: return Palette.done
     case .cancelled, .noChange: return .secondary
-    case .unknown(let raw) where raw.isEmpty: return .secondary
+    case .unknown(let raw) where raw.isEmpty:
+        return seed.column == BoardColumn.needsInput.rawValue ? Palette.attention : .secondary
     case .planning, .discovering, .implementing, .integrating, .verifying, .reviewing, .delivering, .unknown:
-        return Palette.running
+        return seed.column == BoardColumn.needsInput.rawValue ? Palette.attention : Palette.running
     }
 }
 private let teamClock: DateFormatter = { let f = DateFormatter(); f.dateStyle = .short; f.timeStyle = .short; return f }()
@@ -102,7 +103,7 @@ struct TeamDetailView: View {
         if let error {
             VStack(alignment: .leading, spacing: 10) {
                 note("Could not load team details: \(error)", color: .orange)
-                Button("Retry") { Task { await model.poll() } }.controlSize(.small)
+                Button("Retry") { Task { await model.retryLoad() } }.controlSize(.small).disabled(model.isRetrying)
             }
         } else {
             HStack(spacing: 10) {

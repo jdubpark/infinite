@@ -33,19 +33,22 @@ struct TeamSeed: Equatable, Sendable {
     let status: String
     let projectID: String
     let missionID: String
+    let column: String?
 
     init(
         id: String,
         title: String = "",
         status: String = "",
         projectID: String = "",
-        missionID: String = ""
+        missionID: String = "",
+        column: String? = nil
     ) {
         self.id = id
         self.title = title
         self.status = status
         self.projectID = projectID
         self.missionID = missionID
+        self.column = column
     }
 
     var typedStatus: TeamRun.Status { TeamRun.Status(status) }
@@ -149,6 +152,12 @@ enum TeamLoadState: Equatable, Sendable {
         case failed(String)
     }
 
+    private enum PollMode {
+        case background
+        case manual
+        case forced
+    }
+
     @Published private(set) var loadState: TeamLoadState
     @Published var direction = ""
     @Published private(set) var mutationState: MutationState = .idle
@@ -156,6 +165,7 @@ enum TeamLoadState: Equatable, Sendable {
     @Published private(set) var noticeIsError = false
     @Published private(set) var fresh = false
     @Published private(set) var displayStale = false
+    @Published private(set) var isRetrying = false
 
     var busy: Bool { mutationState.isSending }
     var pending: TeamMutation? { mutationState.pending }
@@ -188,7 +198,7 @@ enum TeamLoadState: Equatable, Sendable {
 
     private var pollGeneration = UUID()
     private var latestPollAttempt: UInt64 = 0
-    private var inFlightPoll: (attempt: UInt64, task: Task<PollOutcome, Never>)?
+    private var inFlightPoll: (attempt: UInt64, manual: Bool, task: Task<PollOutcome, Never>)?
     private lazy var freshness = DisplayFreshness { [weak self] in self?.displayStale = $0 }
 
     init(
@@ -231,8 +241,8 @@ enum TeamLoadState: Equatable, Sendable {
         case .loading:
             loadState = .loaded(next, latestListRow: nil)
         case .listSeed(let current, _):
-            guard Self.supersedes(next, current) else { return }
-            loadState = .loaded(next, latestListRow: nil)
+            let latestListRow = Self.later(current, than: next) ? current : nil
+            loadState = .loaded(next, latestListRow: latestListRow)
         case .loaded(let current, let latestListRow):
             guard Self.supersedes(next, current) else { return }
             if next != current {
@@ -269,7 +279,7 @@ enum TeamLoadState: Equatable, Sendable {
         let token = UUID(), generation = pollGeneration
         refreshToken = token
         Task { [weak self] in
-            _ = await self?.runPoll(generation, coalesce: false)
+            _ = await self?.runPoll(generation, mode: .forced)
             if self?.refreshToken == token { self?.refreshToken = nil }
         }
     }
@@ -292,6 +302,7 @@ enum TeamLoadState: Equatable, Sendable {
             latestPollAttempt &+= 1
             inFlightPoll?.task.cancel()
             inFlightPoll = nil
+            if isRetrying { isRetrying = false }
         }
         updatePolling()
     }
@@ -302,6 +313,7 @@ enum TeamLoadState: Equatable, Sendable {
             latestPollAttempt &+= 1
             inFlightPoll?.task.cancel()
             inFlightPoll = nil
+            if isRetrying { isRetrying = false }
             pollTask?.cancel()
             pollTask = nil
             return
@@ -321,29 +333,43 @@ enum TeamLoadState: Equatable, Sendable {
     }
 
     func poll() async {
-        _ = await runPoll(pollGeneration, coalesce: false)
+        _ = await runPoll(pollGeneration, mode: .forced)
+    }
+
+    func retryLoad() async {
+        _ = await runPoll(pollGeneration, mode: .manual)
     }
 
     private func poll(_ generation: UUID) async {
-        _ = await runPoll(generation, coalesce: true)
+        _ = await runPoll(generation, mode: .background)
     }
 
-    private func runPoll(_ generation: UUID, coalesce: Bool) async -> PollOutcome {
+    private func runPoll(_ generation: UUID, mode: PollMode) async -> PollOutcome {
         guard displayVisible, generation == pollGeneration else { return .skipped }
-        if coalesce, let active = inFlightPoll {
-            return await active.task.value
+        if let active = inFlightPoll {
+            switch mode {
+            case .background:
+                return await active.task.value
+            case .manual where active.manual:
+                return await active.task.value
+            case .manual, .forced:
+                break
+            }
         }
         latestPollAttempt &+= 1
         let attempt = latestPollAttempt
+        let isManual = mode == .manual
         inFlightPoll?.task.cancel()
+        if isRetrying != isManual { isRetrying = isManual }
         let task = Task<PollOutcome, Never> { [weak self] in
             guard let self else { return .skipped }
             return await self.executePoll(generation: generation, attempt: attempt)
         }
-        inFlightPoll = (attempt, task)
+        inFlightPoll = (attempt, isManual, task)
         let outcome = await task.value
         if inFlightPoll?.attempt == attempt {
             inFlightPoll = nil
+            if isRetrying { isRetrying = false }
         }
         return outcome
     }
@@ -476,7 +502,7 @@ enum TeamLoadState: Equatable, Sendable {
             notice = "Delivery unconfirmed. Retry sends this exact request."
             noticeIsError = true
         } catch let error as DesktopError where (400...499).contains(error.status) {
-            let outcome = await runPoll(pollGeneration, coalesce: false)
+            let outcome = await runPoll(pollGeneration, mode: .forced)
             mutationState = .idle
             switch outcome {
             case .updated:

@@ -47,7 +47,7 @@ struct MissionDetailView: View {
         if let error {
             VStack(alignment: .leading, spacing: 10) {
                 note("Could not load mission details: \(error)", color: .orange)
-                Button("Retry") { Task { await model.poll() } }.controlSize(.small)
+                Button("Retry") { Task { await model.retryLoad() } }.controlSize(.small).disabled(model.isRetrying)
             }
         } else {
             HStack(spacing: 10) {

@@ -261,6 +261,55 @@ private actor TeamDeferred<Value: Sendable> {
         XCTAssertEqual(model.direction, "")
     }
 
+    func testFirstFullReadOlderThanNewerListSeedTransitionsToLoadedBehind() async {
+        let rowV1 = run("2026-01-01T00:01:00.000Z", revision: 1)
+        let rowV2 = run("2026-01-01T00:02:00.000Z", revision: 2)
+        let fullV1 = run("2026-01-01T00:01:00.000Z", revision: 1, objective: "Full objective v1")
+        let fullV2 = run("2026-01-01T00:02:00.000Z", revision: 2, objective: "Full objective v2")
+        let firstFetchGate = TeamDeferred<JSON>()
+        actor FetchStep {
+            var count = 0
+            func next() -> Int { count += 1; return count }
+        }
+        let step = FetchStep()
+        let model = TeamModel(
+            run: rowV1,
+            client: RemoteClient(profile: HostProfile(label: "Test", origin: "http://127.0.0.1:1"), token: "token"),
+            role: "owner",
+            sendRequest: { _, _, _ in
+                if await step.next() == 1 {
+                    return try await firstFetchGate.wait()
+                }
+                return fullV2.value
+            }
+        )
+
+        model.setDisplayVisible(true)
+        let initialPoll = Task { @MainActor in await model.poll() }
+        await firstFetchGate.waitUntilEntered()
+
+        model.observeListRow(rowV2)
+        XCTAssertEqual(model.loadState, .listSeed(rowV2, error: nil))
+
+        await firstFetchGate.succeed(fullV1.value)
+        await initialPoll.value
+
+        XCTAssertEqual(model.loadState, .loaded(fullV1, latestListRow: rowV2))
+        XCTAssertTrue(model.isLoaded)
+        XCTAssertNil(model.loadError)
+        XCTAssertEqual(model.run, fullV1)
+        XCTAssertTrue(model.behind)
+        XCTAssertFalse(model.fresh)
+        XCTAssertFalse(model.canSteer)
+        XCTAssertFalse(model.canOwn)
+
+        await model.poll()
+        XCTAssertEqual(model.loadState, .loaded(fullV2, latestListRow: rowV2))
+        XCTAssertFalse(model.behind)
+        XCTAssertTrue(model.fresh)
+        XCTAssertTrue(model.canSteer)
+    }
+
     func testTeamSeedGlyphAndProgressMatchLoadedRunAcrossStatuses() {
         let statuses = [
             "planning", "discovering", "implementing", "integrating", "verifying",
@@ -278,5 +327,17 @@ private actor TeamDeferred<Value: Sendable> {
         XCTAssertEqual(TeamSeed(id: "run-1", status: "reviewing").progressFraction, 0.75)
         XCTAssertEqual(TeamSeed(id: "run-1", status: "delivering").progressFraction, 1.0)
         XCTAssertEqual(StatusGlyph(teamSeed: TeamSeed(id: "run-1")).kind, .todo)
+
+        let openDecisionRun = TeamRun(.object([
+            "id": .string("run-1"),
+            "status": .string("implementing"),
+            "revision": .number(1),
+            "decisions": .array([.object(["id": .string("d1"), "revision": .number(1), "question": .string("Continue?")])])
+        ]))
+        let needsInputSeed = TeamSeed(id: "run-1", status: "implementing", column: BoardColumn.needsInput.rawValue)
+        XCTAssertEqual(StatusGlyph(teamSeed: needsInputSeed).kind, .attention)
+        XCTAssertEqual(StatusGlyph(teamSeed: needsInputSeed).kind, StatusGlyph(team: openDecisionRun).kind)
+        XCTAssertEqual(StatusGlyph(teamSeed: TeamSeed(id: "run-1", column: BoardColumn.needsInput.rawValue)).kind, .attention)
+        XCTAssertEqual(StatusGlyph(teamSeed: TeamSeed(id: "run-1", status: "blocked", column: BoardColumn.needsInput.rawValue)).kind, .blocked)
     }
 }

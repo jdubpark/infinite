@@ -701,8 +701,8 @@ private actor ControlCallTracker {
         XCTAssertEqual(listedModel?.isLoaded, false)
     }
 
-    func testLateFailingPollNeverClobbersNewerSuccessfulRetryInMissionAndTeamModels() async throws {
-        let missionAutoGate = StateMachineDeferred<JSON>()
+    func testLateFailingPollNeverClobbersNewerSuccessfulRetryInMissionAndTeamModels() async {
+        let missionStaleGate = StateMachineDeferred<JSON>()
         actor PollCounter {
             var count = 0
             func next() -> Int { count += 1; return count }
@@ -721,30 +721,30 @@ private actor ControlCallTracker {
             role: "owner",
             sendRequest: { _, path, _ in
                 if path == "/missions/m-race", await missionCounter.next() == 1 {
-                    return try await missionAutoGate.wait()
+                    return try await missionStaleGate.wait()
                 }
                 return loadedMissionPayload
             }
         )
         missionModel.setDisplayVisible(true)
-        missionModel.startPolling()
-        await missionAutoGate.waitUntilEntered()
+        let staleMissionPoll = Task { @MainActor in await missionModel.poll() }
+        await missionStaleGate.waitUntilEntered()
 
-        await missionModel.poll()
+        await missionModel.retryLoad()
+        XCTAssertTrue(missionModel.isLoaded)
+        XCTAssertTrue(missionModel.fresh)
+        XCTAssertTrue(missionModel.canSteer)
+        XCTAssertNil(missionModel.loadError)
+        XCTAssertFalse(missionModel.isRetrying)
+
+        await missionStaleGate.fail(DesktopError("Stale mission poll failed"))
+        await staleMissionPoll.value
         XCTAssertTrue(missionModel.isLoaded)
         XCTAssertTrue(missionModel.fresh)
         XCTAssertTrue(missionModel.canSteer)
         XCTAssertNil(missionModel.loadError)
 
-        await missionAutoGate.fail(DesktopError("Stale mission poll failed"))
-        try await Task.sleep(for: .milliseconds(25))
-        XCTAssertTrue(missionModel.isLoaded)
-        XCTAssertTrue(missionModel.fresh)
-        XCTAssertTrue(missionModel.canSteer)
-        XCTAssertNil(missionModel.loadError)
-        missionModel.stopPolling()
-
-        let teamAutoGate = StateMachineDeferred<JSON>()
+        let teamStaleGate = StateMachineDeferred<JSON>()
         let teamCounter = PollCounter()
         let loadedTeamPayload: JSON = .object([
             "id": .string("t-race"),
@@ -759,29 +759,110 @@ private actor ControlCallTracker {
             role: "owner",
             sendRequest: { _, path, _ in
                 if path == "/teams/t-race", await teamCounter.next() == 1 {
-                    return try await teamAutoGate.wait()
+                    return try await teamStaleGate.wait()
                 }
                 return loadedTeamPayload
             }
         )
         teamModel.setDisplayVisible(true)
-        teamModel.startPolling()
-        await teamAutoGate.waitUntilEntered()
+        let staleTeamPoll = Task { @MainActor in await teamModel.poll() }
+        await teamStaleGate.waitUntilEntered()
 
-        await teamModel.poll()
+        await teamModel.retryLoad()
         XCTAssertTrue(teamModel.isLoaded)
         XCTAssertTrue(teamModel.fresh)
         XCTAssertTrue(teamModel.canSteer)
         XCTAssertNil(teamModel.loadError)
         XCTAssertFalse(teamModel.displayStale)
+        XCTAssertFalse(teamModel.isRetrying)
 
-        await teamAutoGate.fail(DesktopError("Stale team poll failed"))
-        try await Task.sleep(for: .milliseconds(25))
+        await teamStaleGate.fail(DesktopError("Stale team poll failed"))
+        await staleTeamPoll.value
         XCTAssertTrue(teamModel.isLoaded)
         XCTAssertTrue(teamModel.fresh)
         XCTAssertTrue(teamModel.canSteer)
         XCTAssertNil(teamModel.loadError)
         XCTAssertFalse(teamModel.displayStale)
-        teamModel.stopPolling()
+    }
+
+    func testConcurrentManualRetriesCoalesceToSingleRequestInMissionAndTeamModels() async {
+        actor RequestCounter {
+            var count = 0
+            func record() { count += 1 }
+        }
+
+        let missionGate = StateMachineDeferred<JSON>()
+        let missionCounter = RequestCounter()
+        let missionPayload: JSON = .object([
+            "id": .string("m-retry"),
+            "title": .string("Retry mission"),
+            "status": .string("working"),
+            "revision": .number(1),
+            "updatedAt": .string("2026-01-01T00:01:00.000Z")
+        ])
+        let missionModel = MissionModel(
+            seed: MissionSeed(id: "m-retry"),
+            client: makeClient(),
+            role: "owner",
+            sendRequest: { _, _, _ in
+                await missionCounter.record()
+                return try await missionGate.wait()
+            }
+        )
+        missionModel.setDisplayVisible(true)
+        let missionRetry1 = Task { @MainActor in await missionModel.retryLoad() }
+        await missionGate.waitUntilEntered()
+        XCTAssertTrue(missionModel.isRetrying)
+
+        let missionRetry2 = Task { @MainActor in await missionModel.retryLoad() }
+        await Task.yield()
+        XCTAssertTrue(missionModel.isRetrying)
+
+        await missionGate.succeed(missionPayload)
+        await missionRetry1.value
+        await missionRetry2.value
+
+        let missionRequestCount = await missionCounter.count
+        XCTAssertEqual(missionRequestCount, 1)
+        XCTAssertFalse(missionModel.isRetrying)
+        XCTAssertTrue(missionModel.isLoaded)
+        XCTAssertTrue(missionModel.fresh)
+
+        let teamGate = StateMachineDeferred<JSON>()
+        let teamCounter = RequestCounter()
+        let teamPayload: JSON = .object([
+            "id": .string("t-retry"),
+            "title": .string("Retry team"),
+            "status": .string("implementing"),
+            "revision": .number(1),
+            "updatedAt": .string("2026-01-01T00:01:00.000Z")
+        ])
+        let teamModel = TeamModel(
+            seed: TeamSeed(id: "t-retry"),
+            client: makeClient(),
+            role: "owner",
+            sendRequest: { _, _, _ in
+                await teamCounter.record()
+                return try await teamGate.wait()
+            }
+        )
+        teamModel.setDisplayVisible(true)
+        let teamRetry1 = Task { @MainActor in await teamModel.retryLoad() }
+        await teamGate.waitUntilEntered()
+        XCTAssertTrue(teamModel.isRetrying)
+
+        let teamRetry2 = Task { @MainActor in await teamModel.retryLoad() }
+        await Task.yield()
+        XCTAssertTrue(teamModel.isRetrying)
+
+        await teamGate.succeed(teamPayload)
+        await teamRetry1.value
+        await teamRetry2.value
+
+        let teamRequestCount = await teamCounter.count
+        XCTAssertEqual(teamRequestCount, 1)
+        XCTAssertFalse(teamModel.isRetrying)
+        XCTAssertTrue(teamModel.isLoaded)
+        XCTAssertTrue(teamModel.fresh)
     }
 }

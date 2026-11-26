@@ -19,15 +19,17 @@ async function stepGate() {
   const released = new Set<string>();
   const arrived = new Set<string>();
   const responses = new Map<string, ServerResponse[]>();
-  const waiters = new Map<string, (() => void)[]>();
+  const waiters = new Map<string, Set<{ resolve: () => void; reject: (error: Error) => void }>>();
+  let closed = false;
+  let closing: Promise<void> | undefined;
   const server = createServer((req, res) => {
     const key = (req.url ?? "/").replace(/^\/+/, "");
     arrived.add(key);
-    for (const notify of waiters.get(key) ?? []) notify();
+    for (const waiter of waiters.get(key) ?? []) waiter.resolve();
     waiters.delete(key);
-    if (released.has(key)) {
+    if (released.has(key) || closed) {
       res.setHeader("connection", "close");
-      res.end("ok");
+      res.end(closed ? "closed" : "ok");
       return;
     }
     const pending = responses.get(key) ?? [];
@@ -44,26 +46,56 @@ async function stepGate() {
     }
     responses.delete(key);
   };
-  const reached = async (key: string, abortWith?: Promise<unknown>) => {
+  const reached = async (key: string, abortWith?: Promise<unknown>, timeoutMs = 20000) => {
     if (arrived.has(key)) return;
-    const arrivedPromise = new Promise<void>((resolveWait) => {
-      const list = waiters.get(key) ?? [];
-      list.push(resolveWait);
-      waiters.set(key, list);
+    if (closed) throw new Error(`Fixture gate closed before arrival: ${key}`);
+    let cleanup = () => {};
+    const arrivedPromise = new Promise<void>((resolveWait, rejectWait) => {
+      const entry = {
+        resolve: () => {
+          cleanup();
+          resolveWait();
+        },
+        reject: (error: Error) => {
+          cleanup();
+          rejectWait(error);
+        },
+      };
+      const set = waiters.get(key) ?? new Set();
+      set.add(entry);
+      waiters.set(key, set);
+      const timer = setTimeout(() => {
+        entry.reject(new Error(`Timed out waiting for fixture gate: ${key}`));
+      }, timeoutMs);
+      cleanup = () => {
+        clearTimeout(timer);
+        set.delete(entry);
+        if (set.size === 0) waiters.delete(key);
+      };
     });
-    if (!abortWith) {
-      await arrivedPromise;
-      return;
+    try {
+      if (!abortWith) {
+        await arrivedPromise;
+        return;
+      }
+      await Promise.race([
+        arrivedPromise,
+        abortWith.then(
+          (value) => { throw new Error(`Gate ${key} was not reached before operation settled: ${JSON.stringify(value)}`); },
+          (error) => { throw error; },
+        ),
+      ]);
+    } finally {
+      cleanup();
     }
-    await Promise.race([
-      arrivedPromise,
-      abortWith.then(
-        (value) => { throw new Error(`Gate ${key} was not reached before operation settled: ${JSON.stringify(value)}`); },
-        (error) => { throw error; },
-      ),
-    ]);
   };
-  const close = async () => {
+  const close = () => {
+    if (closing) return closing;
+    closed = true;
+    for (const set of [...waiters.values()]) {
+      for (const waiter of [...set]) waiter.reject(new Error("Fixture gate closed"));
+    }
+    waiters.clear();
     for (const list of responses.values()) {
       for (const res of list) {
         res.setHeader("connection", "close");
@@ -72,7 +104,8 @@ async function stepGate() {
     }
     responses.clear();
     server.closeAllConnections();
-    await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+    closing = new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+    return closing;
   };
   return { url: `http://127.0.0.1:${port}`, release, reached, close };
 }
@@ -240,8 +273,9 @@ test("feedback text follows the reject option once the dialog closes; mismatched
   }
 });
 
-test("hook prompts merge only into their own dialog, and never while it is being answered", { timeout: 60000 }, async () => {
+test("hook prompts merge only into their own dialog, and never while it is being answered", { timeout: 60000 }, async (t) => {
   const gate = await stepGate();
+  t.after(() => gate.close());
   const agent = { command: process.execPath, args: [hookAgentScript, "--gate", gate.url] };
   const host = await startHost({ agents: { demo: agent }, config: { attention } });
   try {
@@ -394,8 +428,9 @@ test("input control gates answers and text before the dialog guards, and refusal
   }
 });
 
-test("an answer accepted just before its lease expires does not revive the lease", { timeout: 60000 }, async () => {
+test("an answer accepted just before its lease expires does not revive the lease", { timeout: 60000 }, async (t) => {
   const gate = await stepGate();
+  t.after(() => gate.close());
   const host = await startHost({ agents: { demo: { command: process.execPath, args: [hookAgentScript, "--gate", gate.url] } }, config: { attention } });
   try {
     const id = randomUUID();
@@ -422,8 +457,9 @@ test("an answer accepted just before its lease expires does not revive the lease
   }
 });
 
-test("a dialog drawn before its hooks opens one prompt; rejecting it clears the running tool", { timeout: 60000 }, async () => {
+test("a dialog drawn before its hooks opens one prompt; rejecting it clears the running tool", { timeout: 60000 }, async (t) => {
   const gate = await stepGate();
+  t.after(() => gate.close());
   const host = await startHost({ agents: { demo: { command: process.execPath, args: [hookAgentScript, "--gate", gate.url] } }, config: { attention } });
   try {
     const id = randomUUID();
@@ -537,8 +573,9 @@ const startLimitSession = (host: Host, provider: string, prompt: string) => {
 };
 const sleepMs = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-test("Claude rate-limit evidence is source-order independent and successful turns do not reopen the episode", { timeout: 90000 }, async () => {
+test("Claude rate-limit evidence is source-order independent and successful turns do not reopen the episode", { timeout: 90000 }, async (t) => {
   const gate = await stepGate();
+  t.after(() => gate.close());
   const host = await limitHost("hook-agent.mjs", "claude", ["--gate", gate.url]);
   try {
     const hookFirstId = await startLimitSession(host, "claude", "rate-limit");
@@ -585,11 +622,16 @@ test("Claude rate-limit evidence is source-order independent and successful turn
   }
 });
 
-test("a Codex status row is corroborated only after it persists, once per episode", { timeout: 90000 }, async () => {
+test("a Codex status row is corroborated only after it persists, once per episode", { timeout: 90000 }, async (t) => {
   const gate = await stepGate();
+  t.after(() => gate.close());
   const host = await limitHost("codex-limit-agent.mjs", "codex", ["--gate", gate.url]);
   try {
     const id = await startLimitSession(host, "codex", "limit");
+    const outputText = async () =>
+      ((await host.fetchApi(`/sessions/${id}/events?types=output`)).body.events as { data: { text?: string } }[])
+        .map((e) => String(e.data.text ?? ""))
+        .join("");
     const rows = await waitFor(() => limitsOf(host, id), (r) => r.length >= 2, 20000);
     assert.deepEqual(rows.map((e) => [e.data.confidence, e.data.source]), [["single-source", "screen"], ["corroborated", "screen"]]);
     assert.ok(Date.parse(rows[1].at) - Date.parse(rows[0].at) >= 1900, `${rows[0].at} -> ${rows[1].at}`);
@@ -603,8 +645,12 @@ test("a Codex status row is corroborated only after it persists, once per episod
     assert.equal((await limitsOf(host, id)).length, 2, "No new single-source follows the OSC turn end");
     assert.equal((await host.fetchApi(`/sessions/${id}`)).body.attention.limit?.confidence, "corroborated");
     gate.release("clear");
-    await waitFor(() => host.fetchApi(`/sessions/${id}`), (r) => !r.body.screen.includes("usage limited"), 15000);
-    await sleepMs(4000);
+    await waitFor(() => host.fetchApi(`/sessions/${id}`), (r) => r.body.screen.includes("clear-0") && !r.body.screen.includes("usage limited"), 15000);
+    for (const marker of ["clear-1", "clear-2", "clear-3"]) {
+      gate.release(marker);
+      await waitFor(outputText, (text) => text.includes(marker), 15000);
+      await host.fetchApi(`/sessions/${id}`);
+    }
     gate.release("reopen");
     const all = await waitFor(() => limitsOf(host, id), (r) => r.length >= 4, 25000);
     assert.deepEqual(all.slice(2).map((e) => e.data.confidence), ["single-source", "corroborated"]);

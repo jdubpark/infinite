@@ -32,10 +32,12 @@ test("laptop sync commits once while idle, follows file changes, and recommits u
   let epoch = 0;
   let begins = 0;
   let statusChecks = 0;
+  let unacknowledgedStatusPolls = 0;
   const control: ExecutorControl = async (method, params) => {
     switch (method) {
       case "sync/status":
         statusChecks += 1;
+        if (!acknowledged) unacknowledgedStatusPolls += 1;
         return { location: "laptop", revision, checkpoint, acknowledged };
       case "sync/begin":
         begins += 1;
@@ -84,6 +86,7 @@ test("laptop sync commits once while idle, follows file changes, and recommits u
     await waitUntil(() => commits.length >= 3, 20000, "expected an unacknowledged checkpoint to recommit");
     assert.equal(commits.length, 3, "an unacknowledged checkpoint recommits once");
     assert.equal(begins, 3, "an unacknowledged checkpoint is recommitted at the same revision and ID");
+    assert.equal(unacknowledgedStatusPolls, 1, "the first poll observing an unacknowledged checkpoint triggers the recommit");
   } finally {
     abort.abort();
     await running;

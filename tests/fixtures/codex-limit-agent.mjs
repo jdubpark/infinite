@@ -12,7 +12,15 @@ console.log(["  Unrelated progress line.", STATUS].join("\n"));
 await step("osc", 1500);
 process.stdout.write("\x1b]9;turn complete\x07");
 await step("clear", 3000);
-process.stdout.write("\x1b[2J\x1b[H");
-await step("reopen", 5000);
+process.stdout.write("\x1b[2J\x1b[Hclear-0\n");
+if (gateBase) {
+  for (const marker of ["clear-1", "clear-2", "clear-3"]) {
+    await step(marker, 0);
+    console.log(marker);
+  }
+  await step("reopen", 0);
+} else {
+  await sleep(5000);
+}
 console.log(["", "  The usage limit applies to this workspace.", "", STATUS].join("\n"));
 setInterval(() => {}, 1000);

@@ -80,6 +80,7 @@ export class IntakeStore {
     const changed = structuredClone(current);
     const next = change(changed) ?? changed;
     if (next.issueId !== issueId) throw new Error("An intake record issue ID cannot be changed.");
+    if (next.slackAudienceId !== current.slackAudienceId) throw new Error("An intake record Slack audience identity cannot be changed.");
     const saved = structuredClone(next);
     saved.updatedAt = now();
     this.trim(saved);

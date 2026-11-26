@@ -287,9 +287,15 @@ that qualify and starts one mission per issue. It uses the instance's existing
   "slack": {
     "appTokenFile": "/run/secrets/slack-app-token",
     "botTokenFile": "/run/secrets/slack-bot-token",
-    "teamId": "T00000000", "ownerUserId": "U00000000"
+    "teamId": "T00000000", "ownerUserId": "U00000000",
+    "organizationScope": {
+      "workspaces": [
+        { "projectId": "project-a", "path": "/srv/infinite-data/workspaces/project-a", "repository": "example-org/project-a" },
+        { "projectId": "project-b", "path": "/srv/infinite-data/workspaces/project-b", "repository": "example-org/project-b" }
+      ]
+    }
   },
-  "mission": { "groupId": "work", "maxSubtasks": 8, "maxMinutes": 240, "answerProjectId": "notes" },
+  "mission": { "groupId": "work", "maxSubtasks": 8, "maxMinutes": 240, "answerProjectId": "project-a" },
   "maxActive": 3,
   "requireSlackThread": true
 }
@@ -300,6 +306,10 @@ created by anyone else, or with no creator, is skipped.
 
 `slack` is optional. Without it, intake still starts missions and records
 outcomes in Linear, and the owner answers questions in the apps.
+
+When `slack` is present, a nonempty `organizationScope.workspaces` audience is
+required. Omitting `organizationScope.channelIds` allows all otherwise
+verified internal channels; setting it to an empty list denies every channel.
 
 ### Which issues start a mission
 

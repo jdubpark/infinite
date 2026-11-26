@@ -100,6 +100,7 @@ export class TerminalBarrier {
     drain: (done: () => void) => void,
     fn: () => T,
     beforeDrain?: () => void,
+    refused?: () => void,
   ): Promise<T> {
     this.queue = [];
     this.bytes = 0;
@@ -111,6 +112,9 @@ export class TerminalBarrier {
         this.abort = reject;
         deadline = setTimeout(() => reject(new Error("Terminal renderer is busy")), 1000);
         drain(resolve);
+      }).catch(error => {
+        refused?.();
+        throw error;
       });
       return fn();
     } finally {

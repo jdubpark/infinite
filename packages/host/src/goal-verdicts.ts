@@ -1,5 +1,6 @@
 import type { GoalAssessment, GoalCycle, GoalOutcomeInput, ProductGoal } from "./goal-types.js";
 import type { TeamView } from "./team-types.js";
+import type { VerdictDetail } from "./team-verdicts.js";
 import type { CriteriaRow } from "./verdict-types.js";
 import type { Project } from "./types.js";
 import { autonomyOf } from "./autonomy.js";
@@ -9,7 +10,11 @@ import { checkLabel, objectivePromptsOn } from "./objective-digest.js";
 import { TeamError } from "./team-workspace.js";
 
 export const PROVISIONAL_REASON = "An agent assessment, provisional, found every criterion met. Record your assessment: achieved, or not achieved with continue.";
+export const PROVISIONAL_WITHDRAWN_REASON = "A later agent assessment no longer finds every criterion met. Record your assessment: achieved, or not achieved with continue.";
 export const PROVISIONAL_EVENT = "Agent assessment, provisional: every criterion met. The goal stopped for your assessment and is not marked achieved.";
+export const DELIVERY_HOLD_MS = 600_000;
+export const DELIVERY_HOLD_REASON = "Waiting up to 10 minutes for the host to see this delivery on the base branch before the goal continues.";
+export const LATE_RECEIPT_EVENT = "A delivery receipt changed a cycle's agent assessment.";
 export const CONTINUE_EVENT = "You recorded not achieved and continued the goal. The next cycle reads your direction.";
 
 const STEERING_ENTRIES = 20;
@@ -17,11 +22,78 @@ const STEERING_BYTES = 24000;
 
 const newestAssessed = (cycles: readonly GoalCycle[]): GoalCycle | undefined => [...cycles].reverse().find(item => item.assessment !== undefined);
 
-export function cycleVerdict(goal: Pick<ProductGoal, "cycles">, cycle: GoalCycle, team: Pick<TeamView, "revision" | "assessment">): { assessment?: GoalAssessment } {
+export function verdictIdsOf(cycle: Pick<GoalCycle, "assessment" | "supersededVerdictIds">): string[] {
+  return cycle.assessment === undefined ? [] : [cycle.assessment.verdictId, ...[...(cycle.supersededVerdictIds ?? [])].reverse()];
+}
+
+export function cycleVerdict(goal: Pick<ProductGoal, "cycles">, cycle: GoalCycle, team: Pick<TeamView, "revision" | "assessment">): { assessment?: GoalAssessment; supersededVerdictIds?: string[] } {
   const current = team.assessment !== undefined && team.assessment.revision === team.revision ? team.assessment : undefined;
-  if (current === undefined) return cycle.assessment === undefined ? {} : { assessment: undefined };
+  if (current === undefined) return cycle.assessment === undefined ? {} : { assessment: undefined, supersededVerdictIds: undefined };
   const earlier = newestAssessed(goal.cycles.filter(item => item.cycle < cycle.cycle));
-  return { assessment: { ...current, progress: current.counts.met - (earlier?.assessment?.counts.met ?? 0) } };
+  const assessment = { ...current, progress: current.counts.met - (earlier?.assessment?.counts.met ?? 0) };
+  const held = cycle.assessment;
+  if (held === undefined || held.verdictId === current.verdictId) return { assessment };
+  if (held.revision === current.revision && held.head === current.head) return { assessment, supersededVerdictIds: [...(cycle.supersededVerdictIds ?? []), held.verdictId].slice(-4) };
+  return { assessment, supersededVerdictIds: undefined };
+}
+
+export function lateVerdict(goal: Pick<ProductGoal, "cycles">, cycle: GoalCycle, team: Pick<TeamView, "revision" | "assessment">):
+  { assessment: GoalAssessment; supersededVerdictIds: string[] } | undefined {
+  const held = cycle.assessment;
+  const current = team.assessment;
+  if (held === undefined || current === undefined || current.revision !== team.revision) return undefined;
+  if (current.verdictId === held.verdictId || current.revision !== held.revision || current.head !== held.head) return undefined;
+  const copy = cycleVerdict(goal, cycle, team);
+  return copy.assessment === undefined || copy.supersededVerdictIds === undefined ? undefined : { assessment: copy.assessment, supersededVerdictIds: copy.supersededVerdictIds };
+}
+
+export function markProvisional(goal: ProductGoal): void {
+  goal.status = "ready-for-review"; goal.reason = PROVISIONAL_REASON; goal.stopReason = "provisional-met";
+}
+
+export function applyLateVerdict(goal: ProductGoal, cycle: GoalCycle, team: Pick<TeamView, "revision" | "assessment">): boolean {
+  const late = lateVerdict(goal, cycle, team);
+  if (late === undefined) return false;
+  Object.assign(cycle, late);
+  withdrawProvisional(goal, cycle);
+  return true;
+}
+
+export function withdrawProvisional(goal: ProductGoal, cycle: GoalCycle): void {
+  if (cycle.assessment === undefined || cycle.assessment.result === "met" || goal.cycles.at(-1) !== cycle) return;
+  if (goal.status === "ready-for-review" && goal.stopReason === "provisional-met" && goal.reason === PROVISIONAL_REASON) goal.reason = PROVISIONAL_WITHDRAWN_REASON;
+}
+
+export function holdReasonChange(goal: ProductGoal, holds: boolean): "hold" | "release" | undefined {
+  if (holds && goal.reason !== DELIVERY_HOLD_REASON) { goal.reason = DELIVERY_HOLD_REASON; return "hold"; }
+  if (!holds && goal.reason === DELIVERY_HOLD_REASON) { goal.reason = undefined; return "release"; }
+  return undefined;
+}
+
+export function owedStop(goal: ProductGoal, busy: boolean): boolean {
+  if (goal.status !== "running" || goal.activeTeamId !== undefined || busy) return false;
+  if (autonomyOf(goal) !== "autonomous" || goal.standing !== undefined) return false;
+  const cycle = goal.cycles.at(-1);
+  if (cycle === undefined || !["ready-for-review", "merged"].includes(cycle.status)) return false;
+  if (cycle.assessment?.kind !== "reviewed" || cycle.assessment.result !== "met") return false;
+  const ids = verdictIdsOf(cycle);
+  return !goal.outcomes.some(item => item.verdictId !== undefined && ids.includes(item.verdictId));
+}
+
+export function deliveryHold(goal: Pick<ProductGoal, "autonomy" | "standing" | "cycles">,
+  input: { nowMs: number; scanned: boolean; detail?: Pick<VerdictDetail, "verdictId" | "revision" | "head" | "criteria"> }): boolean {
+  if (autonomyOf(goal) !== "autonomous" || goal.standing !== undefined || !input.scanned) return false;
+  const cycle = goal.cycles.at(-1);
+  const assessment = cycle?.assessment;
+  if (cycle === undefined || assessment === undefined || cycle.status !== "merged" || cycle.finishedAt === undefined) return false;
+  const waited = input.nowMs - Date.parse(cycle.finishedAt);
+  if (!(waited >= 0 && waited < DELIVERY_HOLD_MS)) return false;
+  if (assessment.kind !== "reviewed" || assessment.result !== "inconclusive" || assessment.counts.notMet !== 0) return false;
+  const detail = input.detail;
+  if (detail === undefined || detail.revision !== assessment.revision || detail.head !== assessment.head) return false;
+  if (detail.verdictId !== assessment.verdictId) return true;
+  const open = detail.criteria.filter(item => item.state === "inconclusive");
+  return open.length > 0 && open.every(item => item.reason === "before-delivery");
 }
 
 export function verdictFailed(cycle: Pick<GoalCycle, "assessment">): boolean {
@@ -39,10 +111,10 @@ const ceilingOf = (goal: ProductGoal) => goal.ceilingAt ?? new Date(Date.parse(g
 
 export function assertVerdictAnswer(goal: ProductGoal, body: GoalOutcomeInput, nowMs: number): void {
   if (body.verdictId === undefined) return;
-  if (!goal.cycles.some(item => item.assessment?.verdictId === body.verdictId))
+  if (!goal.cycles.some(item => verdictIdsOf(item).includes(body.verdictId!)))
     throw new TeamError(409, "verdict-not-found", "That agent assessment is not one of this goal's.");
   if (body.continue !== true) return;
-  if (goal.stopReason !== "provisional-met" || newestAssessed(goal.cycles)?.assessment?.verdictId !== body.verdictId)
+  if (goal.stopReason !== "provisional-met" || !verdictIdsOf(newestAssessed(goal.cycles) ?? {}).includes(body.verdictId))
     throw new TeamError(409, "goal-not-provisional", "Continue applies only to a goal stopped by a provisional agent assessment.");
   if (nowMs >= Date.parse(goal.deadlineAt) || nowMs >= Date.parse(ceilingOf(goal)) || goal.memberCount >= goal.maxMembers || goal.cycles.length >= (goal.maxRuns ?? 0))
     throw new TeamError(409, "goal-limit-reached", "The goal's time, member, or feature-run allowance is spent. Start a new goal to continue.");

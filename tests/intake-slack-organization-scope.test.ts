@@ -12,12 +12,14 @@ import type { Config } from "../packages/host/src/types.js";
 import type { MissionService } from "../packages/host/src/missions.js";
 import type { TeamService } from "../packages/host/src/teams.js";
 import { scriptedMissionHarness } from "./mission-harness.js";
-import { startSlackServer } from "./fixtures/slack-server.js";
 import { waitFor } from "./helpers.js";
+import { slackAudienceIdentity } from "../packages/host/src/intake-audience.js";
+import { slackAudienceFixture, startSlackServer, testIntakeAudience } from "./fixtures/slack-server.js";
 
 const OWNER = "U00000000", BOT = "U00000001";
 const BINDING: IntakeThread = { channelId: "C0000000000", threadTs: "1700000000.000100" };
 const OTHER: IntakeThread = { channelId: "C0000000001", threadTs: "1700000000.000200" };
+const { scope: TEST_SCOPE } = slackAudienceFixture();
 const NOW = new Date().toISOString();
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -36,10 +38,10 @@ async function scopedSurface(options: { workspaceAllowed?: () => boolean; direct
   const root = mkdtempSync(join(tmpdir(), "intake-scope-"));
   const slack = await startSlackServer();
   for (const thread of [BINDING, OTHER]) slack.seedThread(thread, [{ user: OWNER, text: "Export context" }]);
-  const scope = {};
+  const scope = structuredClone(TEST_SCOPE);
   const config = {
     stateDir: join(root, "state"), runDir: join(root, "run"),
-    projects: [{ id: "api", name: "API", path: join(root, "api") }],
+    projects: [{ id: "api", name: "API", path: "/data/instances/work/api" }, { id: "web", name: "Web", path: "/data/instances/work/web" }],
     intake: {
       linear: { teamIds: [randomUUID()], creatorId: randomUUID(), label: "infinite", commentsMirrorToSlack: false },
       slack: { appTokenFile: slack.appTokenFile, botTokenFile: slack.botTokenFile, endpoint: slack.endpoint,
@@ -48,16 +50,17 @@ async function scopedSurface(options: { workspaceAllowed?: () => boolean; direct
     },
   } as unknown as Config;
   const store = new IntakeStore(config, randomBytes(32));
+  const audienceId = slackAudienceIdentity(config)!;
   const client = new SlackClient({ botTokenFile: slack.botTokenFile, appTokenFile: slack.appTokenFile, endpoint: slack.endpoint,
-    timeoutMs: 2000, teamId: slack.teamId, organizationScope: scope, workspaceAllowed: options.workspaceAllowed });
+    timeoutMs: 2000, teamId: slack.teamId, organizationScope: scope, workspaceAllowed: options.workspaceAllowed ?? (() => true) });
   const direct = options.direct ? (input: { thread: IntakeThread; ts: string; eventId: string; text: string }) => {
     const issueId = randomUUID();
     store.create(record(issueId, "queued", { thread: input.thread,
-      direct: { eventId: input.eventId, ts: input.ts, text: input.text } }));
+      slackAudienceId: audienceId, direct: { eventId: input.eventId, ts: input.ts, text: input.text } }));
     return "accepted" as const;
   } : undefined;
   const surface = new IntakeSlackSurface(config, store, harness.missions as unknown as MissionService,
-    harness.teams as unknown as TeamService, client, { ...(direct ? { direct } : {}) });
+    harness.teams as unknown as TeamService, client, { audience: testIntakeAudience(config), ...(direct ? { direct } : {}) });
   return {
     harness, root, slack, config, store, client, surface,
     async connect() { await surface.start(); await waitFor(async () => surface.status().connected, Boolean, 10000); },
@@ -94,7 +97,7 @@ test("a persisted inbound action waits through revocation and applies once after
     const { id } = await s.harness.create();
     const eventId = "Ev-durable-replay", ts = "1700000900.000001";
     const revisionBeforeReplay = s.harness.get(id)!.revision;
-    s.store.create(record(id, "started", { thread: BINDING, missionId: id,
+    s.store.create(record(id, "started", { thread: BINDING, missionId: id, slackAudienceId: slackAudienceIdentity(s.config),
       inbound: [{ eventId, ts, text: "cancel", receivedAt: NOW }] }));
     s.slack.setConversationInfo(BINDING.channelId, { is_shared: true, is_ext_shared: true,
       shared_team_ids: [s.slack.teamId, "TEXTERNAL"] });
@@ -116,6 +119,107 @@ test("a persisted inbound action waits through revocation and applies once after
   } finally { await s.close(); }
 });
 
+test("steering stays in arrival order while another thread can finish authorization", { timeout: 30000 }, async () => {
+  const s = await scopedSurface();
+  let release = () => {};
+  try {
+    const { id } = await s.harness.create();
+    s.store.create(record(id, "started", { thread: BINDING, missionId: id, slackAudienceId: slackAudienceIdentity(s.config) }));
+    await s.connect();
+    await waitFor(async () => s.store.get(id)?.messages[0]?.status, status => status === "sent");
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const check = s.client.organizationChannelAllowed.bind(s.client);
+    let firstStarted = false;
+    s.client.organizationChannelAllowed = async channel => {
+      if (channel === BINDING.channelId && !firstStarted) { firstStarted = true; await held; }
+      return check(channel);
+    };
+    await s.slack.emit(mention(BINDING.channelId, "1700000900.000101", "Keep the schema", BINDING.threadTs));
+    await waitFor(async () => firstStarted, Boolean);
+    const second = await s.slack.emit(mention(BINDING.channelId, "1700000900.000102", "Update the migration", BINDING.threadTs));
+    const independent = await s.slack.emit(mention(OTHER.channelId, "1700000900.000103", "status", OTHER.threadTs));
+    await waitFor(async () => s.slack.acks(), acks => acks.includes(independent));
+    assert.equal(s.slack.acks().includes(second), false);
+    assert.deepEqual(s.store.get(id)?.inbound, []);
+    release();
+    await waitFor(async () => s.harness.get(id).steering, items => items.length === 2);
+    assert.deepEqual(s.harness.get(id).steering.map(item => item.text), ["Keep the schema", "Update the migration"]);
+  } finally { release(); await s.close(); }
+});
+
+test("a queued Slack mutation rechecks the sealed audience before committing", { timeout: 60000 }, async () => {
+  const s = await scopedSurface();
+  let releaseQueue = () => {};
+  try {
+    const { id } = await s.harness.create();
+    const mission = s.harness.get(id)!;
+    const eventId = "Ev-queued-audience-race", text = "Change the exporter.";
+    s.store.create(record(id, "started", { thread: BINDING, missionId: id, slackAudienceId: slackAudienceIdentity(s.config),
+      inbound: [{ eventId, ts: "1700000900.000003", text, receivedAt: NOW,
+        call: { action: "steer", text, revision: mission.revision } }] }));
+    let enteredQueue = false;
+    const blockedQueue = new Promise<void>(resolve => { releaseQueue = resolve; });
+    const queued = s.harness.missions as unknown as { enqueue<T>(id: string, task: () => Promise<T>): Promise<T> };
+    const held = queued.enqueue(id, async () => { enteredQueue = true; await blockedQueue; });
+    await waitFor(async () => enteredQueue, Boolean, 10000);
+    let mutation: ReturnType<MissionService["steer"]> | undefined;
+    const missionService = s.harness.missions as MissionService;
+    const steer = missionService.steer.bind(missionService);
+    missionService.steer = (missionId, input, source, authorize) => {
+      mutation = steer(missionId, input, source, authorize);
+      return mutation;
+    };
+    await s.connect();
+    await waitFor(async () => mutation !== undefined, Boolean, 10000);
+    s.config.intake!.mission.groupId = "reconfigured-group";
+    releaseQueue();
+    await held;
+    await assert.rejects(mutation!, /organization_scope_denied/);
+    assert.deepEqual(s.harness.get(id)!.steering, [], "The queued action is denied after the audience changes");
+    assert.equal(s.store.get(id)!.inbound[0]!.handledAt, undefined, "The denied action remains available as sealed audit evidence");
+  } finally { releaseQueue(); await s.close(); }
+});
+
+test("a record sealed for a prior audience cannot be read, published, bound, or acted on after reconfiguration", { timeout: 60000 }, async () => {
+  const s = await scopedSurface();
+  try {
+    const { id } = await s.harness.create();
+    const issueId = randomUUID();
+    const unboundIssueId = randomUUID();
+    const connectorIssueId = randomUUID();
+    const audienceId = slackAudienceIdentity(s.config);
+    s.store.create(record(issueId, "started", { thread: BINDING, missionId: id, slackAudienceId: slackAudienceIdentity(s.config),
+      messages: [{ key: "ack", kind: "ack", text: "Old audience result", createdAt: NOW, status: "pending", attempts: 0, uncertain: true }],
+      inbound: [{ eventId: "Ev-old-audience", ts: "1700000900.000001", text: "cancel", receivedAt: NOW }] }));
+    s.store.create(record(unboundIssueId, "queued", { identifier: "TEST-2", slackAudienceId: audienceId }));
+    s.store.create(record(connectorIssueId, "queued", { identifier: "TEST-3", external: {
+      connectorId: "connector", requestId: "connector-request", fingerprint: "connector-fingerprint",
+      scope: { groupId: "connector-group", repositories: [], selectedCheckouts: [] },
+    } }));
+    s.config.intake!.mission.groupId = "reconfigured-group";
+    s.config.intake!.slack!.organizationScope.workspaces = [
+      { projectId: "other", path: "/data/instances/work/other", repository: "Example/other" },
+    ];
+    s.config.intake!.slack!.bindByMention = true;
+
+    await s.connect();
+    await delay(200);
+
+    assert.notEqual(s.harness.get(id)?.status, "cancelled", "A stale inbound replay cannot steer the old mission");
+    assert.equal(s.store.get(issueId)!.inbound[0]!.handledAt, undefined);
+    assert.equal(s.store.get(issueId)!.messages[0]!.status, "pending");
+    assert.equal(s.slack.calls.some(call => ["conversations.info", "conversations.replies", "chat.postMessage"].includes(call.method)), false,
+      "The stale record is rejected before Slack channel reads, recovery reads, or sends");
+    const eventId = await s.slack.emit(mention(BINDING.channelId, "1700000900.000002", "TEST-2", BINDING.threadTs));
+    await waitFor(async () => s.slack.acks(), acks => acks.includes(eventId));
+    assert.equal(s.store.get(unboundIssueId)!.thread, undefined, "A mention cannot bind a record from the prior audience");
+    const connectorEventId = await s.slack.emit(mention(BINDING.channelId, "1700000900.000004", "TEST-3", BINDING.threadTs));
+    await waitFor(async () => s.slack.acks(), acks => acks.includes(connectorEventId));
+    assert.equal(s.store.get(connectorIssueId)!.thread, undefined, "Slack mentions cannot bind connector-owned records without a Slack audience identity");
+    assert.equal(s.slack.calls.some(call => ["conversations.replies", "chat.postMessage"].includes(call.method)), false);
+  } finally { await s.close(); }
+});
+
 test("a block action is not persisted after its Slack channel becomes shared", { timeout: 60000 }, async () => {
   const s = await scopedSurface();
   try {
@@ -123,7 +227,7 @@ test("a block action is not persisted after its Slack channel becomes shared", {
     await s.harness.report(1, { kind: "question", question: "Which format should the endpoint use?", options: ["CSV", "JSON"] });
     const asked = await waitFor(async () => s.harness.get(id), mission => mission.status === "needs-input", 15000);
     const decision = asked.decisions[0]!;
-    s.store.create(record(id, "started", { thread: BINDING, missionId: id, questions: [{ decisionId: decision.id, n: 1 }] }));
+    s.store.create(record(id, "started", { thread: BINDING, missionId: id, slackAudienceId: slackAudienceIdentity(s.config), questions: [{ decisionId: decision.id, n: 1 }] }));
     await s.connect();
     await waitFor(async () => s.slack.postPayloads(BINDING), posts => posts.some(post => String(post.text).includes("Which format")), 10000);
     const question = s.slack.posts(BINDING).find(post => post.text.includes("Which format"))!;
@@ -149,7 +253,8 @@ test("an uncertain Slack outbox waits through revocation and recovers once after
   const entry = { key: "ack", kind: "ack" as const, text: "Started on TEST-1.", createdAt: NOW,
     status: "pending" as const, attempts: 1, uncertain: true };
   try {
-    s.store.create(record(randomUUID(), "started", { thread: BINDING, messages: [entry] }));
+    const { id } = await s.harness.create();
+    s.store.create(record(randomUUID(), "started", { thread: BINDING, missionId: id, slackAudienceId: slackAudienceIdentity(s.config), messages: [entry] }));
     s.slack.setConversationInfo(BINDING.channelId, { is_shared: true, is_ext_shared: true,
       shared_team_ids: [s.slack.teamId, "TEXTERNAL"] });
     await s.connect();
@@ -162,7 +267,7 @@ test("an uncertain Slack outbox waits through revocation and recovers once after
     s.surface.close();
     s.slack.setConversationInfo(BINDING.channelId, {});
     const resumed = new IntakeSlackSurface(s.config, s.store, s.harness.missions as unknown as MissionService,
-      s.harness.teams as unknown as TeamService, s.client);
+      s.harness.teams as unknown as TeamService, s.client, { audience: testIntakeAudience(s.config) });
     await resumed.start();
     await waitFor(async () => s.store.list()[0]!.messages[0]!.status, status => status === "sent", 10000);
     assert.equal(s.slack.posts(BINDING).length, 1, "The restored grant recovers one post");
@@ -183,7 +288,7 @@ test("a final mission result is composed after transient source metadata recover
     await waitFor(async () => s.harness.get(id), mission => mission.subtasks[0]?.status === "done", 15000);
     await s.harness.report(2, { kind: "result", summary: "The endpoint already exists." });
     await waitFor(async () => s.harness.get(id), mission => mission.status === "ready-for-review", 15000);
-    s.store.create(record(id, "started", { thread: BINDING, missionId: id }));
+    s.store.create(record(id, "started", { thread: BINDING, missionId: id, slackAudienceId: slackAudienceIdentity(s.config) }));
     await s.connect();
     await delay(150);
     assert.equal(s.store.get(id)!.messages.length, 0, "The result is not composed under uncertain metadata");

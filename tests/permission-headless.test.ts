@@ -1,87 +1,20 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { randomBytes, randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { Manager } from "../packages/host/src/manager.js";
 import { workerCall } from "../packages/host/src/ipc.js";
 import { headlessChannelArgs } from "../packages/host/src/launch.js";
-import {
-  HeadlessPermissionChannel, channelToken, deferredCallOpen, deliveryKey, type ChannelReply,
-} from "../packages/host/src/permission-headless.js";
-import {
-  claudeTurnSignals, DEFERRAL_RETENTION_MS, HeadlessChannelWorker, OPEN_CALL_KEYS, OWNER_DENIED, PENDING_NOTICE, type ChannelWorkerHost,
-} from "../packages/host/src/permission-headless-worker.js";
+import { HeadlessPermissionChannel, channelToken, deferredCallOpen, deliveryKey, type ChannelReply } from "../packages/host/src/permission-headless.js";
+import { claudeTurnSignals, DEFERRAL_RETENTION_MS, HeadlessChannelWorker, OPEN_CALL_KEYS, OWNER_DENIED, PENDING_NOTICE, type ChannelWorkerHost } from "../packages/host/src/permission-headless-worker.js";
 import { ask, hookOutput, type ChannelPost } from "../packages/host/src/permission-hook.js";
 import { requesterNotice } from "../packages/host/src/permission-policy.js";
 import { Journal, writeSealed } from "../packages/host/src/vault.js";
-import type { PermissionAgentServices, PermissionOutcome, PermissionPipeline, PermissionRequest } from "../packages/host/src/permission-agent-types.js";
-import type { Config, Event, Session } from "../packages/host/src/types.js";
-import { stopSessionWorkers, waitFor } from "./helpers.js";
-
-const FAKE = resolve("tests/fixtures/headless-claude.mjs");
-
-function fakePipeline(overrides: Partial<PermissionPipeline> = {}) {
-  const deliveries: Array<{ decisionId: string; kind: string; detail?: string }> = [];
-  const decided: PermissionRequest[] = [];
-  const classOf = (request: PermissionRequest) =>
-    /production/.test(request.action) ? { interruptClass: "production-or-staging" as const, rule: "production-deploy" } : undefined;
-  const pipeline: PermissionPipeline = {
-    serves: () => ({ served: true }),
-    classOf,
-    async decide(request): Promise<PermissionOutcome> {
-      decided.push(request);
-      const decisionId = randomUUID();
-      const match = classOf(request);
-      if (match) return { kind: "owner", decisionId, interruptClass: match.interruptClass };
-      if (/safe-build/.test(request.action)) return { kind: "allow", decisionId, strongTier: false };
-      return { kind: "reject", decisionId, code: "unsafe", notice: "MODEL TEXT that must never reach the agent" };
-    },
-    applicable: () => true,
-    recordDelivery: (decisionId, kind, detail) => { deliveries.push({ decisionId, kind, ...(detail ? { detail } : {}) }); },
-    taskEnded() {},
-    ...overrides,
-  };
-  return { pipeline, deliveries, decided };
-}
-
-async function rig(options: { args?: string[]; pipeline?: PermissionPipeline; overrides?: Partial<PermissionPipeline> } = {}) {
-  const root = realpathSync(mkdtempSync("/tmp/inf-headless-"));
-  const workspace = join(root, "workspace");
-  mkdirSync(workspace);
-  const key = randomBytes(32);
-  const keyFile = join(root, "key");
-  writeFileSync(keyFile, key, { mode: 0o600 });
-  const config: Config = {
-    port: 0, origin: "http://127.0.0.1", keyFile, stateDir: join(root, "state"), runDir: join(root, "run"),
-    environment: "local", enableDemo: false, maxSessions: 8,
-    agents: { claude: { command: process.execPath, args: [FAKE, "--print", ...(options.args ?? [])] } },
-    projects: [{ id: "rehearsal", name: "Rehearsal", path: workspace }],
-    tokens: [],
-    attention: { hooks: { claude: true, codex: false }, idleAfterMs: 3000, limitConfirmMs: 30000 },
-  } as Config;
-  const manager = new Manager(config, key);
-  const fake = fakePipeline(options.overrides);
-  const services: PermissionAgentServices = { pipeline: options.pipeline ?? fake.pipeline };
-  const channel = new HeadlessPermissionChannel({ key, runDir: config.runDir, sessions: manager, services });
-  manager.useHeadlessChannel(channel);
-  await channel.listen();
-  return {
-    root, workspace, config, key, manager, channel, services, ...fake,
-    log: (name: string) => existsSync(join(workspace, name)) ? readFileSync(join(workspace, name), "utf8") : "",
-    channelEvents: (id: string) => manager.events(id, 0, 500, new Set(["lifecycle"])).events
-      .map(event => (event.data as { permissionChannel?: Record<string, unknown> }).permissionChannel).filter(Boolean) as Array<Record<string, unknown>>,
-    stop: async () => {
-      await stopSessionWorkers(config);
-      channel.close();
-      await new Promise(done => setTimeout(done, 1700));
-      rmSync(root, { recursive: true, force: true });
-    },
-  };
-}
-
-type Live = Session & { status: string; attention: { state: string; prompt?: { id: number; source: string; options: Array<{ label: string }> } }; permissionChannel?: { served: boolean; waiting?: { interruptClass: string; tool: string }; notice?: { id: string; interruptClass?: string } } };
-const live = async (r: Awaited<ReturnType<typeof rig>>, id: string) => ({ ...r.manager.meta(id).session, ...(await r.manager.state(id)) }) as unknown as Live;
+import type { PermissionPipeline, PermissionRequest } from "../packages/host/src/permission-agent-types.js";
+import type { Event, Session } from "../packages/host/src/types.js";
+import { waitFor } from "./helpers.js";
+import { fakePipeline, live, rig } from "./headless-rig.js";
 
 test("a class call waits for the owner, and the owner's allow runs that one call once in the same session", { timeout: 90_000 }, async () => {
   const r = await rig();

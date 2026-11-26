@@ -112,4 +112,12 @@ test("workspace enrollment bounds saved context links on reads and writes in bot
   assert.equal(scoped.snapshot("outside").text, "outside context");
   assert.throws(() => scoped.setLinks("alpha", { expectedVersion: 1, links: [link("outside")] }), /workspace audience/);
   assert.throws(() => scoped.setLinks("outside", { expectedVersion: 1, links: [link("unknown")] }), /workspace audience/);
+
+  const replacement = join(root, "replacement");
+  mkdirSync(replacement);
+  const beta = projects.find(p => p.id === "beta")!;
+  beta.path = replacement;
+  intake.slack!.organizationScope!.workspaces!.find(p => p.projectId === "beta")!.path = replacement;
+  assert.deepEqual(scoped.listLinks("alpha").links, []);
+  assert.equal(scoped.snapshot("alpha").text, "alpha context");
 });

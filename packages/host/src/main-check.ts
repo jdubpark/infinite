@@ -571,7 +571,7 @@ export class MainCheckService {
       this.unwritten.delete(active);
       return;
     }
-    const entry: Retiring = { directory: active.directory, root: active.root, witness: structuredClone(active.witness), ...(active.inFlight > 0 ? { recording: true as const } : {}) };
+    const entry: Retiring = { directory: active.directory, root: active.root, witness: structuredClone(active.witness) };
     if (!this.commit(active.projectId, finish(record, active.result!, entry, active.seenAt))) return;
     this.unwritten.delete(active);
     if (active.inFlight === 0) this.tails.delete(entryKey(active.projectId, active.directory));
@@ -614,7 +614,7 @@ export class MainCheckService {
 
   private saveEntry(active: Active): boolean {
     const record = this.slots.get(active.projectId)?.record;
-    const next = record && withWitness(record, active.directory, structuredClone(active.witness), active.inFlight > 0);
+    const next = record && withWitness(record, active.directory, structuredClone(active.witness), active.inFlight > 0 && !active.finished);
     return next !== undefined && this.commit(active.projectId, next);
   }
 

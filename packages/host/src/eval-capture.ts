@@ -329,7 +329,12 @@ export class TaskCapture implements CaptureSink {
         { state: "failed" },
       );
       if (read.state === "too-large") return { kind: "reject", reason: "patch-too-large" };
-      baseDelta = read.state === "read" ? { state: "stored", bytes: read.bytes } : { state: "missing" };
+      if (read.state === "failed") return { kind: "reject", reason: "capture-failed" };
+      baseDelta = read.state === "read"
+        ? { state: "stored", bytes: read.bytes }
+        : read.state === "empty"
+          ? { state: "stored", bytes: Buffer.alloc(0) }
+          : { state: "missing" };
     }
 
     const reference = await this.bounded<PatchRead>(
@@ -337,6 +342,8 @@ export class TaskCapture implements CaptureSink {
       { state: "failed" },
     );
     if (reference.state === "too-large") return { kind: "reject", reason: "patch-too-large" };
+    if (reference.state === "failed" || reference.state === "empty") return { kind: "reject", reason: "capture-failed" };
+    if (reference.state === "read" && reference.bytes.length === 0) return { kind: "reject", reason: "capture-failed" };
 
     const base = await this.baseCheck(start);
     return {
@@ -344,7 +351,7 @@ export class TaskCapture implements CaptureSink {
       files: verdict.files,
       hiddenFiles: verdict.hiddenFiles,
       baseDelta,
-      reference: reference.state === "read" && reference.bytes.length > 0 ? { state: "stored", bytes: reference.bytes } : { state: "missing" },
+      reference: reference.state === "read" ? { state: "stored", bytes: reference.bytes } : { state: "missing" },
       base,
     };
   }

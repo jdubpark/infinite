@@ -117,17 +117,23 @@ test("GoalService processes independent goals concurrently, serializes same-goal
     const steerA = goals.steer(gA.id, { requestId: randomUUID(), revision: gA.revision, text: "Queued behind extend" });
     let steerASettled = false;
     void steerA.then(() => { steerASettled = true; }, () => { steerASettled = true; });
+    let idleDone = false;
+    const idling = goals.idle().then(() => { idleDone = true; });
 
     const steeredB = await goals.steer(gB.id, { requestId: randomUUID(), revision: gB.revision, text: "Goal B direction" });
     assert.equal(steeredB.steering.length, 1);
     const pausedB = await goals.pause(gB.id, { requestId: randomUUID(), revision: steeredB.revision });
     assert.equal(pausedB.status, "paused");
     assert.equal(steerASettled, false);
+    assert.equal(idleDone, false);
 
     extendGate.resolve();
     const extendedA = await extendA;
     assert.ok(Date.parse(extendedA.deadlineAt) >= Date.parse(gA.deadlineAt));
     await assert.rejects(steerA, { code: "stale-goal-revision" });
+    await idling;
+    assert.equal(idleDone, true);
+    assert.equal(steerASettled, true);
 
     const storedB = (goals as unknown as { records: Map<string, { goal: ProductGoal }> }).records.get(gB.id)!;
     storedB.goal.activeTeamId = randomUUID();

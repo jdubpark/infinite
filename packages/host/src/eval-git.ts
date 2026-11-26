@@ -33,7 +33,7 @@ function readPatch(
   } catch {
     return Promise.resolve({ state: "failed" });
   }
-  return readGitStream({ cwd, args, prefix, maxBytes: PATCH_MAX_BYTES, timeoutMs, signal, stop, releaseMs });
+  return readGitStream({ cwd, args, prefix, maxBytes: PATCH_MAX_BYTES, timeoutMs, signal, stop, releaseMs, env: { LC_ALL: "C" } });
 }
 
 export function captureGit(

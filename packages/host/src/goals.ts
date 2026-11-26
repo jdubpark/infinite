@@ -565,6 +565,11 @@ export class GoalService {
     while (this.activeTicks.size > 0) await Promise.allSettled([...this.activeTicks]);
     await this.queues.drain();
   }
+  async idle(): Promise<void> {
+    while (this.activeTicks.size > 0) await Promise.allSettled([...this.activeTicks]);
+    await this.queues.settle();
+    while (this.activeTicks.size > 0) await Promise.allSettled([...this.activeTicks]);
+  }
   private refresh(stored: Stored, team: TeamView) {
     const cycle = stored.goal.cycles.find(value => value.teamId === team.id)!;
     Object.assign(cycle, { status: team.status, memberCount: team.members.length, baseCommit: team.baseCommit, headCommit: team.headCommit, branch: team.branch, workspace: team.workspace, brief: team.brief, reason: team.reason }, cycleVerdict(stored.goal, cycle, team));

@@ -585,29 +585,90 @@ test("an owner exclusion demotes a candidate", async () => {
   }
 });
 
-test("a refused patch form leaves the patch missing", async () => {
+test("a missing patch ref leaves the patch missing while stream and empty reference failures reject explicitly", async () => {
   const w = world();
   try {
-    w.git.answer("patch", COMMIT, { state: "failed" });
+    w.git.answer("patch", COMMIT, { state: "missing" });
     w.capture.integrated(start());
     w.capture.approved(approval(REVIEWED));
     await w.capture.idle();
     const partial = taskRow(w.store);
     assert.equal(partial?.material, "partial");
+    assert.equal((partial?.payload as { reference?: string } | undefined)?.reference, "missing");
     const parts = partsOf(w.store);
     assert.notEqual(parts.capsule, undefined);
     assert.equal(parts.reference, undefined);
-    w.git.answer("names", OTHER_COMMIT, { state: "read", names: ["a.txt", "tests/a.test.ts"] });
-    w.git.answer("patch", OTHER_COMMIT, { state: "read", bytes: Buffer.alloc(0) });
-    w.capture.integrated(start({ memberId: OTHER_MEMBER, commit: OTHER_COMMIT }));
-    await w.capture.idle();
-    assert.equal((taskRow(w.store, OTHER_MEMBER)?.payload as { reference?: string } | undefined)?.reference, "missing");
     writeLedger(w.store, ledger());
     w.capture.reconcile();
     const row = taskRow(w.store);
     assert.equal(row?.state, "rejected");
     assert.equal(row?.reason, "patch-missing");
     assert.deepEqual(partsOf(w.store), {});
+
+    const missingBase = "7".repeat(40);
+    w.git.answer("names", OTHER_COMMIT, { state: "read", names: ["a.txt", "tests/a.test.ts"] });
+    w.git.answer("patch", missingBase, { state: "missing" });
+    w.capture.integrated(start({ memberId: "m-missing-base", memberBaseCommit: missingBase, commit: OTHER_COMMIT }));
+    await w.capture.idle();
+    const partialBase = taskRow(w.store, "m-missing-base");
+    assert.equal(partialBase?.material, "partial");
+    assert.equal((partialBase?.payload as { baseDelta?: string } | undefined)?.baseDelta, "missing");
+
+    const failedCommit = "6".repeat(40);
+    w.git.answer("names", failedCommit, { state: "read", names: ["a.txt", "tests/a.test.ts"] });
+    w.git.answer("patch", failedCommit, { state: "failed" });
+    w.capture.integrated(start({ memberId: "m-failed-ref", commit: failedCommit }));
+    await w.capture.idle();
+    const failedRef = taskRow(w.store, "m-failed-ref");
+    assert.equal(failedRef?.state, "rejected");
+    assert.equal(failedRef?.reason, "capture-failed");
+    assert.equal(failedRef?.material, "none");
+    assert.deepEqual(partsOf(w.store, "m-failed-ref"), {});
+
+    const emptyCommit = "5".repeat(40);
+    w.git.answer("names", emptyCommit, { state: "read", names: ["a.txt", "tests/a.test.ts"] });
+    w.git.answer("patch", emptyCommit, { state: "empty" });
+    w.capture.integrated(start({ memberId: "m-empty-ref", commit: emptyCommit }));
+    await w.capture.idle();
+    const emptyRef = taskRow(w.store, "m-empty-ref");
+    assert.equal(emptyRef?.state, "rejected");
+    assert.equal(emptyRef?.reason, "capture-failed");
+    assert.equal(emptyRef?.material, "none");
+    assert.deepEqual(partsOf(w.store, "m-empty-ref"), {});
+
+    const zeroCommit = "4".repeat(40);
+    w.git.answer("names", zeroCommit, { state: "read", names: ["a.txt", "tests/a.test.ts"] });
+    w.git.answer("patch", zeroCommit, { state: "read", bytes: Buffer.alloc(0) });
+    w.capture.integrated(start({ memberId: "m-zero-ref", commit: zeroCommit }));
+    await w.capture.idle();
+    const zeroRef = taskRow(w.store, "m-zero-ref");
+    assert.equal(zeroRef?.state, "rejected");
+    assert.equal(zeroRef?.reason, "capture-failed");
+    assert.equal(zeroRef?.material, "none");
+    assert.deepEqual(partsOf(w.store, "m-zero-ref"), {});
+
+    const failedBase = "3".repeat(40);
+    w.git.answer("patch", failedBase, { state: "failed" });
+    w.capture.integrated(start({ memberId: "m-failed-base", memberBaseCommit: failedBase, commit: OTHER_COMMIT }));
+    await w.capture.idle();
+    const failedBaseRow = taskRow(w.store, "m-failed-base");
+    assert.equal(failedBaseRow?.state, "rejected");
+    assert.equal(failedBaseRow?.reason, "capture-failed");
+    assert.equal(failedBaseRow?.material, "none");
+
+    const equalBase = "2".repeat(40);
+    w.git.answer("patch", equalBase, { state: "empty" });
+    w.capture.integrated(start({ memberId: "m-empty-base", memberBaseCommit: equalBase, commit: OTHER_COMMIT }));
+    w.capture.approved(approval(REVIEWED));
+    await w.capture.idle();
+    const equalBaseRow = taskRow(w.store, "m-empty-base");
+    assert.equal(equalBaseRow?.state, "captured");
+    assert.equal(equalBaseRow?.material, "stored");
+    assert.equal((equalBaseRow?.payload as { baseDelta?: string } | undefined)?.baseDelta, "stored");
+    assert.deepEqual(partsOf(w.store, "m-empty-base").baseDelta, Buffer.alloc(0));
+    writeLedger(w.store, ledger({ memberId: "m-empty-base" }));
+    assert.equal(w.capture.reconcile().promoted, 1);
+    assert.equal(taskRow(w.store, "m-empty-base")?.state, "candidate");
   } finally {
     await finish(w);
   }

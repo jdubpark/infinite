@@ -401,3 +401,28 @@ test("close stops the reads in flight", async () => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("patch reads distinguish empty diffs, missing refs, and repository errors", async () => {
+  const dir = makeRepo();
+  const nonRepo = mkdtempSync(join(tmpdir(), "eval-git-nonrepo-"));
+  try {
+    const from = commit(dir, writeFiles({ "a.txt": "one\n" }), "from");
+    const equalTree = commit(dir, () => {}, "equal tree");
+    const to = commit(dir, writeFiles({ "a.txt": "two\n" }), "to");
+    const missingSha = "0".repeat(40);
+    const git = captureGit(() => undefined);
+
+    assert.deepEqual(await git.patch(dir, from, equalTree), { state: "empty" });
+    assert.deepEqual(await git.patch(dir, missingSha, to), { state: "missing" });
+    assert.deepEqual(await git.patch(dir, from, missingSha), { state: "missing" });
+    assert.deepEqual(await git.patch(nonRepo, from, to), { state: "failed" });
+
+    const silentScript = join(dir, "silent.sh");
+    writeFileSync(silentScript, "#!/bin/sh\nexit 0\n");
+    const silent = captureGit(() => ({ command: "/bin/sh", args: [silentScript] }));
+    assert.deepEqual(await silent.patch(dir, from, to), { state: "empty" });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(nonRepo, { recursive: true, force: true });
+  }
+});

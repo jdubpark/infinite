@@ -1,7 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
+  TEAM_PROMPT_LIMIT_BYTES,
   appendBuiltPrompt,
   codexMemberToolInstructions,
   codexSandboxInstructions,
@@ -9,10 +10,12 @@ import {
   entryInstructions,
   escalationInstructions,
   escalationSpec,
+  getMemberPromptSections,
   permissionFollowUpPromptSpec,
   profileInstructions,
   readOnlyWorkspaceInstructions,
   refreshBuiltPrompt,
+  refreshMemberPromptForLaunch,
   refreshReportingInstructions,
   renderPromptSections,
   reportingInstructions,
@@ -21,6 +24,7 @@ import {
   retargetPromptSections,
   teamPrompt,
   teamPromptSpec,
+  type MemberPromptSectionStore,
   type TeamPromptSection,
 } from "../packages/host/src/team-prompts.js";
 import { intentCheckerPrompt, intentCheckerPromptSpec } from "../packages/host/src/intent-prompt.js";
@@ -28,7 +32,7 @@ import { evaluatorPrompt, evaluatorPromptSpec } from "../packages/host/src/verdi
 import { judgePrompt, judgePromptSpec } from "../packages/host/src/judge-prompt.js";
 import { commitProviderLimitSwitch, resolveProviderLimitLaunch } from "../packages/host/src/team-diagnostics.js";
 import type { Manager } from "../packages/host/src/manager.js";
-import { TeamService, type Stored } from "../packages/host/src/teams.js";
+import { TeamError, TeamService, type Stored } from "../packages/host/src/teams.js";
 import type { TeamLineup, TeamMember, TeamModelProfile, TeamRun } from "../packages/host/src/team-types.js";
 import { ENTRY_PROFILE, ENTRY_PROVIDERS, smallRun } from "./fixtures/team-prompt-run.js";
 import { schedulerFixture } from "./fixtures/team-scheduler.js";
@@ -525,7 +529,48 @@ type PromptRetargetServiceInternal = {
   switchLimitedMember(stored: Stored, member: TeamMember, limit: { kind: "limit"; limit: "usage" | "credits"; confidence: "corroborated"; message: string; resetsAt?: string; at: string; seq: number }): Promise<void>;
 };
 
-test("sealed persisted members re-render stale pre-upgrade wording from promptSections on launch and fallback, and redact promptSections from TeamView", async t => {
+const LEGACY_SHIPPED_CODEX_RULES = [
+  {
+    name: "v1-short-report-only",
+    entryTools: false,
+    sha256: "77d618fea6ee839cec3d9641f560e0ce2749985fc0330a1463b38c75470833b5",
+    text: "Working rule for tools: when you call tools through exec, do the reading, filtering, counting and comparing inside the program, and print only the result you need for your next decision. Do not print whole tool results. When a program lists or reads items, print how many it listed, read, and matched. Read the context file with a shell call inside a program, and select only the fields needed for your next decision. Tool signatures (arguments -> fields of a successful result's structuredContent): report({report}) -> {requestId, runId, memberId, revision, message}.",
+  },
+  {
+    name: "v1-short-with-entries",
+    entryTools: true,
+    sha256: "7595d799220ed280b9f93aacd694e6362570b107e7bb19ac814a8c431ae4ac10",
+    text: "Working rule for tools: when you call tools through exec, do the reading, filtering, counting and comparing inside the program, and print only the result you need for your next decision. Do not print whole tool results. When a program lists or reads items, print how many it listed, read, and matched. Read the context file with a shell call inside a program, and select only the fields needed for your next decision. Tool signatures (arguments -> fields of a successful result's structuredContent): report({report}) -> {requestId, runId, memberId, revision, message}; entry_list({kinds?, taskId?, path?, since?, limit?}) -> {notice, heads, more, cursor?, unreadable}; entry_get({entryId}) -> {notice, head, body}; entry_post({entry}) -> {entryId, state, message}.",
+  },
+  {
+    name: "v2-schema-report-only",
+    entryTools: false,
+    sha256: "e6ff71704aae9e01b8e94482cd8f49b02fd685de11b68cb863b6129f14888887",
+    text: codexMemberToolInstructions(false),
+  },
+  {
+    name: "v2-schema-with-entries",
+    entryTools: true,
+    sha256: "6896da1485bc8ccbafa98bc08d6a3f27eaf54884f17acdb68c4e725ff0845bab",
+    text: codexMemberToolInstructions(true),
+  },
+] as const;
+
+function baseHostRollbackMemberProjection(member: TeamMember): Record<string, unknown> {
+  const {
+    prompt: _prompt,
+    contextFeedback: _feedback,
+    nativeSessionId: _nativeSessionId,
+    goalCriteriaPlan: _goalCriteriaPlan,
+    continuation: _continuation,
+    turns: _turns,
+    pendingFeedback: _pendingFeedback,
+    ...rest
+  } = member as TeamMember & Record<string, unknown>;
+  return rest;
+}
+
+test("sealed persisted members keep promptSections outside run.members for rollback privacy, re-render on launch/fallback, and prune orphans", async t => {
   const f = schedulerFixture();
   t.after(() => f.close());
   const now = Date.parse("2026-11-26T09:00:00.000Z");
@@ -559,13 +604,21 @@ test("sealed persisted members re-render stale pre-upgrade wording from promptSe
     teamPromptSpec(f.run, "implementer", f.run.tasks[1], undefined, "codex", codexPrimary),
     "User answered: Switch cleanly on limit.",
   );
+  const permissionEvidenceSentinel = "CONFIDENTIAL_PERMISSION_REQUEST_AND_FILE_EVIDENCE_SENTINEL";
+  const builtCoordinator = teamPromptSpec(
+    f.run,
+    "permission-coordinator",
+    undefined,
+    `Recorded permission request and collected file evidence: ${permissionEvidenceSentinel}`,
+    "claude",
+    lineup.reviewer,
+  );
 
   const memberOne: TeamMember = {
     runId: f.run.id, memberId: randomUUID(), revision: 1, role: "implementer", taskId: "t1", entryTools: true,
     provider: "codex", modelProfile: structuredClone(codexPrimary), sessionId: randomUUID(), title: "implementer: t1",
     status: "queued", cwd: f.run.workspace, baseCommit: f.run.baseCommit,
     prompt: "Stale pre-upgrade Codex prompt with obsolete tool-rule prose.",
-    promptSections: builtOne.promptSections,
     cursor: 0, stopRequestId: randomUUID(),
   };
   const memberTwo: TeamMember = {
@@ -573,21 +626,41 @@ test("sealed persisted members re-render stale pre-upgrade wording from promptSe
     provider: "codex", modelProfile: structuredClone(codexPrimary), sessionId: randomUUID(), title: "implementer: t2",
     status: "queued", cwd: f.run.workspace, baseCommit: f.run.baseCommit,
     prompt: "Stale pre-upgrade Codex prompt that should switch to Claude.",
-    promptSections: builtTwo.promptSections,
     cursor: 0, stopRequestId: randomUUID(),
   };
+  const coordinatorMember: TeamMember = {
+    runId: f.run.id, memberId: randomUUID(), revision: 1, role: "permission-coordinator",
+    provider: "claude", modelProfile: structuredClone(lineup.reviewer), sessionId: randomUUID(), title: "permission-coordinator",
+    status: "waiting", cwd: f.run.workspace, baseCommit: f.run.baseCommit,
+    prompt: builtCoordinator.prompt,
+    cursor: 0, stopRequestId: randomUUID(),
+  };
+  const orphanMemberId = randomUUID();
   f.run.tasks[0]!.memberId = memberOne.memberId;
   f.run.tasks[1]!.memberId = memberTwo.memberId;
-  f.run.members = [memberOne];
-  f.writeTeam();
+  f.run.members = [memberOne, coordinatorMember];
+  f.writeTeam({
+    memberPromptSections: {
+      [memberOne.memberId]: builtOne.promptSections,
+      [coordinatorMember.memberId]: builtCoordinator.promptSections,
+      [orphanMemberId]: builtTwo.promptSections,
+    },
+  });
 
   const teams = new TeamService(f.config, f.key, f.manager as unknown as Manager, (_project, start) => start(), undefined, undefined, { now: () => now });
   t.after(() => teams.close());
   const internal = teams as unknown as PromptRetargetServiceInternal;
   const stored = internal.records.get(f.run.id)!;
 
+  assert.equal(getMemberPromptSections(stored, orphanMemberId), undefined, "stale orphan sections are pruned on load");
+  assert.ok(getMemberPromptSections(stored, memberOne.memberId), "live member sections remain loaded on Stored");
+  assert.ok(getMemberPromptSections(stored, coordinatorMember.memberId), "permission coordinator sections remain loaded on Stored");
+
   const view = teams.get(f.run.id);
-  assert.equal("promptSections" in view.members[0]!, false, "TeamView omits internal promptSections");
+  for (const item of view.members) {
+    assert.equal("promptSections" in item, false, "TeamView omits promptSections");
+  }
+  assert.equal(JSON.stringify(view).includes(permissionEvidenceSentinel), false, "TeamView hides permission coordinator prompt evidence");
 
   await internal.step(stored);
   assert.equal(f.launches.length, 1);
@@ -599,19 +672,31 @@ test("sealed persisted members re-render stale pre-upgrade wording from promptSe
   assert.ok(f.launches[0]!.prompt.includes("User answered: Keep existing API."));
   assert.equal(f.launches[0]!.prompt.includes("Stale pre-upgrade Codex prompt"), false);
 
+  const persistedAfterLaunch = f.readRecord<Stored>("team", f.run.id);
+  assert.equal(persistedAfterLaunch.memberPromptSections?.[orphanMemberId], undefined, "sealed disk state omits pruned orphans");
+  for (const savedMember of persistedAfterLaunch.run.members) {
+    assert.equal("promptSections" in savedMember, false, "sealed run.members never carries promptSections");
+    const rolledBackView = baseHostRollbackMemberProjection(savedMember);
+    assert.equal("promptSections" in rolledBackView, false, "base-host rollback TeamView spread never exposes promptSections");
+    assert.equal(JSON.stringify(rolledBackView).includes(permissionEvidenceSentinel), false, "base-host rollback TeamView never leaks permission coordinator evidence");
+  }
+
   const codexLimit = { provider: "codex" as const, detectedAt: new Date(now).toISOString(), resetsAt: new Date(now + 10 * 60_000).toISOString(), expiresAt: new Date(now + 10 * 60_000).toISOString(), sessionId: "s-codex", confidence: "corroborated" as const };
-  const switchDecision = resolveProviderLimitLaunch(stored.run, memberTwo, [codexLimit], new Set(["codex"]));
+  const rollbackStore: MemberPromptSectionStore = { memberPromptSections: { [memberTwo.memberId]: builtTwo.promptSections! } };
+  const switchDecision = resolveProviderLimitLaunch(stored.run, memberTwo, [codexLimit], new Set(["codex"]), undefined, getMemberPromptSections(rollbackStore, memberTwo.memberId));
   assert.equal(switchDecision.kind, "switch");
-  const originalSections = memberTwo.promptSections;
-  const undo = commitProviderLimitSwitch(stored.run, memberTwo, switchDecision, () => {});
+  const originalSections = getMemberPromptSections(rollbackStore, memberTwo.memberId);
+  const undo = commitProviderLimitSwitch(stored.run, memberTwo, switchDecision, () => {}, rollbackStore);
   assert.equal(memberTwo.provider, "claude");
   assert.ok(memberTwo.prompt.includes(reportingInstructions("claude")));
+  assert.equal("promptSections" in memberTwo, false, "commit keeps promptSections off TeamMember");
   assert.equal(undo(), true);
   assert.equal(memberTwo.provider, "codex");
   assert.equal(memberTwo.prompt, "Stale pre-upgrade Codex prompt that should switch to Claude.");
-  assert.equal(memberTwo.promptSections, originalSections, "rollback restores original promptSections");
+  assert.equal(getMemberPromptSections(rollbackStore, memberTwo.memberId), originalSections, "rollback restores original Stored promptSections");
 
   stored.run.members.push(memberTwo);
+  (stored.memberPromptSections ??= {})[memberTwo.memberId] = builtTwo.promptSections!;
   internal.limits.observe(codexLimit);
   await internal.step(stored);
   assert.equal(f.launches.length, 2);
@@ -623,14 +708,19 @@ test("sealed persisted members re-render stale pre-upgrade wording from promptSe
   assert.ok(f.launches[1]!.prompt.includes("User answered: Switch cleanly on limit."));
   assert.equal(f.launches[1]!.prompt.includes(codexSandboxInstructions), false);
   assert.equal(f.launches[1]!.prompt.includes("Working rule for tools:"), false);
+  const persistedFinal = f.readRecord<Stored>("team", f.run.id);
+  for (const savedMember of persistedFinal.run.members) {
+    assert.equal("promptSections" in savedMember, false, "sealed run.members stays free of promptSections after fallback switch");
+  }
 });
 
-test("legacy persisted prompt-only members load, retarget recognizable prompts, defer unrecognized ones, and upgrade on running limit switch", async t => {
+test("legacy persisted prompt-only members recognize all four shipped Codex rules, defer unrecognized rules, and upgrade on running limit switch", async t => {
   const f = schedulerFixture();
   t.after(() => f.close());
   let now = Date.parse("2026-11-26T10:00:00.000Z");
   const claudeFallback: TeamModelProfile = { id: "claude-fallback", label: "Claude Fallback", provider: "claude", model: "claude-haiku-5-5", effort: "medium", tier: "light" };
   const codexPrimary: TeamModelProfile = { id: "codex-primary", label: "Codex Primary", provider: "codex", model: "gpt-6-astra", effort: "low", tier: "light", limitFallback: "claude-fallback" };
+  const opencodeProfile: TeamModelProfile = { id: "deepseek-light", label: "DeepSeek", provider: "opencode", model: "deepseek/deepseek-flash", variant: "high", tier: "light" };
   const lineup: TeamLineup = {
     coordinator: { id: "coord", label: "Coord", provider: "codex", model: "gpt-6-astra", effort: "xhigh", tier: "strong" },
     integrator: { id: "integ", label: "Integ", provider: "codex", model: "gpt-6-astra", effort: "high", tier: "strong" },
@@ -639,47 +729,71 @@ test("legacy persisted prompt-only members load, retarget recognizable prompts, 
     fallbacks: [claudeFallback],
   };
 
+  for (const variant of LEGACY_SHIPPED_CODEX_RULES) {
+    assert.equal(createHash("sha256").update(variant.text).digest("hex"), variant.sha256, `frozen hash matches ${variant.name}`);
+    const run = smallRun(variant.entryTools ? { blackboard: { tools: true } } : {});
+    const legacyPrompt = teamPrompt(run, "implementer", undefined, undefined, "codex", codexPrimary)
+      .replace(codexMemberToolInstructions(variant.entryTools), variant.text);
+    const toClaude = retargetPrompt(legacyPrompt, { provider: "claude", profile: claudeFallback, role: "implementer", entryTools: variant.entryTools });
+    assert.equal(toClaude, teamPrompt(run, "implementer", undefined, undefined, "claude", claudeFallback), `${variant.name} -> claude`);
+    const toOpenCode = retargetPrompt(legacyPrompt, { provider: "opencode", profile: opencodeProfile, role: "implementer", entryTools: variant.entryTools });
+    assert.equal(toOpenCode, teamPrompt(run, "implementer", undefined, undefined, "opencode", opencodeProfile), `${variant.name} -> opencode`);
+    const toCodex = retargetPrompt(legacyPrompt, { provider: "codex", profile: codexPrimary, role: "implementer", entryTools: variant.entryTools });
+    assert.equal(toCodex, teamPrompt(run, "implementer", undefined, undefined, "codex", codexPrimary), `${variant.name} -> codex upgrades rule`);
+  }
+
   f.config.teams!.stallMinutes = 60;
   f.run.lineup = lineup;
   f.run.provider = "codex";
+  f.run.blackboard = { tools: true };
   f.run.status = "implementing";
   f.run.headCommit = f.run.baseCommit;
-  f.run.parallelism = 3;
+  f.run.parallelism = 4;
   f.run.tasks = [
-    { id: "legacy-ok", title: "Legacy recognizable", instructions: "Do ok", agentProfileId: "codex-primary", paths: ["a.txt"], dependsOn: [], revision: 1, status: "running" },
-    { id: "legacy-old-rule", title: "Legacy old rule", instructions: "Do old", agentProfileId: "codex-primary", paths: ["b.txt"], dependsOn: [], revision: 1, status: "running" },
-    { id: "legacy-running", title: "Legacy running", instructions: "Do running", agentProfileId: "codex-primary", paths: ["c.txt"], dependsOn: [], revision: 1, status: "running" },
+    { id: "legacy-v1-short", title: "Legacy v1 short", instructions: "Do v1", agentProfileId: "codex-primary", paths: ["a.txt"], dependsOn: [], revision: 1, status: "running" },
+    { id: "legacy-v1-entries", title: "Legacy v1 entries", instructions: "Do v1 entries", agentProfileId: "codex-primary", paths: ["b.txt"], dependsOn: [], revision: 1, status: "running" },
+    { id: "legacy-unknown-rule", title: "Legacy unknown rule", instructions: "Do unknown", agentProfileId: "codex-primary", paths: ["c.txt"], dependsOn: [], revision: 1, status: "running" },
+    { id: "legacy-running", title: "Legacy running", instructions: "Do running", agentProfileId: "codex-primary", paths: ["d.txt"], dependsOn: [], revision: 1, status: "running" },
   ];
 
-  const currentCodexPrompt = teamPrompt(f.run, "implementer", f.run.tasks[0], undefined, "codex", codexPrimary);
-  const obsoleteRulePrompt = teamPrompt(f.run, "implementer", f.run.tasks[1], undefined, "codex", codexPrimary)
-    .replace(codexMemberToolInstructions(false), "Working rule for tools: obsolete schema wording from an older release.");
-  assert.notEqual(obsoleteRulePrompt, teamPrompt(f.run, "implementer", f.run.tasks[1], undefined, "codex", codexPrimary));
+  const v1ShortPrompt = teamPrompt({ ...f.run, blackboard: undefined }, "implementer", f.run.tasks[0], undefined, "codex", codexPrimary)
+    .replace(codexMemberToolInstructions(false), LEGACY_SHIPPED_CODEX_RULES[0].text);
+  const v1EntriesPrompt = teamPrompt(f.run, "implementer", f.run.tasks[1], undefined, "codex", codexPrimary)
+    .replace(codexMemberToolInstructions(true), LEGACY_SHIPPED_CODEX_RULES[1].text);
+  const unknownRulePrompt = teamPrompt(f.run, "implementer", f.run.tasks[2], undefined, "codex", codexPrimary)
+    .replace(codexMemberToolInstructions(true), "Working rule for tools: unrecognized unshipped wording.");
+  assert.notEqual(unknownRulePrompt, teamPrompt(f.run, "implementer", f.run.tasks[2], undefined, "codex", codexPrimary));
 
-  const legacyOk: TeamMember = {
-    runId: f.run.id, memberId: randomUUID(), revision: 1, role: "implementer", taskId: "legacy-ok",
-    provider: "codex", modelProfile: structuredClone(codexPrimary), sessionId: randomUUID(), title: "implementer: legacy-ok",
-    status: "queued", cwd: f.run.workspace, baseCommit: f.run.baseCommit, prompt: currentCodexPrompt, cursor: 0, stopRequestId: randomUUID(),
+  const legacyV1Short: TeamMember = {
+    runId: f.run.id, memberId: randomUUID(), revision: 1, role: "implementer", taskId: "legacy-v1-short",
+    provider: "codex", modelProfile: structuredClone(codexPrimary), sessionId: randomUUID(), title: "implementer: legacy-v1-short",
+    status: "queued", cwd: f.run.workspace, baseCommit: f.run.baseCommit, prompt: v1ShortPrompt, cursor: 0, stopRequestId: randomUUID(),
   };
-  const legacyOldRule: TeamMember = {
-    runId: f.run.id, memberId: randomUUID(), revision: 1, role: "implementer", taskId: "legacy-old-rule",
-    provider: "codex", modelProfile: structuredClone(codexPrimary), sessionId: randomUUID(), title: "implementer: legacy-old-rule",
-    status: "queued", cwd: f.run.workspace, baseCommit: f.run.baseCommit, prompt: obsoleteRulePrompt, cursor: 0, stopRequestId: randomUUID(),
+  const legacyV1Entries: TeamMember = {
+    runId: f.run.id, memberId: randomUUID(), revision: 1, role: "implementer", taskId: "legacy-v1-entries", entryTools: true,
+    provider: "codex", modelProfile: structuredClone(codexPrimary), sessionId: randomUUID(), title: "implementer: legacy-v1-entries",
+    status: "queued", cwd: f.run.workspace, baseCommit: f.run.baseCommit, prompt: v1EntriesPrompt, cursor: 0, stopRequestId: randomUUID(),
+  };
+  const legacyUnknownRule: TeamMember = {
+    runId: f.run.id, memberId: randomUUID(), revision: 1, role: "implementer", taskId: "legacy-unknown-rule", entryTools: true,
+    provider: "codex", modelProfile: structuredClone(codexPrimary), sessionId: randomUUID(), title: "implementer: legacy-unknown-rule",
+    status: "queued", cwd: f.run.workspace, baseCommit: f.run.baseCommit, prompt: unknownRulePrompt, cursor: 0, stopRequestId: randomUUID(),
   };
   const legacyRunning: TeamMember = {
-    runId: f.run.id, memberId: randomUUID(), revision: 1, role: "implementer", taskId: "legacy-running",
+    runId: f.run.id, memberId: randomUUID(), revision: 1, role: "implementer", taskId: "legacy-running", entryTools: true,
     provider: "codex", modelProfile: structuredClone(codexPrimary), sessionId: f.run.members[0]!.sessionId, title: "implementer: legacy-running",
-    status: "running", cwd: f.run.workspace, baseCommit: f.run.baseCommit, prompt: obsoleteRulePrompt, cursor: 0, stopRequestId: randomUUID(),
+    status: "running", cwd: f.run.workspace, baseCommit: f.run.baseCommit, prompt: unknownRulePrompt, cursor: 0, stopRequestId: randomUUID(),
     startedAt: new Date(now - 60_000).toISOString(),
   };
   f.run.decisions = [{
     id: "d-legacy", memberId: legacyRunning.memberId, revision: 1, question: "Which format?", options: [],
     createdAt: new Date(now - 30_000).toISOString(), answer: "Keep JSON.", answeredBy: "owner", answeredAt: new Date(now - 20_000).toISOString(),
   }];
-  f.run.tasks[0]!.memberId = legacyOk.memberId;
-  f.run.tasks[1]!.memberId = legacyOldRule.memberId;
-  f.run.tasks[2]!.memberId = legacyRunning.memberId;
-  f.run.members = [legacyOk, legacyOldRule, legacyRunning];
+  f.run.tasks[0]!.memberId = legacyV1Short.memberId;
+  f.run.tasks[1]!.memberId = legacyV1Entries.memberId;
+  f.run.tasks[2]!.memberId = legacyUnknownRule.memberId;
+  f.run.tasks[3]!.memberId = legacyRunning.memberId;
+  f.run.members = [legacyV1Short, legacyV1Entries, legacyUnknownRule, legacyRunning];
   f.writeTeam();
 
   const teams = new TeamService(f.config, f.key, f.manager as unknown as Manager, (_project, start) => start(), undefined, undefined, { now: () => now });
@@ -690,14 +804,17 @@ test("legacy persisted prompt-only members load, retarget recognizable prompts, 
   internal.limits.observe({ provider: "codex", detectedAt: new Date(now).toISOString(), resetsAt: codexReset, sessionId: "s-codex", confidence: "corroborated" });
 
   await internal.step(stored);
-  assert.equal(f.launches.length, 1, "recognizable legacy member switches onto Claude while unrecognized legacy member defers fail-closed");
-  assert.equal(f.launches[0]!.provider, "claude");
-  assert.ok(f.launches[0]!.prompt.includes(reportingInstructions("claude")));
-  assert.equal(f.launches[0]!.prompt.includes(codexSandboxInstructions), false);
-  assert.equal(stored.run.members[1]!.status, "queued");
-  assert.equal(stored.run.members[1]!.pendingLimit, true);
+  assert.equal(f.launches.length, 2, "both shipped v1 legacy Codex members switch onto Claude while unrecognized rule defers");
+  for (const launch of f.launches) {
+    assert.equal(launch.provider, "claude");
+    assert.ok(launch.prompt.includes(reportingInstructions("claude")));
+    assert.equal(launch.prompt.includes(codexSandboxInstructions), false);
+    assert.equal(launch.prompt.includes("Working rule for tools:"), false);
+  }
+  assert.equal(stored.run.members[2]!.status, "queued");
+  assert.equal(stored.run.members[2]!.pendingLimit, true);
 
-  await internal.switchLimitedMember(stored, stored.run.members[2]!, {
+  await internal.switchLimitedMember(stored, stored.run.members[3]!, {
     kind: "limit", limit: "usage", confidence: "corroborated", message: "limit", resetsAt: codexReset, at: new Date(now).toISOString(), seq: 1,
   });
   const deadline = Date.now() + 10_000;
@@ -706,15 +823,71 @@ test("legacy persisted prompt-only members load, retarget recognizable prompts, 
   const upgraded = stored.run.members.at(-1)!;
   assert.equal(upgraded.taskId, "legacy-running");
   assert.equal(upgraded.provider, "claude");
-  assert.ok(Array.isArray(upgraded.promptSections), "running legacy fallback rebuilds with structured promptSections");
+  assert.equal("promptSections" in upgraded, false, "upgraded member stores sections on Stored, not on TeamMember");
+  assert.ok(Array.isArray(getMemberPromptSections(stored, upgraded.memberId)), "running legacy fallback rebuilds with structured sections on Stored");
   assert.ok(upgraded.prompt.includes(reportingInstructions("claude")));
   assert.ok(upgraded.prompt.includes("User answered: Keep JSON."));
-  assert.equal(upgraded.prompt.includes("obsolete schema wording"), false);
+  assert.equal(upgraded.prompt.includes("unrecognized unshipped wording"), false);
 
   now = Date.parse(codexReset) + 1000;
   await internal.step(stored);
-  const oldRuleLaunch = f.launches.find(launch => launch.requestId === stored.run.members[1]!.sessionId);
+  const oldRuleLaunch = f.launches.find(launch => launch.requestId === stored.run.members[2]!.sessionId);
   assert.ok(oldRuleLaunch, "deferred legacy prompt launches once Codex limit clears");
   assert.equal(oldRuleLaunch!.provider, "codex");
-  assert.equal(oldRuleLaunch!.prompt.includes("obsolete schema wording"), true);
+  assert.equal(oldRuleLaunch!.prompt.includes("unrecognized unshipped wording"), true);
+});
+
+test("same-provider launch refresh enforces TEAM_PROMPT_LIMIT_BYTES and fails closed without launching", async t => {
+  const f = schedulerFixture();
+  t.after(() => f.close());
+  const now = Date.parse("2026-11-26T11:00:00.000Z");
+  const codexPrimary: TeamModelProfile = { id: "codex-primary", label: "Codex Primary", provider: "codex", model: "gpt-6-astra", effort: "low", tier: "light" };
+  f.config.teams!.stallMinutes = 60;
+  f.run.provider = "codex";
+  f.run.blackboard = { tools: true };
+  f.run.status = "implementing";
+  f.run.headCommit = f.run.baseCommit;
+  f.run.tasks = [
+    { id: "near-cap", title: "Near cap", instructions: "Work within limit", agentProfileId: "codex-primary", paths: ["a.txt"], dependsOn: [], revision: 1, status: "running" },
+  ];
+
+  const baseSpec = teamPromptSpec(f.run, "implementer", f.run.tasks[0], undefined, "codex", codexPrimary);
+  const fillerBytes = TEAM_PROMPT_LIMIT_BYTES - Buffer.byteLength(baseSpec.prompt, "utf8") + 128;
+  const overgrownSections: TeamPromptSection[] = [...baseSpec.promptSections, { kind: "text", text: "x".repeat(fillerBytes) }];
+  const staleShorterPrompt = baseSpec.prompt;
+  assert.ok(Buffer.byteLength(staleShorterPrompt, "utf8") <= TEAM_PROMPT_LIMIT_BYTES);
+  assert.ok(
+    Buffer.byteLength(renderPromptSections(overgrownSections, { provider: "codex", profile: codexPrimary, role: "implementer", entryTools: true }), "utf8") > TEAM_PROMPT_LIMIT_BYTES,
+  );
+
+  const member: TeamMember = {
+    runId: f.run.id, memberId: randomUUID(), revision: 1, role: "implementer", taskId: "near-cap", entryTools: true,
+    provider: "codex", modelProfile: structuredClone(codexPrimary), sessionId: randomUUID(), title: "implementer: near-cap",
+    status: "queued", cwd: f.run.workspace, baseCommit: f.run.baseCommit,
+    prompt: staleShorterPrompt,
+    cursor: 0, stopRequestId: randomUUID(),
+  };
+
+  const directStore: MemberPromptSectionStore = { memberPromptSections: { [member.memberId]: overgrownSections } };
+  assert.throws(
+    () => refreshMemberPromptForLaunch(directStore, member, "codex"),
+    error => error instanceof TeamError && error.code === "team-prompt-too-large",
+    "unit refresh fails closed when re-rendered prompt exceeds TEAM_PROMPT_LIMIT_BYTES",
+  );
+  assert.equal(member.prompt, staleShorterPrompt, "refused refresh leaves member.prompt unchanged");
+
+  f.run.tasks[0]!.memberId = member.memberId;
+  f.run.members = [member];
+  f.writeTeam({ memberPromptSections: { [member.memberId]: overgrownSections } });
+
+  const teams = new TeamService(f.config, f.key, f.manager as unknown as Manager, (_project, start) => start(), undefined, undefined, { now: () => now });
+  t.after(() => teams.close());
+  const internal = teams as unknown as PromptRetargetServiceInternal;
+  const stored = internal.records.get(f.run.id)!;
+
+  await internal.step(stored);
+  assert.equal(f.launches.length, 0, "oversized refreshed prompt is never passed to createTeamSession");
+  assert.equal(stored.run.status, "blocked");
+  assert.equal(stored.run.blockCode, "team-prompt-too-large");
+  assert.equal(stored.run.members[0]!.prompt, staleShorterPrompt, "blocked launch leaves persisted member.prompt untouched");
 });

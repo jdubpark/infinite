@@ -1,6 +1,8 @@
+import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { outputSchemas } from "./team-mcp-results.js";
 import { escalationPool, hostSelects, type TeamMember, type TeamModelProfile, type TeamRun } from "./team-types.js";
+import { TeamError } from "./team-workspace.js";
 import { toolSignature } from "./tool-signature.js";
 import type { Provider } from "./types.js";
 
@@ -220,30 +222,124 @@ export function appendBuiltPrompt(built: BuiltPrompt, extra: string | readonly s
   };
 }
 
-export function setMemberPrompt(member: Pick<TeamMember, "prompt" | "promptSections">, built: BuiltPrompt): void {
-  member.prompt = built.prompt;
-  if (built.promptSections) member.promptSections = built.promptSections;
-  else delete member.promptSections;
+export type MemberPromptSectionStore = {
+  memberPromptSections?: Record<string, TeamPromptSection[]>;
+};
+
+export function getMemberPromptSections(
+  store: MemberPromptSectionStore | undefined,
+  memberId: string,
+): TeamPromptSection[] | undefined {
+  return store?.memberPromptSections?.[memberId];
 }
 
-export function appendMemberPrompt(member: Pick<TeamMember, "prompt" | "promptSections">, text: string): void {
+export function builtPromptForMember(
+  store: MemberPromptSectionStore | undefined,
+  member: Pick<TeamMember, "memberId" | "prompt">,
+): BuiltPrompt {
+  const promptSections = getMemberPromptSections(store, member.memberId);
+  return promptSections ? { prompt: member.prompt, promptSections } : { prompt: member.prompt };
+}
+
+export function setMemberPromptSections(
+  store: MemberPromptSectionStore | undefined,
+  memberId: string,
+  sections: TeamPromptSection[] | undefined,
+): void {
+  if (!store) return;
+  if (sections) {
+    (store.memberPromptSections ??= {})[memberId] = sections;
+  } else if (store.memberPromptSections) {
+    delete store.memberPromptSections[memberId];
+    if (!Object.keys(store.memberPromptSections).length) delete store.memberPromptSections;
+  }
+}
+
+export function takeMemberPromptStore(
+  store: MemberPromptSectionStore | undefined,
+  memberId: string,
+): MemberPromptSectionStore {
+  const sections = getMemberPromptSections(store, memberId);
+  setMemberPromptSections(store, memberId, undefined);
+  return sections ? { memberPromptSections: { [memberId]: sections } } : {};
+}
+
+export function commitMemberPromptStore(
+  target: MemberPromptSectionStore | undefined,
+  draft: MemberPromptSectionStore,
+  memberId: string,
+): void {
+  setMemberPromptSections(target, memberId, getMemberPromptSections(draft, memberId));
+}
+
+export function setStoredMemberPrompt(
+  store: MemberPromptSectionStore | undefined,
+  member: Pick<TeamMember, "memberId" | "prompt">,
+  built: BuiltPrompt,
+): void {
+  member.prompt = built.prompt;
+  setMemberPromptSections(store, member.memberId, built.promptSections);
+}
+
+export function appendStoredMemberPrompt(
+  store: MemberPromptSectionStore | undefined,
+  member: Pick<TeamMember, "memberId" | "prompt">,
+  text: string,
+): void {
   if (!text) return;
   member.prompt = `${member.prompt}\n\n${text}`;
-  if (member.promptSections) member.promptSections = appendPromptText(member.promptSections, text);
+  const sections = getMemberPromptSections(store, member.memberId);
+  if (sections) setMemberPromptSections(store, member.memberId, appendPromptText(sections, text));
+}
+
+export function pruneMemberPromptSections(
+  store: MemberPromptSectionStore,
+  members: readonly Pick<TeamMember, "memberId">[],
+): boolean {
+  if (!store.memberPromptSections) return false;
+  const live = new Set(members.map(member => member.memberId));
+  let changed = false;
+  for (const memberId of Object.keys(store.memberPromptSections)) {
+    if (!live.has(memberId)) {
+      delete store.memberPromptSections[memberId];
+      changed = true;
+    }
+  }
+  if (!Object.keys(store.memberPromptSections).length) {
+    delete store.memberPromptSections;
+    changed = true;
+  }
+  return changed;
+}
+
+export function storedWithPrunedPromptSections<T extends MemberPromptSectionStore & { run: Pick<TeamRun, "members"> }>(stored: T): T {
+  if (!stored.memberPromptSections) return stored;
+  const live = new Set(stored.run.members.map(member => member.memberId));
+  const entries = Object.entries(stored.memberPromptSections).filter(([memberId]) => live.has(memberId));
+  if (entries.length === Object.keys(stored.memberPromptSections).length) return stored;
+  const copy = { ...stored };
+  if (entries.length) copy.memberPromptSections = Object.fromEntries(entries);
+  else delete copy.memberPromptSections;
+  return copy;
 }
 
 export function refreshMemberPromptForLaunch(
-  member: Pick<TeamMember, "prompt" | "promptSections" | "provider" | "modelProfile" | "role" | "entryTools">,
+  store: MemberPromptSectionStore | undefined,
+  member: Pick<TeamMember, "memberId" | "prompt" | "provider" | "modelProfile" | "role" | "entryTools">,
   fallbackProvider: Provider,
 ): boolean {
-  if (!member.promptSections) return false;
-  const rendered = renderPromptSections(member.promptSections, {
+  const sections = getMemberPromptSections(store, member.memberId);
+  if (!sections) return false;
+  const rendered = renderPromptSections(sections, {
     provider: member.provider ?? fallbackProvider,
     profile: member.modelProfile,
     role: member.role,
     entryTools: member.entryTools === true,
   });
   if (rendered === member.prompt) return false;
+  if (Buffer.byteLength(rendered, "utf8") > TEAM_PROMPT_LIMIT_BYTES) {
+    throw new TeamError(409, "team-prompt-too-large", "The accumulated team requirements exceed the prompt limit. Start a new team with consolidated requirements.");
+  }
   member.prompt = rendered;
   return true;
 }
@@ -254,6 +350,12 @@ const REPORT_PARAGRAPHS = [reportingInstructions("claude"), reportingInstruction
 const ENTRY_PARAGRAPHS = [entryInstructions("claude"), entryInstructions("codex")];
 const CONTEXT_PARAGRAPH = contextAccessInstructions();
 const RULE_PARAGRAPHS = [codexMemberToolInstructions(false), codexMemberToolInstructions(true)];
+const LEGACY_CODEX_RULE_HASHES: ReadonlySet<string> = new Set([
+  "77d618fea6ee839cec3d9641f560e0ce2749985fc0330a1463b38c75470833b5",
+  "7595d799220ed280b9f93aacd694e6362570b107e7bb19ac814a8c431ae4ac10",
+  "e6ff71704aae9e01b8e94482cd8f49b02fd685de11b68cb863b6129f14888887",
+  "6896da1485bc8ccbafa98bc08d6a3f27eaf54884f17acdb68c4e725ff0845bab",
+]);
 
 type PromptParagraphKind = "report" | "entry" | "context" | "sandbox" | "rule" | "profile" | "readonly";
 type PromptLayoutRole = TeamMember["role"];
@@ -265,13 +367,19 @@ function commandParagraph(text: string, head: string, tail: string) {
   return command.length > 0 && !/[\r\n]/.test(command);
 }
 
+function isRecognizedLegacyCodexRule(text: string): boolean {
+  if (RULE_PARAGRAPHS.includes(text)) return true;
+  if (!text.startsWith("Working rule for tools:")) return false;
+  return LEGACY_CODEX_RULE_HASHES.has(createHash("sha256").update(text).digest("hex"));
+}
+
 function paragraphKind(text: string | undefined): PromptParagraphKind | undefined {
   if (text === undefined) return undefined;
   if (REPORT_PARAGRAPHS.includes(text) || commandParagraph(text, reportCommandHead!, reportCommandTail!)) return "report";
   if (ENTRY_PARAGRAPHS.includes(text) || commandParagraph(text, entryCommandHead!, entryCommandTail!)) return "entry";
   if (text === CONTEXT_PARAGRAPH) return "context";
   if (text === codexSandboxInstructions) return "sandbox";
-  if (RULE_PARAGRAPHS.includes(text)) return "rule";
+  if (isRecognizedLegacyCodexRule(text)) return "rule";
   if (text === readOnlyWorkspaceInstructions) return "readonly";
   const profilePrefix = "Requested runtime profile: ";
   if (text.startsWith(profilePrefix) && text.endsWith(profileSuffix)) {

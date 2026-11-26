@@ -26,7 +26,6 @@ import type { UsageTotals } from "./usage.js";
 import type { UsageRollup } from "./team-usage.js";
 import type { ProviderLimit } from "./provider-limits.js";
 import type { AutonomyMode } from "./autonomy.js";
-import type { TeamPromptSection } from "./team-prompt-sections.js";
 import {
   commitHashSchema,
   deliveryReconciliationReportSchema,
@@ -612,7 +611,6 @@ export interface TeamMember extends TeamAssignment {
   scratchDirectory?: string;
   baseCommit: string;
   prompt: string;
-  promptSections?: TeamPromptSection[];
   contextFeedback?: string;
   startedAt?: string;
   reportedAt?: string;
@@ -789,7 +787,7 @@ export type TeamView = Omit<TeamRun, "members" | "permissionDecisions" | "permis
   lastActivityAt: string;
   pendingOperation?: TeamPendingOperation;
   publishing?: boolean;
-  members: Omit<TeamMember, "prompt" | "promptSections" | "contextFeedback" | "nativeSessionId" | "continuation" | "turns" | "pendingFeedback" | "goalCriteriaPlan">[];
+  members: Omit<TeamMember, "prompt" | "contextFeedback" | "nativeSessionId" | "continuation" | "turns" | "pendingFeedback" | "goalCriteriaPlan">[];
   permissionDecisions?: Omit<TeamPermissionDecision, "prompt" | "coordinatorSessionId">[];
   permissionRecovery?: { outcomes: TeamPermissionRecoveryView[] };
   usage: UsageRollup;

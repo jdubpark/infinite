@@ -27,7 +27,7 @@ import { projectMissionSource } from "./mission-progress.js";
 import { MissionReview, type MissionReviewRecord, type ReviewDirection, type ReviewForwardOp } from "./mission-review.js";
 import {
   CoordinatorContextReadTracker,
-  readSessionPromptContext,
+  readSessionPromptContext, sameRealPath,
   reconcileDeliveredUnapplied,
   returnConsumedMessages,
   selectCoordinatorContinuation,
@@ -262,9 +262,9 @@ export class MissionService {
   list() { return [...this.records.values()].map(stored => this.view(stored)).sort((a, b) => b.createdAt.localeCompare(a.createdAt)); }
   understandingRecords() { return [...this.records.values()].map(stored => structuredClone(stored.mission)); }
   progressSource(id: string) { return projectMissionSource(this.record(id)); }
-  understandingOwnsSession(missionId: string, memberId: string, sessionId: string, projectId: string): boolean {
+  understandingOwnsSession(missionId: string, memberId: string, sessionId: string, projectId: string, cwd?: string): boolean {
     const stored = this.records.get(missionId);
-    return Boolean(stored && stored.mission.repoProjectIds.includes(projectId) && stored.attempts.some(attempt =>
+    return Boolean(stored && stored.mission.repoProjectIds.includes(projectId) && (cwd === undefined || sameRealPath(stored.folder, cwd)) && stored.attempts.some(attempt =>
       attempt.memberId === memberId && attempt.sessionId === sessionId));
   }
   get(id: string) { return this.view(this.record(id)); }

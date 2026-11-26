@@ -125,6 +125,8 @@ type Tracked = { cursor: number; createdAt: number; checkpointDue?: number };
 type BriefingRetention = {
   capture(session: Session, location: Location): Promise<unknown>;
   persist(session: Session, location: Location, summary: RepositorySummary, captured: unknown): Promise<void>;
+  cacheKey?(session: Session, location: Location): Promise<string | undefined>;
+  captureKey?(captured: unknown): string | undefined;
 };
 
 type Lifecycle =
@@ -323,12 +325,27 @@ export class RepositoryBriefings {
     const state = await this.manager.state(session.id);
     const activity = await this.readMessages(session, state.capabilities?.transcript === 1, from, state.seq);
     const { messages, cursor: to } = activity;
-    const key = rangeKey(session.id, from, messages);
-    const cached = this.reports.get(key);
-    if (cached) return cached;
+    const baseKey = rangeKey(session.id, from, messages);
+    const pinnedLookup = Boolean(this.retention?.cacheKey && session.team?.role === "mission-coordinator");
+    if (!pinnedLookup) {
+      const cached = this.reports.get(baseKey);
+      if (cached) return cached;
+    }
     const location = await this.location(session);
     if (this.isClosed()) throw new Error("Repository brief service closed");
     if (messages.length === 0) return { engine: "jevcode", model: this.model, text: "", from, to, messages: 0, at: new Date().toISOString() };
+    let key = baseKey;
+    if (pinnedLookup) {
+      try {
+        const sourceKey = await this.retention!.cacheKey!(session, location);
+        if (this.isClosed()) throw new Error("Repository brief service closed");
+        if (sourceKey) key = `${baseKey}:${sourceKey}`;
+      } catch {
+        key = `${baseKey}:uncached:${Date.now()}`;
+      }
+      const cached = this.reports.get(key);
+      if (cached) return cached;
+    }
     const baseline = location.baseline ?? await this.captureHead(location.root);
     const nextLocation = { ...location, baseline };
     this.rememberLocation(session.id, nextLocation);
@@ -394,7 +411,16 @@ export class RepositoryBriefings {
     const activity = await this.readMessages(session, transcript, "0", listed.seq);
     if (!activity.messages.length) { this.setStatus(listed.id, { state: "empty", error: EMPTY_MESSAGE }); return; }
     const to = activity.cursor;
-    const key = rangeKey(session.id, "0", activity.messages);
+    const baseKey = rangeKey(session.id, "0", activity.messages);
+    let key = baseKey;
+    if (this.retention?.cacheKey && session.team?.role === "mission-coordinator") {
+      try {
+        const sourceKey = await this.retention.cacheKey(session, location);
+        if (sourceKey) key = `${baseKey}:${sourceKey}`;
+      } catch {
+        key = `${baseKey}:uncached:${Date.now()}`;
+      }
+    }
     if (this.reports.has(key) || this.inFlight.has(key)) return;
     const priorAttempt = this.lastAttempt.get(session.id) ?? 0;
     const dueAt = Math.max(Date.now() + DEBOUNCE_MS, priorAttempt + this.config.cooldownMs);
@@ -484,24 +510,37 @@ export class RepositoryBriefings {
             const activity = await this.readMessages(ready.session, state.capabilities?.transcript === 1, ready.from, state.seq);
             ready.messages = activity.messages; ready.to = activity.cursor;
             ready.observedMessages = activity.observedMessages; ready.truncated = activity.truncated;
-            ready.key = rangeKey(ready.session.id, ready.from, ready.messages);
+            const baseKey = rangeKey(ready.session.id, ready.from, ready.messages);
+            const sourceKey = this.retention?.cacheKey && ready.session.team?.role === "mission-coordinator"
+              ? await this.retention.cacheKey(ready.session, ready.location) : undefined;
+            ready.key = sourceKey ? `${baseKey}:${sourceKey}` : baseKey;
             if (this.reports.has(ready.key)) continue;
             const matching = this.pending.get(ready.key);
             if (matching) { ready.waiters.push(...matching.waiters); this.pending.delete(ready.key); }
           }
           if (this.isClosed()) { for (const waiter of ready.waiters) waiter.reject(new Error("Repository brief service closed")); break; }
           this.setStatus(ready.session.id, { state: "running", ...(this.latest.get(ready.session.id)?.summary ? { summary: this.latest.get(ready.session.id)!.summary } : {}) });
-          this.inFlight.set(ready.key, ready);
+          const queueKey = ready.key;
+          this.inFlight.set(queueKey, ready);
           this.lastAttempt.delete(ready.session.id);
           this.lastAttempt.set(ready.session.id, Date.now());
           while (this.lastAttempt.size > MAX_TRACKED) this.lastAttempt.delete(this.lastAttempt.keys().next().value!);
           const retentionCapture = this.retention ? await this.retention.capture(ready.session, ready.location) : undefined;
+          const baseKey = rangeKey(ready.session.id, ready.from, ready.messages);
+          const capturedSourceKey = ready.session.team?.role === "mission-coordinator"
+            ? this.retention?.captureKey?.(retentionCapture)
+            : undefined;
+          const reportKey = ready.session.team?.role === "mission-coordinator"
+            ? (capturedSourceKey ? `${baseKey}:${capturedSourceKey}` : undefined)
+            : ready.key;
           const summary = await this.run(ready);
           if (this.retention && retentionCapture !== undefined)
             await this.retention.persist(ready.session, ready.location, summary, retentionCapture);
-          this.inFlight.delete(ready.key);
-          this.reports.set(ready.key, summary);
-          if (this.reports.size > MAX_CACHE) this.reports.delete(this.reports.keys().next().value!);
+          this.inFlight.delete(queueKey);
+          if (reportKey) {
+            this.reports.set(reportKey, summary);
+            if (this.reports.size > MAX_CACHE) this.reports.delete(this.reports.keys().next().value!);
+          }
           this.setStatus(ready.session.id, { state: "ready", summary });
           for (const waiter of ready.waiters) waiter.resolve(summary);
         } catch (error) {
@@ -530,8 +569,9 @@ export class RepositoryBriefings {
     if (this.isClosed()) throw new Error("Repository brief service closed");
     const current = await this.location(job.session);
     if (this.isClosed() || current.cwd !== job.location.cwd || current.root !== job.location.root) throw new Error("Repository source changed");
+    const repoTarget = inside(job.location.root, job.location.cwd) ? job.location.cwd : job.location.root;
     const args = [...this.config.args, "auto", "--trigger", "host", "--format", "json", "--activity-stdin", "--session", job.session.id,
-      "--repo", job.location.cwd, "--timeout", String(Math.ceil(this.config.timeoutMs / 1000))];
+      "--repo", repoTarget, "--timeout", String(Math.ceil(this.config.timeoutMs / 1000))];
     if (job.location.baseline) args.push("--base", job.location.baseline);
     if (this.config.runner) args.push("--runner", this.config.runner);
     if (this.config.model) args.push("--model", this.config.model);
@@ -540,7 +580,7 @@ export class RepositoryBriefings {
     try {
       const activity = activityInput(job.messages);
       const raw = await collectProcess(this.config.command, args, {
-        cwd: job.location.cwd, env: agentModelClientEnvironment(), input: activity.input, timeoutMs: this.config.timeoutMs,
+        cwd: repoTarget, env: agentModelClientEnvironment(), input: activity.input, timeoutMs: this.config.timeoutMs,
         maxBytes: MAX_STDOUT_BYTES, signal: controller.signal,
       });
       const value: unknown = JSON.parse(raw);
@@ -572,9 +612,12 @@ export class RepositoryBriefings {
     const projectRoot = realpathSync(project.path);
     const allowedRoot = session.team && teamRoot ? teamRoot : projectRoot;
     if (!inside(allowedRoot, cwd)) throw new Error("outside");
-    const output = await collectProcess("git", ["-c", `safe.directory=${cwd}`, "-C", cwd, "rev-parse", "--show-toplevel"], { cwd, timeoutMs: MAX_GIT_MS, maxBytes: 4096 });
+    const isMissionCoordinator = session.team?.role === "mission-coordinator";
+    const repoTarget = isMissionCoordinator && !inside(projectRoot, cwd) ? projectRoot : cwd;
+    const expectedRoot = isMissionCoordinator ? projectRoot : allowedRoot;
+    const output = await collectProcess("git", ["-c", `safe.directory=${repoTarget}`, "-C", repoTarget, "rev-parse", "--show-toplevel"], { cwd: repoTarget, timeoutMs: MAX_GIT_MS, maxBytes: 4096 });
     const root = realpathSync(output.trim());
-    if (!inside(allowedRoot, root)) throw new Error("git-root");
+    if (!inside(expectedRoot, root)) throw new Error("git-root");
     const previous = this.locations.get(session.id);
     const baseline = previous?.root === root ? previous.baseline : await this.captureHead(root);
     return { cwd, root, baseline };

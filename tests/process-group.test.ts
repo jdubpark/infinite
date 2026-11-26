@@ -50,6 +50,18 @@ function watched(args: string[]) {
   return { child, closed: new Promise<number | null>(done => child.once("close", done)) };
 }
 
+function besideDrain(callback: () => void) {
+  const due = performance.now() + EXIT_DRAIN_MS;
+  const guard = setTimeout(() => {
+    while (performance.now() < due + 50);
+  }, EXIT_DRAIN_MS - 200);
+  const timer = setTimeout(callback, EXIT_DRAIN_MS);
+  return () => {
+    clearTimeout(guard);
+    clearTimeout(timer);
+  };
+}
+
 function pausedWriter(atDrainEnd?: (release: () => void) => void) {
   const { child, closed } = watched(["-e", `process.stdout.write(Buffer.alloc(${BUFFERED}, 120))`]);
   const out = child.stdout!;
@@ -59,7 +71,7 @@ function pausedWriter(atDrainEnd?: (release: () => void) => void) {
     out.resume();
   };
   out.pause();
-  if (atDrainEnd) child.once("exit", () => setTimeout(atDrainEnd, EXIT_DRAIN_MS, release));
+  if (atDrainEnd) child.once("exit", () => besideDrain(() => atDrainEnd(release)));
   const exited = new Promise(done => child.once("exit", done));
   const leader = watchLeader(child);
   out.on("data", (chunk: Buffer) => {
@@ -77,7 +89,7 @@ function lateHolder(steps: string[], atDrainEnd: (step: () => void) => void) {
   const flag = join(base, "step");
   const leaderScript = `const holder = require('node:child_process').spawn(process.execPath, ['-e', ${JSON.stringify(LATE_HOLDER)}, ${JSON.stringify(flag)}, ...${JSON.stringify(steps)}], { detached: true, stdio: ['ignore', 'inherit', 'pipe'] }); holder.stderr.once('data', () => { holder.stderr.destroy(); holder.unref(); process.stdout.write(holder.pid + '\\n'); });`;
   const { child, closed } = watched(["-e", leaderScript]);
-  let output = "", holder = 0, taken = 0, ended = false, timer: NodeJS.Timeout | undefined;
+  let output = "", holder = 0, taken = 0, ended = false, cancel = () => {};
   const step = () => {
     if (ended || holder <= 1 || gone(holder)) return;
     taken += 1;
@@ -85,7 +97,7 @@ function lateHolder(steps: string[], atDrainEnd: (step: () => void) => void) {
     const deadline = Date.now() + 5_000;
     while (!existsSync(`${flag}.${taken}`) && Date.now() < deadline);
   };
-  child.once("exit", () => { timer = setTimeout(atDrainEnd, EXIT_DRAIN_MS, step); });
+  child.once("exit", () => { cancel = besideDrain(() => atDrainEnd(step)); });
   const leader = watchLeader(child);
   child.stdout!.on("data", (chunk: Buffer) => {
     output += chunk.toString("latin1");
@@ -95,7 +107,7 @@ function lateHolder(steps: string[], atDrainEnd: (step: () => void) => void) {
   const everyStep = () => steps.every((_, index) => existsSync(`${flag}.${index + 1}`));
   const end = () => {
     ended = true;
-    clearTimeout(timer);
+    cancel();
     if (holder > 1 && !gone(holder)) process.kill(holder, "SIGKILL");
     rmSync(base, { recursive: true, force: true });
   };
@@ -290,10 +302,10 @@ test("a reader paused at a drain's end and again on a late chunk re-arms the dra
     const out = late.child.stdout!;
     out.pause();
     setTimeout(() => out.resume(), 500);
-    setTimeout(() => {
+    besideDrain(() => {
       armed = true;
       step();
-    }, EXIT_DRAIN_MS);
+    });
   });
   late.child.stdout!.on("data", () => {
     if (!armed) return;

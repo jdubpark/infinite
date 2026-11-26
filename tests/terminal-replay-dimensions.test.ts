@@ -1,19 +1,28 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { join, resolve } from "node:path";
 import { randomBytes, randomUUID } from "node:crypto";
+import headless from "@xterm/headless";
 import { WebSocket } from "ws";
 import { initialAttention } from "@infinite/attention";
 import { hashToken } from "../packages/host/src/config.js";
 import { workerCall } from "../packages/host/src/ipc.js";
 import { Manager } from "../packages/host/src/manager.js";
+import {
+  readTerminalSizeIndex,
+  resolveReplayTerminalSize,
+  TERMINAL_SIZE_INDEX_FILE,
+  TerminalSizeIndex,
+  terminalSizeFromEvent,
+  type TerminalSizeEntry,
+} from "../packages/host/src/terminal-size.js";
 import { connectTerminals, terminalPages } from "../packages/host/src/terminal-stream.js";
 import { Journal, readEvents, unseal, writeSealed } from "../packages/host/src/vault.js";
 import { waitFor } from "./helpers.js";
-import type { Bootstrap, Config, ControlLease, Event, Receipt, TerminalOpen, TerminalSnapshot, WorkerRequest, WorkerState } from "../packages/host/src/types.js";
+import type { Bootstrap, Config, ControlLease, Event, Receipt, TerminalOpen, TerminalSize, TerminalSnapshot, WorkerRequest, WorkerState } from "../packages/host/src/types.js";
 
 type StreamFrame = {
   open?: TerminalOpen;
@@ -39,6 +48,9 @@ process.stdin.on("data", data => {
     pending = pending.slice(end + 1);
     if (command === "sgr21") {
       process.stdout.write("\x1b[21mEXTENDED_SGR\x1b[0m\r\n");
+    } else if (command === "wideburst") {
+      for (let i = 1; i <= 40; i++) process.stdout.write("B" + String(i).padStart(2, "0") + "_" + "X".repeat(104) + "\r\n");
+      process.stdout.write("WIDEBURST_END\r\n");
     } else if (command === "exit") {
       process.stdout.write("GOODBYE\r\n");
       setTimeout(() => process.exit(0), 20);
@@ -340,4 +352,343 @@ test("legacy unsized exited sessions omit cols and rows cleanly without failing 
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+function terminalImage(terminal: headless.Terminal) {
+  const buffer = terminal.buffer.active;
+  const lines: string[] = [];
+  for (let i = Math.max(0, buffer.length - 120); i < buffer.length; i++) {
+    lines.push(buffer.getLine(i)?.translateToString(true) ?? "");
+  }
+  return { lines, cols: terminal.cols, rows: terminal.rows, cursorX: buffer.cursorX, cursorY: buffer.cursorY, type: buffer.type };
+}
+
+test("worker drains pending xterm writes across the resize barrier so snapshot and journal replay render identically", { timeout: 25_000 }, async () => {
+  const f = await startFixture();
+  const terminals: headless.Terminal[] = [];
+  try {
+    const actor = { id: "barrier-owner", label: "Barrier" };
+    const lease = await f.call<ControlLease>({ op: "control", action: "claim", actor });
+    await f.call<Receipt>({ op: "raw", requestId: randomUUID(), text: "wideburst\n", actor, leaseId: lease.id });
+    await f.call({ op: "resize", cols: 70, rows: 20, actor, leaseId: lease.id });
+    await f.call<Receipt>({ op: "raw", requestId: randomUUID(), text: "POST_BARRIER\n", actor, leaseId: lease.id });
+    await waitFor(async () => f.output(), text => text.includes("WIDEBURST_END") && text.includes("ECHO:POST_BARRIER"));
+
+    const snap = await f.call<TerminalSnapshot>({ op: "snapshot" });
+    assert.deepEqual([snap.cols, snap.rows], [70, 20]);
+
+    const events = f.events().filter(event => event.seq <= snap.seq && (event.type === "output" || event.type === "lifecycle"));
+    const initialSize = terminalSizeFromEvent(events.find(event => event.type === "lifecycle" && terminalSizeFromEvent(event))!)!;
+    const replayed = new headless.Terminal({ cols: initialSize.cols, rows: initialSize.rows, scrollback: 5000, allowProposedApi: true });
+    const restored = new headless.Terminal({ cols: snap.cols, rows: snap.rows, scrollback: 5000, allowProposedApi: true });
+    terminals.push(replayed, restored);
+
+    for (const event of events) {
+      if (event.type === "lifecycle") {
+        const size = terminalSizeFromEvent(event);
+        if (size && (replayed.cols !== size.cols || replayed.rows !== size.rows)) {
+          replayed.resize(size.cols, size.rows);
+        }
+      } else if (event.type === "output") {
+        await new Promise<void>(resolveWrite => replayed.write(String(event.data.text), resolveWrite));
+      }
+    }
+    await new Promise<void>(resolveWrite => restored.write(snap.ansi, resolveWrite));
+    assert.deepEqual(terminalImage(replayed), terminalImage(restored));
+  } finally {
+    terminals.forEach(terminal => terminal.dispose());
+    await f.stop();
+  }
+});
+
+test("reconnect geometry stays exact past 32 encrypted readEvents pages with size index and in legacy scan mode", { timeout: 25_000 }, () => {
+  const root = mkdtempSync("/tmp/inf-long-replay-");
+  const id = randomUUID();
+  const key = randomBytes(32);
+  const eventsDir = join(root, "events");
+  const indexFile = join(root, TERMINAL_SIZE_INDEX_FILE);
+  try {
+    const journal = new Journal(eventsDir, key, id);
+    const sizeIndex = new TerminalSizeIndex(indexFile, key, id);
+    const running = journal.append("lifecycle", { status: "running", pid: 42, cols: 120, rows: 32 });
+    sizeIndex.append(running.seq, { cols: 120, rows: 32 });
+    const chunk = "P".repeat(260 * 1024);
+    for (let i = 0; i < 68; i++) journal.append("output", { text: chunk });
+    const resized = journal.append("lifecycle", { event: "resize", cols: 94, rows: 30 });
+    sizeIndex.append(resized.seq, { cols: 94, rows: 30 });
+    const afterResize = journal.append("output", { text: "AFTER_LONG_HISTORY\r\n" });
+
+    let indexedReads = 0;
+    const entries = readTerminalSizeIndex(indexFile, key, id);
+    const fromIndex = resolveReplayTerminalSize(
+      (after, limit, types) => {
+        indexedReads++;
+        return readEvents(eventsDir, key, id, after, limit, types);
+      },
+      afterResize.seq,
+      undefined,
+      entries,
+    );
+    assert.deepEqual(fromIndex, { cols: 94, rows: 30 });
+    assert.ok(indexedReads <= 1, `size index jumps past earlier pages (reads=${indexedReads})`);
+
+    const midHistory = resolveReplayTerminalSize(
+      (after, limit, types) => {
+        indexedReads++;
+        return readEvents(eventsDir, key, id, after, limit, types);
+      },
+      resized.seq - 1,
+      undefined,
+      entries,
+    );
+    assert.deepEqual(midHistory, { cols: 120, rows: 32 });
+
+    let legacyPages = 0;
+    const fromLegacyScan = resolveReplayTerminalSize(
+      (after, limit, types) => {
+        legacyPages++;
+        return readEvents(eventsDir, key, id, after, limit, types);
+      },
+      afterResize.seq,
+      undefined,
+      [],
+    );
+    assert.ok(legacyPages > 32, `recording must exceed 32 encrypted readEvents pages (saw ${legacyPages})`);
+    assert.deepEqual(fromLegacyScan, { cols: 94, rows: 30 });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+function mulberry32(seed: number) {
+  let state = seed >>> 0;
+  return () => {
+    state = (state + 0x6d2b79f5) >>> 0;
+    let t = Math.imul(state ^ (state >>> 15), 1 | state);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function oracleSizeAt(history: readonly TerminalSizeEntry[], after: number): TerminalSize | undefined {
+  if (after === 0) return history[0] ? { cols: history[0].cols, rows: history[0].rows } : undefined;
+  let found: TerminalSize | undefined;
+  for (const entry of history) {
+    if (entry.seq <= after) found = { cols: entry.cols, rows: entry.rows };
+    else break;
+  }
+  return found;
+}
+
+type Resolver = (
+  readPage: (after: number, limit: number, types?: Set<string>) => { events: Event[]; cursor: number; more: boolean },
+  after: number,
+  fallback: TerminalSize | undefined,
+  entries: readonly TerminalSizeEntry[],
+) => TerminalSize | undefined;
+
+function runDurableGeometrySimulation(resolver: Resolver, seeds: readonly number[]) {
+  const coverage = {
+    resizes: 0,
+    outputs: 0,
+    largeBursts: 0,
+    reconnectAtZero: 0,
+    reconnectAtResizeBoundary: 0,
+    reconnectMidStream: 0,
+    crashAfterJournal: 0,
+    tornSizeIndex: 0,
+    crashAfterIndex: 0,
+    legacyNoIndex: 0,
+  };
+  for (const seed of seeds) {
+    const rng = mulberry32(seed);
+    const root = mkdtempSync(`/tmp/inf-sim-${seed}-`);
+    const id = randomUUID();
+    const key = randomBytes(32);
+    const eventsDir = join(root, "events");
+    const indexFile = join(root, TERMINAL_SIZE_INDEX_FILE);
+    const statusFile = join(root, "status.sealed");
+    try {
+      const journal = new Journal(eventsDir, key, id);
+      const sizeIndex = new TerminalSizeIndex(indexFile, key, id);
+      const history: TerminalSizeEntry[] = [];
+      let current: TerminalSize = {
+        cols: 40 + Math.floor(rng() * 160),
+        rows: 10 + Math.floor(rng() * 60),
+      };
+      let statusSize: TerminalSize = current;
+      const runEvent = journal.append("lifecycle", { status: "running", pid: 100 + seed, cols: current.cols, rows: current.rows });
+      history.push({ seq: runEvent.seq, cols: current.cols, rows: current.rows });
+      sizeIndex.append(runEvent.seq, current);
+      writeSealed(statusFile, key, `${id}:status`, {
+        status: "running",
+        seq: journal.seq,
+        screen: "",
+        terminalSize: statusSize,
+        attention: initialAttention("2026-11-26T00:00:00.000Z", false),
+      });
+
+      const readPage = (after: number, limit: number, types?: Set<string>) => readEvents(eventsDir, key, id, after, limit, types);
+      const verifyCursor = (after: number, useIndex: boolean) => {
+        const persisted = unseal<WorkerState>(key, `${id}:status`, readFileSync(statusFile, "utf8"));
+        const entries = useIndex ? readTerminalSizeIndex(indexFile, key, id) : [];
+        const actual = resolver(readPage, after, persisted.terminalSize, entries);
+        const expected = oracleSizeAt(history, after);
+        assert.deepEqual(actual, expected, `seed=${seed} after=${after} useIndex=${useIndex}`);
+      };
+
+      const steps = 28;
+      let crashed = false;
+      for (let step = 0; step < steps && !crashed; step++) {
+        const roll = rng();
+        if (roll < 0.42) {
+          const isLarge = rng() < 0.12;
+          const text = isLarge ? "L".repeat(64 * 1024) : `step-${step}-${"x".repeat(Math.floor(rng() * 80))}\r\n`;
+          journal.append("output", { text });
+          coverage.outputs++;
+          if (isLarge) coverage.largeBursts++;
+        } else if (roll < 0.72) {
+          const next: TerminalSize = rng() < 0.1
+            ? current
+            : { cols: 20 + Math.floor(rng() * 200), rows: 5 + Math.floor(rng() * 80) };
+          if (next.cols !== current.cols || next.rows !== current.rows) {
+            current = next;
+            const resized = journal.append("lifecycle", { event: "resize", cols: current.cols, rows: current.rows });
+            history.push({ seq: resized.seq, cols: current.cols, rows: current.rows });
+            coverage.resizes++;
+            const fault = rng();
+            if (fault < 0.12) {
+              coverage.crashAfterJournal++;
+              crashed = true;
+            } else if (fault < 0.24) {
+              appendFileSync(indexFile, "{\"v\":1,\"n\":\"torn");
+              coverage.tornSizeIndex++;
+              crashed = true;
+            } else if (fault < 0.36) {
+              sizeIndex.append(resized.seq, current);
+              coverage.crashAfterIndex++;
+              crashed = true;
+            } else {
+              sizeIndex.append(resized.seq, current);
+              statusSize = current;
+              writeSealed(statusFile, key, `${id}:status`, {
+                status: "running",
+                seq: journal.seq,
+                screen: "",
+                terminalSize: statusSize,
+                attention: initialAttention("2026-11-26T00:00:00.000Z", false),
+              });
+            }
+          }
+        } else {
+          const targetKind = rng();
+          if (targetKind < 0.25) {
+            verifyCursor(0, true);
+            coverage.reconnectAtZero++;
+          } else if (targetKind < 0.65) {
+            const pick = history[Math.floor(rng() * history.length)];
+            for (const candidate of [pick.seq - 1, pick.seq, Math.min(journal.seq, pick.seq + 1)]) {
+              verifyCursor(candidate, true);
+            }
+            coverage.reconnectAtResizeBoundary++;
+          } else {
+            const mid = 1 + Math.floor(rng() * journal.seq);
+            verifyCursor(mid, true);
+            coverage.reconnectMidStream++;
+          }
+        }
+      }
+
+      verifyCursor(0, true);
+      coverage.reconnectAtZero++;
+      const lastResize = history.at(-1)!;
+      for (const candidate of [lastResize.seq - 1, lastResize.seq, journal.seq]) {
+        verifyCursor(candidate, true);
+      }
+      coverage.reconnectAtResizeBoundary++;
+      verifyCursor(journal.seq, false);
+      coverage.legacyNoIndex++;
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+  return coverage;
+}
+
+test("seeded durable-state simulator verifies replay geometry across crashes and rejects broken mutants", { timeout: 30_000 }, () => {
+  const seeds = Array.from({ length: 24 }, (_, index) => 1001 + index);
+  const coverage = runDurableGeometrySimulation(resolveReplayTerminalSize, seeds);
+  for (const [metric, count] of Object.entries(coverage)) {
+    assert.ok(count > 0, `expected non-zero coverage for ${metric}, got ${count}`);
+  }
+
+  const indexOnlyNoTailMutant: Resolver = (readPage, after, fallback, entries) => {
+    if (after === 0) return resolveReplayTerminalSize(readPage, 0, fallback, entries);
+    let found: TerminalSize | undefined;
+    for (const entry of entries) if (entry.seq <= after) found = { cols: entry.cols, rows: entry.rows };
+    return found ?? fallback;
+  };
+  assert.throws(
+    () => runDurableGeometrySimulation(indexOnlyNoTailMutant, seeds),
+    "index-only mutant without journal tail catch-up must fail on crash-after-journal and torn-size-index faults",
+  );
+
+  const finalSizeForZeroMutant: Resolver = (readPage, after, fallback, entries) => {
+    if (after === 0) return fallback;
+    return resolveReplayTerminalSize(readPage, after, fallback, entries);
+  };
+  assert.throws(
+    () => runDurableGeometrySimulation(finalSizeForZeroMutant, seeds),
+    "using final status.sealed terminalSize for after=0 must fail after any resize",
+  );
+
+  const strictLessBoundaryMutant: Resolver = (readPage, after, fallback, entries) => {
+    if (after === 0) return resolveReplayTerminalSize(readPage, 0, fallback, entries);
+    return resolveReplayTerminalSize(readPage, Math.max(0, after - 1), fallback, entries);
+  };
+  assert.throws(
+    () => runDurableGeometrySimulation(strictLessBoundaryMutant, seeds),
+    "strict < boundary mutant must fail at exact resize seq boundaries",
+  );
+
+  const staleBoundedScanMutant: Resolver = (readPage, after, fallback) => {
+    if (after === 0) return resolveReplayTerminalSize(readPage, 0, fallback, []);
+    let cursor = 0;
+    let resolved: TerminalSize | undefined;
+    for (let scanned = 0; scanned < 2 && cursor < after; scanned++) {
+      const page = readPage(cursor, 200, new Set(["lifecycle"]));
+      for (const event of page.events) {
+        if (event.seq > after) return resolved ?? fallback;
+        const size = terminalSizeFromEvent(event);
+        if (size) resolved = size;
+      }
+      if (!page.more || page.cursor <= cursor) break;
+      cursor = page.cursor;
+    }
+    return resolved ?? fallback;
+  };
+  assert.throws(() => {
+    const root = mkdtempSync("/tmp/inf-mutant-bounded-");
+    const id = randomUUID();
+    const key = randomBytes(32);
+    const eventsDir = join(root, "events");
+    try {
+      const journal = new Journal(eventsDir, key, id);
+      journal.append("lifecycle", { status: "running", pid: 7, cols: 120, rows: 32 });
+      const big = "M".repeat(260 * 1024);
+      for (let i = 0; i < 6; i++) journal.append("output", { text: big });
+      const resized = journal.append("lifecycle", { event: "resize", cols: 84, rows: 24 });
+      const tail = journal.append("output", { text: "TAIL" });
+      const actual = staleBoundedScanMutant(
+        (after, limit, types) => readEvents(eventsDir, key, id, after, limit, types),
+        tail.seq,
+        undefined,
+        [],
+      );
+      assert.deepEqual(actual, { cols: 84, rows: 24 });
+      assert.ok(resized.seq < tail.seq);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, "bounded forward scan mutant must fail when output exceeds page budget before resize");
 });

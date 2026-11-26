@@ -8,7 +8,7 @@ import { workerCall, type WorkerError } from "./ipc.js";
 import { controlActor, type PairedDevice } from "./device-control.js";
 import type { Manager } from "./manager.js";
 import { normalizeControlRequest, type ControlActor, type Event, type Receipt, type TerminalSize, type TerminalSnapshot, type WorkerState } from "./types.js";
-import { resolveReplayTerminalSize, terminalSizeFromEvent, terminalSizeOf } from "./terminal-size.js";
+import { readTerminalSizeIndex, resolveReplayTerminalSize, TERMINAL_SIZE_INDEX_FILE, terminalSizeFromEvent, terminalSizeOf } from "./terminal-size.js";
 
 export async function* terminalPages(
   manager: Manager,
@@ -54,10 +54,16 @@ export async function* terminalPages(
       }
     }
     if (!opened) {
+      const sizeIndex = readTerminalSizeIndex(
+        join(manager.config.stateDir, "sessions", sessionId, TERMINAL_SIZE_INDEX_FILE),
+        manager.key,
+        sessionId,
+      );
       activeSize = resolveReplayTerminalSize(
         (from, limit, types) => manager.events(sessionId, from, limit, types),
         cursor,
         state?.terminalSize ?? snapshotSize,
+        sizeIndex,
       );
       if (!activeSize && !state) {
         try {

@@ -270,6 +270,46 @@ test("legacy unsized replay frames fall back gracefully to viewport fit even whe
   }
 });
 
+test("macOS TerminalPipe buffered history replay and subsequent non-reset resize feed preserve server geometry across control handoff", async () => {
+  const h = mountTerminalJs({ cols: 64, rows: 20 });
+  try {
+    h.clearTrace();
+    const bufferedHistory = "H".repeat(108) + "\r\nSECOND_HISTORY";
+    await h.api.feed(Buffer.from(bufferedHistory, "utf8").toString("base64"), true, 120, 32);
+    assert.equal(h.terminal.cols, 120);
+    assert.equal(h.terminal.rows, 32);
+    assert.equal(h.lineText(0), "H".repeat(108));
+
+    await h.api.feed(Buffer.from("\r\nLIVE_SAME_SIZE", "utf8").toString("base64"), false, 120, 32);
+    assert.equal(h.terminal.cols, 120);
+    assert.equal(h.terminal.rows, 32);
+
+    const postResize = "\r\n" + "R".repeat(86);
+    await h.api.feed(Buffer.from(postResize, "utf8").toString("base64"), false, 92, 27);
+    assert.equal(h.terminal.cols, 92);
+    assert.equal(h.terminal.rows, 27);
+    const writes = h.ops.filter((entry): entry is Extract<OpLog, { op: "write" }> => entry.op === "write");
+    const lastWrite = writes.at(-1)!;
+    assert.deepEqual([lastWrite.cols, lastWrite.rows], [92, 27]);
+    assert.equal(h.ops.filter(entry => entry.op === "propose").length, 0);
+
+    h.api.follow(true);
+    assert.equal(h.terminal.cols, 64);
+    assert.equal(h.terminal.rows, 20);
+    assert.deepEqual(h.posted, [{ type: "resize", cols: 64, rows: 20 }]);
+
+    h.clearTrace();
+    h.api.follow(false);
+    h.setViewport({ cols: 50, rows: 15 });
+    h.triggerResizeObserver();
+    assert.equal(h.ops.filter(entry => entry.op === "propose").length, 0);
+    assert.equal(h.terminal.cols, 64);
+    assert.equal(h.terminal.rows, 20);
+  } finally {
+    h.dispose();
+  }
+});
+
 test("web TerminalView extracts authoritative server dimensions from lifecycle and output events", () => {
   assert.deepEqual(
     eventTerminalDimensions({ seq: 2, at: "2026-11-26T00:00:00.000Z", type: "lifecycle", data: { status: "running", pid: 42, cols: 120, rows: 32 } }),

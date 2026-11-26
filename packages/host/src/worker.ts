@@ -57,7 +57,7 @@ import { addClaudeCodeModeToLaunchEnv, addProjectIdToLaunchEnv } from "./worker-
 import { clearEgressEnvironment, workerEgressEnvironment } from "./egress.js";
 import { claudeConfigPath, recordClaudeTrustAsync } from "./workspace-trust.js";
 import { TerminalSnapshots } from "./terminal-snapshot.js";
-import { DEFAULT_TERMINAL_SIZE, isPtyTerminalSize } from "./terminal-size.js";
+import { DEFAULT_TERMINAL_SIZE, isPtyTerminalSize, TERMINAL_SIZE_INDEX_FILE, TerminalBarrier, TerminalSizeIndex } from "./terminal-size.js";
 import { startNativeCodex, validateNativeCodexArgs } from "./native-codex.js";
 import { startNativeOpenCode, validateNativeOpenCodeArgs } from "./native-opencode.js";
 import { createExecutorTunnel, type ExecutorTunnel } from "./executor-tunnel.js";
@@ -91,6 +91,7 @@ const dir = join(stateDir, "sessions", session.id);
 const journal = new Journal(join(dir, "events"), key, session.id);
 if (journal.seq !== 0)
   throw new Error("Refusing to start a second process for an existing session");
+const sizeIndex = new TerminalSizeIndex(join(dir, TERMINAL_SIZE_INDEX_FILE), key, session.id);
 const terminal = new headless.Terminal({ ...DEFAULT_TERMINAL_SIZE, scrollback: 5000, allowProposedApi: true });
 const snapshots = new TerminalSnapshots(terminal);
 type AnswerRequest = Extract<WorkerRequest, { op: "answer" }>;
@@ -139,9 +140,7 @@ terminal.parser.registerOscHandler(9, (data) => {
 let pending = "";
 const usageLines = provider === "opencode" && session.team ? new JsonLineAssembler() : undefined;
 let flushTimer: ReturnType<typeof setTimeout> | undefined;
-let snapshotQueue: (() => void)[] | undefined;
-let snapshotBytes = 0;
-let abortSnapshot: ((error: Error) => void) | undefined;
+const terminalBarrier = new TerminalBarrier();
 const persist = () =>
   writeSealed(join(dir, "status.sealed"), key, `${session.id}:status`, {
     ...state,
@@ -167,35 +166,21 @@ function flush() {
   }
 }
 
+function withTerminalBarrier<T>(fn: () => T): Promise<T> {
+  if (state.status === "recording-error") return Promise.reject(new Error("Recording failed"));
+  return terminalBarrier.run(flush, done => terminal.write("", done), () => {
+    if ((state as WorkerState).status === "recording-error") throw new Error("Recording failed during snapshot");
+    return fn();
+  });
+}
+
 async function snapshot(): Promise<TerminalSnapshot> {
   if (state.status === "recording-error") throw new Refusal("snapshot-unavailable");
-  snapshotQueue = [];
-  snapshotBytes = 0;
-  let deadline: ReturnType<typeof setTimeout> | undefined;
   try {
-    flush();
-    await new Promise<void>((resolve, reject) => {
-      abortSnapshot = reject;
-      deadline = setTimeout(() => reject(new Error("Terminal renderer is busy")), 1000);
-      terminal.write("", resolve);
-    });
-    if ((state as WorkerState).status === "recording-error") throw new Error("Recording failed during snapshot");
-    return {
-      ansi: snapshots.capture(),
-      seq: journal.seq,
-      cols: terminal.cols,
-      rows: terminal.rows,
-      capturedAt: new Date().toISOString(),
-    };
-  } catch {
-    throw new Refusal("snapshot-unavailable");
-  } finally {
-    clearTimeout(deadline);
-    abortSnapshot = undefined;
-    const queued = snapshotQueue;
-    snapshotQueue = undefined;
-    for (const task of queued) task();
-  }
+    return await withTerminalBarrier(() => ({
+      ansi: snapshots.capture(), seq: journal.seq, cols: terminal.cols, rows: terminal.rows, capturedAt: new Date().toISOString(),
+    }));
+  } catch { throw new Refusal("snapshot-unavailable"); }
 }
 function publish(next: Attention) {
   attention = { ...next, now: describeNow(next, provider) };
@@ -1313,18 +1298,20 @@ const server = createServer((socket) => {
         result = { invalidated: true };
       } else if (request.op === "resize") {
         if (!isPtyTerminalSize(request.cols, request.rows)) throw new Error("Invalid terminal size");
-        result = await serialize(() => {
+        result = await serialize(async () => {
           checkControl(request);
-          flush();
-          child?.resize(request.cols, request.rows);
-          terminal.resize(request.cols, request.rows);
-          const terminalSize = { cols: terminal.cols, rows: terminal.rows };
-          if (state.terminalSize?.cols !== terminalSize.cols || state.terminalSize?.rows !== terminalSize.rows) {
-            state = { ...state, terminalSize };
-            append("lifecycle", { event: "resize", cols: terminalSize.cols, rows: terminalSize.rows });
-            persist();
-          }
-          refreshControl(request);
+          await withTerminalBarrier(() => {
+            child?.resize(request.cols, request.rows);
+            terminal.resize(request.cols, request.rows);
+            const terminalSize = { cols: terminal.cols, rows: terminal.rows };
+            if (state.terminalSize?.cols !== terminalSize.cols || state.terminalSize?.rows !== terminalSize.rows) {
+              state = { ...state, terminalSize };
+              const resized = append("lifecycle", { event: "resize", cols: terminalSize.cols, rows: terminalSize.rows });
+              sizeIndex.append(resized.seq, terminalSize);
+              persist();
+            }
+            refreshControl(request);
+          });
           return { ok: true };
         });
       } else if (request.op === "answer") {
@@ -1608,7 +1595,8 @@ server.listen(socketPath(runDir, session.id), async () => {
     });
     state = { ...state, status: "running", pid: child.pid, terminalSize: { cols: terminal.cols, rows: terminal.rows } };
     publish(attention);
-    journal.append("lifecycle", { status: "running", pid: child.pid, cols: terminal.cols, rows: terminal.rows });
+    const runningEvent = journal.append("lifecycle", { status: "running", pid: child.pid, cols: terminal.cols, rows: terminal.rows });
+    sizeIndex.append(runningEvent.seq, { cols: terminal.cols, rows: terminal.rows });
     persist();
     const output = (data: string) => {
       pending += data;
@@ -1639,13 +1627,7 @@ server.listen(socketPath(runDir, session.id), async () => {
           checkScreen();
         }, 40);
     };
-    const onData = (data: string) => {
-      if (snapshotQueue) {
-        snapshotQueue.push(() => output(data));
-        snapshotBytes += Buffer.byteLength(data, "utf8");
-        if (snapshotBytes > 2 * 1024 * 1024) abortSnapshot?.(new Error("Snapshot output queue is full"));
-      } else output(data);
-    };
+    const onData = (data: string) => terminalBarrier.dispatch(() => output(data), Buffer.byteLength(data, "utf8"));
     child.onData(onData);
     const finalDrain = async () => {
       try {
@@ -1687,10 +1669,7 @@ server.listen(socketPath(runDir, session.id), async () => {
         setTimeout(finish, 1500);
       })();
     };
-    const onExit = ({ exitCode }: { exitCode: number }) => {
-      if (snapshotQueue) snapshotQueue.push(() => exited(exitCode));
-      else exited(exitCode);
-    };
+    const onExit = ({ exitCode }: { exitCode: number }) => terminalBarrier.dispatch(() => exited(exitCode));
     child.onExit(onExit);
     resumeProvider = nativeSessionId => {
       const next = buildLaunch(
@@ -1703,7 +1682,8 @@ server.listen(socketPath(runDir, session.id), async () => {
       const pty = spawn(next.command, next.args, { cwd: session.cwd, env, cols: terminal.cols, rows: terminal.rows, name: "xterm-256color" });
       child = pty;
       state = { ...state, status: "running", pid: pty.pid };
-      append("lifecycle", { status: "running", pid: pty.pid, cols: terminal.cols, rows: terminal.rows, permissionChannel: { event: "resumed" } });
+      const resumedEvent = append("lifecycle", { status: "running", pid: pty.pid, cols: terminal.cols, rows: terminal.rows, permissionChannel: { event: "resumed" } });
+      sizeIndex.append(resumedEvent.seq, { cols: terminal.cols, rows: terminal.rows });
       persist();
       pty.onData(onData);
       pty.onExit(onExit);

@@ -282,9 +282,17 @@ export class CmuxSessions {
           if (screen.surface_id && screen.surface_id !== record.surfaceId || screen.workspace_id && screen.workspace_id !== record.workspaceId) throw new CmuxError("snapshot-unavailable");
           const replay = await this.client.rpc("terminal.replay", { surface_id: record.surfaceId, workspace_id: record.workspaceId }).catch(() => undefined);
           if (replay?.surface_id && replay.surface_id !== record.surfaceId) throw new CmuxError("snapshot-unavailable");
-          if (replay && Number.isInteger(replay.columns) && Number.isInteger(replay.rows) && replay.columns > 0 && replay.columns <= 1000 && replay.rows > 0 && replay.rows <= 1000) {
-            record.columns = replay.columns;
-            record.rows = replay.rows;
+          const previousSize = record.columns && record.rows ? { cols: record.columns, rows: record.rows } : undefined;
+          const observedSize = replay && Number.isInteger(replay.columns) && Number.isInteger(replay.rows) &&
+            replay.columns > 0 && replay.columns <= 1000 && replay.rows > 0 && replay.rows <= 1000
+            ? { cols: replay.columns, rows: replay.rows }
+            : undefined;
+          if (observedSize) {
+            record.columns = observedSize.cols;
+            record.rows = observedSize.rows;
+            if (!previousSize || previousSize.cols !== observedSize.cols || previousSize.rows !== observedSize.rows) {
+              this.append(record, "lifecycle", { event: "resize", cols: observedSize.cols, rows: observedSize.rows });
+            }
           }
           const grid = replay?.render_grid;
           const cursorRow = grid?.cursor?.row;
@@ -297,7 +305,7 @@ export class CmuxSessions {
           record.draft = Boolean(row && /^[\s│┃]*[>›❯]\s*\S/.test(row));
           if (record.screen !== screen.text) {
             record.screen = screen.text.slice(-512 * 1024);
-            this.append(record, "output", { text: `\u001b[2J\u001b[H${record.screen.replace(/\r?\n/g, "\r\n")}`, snapshot: true, ...(record.columns && record.rows ? { cols: record.columns, rows: record.rows } : {}) });
+            this.append(record, "output", { text: `\u001b[2J\u001b[H${record.screen.replace(/\r?\n/g, "\r\n")}`, snapshot: true, ...(observedSize ? { cols: observedSize.cols, rows: observedSize.rows } : {}) });
           }
         } catch { unreadable = true; }
       }

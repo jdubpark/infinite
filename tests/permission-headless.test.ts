@@ -650,6 +650,51 @@ test("an owner's allow whose resume check returns after the resumed provider exi
   } finally { await r.stop(); }
 });
 
+test("a call retired at the resume is recorded as answered by the owner, and a newer waiting call stays open", async () => {
+  const text = "Headless: the deferred call was retired before the owner's answer reached it (resume-ended).";
+  const lastDelivery = (w: ReturnType<typeof workerRig>) => {
+    const sent = w.requests.filter(request => (request as { op: string }).op === "delivery").at(-1) as { kind?: string; detail?: string } | undefined;
+    return [sent?.kind, sent?.detail];
+  };
+  const early = workerRig([owner]);
+  await early.pre("deploy production", "toolu_1");
+  early.channel.exited(0);
+  early.channel.answer({ requestId: "a1", promptId: early.prompts[0]!, option: 0 });
+  assert.equal(early.channel.exited(0), false);
+  assert.deepEqual([early.records.at(-1)?.reason, ...lastDelivery(early)], ["resume-ended", "refusal", text]);
+
+  const confirm = held();
+  const late = workerRig([owner, owner]);
+  late.answerResume(confirm.reply);
+  await late.pre("deploy production", "toolu_1");
+  late.channel.exited(0);
+  late.channel.answer({ requestId: "a1", promptId: late.prompts[0]!, option: 0 });
+  const returning = late.pre("deploy production", "toolu_1");
+  assert.equal((await late.pre("deploy staging", "toolu_2")).decision, "defer");
+  assert.equal(late.channel.exited(0), true);
+  confirm.release({ result: "ok" });
+  assert.deepEqual(await returning, { decision: "deny", reason: requesterNotice("unavailable") });
+  assert.deepEqual([late.records.at(-1)?.callId, late.records.at(-1)?.reason, ...lastDelivery(late)], ["toolu_1", "resume-ended", "refusal", text]);
+  assert.equal(late.channel.waiting(), true);
+  assert.deepEqual(late.closed.map(([id]) => id), [late.prompts[0]]);
+});
+
+test("a verdict that arrives after its provider exited is recorded as never returned, and the call is denied", async () => {
+  const text = "Headless: the provider run that made the call ended while the call was decided; the verdict never reached the call, which was denied as unavailable.";
+  for (const verdict of [{ result: "allow" }, { result: "deny", code: "needs-owner", notice: "MODEL TEXT" }]) {
+    const decided = held();
+    const w = workerRig([decided.reply]);
+    const decisionId = randomUUID(), deliveryKey = "e".repeat(64);
+    const asked = raise(w, "git push");
+    assert.equal(w.channel.exited(0), false);
+    decided.release({ ...verdict, decisionId, deliveryKey } as ChannelReply);
+    assert.deepEqual(await asked, { decision: "deny", reason: requesterNotice("unavailable") });
+    const sent = w.requests.at(-1) as Record<string, unknown>;
+    assert.deepEqual([sent.op, sent.decisionId, sent.deliveryKey, sent.kind, sent.detail], ["delivery", decisionId, deliveryKey, "refusal", text]);
+    assert.deepEqual(w.records, []);
+  }
+});
+
 test("a run that passed its bound leaves the next run's call ids intact after a resume", async () => {
   const w = workerRig([...Array<ChannelReply>(OPEN_CALL_KEYS + 1).fill({ result: "none" }), owner]);
   for (let other = 0; other <= OPEN_CALL_KEYS; other++) await w.pre(`echo ${other}`, `toolu_other_${other}`);

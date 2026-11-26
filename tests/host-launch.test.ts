@@ -602,6 +602,8 @@ test("a served headless Claude launch loads only the host's settings, with the c
   const quiet = JSON.parse(buildLaunch("claude", { command: "claude", args: ["-p"] }, "", hooks, relay, { claude: false, codex: false }, false, undefined, undefined, undefined, undefined, 1).args.at(-1)!);
   assert.deepEqual(Object.keys(quiet.hooks).sort(), ["PermissionRequest", "PreToolUse"]);
   assert.match(buildLaunch("claude", profile, "go", hooks, relay, enabled, false, undefined, undefined, undefined, undefined, 0).args.join(" "), /--setting-sources {2}--settings .*permission-hook\.js check 0/);
+  const teamRun = (run: number) => buildLaunch("claude", profile, "go", hooks, relay, enabled, true, undefined, undefined, undefined, undefined, run, false, true).args;
+  assert.deepEqual(teamRun(0), teamRun(1).map(arg => arg.replaceAll("permission-hook.js check 1", "permission-hook.js check 0").replaceAll("permission-hook.js request 1", "permission-hook.js request 0")), "run 0 is a channel launch at every channel comparison");
 });
 
 test("Claude team launches load no project or local settings file, so one member cannot widen a later member", () => {

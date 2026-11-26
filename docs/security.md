@@ -873,7 +873,8 @@ that runs now. A hook of a provider that exited, or a hook without a run
 number, is denied with `unavailable` and changes nothing. The worker checks the
 run again when the host's reply to a hook arrives, so a hook that was already
 waiting on the host when its provider exited is denied the same way and changes
-nothing. The one exception is the resumed call that the owner answered, when
+nothing. When the host had already decided such a request, the worker records
+that the verdict never reached the call. The one exception is the resumed call that the owner answered, when
 its provider exits while the worker confirms the answer with the host. The
 call is denied, and the deferral is retired as ended at the resume, as it is
 when the resumed provider exits before its call arrives. The deferred call

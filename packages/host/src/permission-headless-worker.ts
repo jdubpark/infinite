@@ -169,9 +169,7 @@ export class HeadlessChannelWorker {
         catch { reply = undefined; }
       }
       if (this.stale(run)) {
-        this.host.record({ event: "retired", callId: deferred.callId, reason: "resume-ended" });
-        this.delivery(deferred.issued, "refusal", "Headless: the resumed provider ended before the owner's allow was returned; the deferred call was retired and denied as unavailable.");
-        this.host.publish(this.view());
+        this.retireCall("resume-ended", deferred);
         return this.deny("unavailable");
       }
       if (reply?.result !== "ok") {
@@ -231,7 +229,10 @@ export class HeadlessChannelWorker {
     let reply: ChannelReply;
     try { reply = await this.ask({ op: "decide", call: forwarded, requestId }, DECIDE_MS); }
     catch { return this.deny("unavailable"); }
-    if (this.stale(run)) return this.deny("unavailable");
+    if (this.stale(run)) {
+      this.delivery("decisionId" in reply ? reply : undefined, "refusal", "Headless: the provider run that made the call ended while the call was decided; the verdict never reached the call, which was denied as unavailable.");
+      return this.deny("unavailable");
+    }
     if (reply.result === "not-served") return { decision: "none" };
     if (reply.result === "allow") return { decision: "allow" };
     if (reply.result !== "deny") return this.deny("unavailable");
@@ -318,13 +319,14 @@ export class HeadlessChannelWorker {
     return owed;
   }
 
-  private retireCall(reason: string) {
-    const deferred = this.deferred;
+  private retireCall(reason: string, deferred = this.deferred) {
     if (!deferred) return;
-    this.deferred = undefined;
+    if (this.deferred === deferred) this.deferred = undefined;
     if (deferred.promptId !== undefined && deferred.phase === "waiting") this.host.closePrompt(deferred.promptId, OWNER_DENY);
     this.host.record({ event: "retired", callId: deferred.callId, reason });
-    this.delivery(deferred.issued, "refusal", `Headless: the deferred call was retired unanswered (${reason}).`);
+    this.delivery(deferred.issued, "refusal", deferred.answer
+      ? `Headless: the deferred call was retired before the owner's answer reached it (${reason}).`
+      : `Headless: the deferred call was retired unanswered (${reason}).`);
     this.host.publish(this.view());
   }
 

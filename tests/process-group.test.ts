@@ -20,10 +20,6 @@ const CASE = { timeout: 600_000, skip: process.platform === "win32" && "process 
 const SETTLE_MS = EXIT_DRAIN_MS + 5_000;
 const BUFFERED = 131_072;
 const pause = (ms: number) => new Promise(done => setTimeout(done, ms));
-const busy = (ms: number) => {
-  const end = performance.now() + ms;
-  while (performance.now() < end);
-};
 
 type Ending = "exits" | "is killed" | "runs";
 type Run = { settled: Promise<string>; stop(): unknown };
@@ -72,6 +68,35 @@ function pausedWriter(atDrainEnd?: (release: () => void) => void) {
   });
   child.stderr!.resume();
   return { child, leader, exited, closed, release, size: () => size };
+}
+
+const LATE_HOLDER = "const fs = require('node:fs'); const [flag, ...steps] = process.argv.slice(1); let taken = 0; process.on('SIGUSR2', () => { const step = steps[taken++] ?? ''; if (step.includes('w')) process.stdout.write(Buffer.alloc(4096, 121)); if (step.includes('c')) fs.closeSync(1); fs.writeFileSync(flag + '.' + taken, ''); if (step.includes('c')) process.exit(0); }); process.stderr.write('ready'); setTimeout(() => {}, 30000)";
+
+function lateHolder(steps: string[], atDrainEnd: (step: () => void) => void) {
+  const { base } = scratch();
+  const flag = join(base, "step");
+  const leaderScript = `const holder = require('node:child_process').spawn(process.execPath, ['-e', ${JSON.stringify(LATE_HOLDER)}, ${JSON.stringify(flag)}, ...${JSON.stringify(steps)}], { detached: true, stdio: ['ignore', 'inherit', 'pipe'] }); holder.stderr.once('data', () => { holder.stderr.destroy(); holder.unref(); process.stdout.write(holder.pid + '\\n'); });`;
+  const { child, closed } = watched(["-e", leaderScript]);
+  let output = "", holder = 0, taken = 0;
+  const step = () => {
+    taken += 1;
+    if (holder > 1) process.kill(holder, "SIGUSR2");
+    const deadline = Date.now() + 5_000;
+    while (!existsSync(`${flag}.${taken}`) && Date.now() < deadline);
+  };
+  child.once("exit", () => setTimeout(atDrainEnd, EXIT_DRAIN_MS, step));
+  const leader = watchLeader(child);
+  child.stdout!.on("data", (chunk: Buffer) => {
+    output += chunk.toString("latin1");
+    if (!holder && output.includes("\n")) holder = Number.parseInt(output, 10);
+  });
+  child.stderr!.resume();
+  const everyStep = () => steps.every((_, index) => existsSync(`${flag}.${index + 1}`));
+  const end = () => {
+    if (holder > 1 && !gone(holder)) process.kill(holder, "SIGKILL");
+    rmSync(base, { recursive: true, force: true });
+  };
+  return { child, closed, leader, output: () => output, holder: () => holder, everyStep, end };
 }
 
 const outcome = (work: Promise<unknown>) => work.then(
@@ -185,15 +210,16 @@ test("a group signal reaches the group while its leader runs and nothing once th
 test("a watched leader that exits while an escaped holder keeps its output closes a drain later as a leftover", CASE, async () => {
   const { base, record } = scratch();
   try {
-    const spawnedAt = performance.now();
     const { child, closed } = watched([LEADER_LEAVES, record, "print", "partial"]);
     const leader = watchLeader(child);
-    let output = "";
+    let output = "", exitedAt = 0;
+    child.once("exit", () => { exitedAt = performance.now(); });
     child.stdout!.on("data", (chunk: Buffer) => { output += chunk.toString("utf8"); });
     child.stderr!.resume();
     const left = await leaderGone(record);
     assert.equal(await within(closed, SETTLE_MS, "the watched child closes"), 0);
-    assert.ok(performance.now() - spawnedAt >= EXIT_DRAIN_MS, "the watch waits the drain before it ends the output");
+    const waited = performance.now() - exitedAt;
+    assert.ok(waited >= EXIT_DRAIN_MS - 50, `the watch waits the drain after the leader's exit before it ends the output, not ${Math.round(waited)} ms`);
     assert.equal(leader.leftover, true, "the drain, not the holder, ended the output");
     assert.equal(output, "partial");
     assert.equal(gone(left.holder), false, "the holder was not signalled");
@@ -230,38 +256,43 @@ test("a reader paused when the drain ends and resumed in that loop turn is not a
   }
 });
 
-test("a holder whose last bytes arrive as the drain ends and that closes within the drain turns is not a leftover", CASE, async () => {
-  const { base } = scratch();
-  const flag = join(base, "written");
-  const last = "process.on('SIGUSR2', () => { process.stdout.write(Buffer.alloc(8192, 121)); require('node:fs').writeFileSync(process.argv[1], ''); setTimeout(() => process.exit(0), 30); }); process.stderr.write('ready'); setTimeout(() => {}, 30000)";
-  const leaderScript = `const holder = require('node:child_process').spawn(process.execPath, ['-e', ${JSON.stringify(last)}, ${JSON.stringify(flag)}], { detached: true, stdio: ['ignore', 'inherit', 'pipe'] }); holder.stderr.once('data', () => { holder.stderr.destroy(); holder.unref(); process.stdout.write(holder.pid + '\\n'); });`;
-  const { child, closed } = watched(["-e", leaderScript]);
-  let output = "", holder = 0;
-  child.once("exit", () => setTimeout(() => {
-    if (holder > 1) process.kill(holder, "SIGUSR2");
-    const deadline = Date.now() + 5_000;
-    while (!existsSync(flag) && Date.now() < deadline);
-    let turns = 0;
-    const slow = () => {
-      busy(300);
-      if (++turns < 2) setImmediate(slow);
-    };
-    setImmediate(slow);
-  }, EXIT_DRAIN_MS));
-  const leader = watchLeader(child);
-  child.stdout!.on("data", (chunk: Buffer) => {
-    output += chunk.toString("latin1");
-    if (!holder && output.includes("\n")) holder = Number.parseInt(output, 10);
+test("a reader that pauses on bytes read after the drain ends is not a leftover and its output arrives whole", CASE, async () => {
+  let armed = false;
+  const late = lateHolder(["wc"], step => {
+    armed = true;
+    step();
   });
-  child.stderr!.resume();
+  late.child.stdout!.on("data", () => {
+    if (!armed) return;
+    armed = false;
+    late.child.stdout!.pause();
+    setTimeout(() => late.child.stdout!.resume(), 500);
+  });
   try {
-    assert.equal(await within(closed, SETTLE_MS, "the watched child closes"), 0);
-    assert.equal(existsSync(flag), true, "the holder wrote its last bytes as the drain ended");
-    assert.equal(leader.leftover, false, "bytes still arriving hold the drain open for a few turns");
-    assert.equal(output, `${holder}\n${"y".repeat(8192)}`);
+    assert.equal(await within(late.closed, 2 * EXIT_DRAIN_MS + 5_000, "the watched child closes"), 0);
+    assert.equal(late.everyStep(), true, "the holder wrote its last bytes and closed as the drain ended");
+    assert.equal(late.leader.leftover, false, "a reader that backpressure paused after the drain ended is not a leftover holder");
+    assert.equal(late.output(), `${late.holder()}\n${"y".repeat(4096)}`);
   } finally {
-    if (holder > 1 && !gone(holder)) process.kill(holder, "SIGKILL");
-    rmSync(base, { recursive: true, force: true });
+    late.end();
+  }
+});
+
+test("bytes arriving in each of the first two drain turns hold the output open until it ends in the third", CASE, async () => {
+  const late = lateHolder(["w", "w", "c"], step => {
+    step();
+    setImmediate(() => {
+      step();
+      setImmediate(step);
+    });
+  });
+  try {
+    assert.equal(await within(late.closed, SETTLE_MS, "the watched child closes"), 0);
+    assert.equal(late.everyStep(), true, "the holder wrote in two turns and closed in the third");
+    assert.equal(late.leader.leftover, false, "an output that ends in the third turn is not a leftover");
+    assert.equal(late.output(), `${late.holder()}\n${"y".repeat(8192)}`);
+  } finally {
+    late.end();
   }
 });
 
@@ -310,9 +341,12 @@ test("every spawner settles about a drain after its leader exits while an escape
         assert.equal(gone(left.witness), false, "the process left in the leader's group was not signalled");
         assert.equal(gone(left.holder), false, "the holder outside the group runs on");
       } finally {
-        endLeftBehind(record);
-        if (run && !stopped) await run.stop();
-        rmSync(base, { recursive: true, force: true });
+        try {
+          if (run && !stopped) await run.stop();
+        } finally {
+          endLeftBehind(record);
+          rmSync(base, { recursive: true, force: true });
+        }
       }
     });
   }
@@ -338,9 +372,12 @@ test("a stop inside the drain after a signal ended the leader settles the spawne
         await pause(500);
         assert.equal(gone(left.witness), false, "the process left in the leader's group was not signalled");
       } finally {
-        endLeftBehind(record);
-        if (run && !stopped) await run.stop();
-        rmSync(base, { recursive: true, force: true });
+        try {
+          if (run && !stopped) await run.stop();
+        } finally {
+          endLeftBehind(record);
+          rmSync(base, { recursive: true, force: true });
+        }
       }
     });
   }
@@ -364,9 +401,12 @@ test("a stop whose SIGTERM ends a running leader sends no SIGKILL after it, so a
         await pause(Math.max(0, stoppedAt + place.escalationMs! + 500 - performance.now()));
         assert.equal(gone(member), false, "the group member that ignores SIGTERM was not signalled after the leader ended");
       } finally {
-        endLeftBehind(record);
-        if (run && !stopped) await run.stop();
-        rmSync(base, { recursive: true, force: true });
+        try {
+          if (run && !stopped) await run.stop();
+        } finally {
+          endLeftBehind(record);
+          rmSync(base, { recursive: true, force: true });
+        }
       }
     });
   }

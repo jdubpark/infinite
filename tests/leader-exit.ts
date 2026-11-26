@@ -23,9 +23,11 @@ export async function until(what: string, ready: () => boolean, limitMs = 10_000
   }
 }
 
-function recorded(record: string): Record<string, number> | undefined {
+type Recorded = { leader: number; holder?: number; witness?: number; member?: number; ready?: boolean };
+
+function recorded(record: string): Recorded | undefined {
   const text = existsSync(record) ? readFileSync(record, "utf8") : "";
-  return text.endsWith("\n") ? JSON.parse(text) as Record<string, number> : undefined;
+  return text.endsWith("\n") ? JSON.parse(text) as Recorded : undefined;
 }
 
 export function leftBehind(record: string): LeftBehind | undefined {
@@ -33,7 +35,7 @@ export function leftBehind(record: string): LeftBehind | undefined {
 }
 
 export async function stubbornMember(record: string): Promise<Stubborn> {
-  await until("the leader records its member that ignores SIGTERM", () => recorded(record)?.member !== undefined);
+  await until("the leader's member ignores SIGTERM", () => recorded(record)?.ready === true);
   return recorded(record) as Stubborn;
 }
 
@@ -45,9 +47,9 @@ export async function leaderGone(record: string): Promise<LeftBehind> {
 }
 
 export function endLeftBehind(record: string) {
-  const left = Object.entries(recorded(record) ?? {}).filter(([role]) => role !== "leader");
-  for (const [, pid] of left)
-    if (Number.isSafeInteger(pid) && pid > 1 && !gone(pid)) process.kill(pid, "SIGKILL");
+  const left = recorded(record);
+  for (const pid of left ? [left.holder, left.witness, left.member] : [])
+    if (pid !== undefined && Number.isSafeInteger(pid) && pid > 1 && !gone(pid)) process.kill(pid, "SIGKILL");
 }
 
 export async function within<T>(work: Promise<T>, limitMs: number, what: string): Promise<T> {

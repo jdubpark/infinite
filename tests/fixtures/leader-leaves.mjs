@@ -1,17 +1,21 @@
 import { spawn, spawnSync } from "node:child_process";
-import { writeFileSync } from "node:fs";
+import { renameSync, writeFileSync } from "node:fs";
 
 const [record, mode, ...rest] = process.argv.slice(2);
-const save = left => writeFileSync(record, `${JSON.stringify({ leader: process.pid, ...left })}\n`);
+const save = left => {
+  writeFileSync(`${record}.next`, `${JSON.stringify({ leader: process.pid, ...left })}\n`);
+  renameSync(`${record}.next`, record);
+};
 if (mode === "bundle" && !(rest.includes("bundle") && rest.includes("create")))
   process.exit(spawnSync(rest[0], rest.slice(1), { stdio: "inherit" }).status ?? 1);
 if (mode === "running") {
   const stubborn = "process.on('SIGTERM', () => {}); process.stdout.write('ready'); setTimeout(() => {}, 30000)";
   const member = spawn(process.execPath, ["-e", stubborn], { stdio: ["ignore", "pipe", "ignore"] });
+  save({ member: member.pid });
   member.stdout.once("data", () => {
     member.stdout.destroy();
     member.unref();
-    save({ member: member.pid });
+    save({ member: member.pid, ready: true });
   });
   process.stdout.write(rest[0]);
   setTimeout(() => process.exit(0), 30000);

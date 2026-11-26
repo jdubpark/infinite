@@ -8,7 +8,7 @@ import { IntakeStore } from "../packages/host/src/intake-store.js";
 import { IntakeService } from "../packages/host/src/intake.js";
 import type { IntakeLinear } from "../packages/host/src/intake-linear.js";
 import type { Mission } from "../packages/host/src/mission-types.js";
-import type { MissionMessage } from "../packages/host/src/team-prompts.js";
+import { queuedForwardText, type MissionMessage } from "../packages/host/src/team-prompts.js";
 
 type Harness = ReturnType<typeof scripted>;
 
@@ -515,9 +515,12 @@ test("a forward held by a paused run outside the mission keeps its review out of
   const h = scripted();
   try {
     const { id, teamId, direction } = await delivered(h);
+    const kept = "Keep the old flag documented.";
+    const ownerDirections = (messages: MissionMessage[]) => messages.filter(message => message.type === "owner-direction" && message.text === kept);
     await h.missions.reviewDirection(id, direction());
+    await h.missions.steer(id, { ...action(h, id), text: kept });
     await h.report(2, { kind: "wait", summary: "Reading the review." });
-    assert.equal(reviewMessages(await h.messages(3)).length, 1);
+    assert.deepEqual([reviewMessages(await h.messages(3)).length, ownerDirections(await h.messages(3)).length], [1, 1]);
     await h.confirmNative(3);
     await h.signal(3, { kind: "tool-start", tool: "Read", input: {}, quiet: true });
     await h.missions.pause(id, action(h, id));
@@ -535,6 +538,7 @@ test("a forward held by a paused run outside the mission keeps its review out of
     const messages = await h.messages(5) as MissionMessage[];
     assert.deepEqual(messages.filter(message => message.type === "repository-held").map(message => message.reviewId), ["PRR_1"]);
     assert.deepEqual(reviewMessages(messages), [], "the fresh conversation is not asked to forward the queued review again");
+    assert.equal(ownerDirections(messages).length, 1, "the owner's direction delivered with the review still reaches the fresh conversation");
     await h.report(5, { kind: "follow-up", inMinutes: 5, reason: "Check whether the API repository is free.", check: "Look at the run that holds it." });
     await until(() => h.get(id), mission => (mission.followUps ?? []).some(item => item.state === "open"));
     h.set("paused-api", { status: "implementing" });
@@ -542,5 +546,64 @@ test("a forward held by a paused run outside the mission keeps its review out of
     await until(() => h.get(id), received);
     assert.deepEqual(h.steers, [{ teamId, text: forwarded }]);
     assert.equal(h.refusals(id), 0);
+  } finally { h.close(); }
+});
+
+test("a forward queued behind a live run outside the mission is in a fresh conversation's mission state, and steering that subtask again is refused without counting", { timeout: 90000 }, async () => {
+  const h = scripted();
+  try {
+    const { id, teamId, direction } = await delivered(h);
+    const note = queuedForwardText("a", "PRR_1");
+    await h.missions.reviewDirection(id, direction());
+    await h.report(2, { kind: "wait", summary: "Reading the review." });
+    assert.equal(reviewMessages(await h.messages(3)).length, 1);
+    await h.confirmNative(3);
+    await h.usage(3, 130000);
+    h.runs.set("live-api", { id: "live-api", projectId: "api", missionId: "", status: "implementing", revision: 1, decisions: [], updatedAt: new Date().toISOString() });
+    await h.report(3, { kind: "steer-subtask", subtaskId: "a", text: forwarded });
+    await until(() => h.get(id), mission => events(mission).includes(forwardedEvent));
+    await h.missions.steer(id, { ...action(h, id), text: "Keep the old flag documented." });
+    const fresh = await h.attempt(4);
+    assert.equal(fresh.request.continuation?.mode, "start");
+    assert.deepEqual(reviewMessages(await h.messages(4)), []);
+    assert.ok(fresh.prompt.includes(`"queuedForwards":[${JSON.stringify({ subtaskId: "a", reviewId: "PRR_1", note })}]`), "the fresh conversation's mission state names the queued forward");
+    await h.confirmNative(4);
+    await h.report(4, { kind: "steer-subtask", subtaskId: "a", text: "Rename the flag to --strict." });
+    await until(() => h.get(id), mission => events(mission).includes(`The coordinator's steer-subtask report for subtask a was not applied: ${note}`));
+    await waitFor(async () => (h.stored(id) as unknown as { notes: MissionMessage[] }).notes, notes => notes.some(message => message.type === "refused" && message.kind === "steer-subtask" && message.reason === note), 10000);
+    assert.deepEqual([h.refusals(id), h.steers], [0, []]);
+    h.set("live-api", { status: "ready-for-review" });
+    await until(() => h.get(id), received);
+    assert.deepEqual(h.steers, [{ teamId, text: forwarded }]);
+    assert.equal(h.refusals(id), 0);
+  } finally { h.close(); }
+});
+
+test("a forward queued for one subtask does not excuse a steer of another finished subtask: that refusal counts", { timeout: 90000 }, async () => {
+  const h = scripted();
+  try {
+    const { id } = await h.create();
+    await h.report(1, { kind: "dispatch", summary: "An API change and a web change", subtasks: [plan("a", "api"), plan("b", "web")] });
+    const started = await until(() => h.get(id), mission => mission.subtasks.length === 2 && mission.subtasks.every(item => item.teamId));
+    const team = (subtaskId: string) => started.subtasks.find(item => item.id === subtaskId)!.teamId!;
+    const deliver = (subtaskId: string) => h.set(team(subtaskId), { status: "ready-for-review", pullRequest: { revision: 1, headCommit: HEAD, pullRequestUrl, summary: "Delivered.", reportedAt: new Date().toISOString(), branch: `infinite/${subtaskId}` } });
+    deliver("b");
+    await until(() => h.get(id), mission => mission.subtasks.find(item => item.id === "b")?.status === "done");
+    await h.attempt(2);
+    await h.report(2, { kind: "wait", summary: "Waiting for subtask a." });
+    deliver("a");
+    await until(() => h.get(id), mission => mission.subtasks.every(item => item.status === "done"));
+    await h.attempt(3);
+    await h.missions.reviewDirection(id, { requestId: reviewRequestId(team("a"), "PRR_1"), runId: team("a"), subtaskId: "a", reviewId: "PRR_1", pullRequestUrl, text: requested, revision: 1, headCommit: HEAD });
+    await h.report(3, { kind: "wait", summary: "Reading the review." });
+    assert.equal(reviewMessages(await h.messages(4)).length, 1);
+    h.runs.set("live-api", { id: "live-api", projectId: "api", missionId: "", status: "implementing", revision: 1, decisions: [], updatedAt: new Date().toISOString() });
+    await h.report(4, { kind: "steer-subtask", subtaskId: "a", text: forwarded });
+    await until(() => h.get(id), mission => events(mission).includes(forwardedEvent));
+    await h.missions.steer(id, { ...action(h, id), text: "Also check the web client." });
+    await h.attempt(5);
+    await h.report(5, { kind: "steer-subtask", subtaskId: "b", text: "Update the web client too." });
+    await until(() => h.get(id), mission => events(mission).some(text => text.startsWith("The coordinator's steer-subtask report was refused: Subtask b has no running or blocked subteam.")));
+    await waitFor(async () => h.refusals(id), count => count === 1, 10000);
   } finally { h.close(); }
 });

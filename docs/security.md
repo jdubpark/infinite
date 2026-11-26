@@ -873,18 +873,18 @@ that runs now. A hook of a provider that exited, or a hook without a run
 number, is denied with `unavailable` and changes nothing. The worker checks the
 run again when the host's reply to a hook arrives, so a hook that was already
 waiting on the host when its provider exited is denied the same way and changes
-nothing. When the host had already decided such a request, the worker records
-that the verdict never reached the call. The one exception is the resumed call that the owner answered, when
-its provider exits while the worker confirms the answer with the host. The
-call is denied, and the deferral is retired as ended at the resume, as it is
-when the resumed provider exits before its call arrives. The deferred call
-then stays open, so, as for a worker that ended while a call waited, the
-session cannot be resumed. The owner's answer is used up and is never reused.
-A `PermissionRequest` hook names no call, so the worker gives it the call
-id of the one open `PreToolUse` call of the same run with the same tool and
-input. Each run starts with no open calls and holds its own, so a late request
-of an earlier run cannot take the call id of an identical call of the next run,
-and after a resume a request again takes its own call id.
+nothing. When the host had already decided the call, the worker records that
+the verdict never reached it. The one exception is the resumed call that the
+owner answered, when its provider exits while the worker confirms the answer
+with the host. The call is denied, and the deferral is retired as ended at the
+resume, as it is when the resumed provider exits before its call arrives. The
+deferred call then stays open, so, as for a worker that ended while a call
+waited, the session cannot be resumed. The owner's answer is used up and is
+never reused. A `PermissionRequest` hook names no call, so the worker gives it
+the call id of the one open `PreToolUse` call of the same run with the same
+tool and input. Each run starts with no open calls and holds its own, so a late
+request of an earlier run cannot take the call id of an identical call of the
+next run, and after a resume a request again takes its own call id.
 
 The run number is not a secret and does not authenticate anything; the hook
 token does. A process of the session holds that token and can read the live

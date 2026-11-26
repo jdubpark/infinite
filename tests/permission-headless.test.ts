@@ -401,6 +401,8 @@ test("a waiting call is retired at the retention limit and the session ends", as
   assert.equal(w.ended, 1);
   assert.deepEqual([w.records.at(-1)?.event, w.records.at(-1)?.reason], ["retired", "expired"]);
   assert.equal(w.channel.waiting(), false);
+  const sent = w.requests.at(-1) as Record<string, unknown>;
+  assert.deepEqual([sent.op, sent.kind, sent.detail], ["delivery", "refusal", "Headless: the deferred call was retired unanswered (expired)."]);
 });
 
 test("a provider that fails after deferring, or a resume that fails, retires the call", async () => {
@@ -623,7 +625,9 @@ test("a call admitted before the provider exited changes nothing when its host r
   classReply.release(owner);
   decideReply.release({ result: "deny", code: "needs-owner", notice: "MODEL TEXT", interruptClass: "production-or-staging", decisionId: randomUUID() });
   assert.deepEqual([await check, await request], [refused, refused]);
-  assert.deepEqual([ended.records, ended.channel.view().notice, ended.requests.length], [[], undefined, 2]);
+  assert.deepEqual([ended.records, ended.channel.view().notice, ended.requests.length], [[], undefined, 3]);
+  const late = ended.requests.at(-1) as Record<string, unknown>;
+  assert.deepEqual([late.op, late.decisionId, late.deliveryKey, late.kind], ["delivery", (owner as { decisionId: string }).decisionId, "d".repeat(64), "refusal"]);
 });
 
 test("an owner's allow whose resume check returns after the resumed provider exited is denied, and the deferral stays open to block an ordinary resume", async () => {

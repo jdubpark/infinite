@@ -105,6 +105,11 @@ export class HeadlessChannelWorker {
 
   private deny(code: RejectCode): ChannelAnswer { return { decision: "deny", reason: requesterNotice(code) }; }
 
+  private late(reply: ChannelReply): ChannelAnswer {
+    this.delivery("decisionId" in reply ? reply : undefined, "refusal", "Headless: the provider run that made the call ended while the call was decided; the verdict never reached the call, which was denied as unavailable.");
+    return this.deny("unavailable");
+  }
+
   private leftOpen(key: string, callId?: string) {
     if (this.lost) return;
     const held = this.recent.get(key);
@@ -182,7 +187,7 @@ export class HeadlessChannelWorker {
     let reply: ChannelReply;
     try { reply = await this.ask({ op: "class", call }, CLASS_CHECK_MS); }
     catch { return this.deny("unavailable"); }
-    if (this.stale(run)) return this.deny("unavailable");
+    if (this.stale(run)) return this.late(reply);
     if (reply.result === "not-served" || reply.result === "none") {
       this.leftOpen(callKey(call, inputHash), call.toolUseId);
       return { decision: "none" };
@@ -229,10 +234,7 @@ export class HeadlessChannelWorker {
     let reply: ChannelReply;
     try { reply = await this.ask({ op: "decide", call: forwarded, requestId }, DECIDE_MS); }
     catch { return this.deny("unavailable"); }
-    if (this.stale(run)) {
-      this.delivery("decisionId" in reply ? reply : undefined, "refusal", "Headless: the provider run that made the call ended while the call was decided; the verdict never reached the call, which was denied as unavailable.");
-      return this.deny("unavailable");
-    }
+    if (this.stale(run)) return this.late(reply);
     if (reply.result === "not-served") return { decision: "none" };
     if (reply.result === "allow") return { decision: "allow" };
     if (reply.result !== "deny") return this.deny("unavailable");

@@ -23,6 +23,7 @@
     "tests/intake.test.ts": 1624,
     "tests/missions.test.ts": 2574,
     "tests/outcome-store.test.ts": 1612,
+    "tests/permission-headless.test.ts": 1002,
     "tests/team-events.test.ts": 1779,
     "tests/teams.test.ts": 3403
   }

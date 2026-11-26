@@ -657,16 +657,18 @@ test("an owner's allow whose resume check returns after the resumed provider exi
 
 test("a deferral recorded while resume reads the session state still refuses the resume", async () => {
   const r = await rig();
-  const id = randomUUID(), dir = join(r.config.stateDir, "sessions", id);
-  mkdirSync(dir, { recursive: true });
-  writeSealed(join(dir, "meta.sealed"), r.key, `${id}:meta`, { session: { id, provider: "claude", projectId: "rehearsal", title: "Headless", cwd: r.workspace, headless: { channel: true } } });
-  const journal = new Journal(join(dir, "events"), r.key, id);
-  const worker = createServer(socket => socket.once("data", () => {
-    journal.append("lifecycle", { permissionChannel: { event: "deferred", callId: "toolu_1" } });
-    socket.end(JSON.stringify({ result: { status: "exited", nativeSession: { id: "native-1", source: "hook" } } }) + "\n");
-  }));
-  await new Promise<void>(done => worker.listen(socketPath(r.config.runDir, id), done));
+  const worker = createServer();
   try {
+    const id = randomUUID(), dir = join(r.config.stateDir, "sessions", id);
+    mkdirSync(dir, { recursive: true });
+    writeSealed(join(dir, "meta.sealed"), r.key, `${id}:meta`, { session: { id, provider: "claude", projectId: "rehearsal", title: "Headless", cwd: r.workspace, headless: { channel: true } } });
+    const journal = new Journal(join(dir, "events"), r.key, id);
+    worker.on("connection", socket => socket.once("data", chunk => {
+      assert.equal(JSON.parse(String(chunk)).op, "state");
+      journal.append("lifecycle", { permissionChannel: { event: "deferred", callId: "toolu_1" } });
+      socket.end(JSON.stringify({ result: { status: "exited", nativeSession: { id: "native-1", source: "hook" } } }) + "\n");
+    }));
+    await new Promise<void>(done => worker.listen(socketPath(r.config.runDir, id), done));
     await assert.rejects(r.manager.resume(id, randomUUID()), /waited for the owner's answer/);
   } finally {
     worker.close();

@@ -1,6 +1,8 @@
 type AppStateStatus = "active" | "inactive" | "background";
 type AppStateListener = (state: AppStateStatus) => void;
-type TokenListener = () => void;
+export type DevicePushToken = { type: "ios" | "android" | "web"; data: string };
+export type ExpoPushTokenOptions = { projectId?: string; devicePushToken?: DevicePushToken };
+type TokenListener = (token: DevicePushToken) => void;
 
 export type Connection = { id?: string; url: string; token: string };
 export type ApiCall = { key: string; path: string; method: string; body: unknown };
@@ -9,16 +11,18 @@ const appStateListeners = new Set<AppStateListener>();
 const tokenListeners = new Set<TokenListener>();
 const secureStore = new Map<string, string>();
 const apiCalls: ApiCall[] = [];
+const tokenFetchOptions: (ExpoPushTokenOptions | undefined)[] = [];
 
 let permissionStatus = "granted";
-let tokenFetcher: () => Promise<{ data: string }> = async () => ({ data: "ExponentPushToken[initial]" });
+let reemitWhenDeviceTokenOmitted = false;
+let tokenFetcher: (options?: ExpoPushTokenOptions) => Promise<{ data: string }> = async () => ({ data: "ExponentPushToken[initial]" });
 let apiHandler: (connection: Connection, path: string, init?: { method?: string; body?: unknown }) => Promise<unknown> = async () => ({});
 let secureSetHandler: (key: string, value: string) => Promise<void> = async (key, value) => {
   secureStore.set(key, value);
 };
 
 export const Platform = { OS: "ios" as "ios" | "android" };
-export const isDevice = true;
+export let isDevice = true;
 export default {
   expoConfig: { extra: { eas: { projectId: "test-eas-project" } } },
   easConfig: { projectId: "test-eas-project" },
@@ -32,8 +36,14 @@ export async function getPermissionsAsync() {
 export async function requestPermissionsAsync() {
   return { status: permissionStatus };
 }
-export async function getExpoPushTokenAsync() {
-  return await tokenFetcher();
+export async function getExpoPushTokenAsync(options?: ExpoPushTokenOptions) {
+  tokenFetchOptions.push(options);
+  if (reemitWhenDeviceTokenOmitted && !options?.devicePushToken) {
+    for (const listener of [...tokenListeners]) {
+      listener({ type: "android", data: "reemitted-device-token" });
+    }
+  }
+  return await tokenFetcher(options);
 }
 export function addPushTokenListener(listener: TokenListener) {
   tokenListeners.add(listener);
@@ -87,18 +97,31 @@ export async function api<T>(
 export const pushTestControl = {
   reset() {
     permissionStatus = "granted";
+    isDevice = true;
+    Platform.OS = "ios";
+    reemitWhenDeviceTokenOmitted = false;
     AppState.currentState = "active";
     appStateListeners.clear();
     tokenListeners.clear();
     secureStore.clear();
     apiCalls.length = 0;
+    tokenFetchOptions.length = 0;
     tokenFetcher = async () => ({ data: "ExponentPushToken[initial]" });
     apiHandler = async () => ({});
     secureSetHandler = async (key, value) => {
       secureStore.set(key, value);
     };
   },
-  setTokenFetcher(fn: () => Promise<{ data: string }>) {
+  setPermissionStatus(status: string) {
+    permissionStatus = status;
+  },
+  setIsDevice(value: boolean) {
+    isDevice = value;
+  },
+  setReemitWhenDeviceTokenOmitted(value: boolean) {
+    reemitWhenDeviceTokenOmitted = value;
+  },
+  setTokenFetcher(fn: (options?: ExpoPushTokenOptions) => Promise<{ data: string }>) {
     tokenFetcher = fn;
   },
   setApiHandler(fn: (connection: Connection, path: string, init?: { method?: string; body?: unknown }) => Promise<unknown>) {
@@ -107,8 +130,14 @@ export const pushTestControl = {
   setSecureSetHandler(fn: (key: string, value: string) => Promise<void>) {
     secureSetHandler = fn;
   },
-  emitTokenRotation() {
-    for (const listener of [...tokenListeners]) listener();
+  emitTokenRotation(devicePushToken: DevicePushToken = { type: "android", data: "native-device-token" }) {
+    for (const listener of [...tokenListeners]) listener(devicePushToken);
+  },
+  tokenFetchOptions() {
+    return [...tokenFetchOptions];
+  },
+  clearTokenFetchOptions() {
+    tokenFetchOptions.length = 0;
   },
   tokenListenerCount() {
     return tokenListeners.size;

@@ -16,9 +16,13 @@ let activeProjectId: string | null = null;
 let retryTimer: ReturnType<typeof setTimeout> | null = null;
 let rotationGeneration = 0;
 let rotationInFlight = false;
+let pendingDevicePushToken: Notifications.DevicePushToken | null = null;
+let lastRotatedDevicePushToken: Notifications.DevicePushToken | null = null;
 let pendingToken: string | null = null;
+let lastRotatedToken: string | null = null;
 let tokenStored = true;
 const registered = new Map<string, Connection>();
+const acceptedTokenByProfile = new Map<string, string>();
 const pendingProfiles = new Set<string>();
 let states: Record<string, PushState> = {};
 const stateListeners = new Set<() => void>();
@@ -49,6 +53,39 @@ function clearRetryTimer() {
   if (retryTimer !== null) {
     clearTimeout(retryTimer);
     retryTimer = null;
+  }
+}
+
+function teardownListeners() {
+  rotationGeneration += 1;
+  rotationInFlight = false;
+  clearRetryTimer();
+  pendingDevicePushToken = null;
+  lastRotatedDevicePushToken = null;
+  pendingToken = null;
+  lastRotatedToken = null;
+  tokenStored = true;
+  activeProjectId = null;
+  tokenListener?.remove();
+  tokenListener = null;
+  foregroundUnsubscribe?.();
+  foregroundUnsubscribe = null;
+}
+
+function flushPendingStoreIfReady() {
+  if (registered.size > 0 && pendingProfiles.size === 0 && !tokenStored && pendingToken && !rotationInFlight && retryTimer === null) {
+    rotationGeneration += 1;
+    void syncRotation(rotationGeneration, 0);
+  }
+}
+
+function removeProfileFromRotation(key: string) {
+  registered.delete(key);
+  pendingProfiles.delete(key);
+  if (!registered.size) {
+    teardownListeners();
+  } else if (pendingProfiles.size === 0 && tokenStored) {
+    clearRetryTimer();
   }
 }
 
@@ -107,10 +144,14 @@ async function syncRotation(generation: number, attempt: number) {
   try {
     let token = pendingToken;
     if (!token) {
-      const fetched = (await Notifications.getExpoPushTokenAsync({ projectId: activeProjectId })).data;
+      const options: Notifications.ExpoPushTokenOptions = pendingDevicePushToken
+        ? { projectId: activeProjectId, devicePushToken: pendingDevicePushToken }
+        : { projectId: activeProjectId };
+      const fetched = (await Notifications.getExpoPushTokenAsync(options)).data;
       if (generation !== rotationGeneration || !registered.size) return;
       token = fetched;
       pendingToken = fetched;
+      lastRotatedToken = fetched;
     }
 
     const targets: [string, Connection][] = [];
@@ -133,7 +174,10 @@ async function syncRotation(generation: number, attempt: number) {
         const [key] = targets[i]!;
         if (results[i]?.status === "fulfilled") {
           pendingProfiles.delete(key);
-          if (registered.has(key)) setPushState(key, "registered");
+          if (registered.has(key)) {
+            acceptedTokenByProfile.set(key, token);
+            setPushState(key, "registered");
+          }
         } else if (!registered.has(key)) {
           pendingProfiles.delete(key);
         }
@@ -145,6 +189,7 @@ async function syncRotation(generation: number, attempt: number) {
       if (generation !== rotationGeneration || !registered.size) return;
       tokenStored = true;
       pendingToken = null;
+      pendingDevicePushToken = null;
       restoreRegisteredStates();
     }
 
@@ -159,11 +204,14 @@ async function syncRotation(generation: number, attempt: number) {
   }
 }
 
-function startTokenRotation() {
+function startTokenRotation(devicePushToken: Notifications.DevicePushToken) {
   if (!registered.size || !activeProjectId) return;
   rotationGeneration += 1;
   clearRetryTimer();
+  pendingDevicePushToken = devicePushToken;
+  lastRotatedDevicePushToken = devicePushToken;
   pendingToken = null;
+  lastRotatedToken = null;
   tokenStored = false;
   pendingProfiles.clear();
   for (const key of registered.keys()) pendingProfiles.add(key);
@@ -176,6 +224,15 @@ function retryPendingOnForeground() {
   rotationGeneration += 1;
   clearRetryTimer();
   void syncRotation(rotationGeneration, 0);
+}
+
+function attachListeners() {
+  tokenListener ??= Notifications.addPushTokenListener(devicePushToken => {
+    startTokenRotation(devicePushToken);
+  });
+  foregroundUnsubscribe ??= onForegroundChange(foreground => {
+    if (foreground) retryPendingOnForeground();
+  });
 }
 
 export function getPushStates(): Record<string, PushState> {
@@ -197,6 +254,8 @@ export async function registerForPush(
     Constants.expoConfig?.extra?.eas?.projectId ??
     Constants.easConfig?.projectId;
   if (!projectId || (!Device.isDevice && Platform.OS === "ios")) {
+    removeProfileFromRotation(key);
+    flushPendingStoreIfReady();
     setPushState(key, "unavailable");
     return "unavailable";
   }
@@ -211,60 +270,85 @@ export async function registerForPush(
       ? current.status
       : (await Notifications.requestPermissionsAsync()).status;
   if (status !== "granted") {
+    removeProfileFromRotation(key);
+    flushPendingStoreIfReady();
     setPushState(key, "denied");
     return "denied";
   }
+  const startGeneration = rotationGeneration;
   const token = (await Notifications.getExpoPushTokenAsync({ projectId })).data;
   await api(connection, "/devices/push", {
     body: { token, platform: platform() },
   });
-  await SecureStore.setItemAsync(TOKEN_KEY, token);
   activeProjectId = projectId;
   registered.set(key, connection);
+  attachListeners();
+
+  const supersededByRotation =
+    rotationGeneration !== startGeneration ||
+    rotationInFlight ||
+    (pendingToken !== null && pendingToken !== token);
+
+  if (supersededByRotation) {
+    if (!acceptedTokenByProfile.has(key)) acceptedTokenByProfile.set(key, token);
+    if (!pendingProfiles.has(key)) {
+      pendingProfiles.add(key);
+      if (lastRotatedDevicePushToken && !pendingDevicePushToken) {
+        pendingDevicePushToken = lastRotatedDevicePushToken;
+      }
+      if (lastRotatedToken && !pendingToken) {
+        pendingToken = lastRotatedToken;
+      }
+      if (!rotationInFlight && retryTimer === null) {
+        rotationGeneration += 1;
+        void syncRotation(rotationGeneration, 0);
+      }
+    }
+    if (!Object.hasOwn(states, key)) setPushState(key, "registered");
+    return states[key] ?? "registered";
+  }
+
+  acceptedTokenByProfile.set(key, token);
   pendingProfiles.delete(key);
   if (pendingProfiles.size === 0) {
-    tokenStored = true;
-    pendingToken = null;
-    clearRetryTimer();
+    await SecureStore.setItemAsync(TOKEN_KEY, token);
+    if (rotationGeneration === startGeneration) {
+      tokenStored = true;
+      pendingToken = null;
+      pendingDevicePushToken = null;
+      clearRetryTimer();
+    }
   }
-  setPushState(key, "registered");
-  tokenListener ??= Notifications.addPushTokenListener(() => {
-    startTokenRotation();
-  });
-  foregroundUnsubscribe ??= onForegroundChange(foreground => {
-    if (foreground) retryPendingOnForeground();
-  });
-  return "registered";
+  if (rotationGeneration === startGeneration) {
+    setPushState(key, "registered");
+  } else if (!Object.hasOwn(states, key)) {
+    setPushState(key, "registered");
+  }
+  return states[key] ?? "registered";
 }
 
 export async function unregisterPush(connection: Connection) {
   const key = connectionKey(connection);
-  registered.delete(key);
-  pendingProfiles.delete(key);
+  const acceptedToken = acceptedTokenByProfile.get(key) ?? null;
+  const activeRotatedToken = pendingToken;
+  acceptedTokenByProfile.delete(key);
+  removeProfileFromRotation(key);
   deletePushState(key);
-  if (!registered.size) {
-    rotationGeneration += 1;
-    rotationInFlight = false;
-    clearRetryTimer();
-    pendingToken = null;
-    tokenStored = true;
-    activeProjectId = null;
-    tokenListener?.remove();
-    tokenListener = null;
-    foregroundUnsubscribe?.();
-    foregroundUnsubscribe = null;
-  } else if (pendingProfiles.size === 0 && tokenStored) {
-    clearRetryTimer();
+  const storedToken = await SecureStore.getItemAsync(TOKEN_KEY).catch(() => null);
+  flushPendingStoreIfReady();
+  const tokens = new Set<string>();
+  if (acceptedToken) tokens.add(acceptedToken);
+  if (storedToken) tokens.add(storedToken);
+  if (activeRotatedToken) tokens.add(activeRotatedToken);
+  if (tokens.size > 0) {
+    await Promise.allSettled(
+      [...tokens].map(token =>
+        api(connection, "/devices/push", {
+          method: "DELETE",
+          body: { token },
+        }),
+      ),
+    );
   }
-  const token = await SecureStore.getItemAsync(TOKEN_KEY).catch(() => null);
-  if (registered.size > 0 && pendingProfiles.size === 0 && !tokenStored && pendingToken && !rotationInFlight && retryTimer === null) {
-    rotationGeneration += 1;
-    void syncRotation(rotationGeneration, 0);
-  }
-  if (!token) return;
-  await api(connection, "/devices/push", {
-    method: "DELETE",
-    body: { token },
-  }).catch(() => {});
   if (!registered.size) await SecureStore.deleteItemAsync(TOKEN_KEY).catch(() => {});
 }

@@ -30,13 +30,20 @@ export function MissionDetail({ connection, id }: { connection: Connection; id: 
     ]);
     return { mission, me, projects, board: board?.items ?? [], at: Date.now() };
   }, 2500, [connection, id]);
-  const [recorded, setRecorded] = useState<Mission | null>(null);
+  const [recordedState, setRecordedState] = useState<{ id: string; mission: Mission } | null>(null);
+  const recorded = recordedState?.id === id ? recordedState.mission : null;
   const [direction, setDirection] = useState("");
   const [dockHeight, setDockHeight] = useState(0);
   const [extendOpen, setExtendOpen] = useState(false);
   const mission = poll.data ? newer(recorded, poll.data.mission) : recorded;
   const request = useRunRequest<Mission>(connection, `${machine}/mission/${id}`, {
-    accepted: result => { setRecorded(previous => newer(previous, result)); poll.refresh(); },
+    accepted: result => {
+      setRecordedState(previous => ({
+        id,
+        mission: newer(previous?.id === id ? previous.mission : null, result),
+      }));
+      poll.refresh();
+    },
     refused: poll.refresh,
   });
   const fresh = poll.online;

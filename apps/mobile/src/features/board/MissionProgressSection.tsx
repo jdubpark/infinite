@@ -10,23 +10,23 @@ import { Card, Chip, Sheet } from "../../components/Glass";
 import { Glyph, StatusIcon } from "../../components/Icon";
 import { age, type StatusKind } from "../../status";
 import { theme } from "../../theme";
-import { authorityLabel } from "../teams/inspector-model";
-import { ROLE_NAMES, shortDate, TEAM_LABELS } from "../teams/model";
+import { authorityLabel, entryAuthorLabel, mergeMobileEntries } from "../teams/inspector-model";
+import { shortDate, TEAM_LABELS } from "../teams/model";
 import { Disclosure, Section, t } from "../teams/parts";
 import {
   applyMissionProgressPage, createMissionProgressState, dismissMissionProgressNotice, linkedTeamIdOf, partitionMissionSubtasks,
   type MissionProgressState,
 } from "./mission-progress-model";
 
+const PREVIEW_PAGE_LIMIT = 100;
+const MAX_PREVIEW_PAGES = 10;
+
 type Action =
-  | { type: "reset"; missionId: string }
   | { type: "page"; page: MissionProgressPage }
   | { type: "dismissNotice" };
 
 function reducer(state: MissionProgressState, action: Action): MissionProgressState {
   switch (action.type) {
-    case "reset":
-      return createMissionProgressState(action.missionId);
     case "page":
       return applyMissionProgressPage(state, action.page);
     case "dismissNotice":
@@ -57,6 +57,12 @@ function summarizeChild(child: MissionProgressSnapshot["subtasks"][number]["chil
   return [teamLabel, `${activeWorkers}/${child.assignments.length} active`, checkText].filter(Boolean).join(" · ");
 }
 
+type PreviewState = {
+  missionId: string;
+  teamId: string;
+  title: string;
+};
+
 export function MissionProgressSection({
   connection,
   missionId,
@@ -70,30 +76,45 @@ export function MissionProgressSection({
   onOpenTeam: (teamId: string) => void;
   onOpenSession: (sessionId: string) => void;
 }) {
-  const [state, dispatch] = useReducer(reducer, missionId, createMissionProgressState);
+  const [rawState, dispatch] = useReducer(reducer, missionId, createMissionProgressState);
+  const state = rawState.missionId === missionId ? rawState : createMissionProgressState(missionId);
   const cursorRef = useRef<string | undefined>(undefined);
-  const [previewTeam, setPreviewTeam] = useState<{ teamId: string; title: string } | null>(null);
+  const pollGenRef = useRef(0);
+  const activeMissionIdRef = useRef(missionId);
+
+  const [previewTeam, setPreviewTeam] = useState<PreviewState | null>(null);
   const [previewEntries, setPreviewEntries] = useState<TeamEntryHead[]>([]);
   const [previewLoading, setPreviewLoading] = useState(false);
   const [previewError, setPreviewError] = useState("");
 
   useEffect(() => {
+    pollGenRef.current += 1;
+    activeMissionIdRef.current = missionId;
     cursorRef.current = undefined;
-    dispatch({ type: "reset", missionId });
-  }, [missionId]);
+    return () => {
+      pollGenRef.current += 1;
+    };
+  }, [connection, missionId]);
 
   const poll = usePoll(async () => {
-    const page = await getMissionProgress(connection, missionId, cursorRef.current);
+    const gen = pollGenRef.current;
+    const targetMissionId = missionId;
+    const page = await getMissionProgress(connection, targetMissionId, cursorRef.current);
+    if (gen !== pollGenRef.current || activeMissionIdRef.current !== targetMissionId || page.missionId !== targetMissionId) {
+      return null;
+    }
     cursorRef.current = page.cursor;
     dispatch({ type: "page", page });
-    return { page, at: Date.now() };
+    return { missionId: targetMissionId, page, at: Date.now() };
   }, 3000, [connection, missionId]);
+
+  const activePreview = previewTeam?.missionId === missionId ? previewTeam : null;
 
   function openPreview(teamId: string, title: string) {
     setPreviewEntries([]);
     setPreviewError("");
     setPreviewLoading(true);
-    setPreviewTeam({ teamId, title });
+    setPreviewTeam({ missionId, teamId, title });
   }
 
   function closePreview() {
@@ -104,23 +125,39 @@ export function MissionProgressSection({
   }
 
   useEffect(() => {
-    if (!previewTeam) return;
+    if (!activePreview) return;
+    const gen = pollGenRef.current;
+    const targetTeamId = activePreview.teamId;
     let active = true;
-    listTeamEntries(connection, previewTeam.teamId, { since: 0, limit: 20 })
-      .then(page => {
-        if (active) setPreviewEntries([...page.entries].reverse().slice(0, 10));
-      })
-      .catch(error => {
-        if (active) setPreviewError(error instanceof Error ? error.message : "Could not load team entries.");
-      })
-      .finally(() => {
-        if (active) setPreviewLoading(false);
-      });
+    void (async () => {
+      try {
+        let accumulated: TeamEntryHead[] = [];
+        let since = 0;
+        for (let pageIndex = 0; pageIndex < MAX_PREVIEW_PAGES; pageIndex += 1) {
+          const page = await listTeamEntries(connection, targetTeamId, { since, limit: PREVIEW_PAGE_LIMIT });
+          if (!active || gen !== pollGenRef.current) return;
+          accumulated = mergeMobileEntries(accumulated, page);
+          if (!page.more || page.cursor <= since) break;
+          since = page.cursor;
+        }
+        if (active && gen === pollGenRef.current) {
+          setPreviewEntries(accumulated.slice(-10).reverse());
+        }
+      } catch (error) {
+        if (active && gen === pollGenRef.current) {
+          setPreviewError(error instanceof Error ? error.message : "Could not load team entries.");
+        }
+      } finally {
+        if (active && gen === pollGenRef.current) {
+          setPreviewLoading(false);
+        }
+      }
+    })();
     return () => { active = false; };
-  }, [connection, previewTeam]);
+  }, [connection, activePreview]);
 
   const snapshot = state.snapshot;
-  const now = poll.data?.at ?? 0;
+  const now = poll.data?.missionId === missionId ? poll.data.at : 0;
   const subtasks = snapshot?.subtasks ?? [];
   const { active, finished } = partitionMissionSubtasks(subtasks);
   const subtaskById = new Map(subtasks.map(item => [item.id, item]));
@@ -156,10 +193,11 @@ export function MissionProgressSection({
         return <View key={subtask.id} style={[s.itemWrap, index > 0 && s.rowRule]}>
           <Pressable
             accessibilityRole="button"
+            accessibilityState={{ disabled: !teamId }}
             disabled={!teamId}
             accessibilityLabel={`${subtask.title}, ${repoName(subtask.repoProjectId)}, ${summarizeChild(subtask.child)}`}
             onPress={() => { if (teamId) openPreview(teamId, subtask.title); }}
-            style={({ pressed }) => [s.itemRow, pressed && teamId && s.pressed]}
+            style={({ pressed }) => [s.itemRow, pressed && Boolean(teamId) && s.pressed]}
           >
             <StatusIcon kind={subtaskIconKind(subtask.status)} size={15} />
             <View style={s.fill}>
@@ -189,9 +227,11 @@ export function MissionProgressSection({
         return <View key={subtask.id} style={s.finishedRow}>
           <Pressable
             accessibilityRole="button"
+            accessibilityState={{ disabled: !teamId }}
+            accessibilityLabel={`${subtask.title}, ${repoName(subtask.repoProjectId)}, ${summarizeChild(subtask.child)}`}
             disabled={!teamId}
             onPress={() => { if (teamId) openPreview(teamId, subtask.title); }}
-            style={({ pressed }) => [s.itemRowCompact, pressed && teamId && s.pressed]}
+            style={({ pressed }) => [s.itemRowCompact, pressed && Boolean(teamId) && s.pressed]}
           >
             <StatusIcon kind={subtaskIconKind(subtask.status)} size={14} />
             <View style={s.fill}>
@@ -221,9 +261,9 @@ export function MissionProgressSection({
     </Disclosure> : null}
 
     <Sheet
-      visible={Boolean(previewTeam)}
+      visible={Boolean(activePreview)}
       onClose={closePreview}
-      title={previewTeam?.title ?? "Child team"}
+      title={activePreview?.title ?? "Child team"}
     >
       <ScrollView style={s.sheetScroll} contentContainerStyle={s.sheetBody}>
         {previewLoading ? <ActivityIndicator style={s.loader} color={theme.colors.forest} /> : null}
@@ -236,16 +276,14 @@ export function MissionProgressSection({
             <Chip label={entry.kind} />
             <Text style={t.note}>{shortDate(entry.at)}</Text>
           </View>
-          <Text style={t.note}>
-            {entry.authorRole ? (ROLE_NAMES[entry.authorRole as keyof typeof ROLE_NAMES] ?? entry.authorRole) : entry.author}
-          </Text>
+          <Text style={t.note}>{entryAuthorLabel(entry.author, entry.authorRole)}</Text>
           <Text style={t.body} numberOfLines={2}>{entry.summary}</Text>
         </View>)}
-        {previewTeam ? <Button
+        {activePreview ? <Button
           title="Open team"
           glyph="forward"
           onPress={() => {
-            const target = previewTeam.teamId;
+            const target = activePreview.teamId;
             closePreview();
             onOpenTeam(target);
           }}
@@ -272,7 +310,7 @@ const s = StyleSheet.create({
   finishedRow: { gap: 6, paddingVertical: 4, borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: theme.colors.rule },
   obsRow: { flexDirection: "row", alignItems: "center", gap: 8, paddingVertical: 4 },
   seq: { fontFamily: theme.mono, fontSize: 12, fontWeight: "700", color: theme.colors.secondaryInk },
-  sheetScroll: { maxHeight: 420 },
+  sheetScroll: { flexShrink: 1 },
   sheetBody: { gap: 10, paddingHorizontal: 8, paddingBottom: 12 },
   previewEntry: { gap: 4, paddingVertical: 8, borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: theme.colors.rule },
 });

@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import {
   authorityLabel,
   deriveMobileOutcomeGroups,
+  deriveReviewerAcceptanceClaims,
+  entryAuthorLabel,
   filterMobileEntries,
   formatEntryBodySummary,
   mergeMobileEntries,
@@ -14,6 +16,7 @@ import {
   dismissMissionProgressNotice,
   linkedTeamIdOf,
   partitionMissionSubtasks,
+  resyncNoticeForReason,
 } from "../apps/mobile/src/features/board/mission-progress-model.ts";
 import type { MissionProgressPage, TeamEntryHead } from "../apps/mobile/src/api/client.ts";
 import type { TeamMember, TeamTask, TeamView } from "../apps/mobile/src/features/teams/model.ts";
@@ -90,7 +93,7 @@ const makeProgressPage = (overrides: Partial<MissionProgressPage> = {}): Mission
   ...overrides,
 });
 
-test("deriveMobileOutcomeGroups uses c0 successCriteria and keeps provisional assessment and reviewer claims separate", () => {
+test("deriveMobileOutcomeGroups uses c0 successCriteria and keeps provisional assessment separate from brief reviewer claims", () => {
   const noCriteria = deriveMobileOutcomeGroups(makeTeam({ tasks: [makeTask("t1", "integrated")] }));
   assert.deepEqual(noCriteria, []);
 
@@ -107,6 +110,15 @@ test("deriveMobileOutcomeGroups uses c0 successCriteria and keeps provisional as
           { id: "c1", statement: "Unit tests pass", check: "npm test", producer: "host" },
         ],
       },
+    },
+    brief: {
+      title: "Inspector brief",
+      problem: "Need inspector",
+      evidence: [{ source: "host", observation: "missing" }],
+      dataShape: "typed",
+      acceptance: ["Brief acceptance 1", "Brief acceptance 2", "Brief acceptance 3"],
+      expectedOutcome: "Works",
+      uiChanges: true,
     },
     tasks: [
       makeTask("t1", "integrated", ["c0"]),
@@ -135,6 +147,7 @@ test("deriveMobileOutcomeGroups uses c0 successCriteria and keeps provisional as
       acceptance: [
         { criterion: 1, verdict: "inconclusive", evidence: "Waiting on owner sign-off" },
         { criterion: 2, verdict: "verified", evidence: "Tests passed on cloud runner" },
+        { criterion: 3, verdict: "verified", evidence: "Extra brief item verified" },
       ],
     },
   });
@@ -147,12 +160,7 @@ test("deriveMobileOutcomeGroups uses c0 successCriteria and keeps provisional as
   assert.equal(groups[0]!.total, 4);
   assert.equal(groups[0]!.integrationSummary, "3 of 4 tasks integrated");
   assert.deepEqual(groups[0]!.provisionalAssessment, { state: "pending-owner", label: "Provisional", revision: 2 });
-  assert.deepEqual(groups[0]!.reviewerClaim, {
-    verdict: "inconclusive",
-    evidence: "Waiting on owner sign-off",
-    revision: 2,
-    label: "Reviewer claim",
-  });
+  assert.equal("reviewerClaim" in groups[0]!, false);
 
   assert.equal(groups[1]!.id, "c1");
   assert.equal(groups[1]!.statement, "Unit tests pass");
@@ -160,26 +168,40 @@ test("deriveMobileOutcomeGroups uses c0 successCriteria and keeps provisional as
   assert.equal(groups[1]!.total, 1);
   assert.equal(groups[1]!.integrationSummary, "1 of 1 tasks integrated");
   assert.deepEqual(groups[1]!.provisionalAssessment, { state: "met", label: "Provisional", revision: 2 });
-  assert.deepEqual(groups[1]!.reviewerClaim, {
-    verdict: "verified",
-    evidence: "Tests passed on cloud runner",
+  assert.equal("reviewerClaim" in groups[1]!, false);
+
+  const claims = deriveReviewerAcceptanceClaims(team);
+  assert.equal(claims.length, 3);
+  assert.deepEqual(claims[0], {
+    criterion: 1,
+    verdict: "inconclusive",
+    evidence: "Waiting on owner sign-off",
+    statement: "Brief acceptance 1",
     revision: 2,
-    label: "Reviewer claim",
+  });
+  assert.deepEqual(claims[2], {
+    criterion: 3,
+    verdict: "verified",
+    evidence: "Extra brief item verified",
+    statement: "Brief acceptance 3",
+    revision: 2,
   });
 });
 
-test("partitionMobileRoster collapses finished attempts and links failed/stopped attempts to replacements", () => {
+test("partitionMobileRoster preserves creation-order replacement links when startedAt is absent or equal", () => {
   const members: TeamMember[] = [
     makeMember("m-old-pm", { role: "project-manager", revision: 1, status: "stopped", startedAt: "2026-11-26T00:00:00.000Z" }),
     makeMember("m-pm", { role: "project-manager", revision: 2, status: "waiting", startedAt: "2026-11-26T00:01:00.000Z" }),
-    makeMember("m-t1-a", { taskId: "t1", status: "stopped", stoppedReason: "timed out", startedAt: "2026-11-26T00:01:30.000Z" }),
-    makeMember("m-t1-b", { taskId: "t1", status: "running", startedAt: "2026-11-26T00:02:00.000Z" }),
+    makeMember("m-t1-a", { taskId: "t1", status: "stopped", stoppedReason: "timed out" }),
+    makeMember("m-t1-b", { taskId: "t1", status: "running" }),
     makeMember("m-t2-done", { taskId: "t2", status: "reported", startedAt: "2026-11-26T00:01:40.000Z" }),
+    makeMember("m-t3-a", { taskId: "t3", status: "stopped", startedAt: "2026-11-26T00:02:00.000Z" }),
+    makeMember("m-t3-b", { taskId: "t3", status: "running", startedAt: "2026-11-26T00:02:00.000Z" }),
   ];
 
   const partitioned = partitionMobileRoster(members, 2);
-  assert.deepEqual(partitioned.active.map(item => item.member.memberId), ["m-pm", "m-t1-b"]);
-  assert.deepEqual(partitioned.finished.map(item => item.member.memberId), ["m-old-pm", "m-t1-a", "m-t2-done"]);
+  assert.deepEqual(partitioned.active.map(item => item.member.memberId), ["m-pm", "m-t1-b", "m-t3-b"]);
+  assert.deepEqual(partitioned.finished.map(item => item.member.memberId), ["m-old-pm", "m-t1-a", "m-t2-done", "m-t3-a"]);
 
   const oldPm = partitioned.finished.find(item => item.member.memberId === "m-old-pm")!;
   const activePm = partitioned.active.find(item => item.member.memberId === "m-pm")!;
@@ -191,11 +213,16 @@ test("partitionMobileRoster collapses finished attempts and links failed/stopped
   assert.equal(stoppedT1.replacedByMemberId, "m-t1-b");
   assert.equal(runningT1.replacesMemberId, "m-t1-a");
 
+  const stoppedT3 = partitioned.finished.find(item => item.member.memberId === "m-t3-a")!;
+  const runningT3 = partitioned.active.find(item => item.member.memberId === "m-t3-b")!;
+  assert.equal(stoppedT3.replacedByMemberId, "m-t3-b");
+  assert.equal(runningT3.replacesMemberId, "m-t3-a");
+
   const doneT2 = partitioned.finished.find(item => item.member.memberId === "m-t2-done")!;
   assert.equal(doneT2.replacedByMemberId, undefined);
 });
 
-test("mergeMobileEntries deduplicates by entryId, preserves sparse seq order, and filterMobileEntries filters by kind", () => {
+test("mergeMobileEntries deduplicates by entryId, preserves sparse seq order, and formats author labels", () => {
   const existing = [
     makeEntry("e1", 4, { kind: "direction", authority: "direction", state: "active" }),
     makeEntry("e2", 9, { kind: "check", authority: "receipt", state: "active" }),
@@ -203,7 +230,7 @@ test("mergeMobileEntries deduplicates by entryId, preserves sparse seq order, an
   const merged = mergeMobileEntries(existing, {
     entries: [
       makeEntry("e2", 9, { kind: "check", authority: "receipt", state: "withdrawn" }),
-      makeEntry("e3", 15, { kind: "report", authority: "claim", state: "active" }),
+      makeEntry("e3", 15, { kind: "report", authority: "claim", state: "active", author: "member", authorRole: "mission-coordinator" }),
       makeEntry("e0", 2, { kind: "integration", authority: "receipt", state: "active" }),
     ],
   });
@@ -220,9 +247,12 @@ test("mergeMobileEntries deduplicates by entryId, preserves sparse seq order, an
   assert.equal(authorityLabel("receipt"), "Host receipt");
   assert.equal(authorityLabel("claim"), "Agent claim");
   assert.equal(authorityLabel("direction"), "Owner direction");
+  assert.equal(entryAuthorLabel("member", "mission-coordinator"), "Mission coordinator");
+  assert.equal(entryAuthorLabel("member", "project-manager"), "Coordinator");
+  assert.equal(entryAuthorLabel("host"), "host");
 });
 
-test("formatEntryBodySummary extracts structured facts across host and member entries safely", () => {
+test("formatEntryBodySummary extracts structured facts across host and member entries without duplicating answer text", () => {
   const checkSummary = formatEntryBodySummary({
     command: { command: "npm", args: ["test"] },
     phase: "setup",
@@ -264,13 +294,14 @@ test("formatEntryBodySummary extracts structured facts across host and member en
   const answerSummary = formatEntryBodySummary({ source: "answer", question: "Ship?", text: "Yes" });
   assert.equal(answerSummary.question, "Ship?");
   assert.equal(answerSummary.answer, "Yes");
+  assert.equal(answerSummary.summary, undefined);
 
   const primitiveSummary = formatEntryBodySummary(null);
   assert.deepEqual(primitiveSummary.facts, []);
   assert.equal(primitiveSummary.rawJson, "null");
 });
 
-test("mission-progress-model advances generation-scoped cursors and resets cleanly on explicit or implicit resync", () => {
+test("mission-progress-model advances generation-scoped cursors and sets explicit notices for every resync reason", () => {
   let state = createMissionProgressState("mission-1");
   const initialPage = makeProgressPage({
     resync: { required: true, reason: "initial" },
@@ -304,6 +335,23 @@ test("mission-progress-model advances generation-scoped cursors and resets clean
 
   state = dismissMissionProgressNotice(state);
   assert.equal(state.resyncNotice, undefined);
+
+  for (const [reason, expected] of [
+    ["invalid-cursor", "Resynchronized after invalid cursor."],
+    ["retention-gap", "Resynchronized after observation retention gap."],
+    ["cursor-ahead", "Resynchronized after cursor reset."],
+    ["mission-mismatch", "Resynchronized for the current mission."],
+  ] as const) {
+    assert.equal(resyncNoticeForReason(reason), expected);
+    state = applyMissionProgressPage(state, makeProgressPage({
+      generation: "gen-1",
+      cursor: `mp1.gen-1.mission-1.inst-${reason}.1`,
+      resync: { required: true, reason },
+      observations: [],
+    }));
+    assert.equal(state.resyncNotice, expected);
+    assert.equal(state.lastResyncReason, reason);
+  }
 
   const restartedPage = makeProgressPage({
     generation: "gen-2",

@@ -1,16 +1,16 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ActivityIndicator, Alert, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import * as Crypto from "expo-crypto";
 import {
-  getTeamEntry, listTeamEntries, TEAM_ENTRY_KINDS, withdrawTeamEntry,
+  connectionKey, getTeamEntry, listTeamEntries, TEAM_ENTRY_KINDS, withdrawTeamEntry,
   type Connection, type Me, type TeamEntryDetail, type TeamEntryHead, type TeamEntryKind,
 } from "../../api/client";
 import { usePoll } from "../../api/usePoll";
 import { Button } from "../../components/Button";
 import { Card, Chip, Sheet } from "../../components/Glass";
 import { theme } from "../../theme";
-import { authorityLabel, filterMobileEntries, formatEntryBodySummary, mergeMobileEntries } from "./inspector-model";
-import { ROLE_NAMES, shortDate, type TeamView } from "./model";
+import { authorityLabel, entryAuthorLabel, filterMobileEntries, formatEntryBodySummary, mergeMobileEntries } from "./inspector-model";
+import { shortDate, type TeamView } from "./model";
 import { Disclosure, Section, t } from "./parts";
 
 const PAGE_LIMIT = 100;
@@ -28,6 +28,22 @@ const KIND_LABELS: Record<TeamEntryKind | "all", string> = {
   handoff: "handoff",
 };
 
+type ExtraState = {
+  key: string;
+  entries: TeamEntryHead[];
+  cursor: number;
+  more: boolean;
+};
+
+type SheetState = {
+  key: string;
+  selectedId: string | null;
+  historyIds: string[];
+  detail: TeamEntryDetail | null;
+  loading: boolean;
+  error: string;
+};
+
 export function TeamEvidenceSection({
   connection,
   team,
@@ -39,102 +55,181 @@ export function TeamEvidenceSection({
   me: Me | null;
   onOpenSession: (sessionId: string) => void;
 }) {
+  const scopeKey = `${connectionKey(connection)}/${team.id}`;
   const [kindFilter, setKindFilter] = useState<TeamEntryKind | "all">("all");
-  const [extraEntries, setExtraEntries] = useState<TeamEntryHead[]>([]);
+  const [extraState, setExtraState] = useState<ExtraState>({ key: scopeKey, entries: [], cursor: 0, more: false });
   const [loadingMore, setLoadingMore] = useState(false);
-  const [extraCursor, setExtraCursor] = useState<{ cursor: number; more: boolean } | null>(null);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [historyIds, setHistoryIds] = useState<string[]>([]);
-  const [detail, setDetail] = useState<TeamEntryDetail | null>(null);
-  const [detailLoading, setDetailLoading] = useState(false);
-  const [detailError, setDetailError] = useState("");
+  const [sheetState, setSheetState] = useState<SheetState>({
+    key: scopeKey,
+    selectedId: null,
+    historyIds: [],
+    detail: null,
+    loading: false,
+    error: "",
+  });
   const [withdrawing, setWithdrawing] = useState(false);
 
+  const epochRef = useRef(0);
+  const highWaterRef = useRef<{ key: string; cursor: number }>({ key: scopeKey, cursor: 0 });
+
+  useEffect(() => {
+    epochRef.current += 1;
+    highWaterRef.current = { key: scopeKey, cursor: 0 };
+    return () => {
+      epochRef.current += 1;
+    };
+  }, [scopeKey]);
+
   const poll = usePoll(async () => {
+    const epoch = epochRef.current;
+    const targetTeamId = team.id;
     let entries: TeamEntryHead[] = [];
     let since = 0;
     let cursor = 0;
     let more = false;
     for (let pageIndex = 0; pageIndex < MAX_AUTO_PAGES; pageIndex += 1) {
-      const page = await listTeamEntries(connection, team.id, { since, limit: PAGE_LIMIT });
+      const page = await listTeamEntries(connection, targetTeamId, { since, limit: PAGE_LIMIT });
+      if (epoch !== epochRef.current) return null;
       entries = mergeMobileEntries(entries, page);
       cursor = page.cursor;
       more = page.more;
       if (!page.more || page.cursor <= since) break;
       since = page.cursor;
     }
-    return { entries, cursor, more };
-  }, 4000, [connection, team.id]);
+    const tail = highWaterRef.current.key === scopeKey ? highWaterRef.current.cursor : 0;
+    if (more && tail > cursor) {
+      const tailPage = await listTeamEntries(connection, targetTeamId, { since: tail, limit: PAGE_LIMIT });
+      if (epoch !== epochRef.current) return null;
+      entries = mergeMobileEntries(entries, tailPage);
+      cursor = Math.max(cursor, tailPage.cursor);
+      more = tailPage.more;
+    }
+    if (highWaterRef.current.key === scopeKey) {
+      highWaterRef.current.cursor = Math.max(highWaterRef.current.cursor, cursor);
+    }
+    return { key: scopeKey, entries, cursor, more };
+  }, 4000, [connection, team.id, scopeKey]);
 
-  const polledEntries = poll.data?.entries ?? [];
-  const mergedEntries = mergeMobileEntries(polledEntries, { entries: extraEntries });
+  const scopedPoll = poll.data?.key === scopeKey ? poll.data : null;
+  const scopedExtra = extraState.key === scopeKey ? extraState : null;
+  const scopedSheet = sheetState.key === scopeKey
+    ? sheetState
+    : { key: scopeKey, selectedId: null, historyIds: [], detail: null, loading: false, error: "" };
+
+  const polledEntries = scopedPoll?.entries ?? [];
+  const mergedEntries = mergeMobileEntries(polledEntries, { entries: scopedExtra?.entries ?? [] });
   const visibleEntries = [...filterMobileEntries(mergedEntries, kindFilter)].reverse();
-  const effectiveCursor = extraCursor?.cursor ?? poll.data?.cursor ?? 0;
-  const hasMore = extraCursor ? extraCursor.more : Boolean(poll.data?.more);
+  const pollCursor = scopedPoll?.cursor ?? 0;
+  const extraCursor = scopedExtra?.cursor ?? 0;
+  const effectiveCursor = Math.max(pollCursor, extraCursor);
+  const hasMore = extraCursor > pollCursor
+    ? Boolean(scopedExtra?.more)
+    : Boolean(scopedPoll?.more || (scopedExtra && scopedExtra.cursor === pollCursor && scopedExtra.more));
 
-  async function loadOlderOrNextPage() {
+  async function loadNewerEntries() {
     if (loadingMore || !hasMore) return;
+    const epoch = epochRef.current;
+    const targetKey = scopeKey;
+    const targetTeamId = team.id;
     setLoadingMore(true);
     try {
-      const page = await listTeamEntries(connection, team.id, { since: effectiveCursor, limit: PAGE_LIMIT });
-      setExtraEntries(prev => mergeMobileEntries(prev, page));
-      setExtraCursor({ cursor: page.cursor, more: page.more });
+      const page = await listTeamEntries(connection, targetTeamId, { since: effectiveCursor, limit: PAGE_LIMIT });
+      if (epoch !== epochRef.current) return;
+      if (highWaterRef.current.key === targetKey) {
+        highWaterRef.current.cursor = Math.max(highWaterRef.current.cursor, page.cursor);
+      }
+      setExtraState(prev => ({
+        key: targetKey,
+        entries: mergeMobileEntries(prev.key === targetKey ? prev.entries : [], page),
+        cursor: Math.max(prev.key === targetKey ? prev.cursor : 0, page.cursor),
+        more: page.more,
+      }));
     } catch (error) {
-      Alert.alert("Could not load entries", error instanceof Error ? error.message : "Request failed.");
+      if (epoch === epochRef.current) {
+        Alert.alert("Could not load entries", error instanceof Error ? error.message : "Request failed.");
+      }
     } finally {
-      setLoadingMore(false);
+      if (epoch === epochRef.current) setLoadingMore(false);
     }
   }
 
   useEffect(() => {
+    const selectedId = scopedSheet.selectedId;
     if (!selectedId) return;
+    const epoch = epochRef.current;
+    const targetKey = scopeKey;
+    const targetTeamId = team.id;
     let active = true;
-    getTeamEntry(connection, team.id, selectedId)
+    getTeamEntry(connection, targetTeamId, selectedId)
       .then(result => {
-        if (active) setDetail(result);
+        if (active && epoch === epochRef.current) {
+          setSheetState(prev => (prev.key === targetKey && prev.selectedId === selectedId
+            ? { ...prev, detail: result, loading: false }
+            : prev));
+        }
       })
       .catch(error => {
-        if (active) setDetailError(error instanceof Error ? error.message : "Could not load entry detail.");
-      })
-      .finally(() => {
-        if (active) setDetailLoading(false);
+        if (active && epoch === epochRef.current) {
+          setSheetState(prev => (prev.key === targetKey && prev.selectedId === selectedId
+            ? { ...prev, error: error instanceof Error ? error.message : "Could not load entry detail.", loading: false }
+            : prev));
+        }
       });
     return () => { active = false; };
-  }, [connection, team.id, selectedId]);
-
-  function selectEntry(entryId: string) {
-    setDetail(null);
-    setDetailError("");
-    setDetailLoading(true);
-    setSelectedId(entryId);
-  }
+  }, [connection, team.id, scopeKey, scopedSheet.selectedId]);
 
   function openEntry(entryId: string) {
-    setHistoryIds([]);
-    selectEntry(entryId);
+    setSheetState({
+      key: scopeKey,
+      selectedId: entryId,
+      historyIds: [],
+      detail: null,
+      loading: true,
+      error: "",
+    });
   }
 
   function openSuperseded(entryId: string) {
-    if (selectedId) setHistoryIds(prev => [...prev, selectedId]);
-    selectEntry(entryId);
+    setSheetState(prev => ({
+      key: scopeKey,
+      selectedId: entryId,
+      historyIds: prev.key === scopeKey && prev.selectedId ? [...prev.historyIds, prev.selectedId] : [],
+      detail: null,
+      loading: true,
+      error: "",
+    }));
   }
 
   function stepBack() {
-    const previous = historyIds[historyIds.length - 1];
-    if (!previous) return;
-    setHistoryIds(prev => prev.slice(0, -1));
-    selectEntry(previous);
+    setSheetState(prev => {
+      if (prev.key !== scopeKey || !prev.historyIds.length) return prev;
+      const previous = prev.historyIds[prev.historyIds.length - 1]!;
+      return {
+        key: scopeKey,
+        selectedId: previous,
+        historyIds: prev.historyIds.slice(0, -1),
+        detail: null,
+        loading: true,
+        error: "",
+      };
+    });
   }
 
   function closeSheet() {
-    setSelectedId(null);
-    setHistoryIds([]);
-    setDetail(null);
-    setDetailError("");
-    setDetailLoading(false);
+    setSheetState({
+      key: scopeKey,
+      selectedId: null,
+      historyIds: [],
+      detail: null,
+      loading: false,
+      error: "",
+    });
   }
 
   function confirmWithdraw(head: TeamEntryHead) {
+    const epoch = epochRef.current;
+    const targetKey = scopeKey;
+    const targetTeamId = team.id;
     Alert.alert("Withdraw this entry?", "Marks the entry as withdrawn on the host blackboard. It remains visible as withdrawn.", [
       { text: "Keep entry", style: "cancel" },
       {
@@ -142,17 +237,28 @@ export function TeamEvidenceSection({
         style: "destructive",
         onPress: () => {
           void (async () => {
+            if (epoch !== epochRef.current) return;
             setWithdrawing(true);
             try {
-              const result = await withdrawTeamEntry(connection, team.id, head.entryId, Crypto.randomUUID());
+              const result = await withdrawTeamEntry(connection, targetTeamId, head.entryId, Crypto.randomUUID());
+              if (epoch !== epochRef.current) return;
               const updatedHead: TeamEntryHead = { ...head, state: result.state };
-              setExtraEntries(prev => mergeMobileEntries(prev, { entries: [updatedHead] }));
-              setDetail(prev => (prev && prev.head.entryId === head.entryId ? { ...prev, head: updatedHead } : prev));
+              setExtraState(prev => ({
+                key: targetKey,
+                entries: mergeMobileEntries(prev.key === targetKey ? prev.entries : [], { entries: [updatedHead] }),
+                cursor: prev.key === targetKey ? prev.cursor : 0,
+                more: prev.key === targetKey ? prev.more : false,
+              }));
+              setSheetState(prev => (prev.key === targetKey && prev.detail?.head.entryId === head.entryId
+                ? { ...prev, detail: { ...prev.detail, head: updatedHead } }
+                : prev));
               poll.refresh();
             } catch (error) {
-              Alert.alert("Withdraw failed", error instanceof Error ? error.message : "Could not withdraw entry.");
+              if (epoch === epochRef.current) {
+                Alert.alert("Withdraw failed", error instanceof Error ? error.message : "Could not withdraw entry.");
+              }
             } finally {
-              setWithdrawing(false);
+              if (epoch === epochRef.current) setWithdrawing(false);
             }
           })();
         },
@@ -160,8 +266,8 @@ export function TeamEvidenceSection({
     ]);
   }
 
-  const detailHead = detail?.head ?? mergedEntries.find(item => item.entryId === selectedId);
-  const formatted = detail ? formatEntryBodySummary(detail.body) : null;
+  const detailHead = scopedSheet.detail?.head ?? mergedEntries.find(item => item.entryId === scopedSheet.selectedId);
+  const formatted = scopedSheet.detail ? formatEntryBodySummary(scopedSheet.detail.body) : null;
   const authorMember = detailHead?.authorMemberId
     ? team.members.find(member => member.memberId === detailHead.authorMemberId)
     : undefined;
@@ -180,15 +286,21 @@ export function TeamEvidenceSection({
       />)}
     </ScrollView>
 
+    {hasMore ? <Button
+      compact
+      secondary
+      title={loadingMore ? "Loading…" : "Load newer"}
+      disabled={loadingMore}
+      onPress={() => void loadNewerEntries()}
+    /> : null}
+
     {poll.loading && !mergedEntries.length ? <ActivityIndicator style={s.loader} color={theme.colors.forest} /> : null}
     {!poll.loading && poll.stale && !mergedEntries.length ? <Text style={t.warning}>Could not load blackboard entries.</Text> : null}
     {!poll.loading && !poll.stale && !visibleEntries.length ? <Text style={t.note}>No matching entries yet.</Text> : null}
 
     {visibleEntries.length ? <Card style={s.listCard}>
       {visibleEntries.map((entry, index) => {
-        const author = entry.authorRole
-          ? (entry.authorRole === "mission-coordinator" ? "Mission coordinator" : ROLE_NAMES[entry.authorRole] ?? entry.authorRole)
-          : entry.author;
+        const author = entryAuthorLabel(entry.author, entry.authorRole);
         return <Pressable
           key={entry.entryId}
           accessibilityRole="button"
@@ -212,16 +324,8 @@ export function TeamEvidenceSection({
       })}
     </Card> : null}
 
-    {hasMore ? <Button
-      compact
-      secondary
-      title={loadingMore ? "Loading…" : "Load older"}
-      disabled={loadingMore}
-      onPress={() => void loadOlderOrNextPage()}
-    /> : null}
-
     <Sheet
-      visible={Boolean(selectedId)}
+      visible={Boolean(scopedSheet.selectedId)}
       onClose={closeSheet}
       title={detailHead ? `seq ${detailHead.seq} · ${detailHead.kind}` : "Entry detail"}
     >
@@ -232,11 +336,11 @@ export function TeamEvidenceSection({
           {detailHead.state !== "active" ? <Chip label={detailHead.state} tone={detailHead.state === "withdrawn" ? "error" : "attention"} /> : null}
         </View> : null}
         {detailHead ? <Text style={t.note}>
-          {shortDate(detailHead.at)} · {detailHead.authorRole ?? detailHead.author}{detailHead.taskId ? ` · task ${detailHead.taskId}` : ""}
+          {shortDate(detailHead.at)} · {entryAuthorLabel(detailHead.author, detailHead.authorRole)}{detailHead.taskId ? ` · task ${detailHead.taskId}` : ""}
         </Text> : null}
 
-        {detailLoading ? <ActivityIndicator style={s.loader} color={theme.colors.forest} /> : null}
-        {detailError ? <Text style={t.error}>{detailError}</Text> : null}
+        {scopedSheet.loading ? <ActivityIndicator style={s.loader} color={theme.colors.forest} /> : null}
+        {scopedSheet.error ? <Text style={t.error}>{scopedSheet.error}</Text> : null}
 
         {formatted ? <View style={s.detailSections}>
           {formatted.summary ? <View style={s.field}><Text style={t.label}>Summary</Text><Text selectable style={t.body}>{formatted.summary}</Text></View> : null}
@@ -276,7 +380,7 @@ export function TeamEvidenceSection({
         </View> : null}
 
         <View style={s.sheetActions}>
-          {historyIds.length ? <Button compact secondary glyph="back" title="Previous entry" onPress={stepBack} /> : null}
+          {scopedSheet.historyIds.length ? <Button compact secondary glyph="back" title="Previous entry" onPress={stepBack} /> : null}
           {detailHead?.supersedes ? <Button
             compact
             secondary
@@ -320,11 +424,11 @@ const s = StyleSheet.create({
   commit: { fontFamily: theme.mono, fontSize: 11, color: theme.colors.mutedInk },
   entryTags: { flexDirection: "row", flexWrap: "wrap", gap: 6 },
   withdrawnText: { color: theme.colors.mutedInk },
-  sheetScroll: { maxHeight: 460 },
+  sheetScroll: { flexShrink: 1 },
   sheetBody: { gap: 10, paddingHorizontal: 8, paddingBottom: 12 },
   detailSections: { gap: 8 },
   field: { gap: 2 },
-  outputBox: { borderRadius: theme.radius.panel, backgroundColor: theme.colors.terminalSurface, maxHeight: 200 },
+  outputBox: { borderRadius: theme.radius.panel, backgroundColor: theme.colors.terminalSurface },
   outputContent: { padding: 10 },
   outputText: { fontFamily: theme.mono, fontSize: 11, lineHeight: 16, color: theme.colors.terminalInk },
   sheetActions: { flexDirection: "row", flexWrap: "wrap", gap: 8, paddingTop: 6 },

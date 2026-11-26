@@ -3,7 +3,7 @@ import { Button } from "../../components/Button";
 import { Card, Chip, ProgressBar } from "../../components/Glass";
 import { StatusIcon } from "../../components/Icon";
 import { theme } from "../../theme";
-import { deriveMobileOutcomeGroups, partitionMobileRoster } from "./inspector-model";
+import { deriveMobileOutcomeGroups, deriveReviewerAcceptanceClaims, partitionMobileRoster } from "./inspector-model";
 import { MEMBER_LABELS, memberKind, ROLE_NAMES, teamProgress, type TeamMember, type TeamView } from "./model";
 import { Clamp, Disclosure, Section, t } from "./parts";
 
@@ -20,6 +20,9 @@ const ACCEPTANCE_LABELS: Record<"verified" | "not-verified" | "inconclusive", st
   inconclusive: "Inconclusive",
 };
 
+const isFailedOrStopped = (member: TeamMember) =>
+  member.status === "stopped" || member.status === "unavailable" || Boolean(member.stoppedReason) || Boolean(member.stalledAt);
+
 export function TeamOverviewGroups({
   team,
   onSelectMember,
@@ -28,11 +31,11 @@ export function TeamOverviewGroups({
   onSelectMember: (member: TeamMember) => void;
 }) {
   const groups = deriveMobileOutcomeGroups(team);
+  const reviewerClaims = deriveReviewerAcceptanceClaims(team);
   const { active, finished } = partitionMobileRoster(team.members, team.revision);
   const memberById = new Map(team.members.map(member => [member.memberId, member]));
   const taskById = new Map(team.tasks.map(task => [task.id, task]));
   const progress = teamProgress(team);
-  const reviewerAcceptance = team.review?.acceptance ?? [];
 
   return <>
     <Section title="Outcome groups" count={groups.length || undefined}>
@@ -45,15 +48,11 @@ export function TeamOverviewGroups({
           </View>
           <Clamp text={group.statement} lines={3} />
           <Text style={t.note}>{group.integrationSummary}</Text>
-          {group.provisionalAssessment || group.reviewerClaim ? <View style={s.chips}>
-            {group.provisionalAssessment ? <Chip
+          {group.provisionalAssessment ? <View style={s.chips}>
+            <Chip
               label={`${group.provisionalAssessment.label} · ${ASSESSMENT_LABELS[group.provisionalAssessment.state]}`}
               tone={group.provisionalAssessment.state === "not-met" ? "error" : group.provisionalAssessment.state === "pending-owner" || group.provisionalAssessment.state === "inconclusive" ? "attention" : undefined}
-            /> : null}
-            {group.reviewerClaim ? <Chip
-              label={`${group.reviewerClaim.label} · ${ACCEPTANCE_LABELS[group.reviewerClaim.verdict]} · rev ${group.reviewerClaim.revision}`}
-              tone={group.reviewerClaim.verdict === "not-verified" ? "error" : group.reviewerClaim.verdict === "inconclusive" ? "attention" : undefined}
-            /> : null}
+            />
           </View> : null}
         </View>)}
       </Card> : <Card style={s.card}>
@@ -62,16 +61,25 @@ export function TeamOverviewGroups({
           <Text style={t.strong}>{progress.done} of {progress.total} tasks integrated</Text>
         </View>
         <Text style={t.note}>No pinned goal criteria for this run.</Text>
-        {reviewerAcceptance.length ? <View style={s.claims}>
-          <Text style={t.label}>Reviewer claim (rev {team.review?.revision})</Text>
-          {reviewerAcceptance.map(item => <View key={item.criterion} style={s.claimItem}>
-            <Text style={t.note}>Criterion {item.criterion} · {ACCEPTANCE_LABELS[item.verdict]}</Text>
-            {team.brief?.acceptance[item.criterion - 1] ? <Text style={t.body}>{team.brief.acceptance[item.criterion - 1]}</Text> : null}
-            <Text style={t.note}>{item.evidence}</Text>
-          </View>)}
-        </View> : null}
       </Card>}
     </Section>
+
+    {reviewerClaims.length ? <Section title="Reviewer claims" count={reviewerClaims.length}>
+      <Card style={s.card}>
+        <Text style={t.note}>Reviewer claim · rev {reviewerClaims[0]!.revision}</Text>
+        {reviewerClaims.map((item, index) => <View key={item.criterion} style={[s.claimItem, index > 0 && s.rowRule]}>
+          <View style={s.rowHead}>
+            <Text style={t.strong}>Acceptance #{item.criterion}</Text>
+            <Chip
+              label={`Reviewer claim · ${ACCEPTANCE_LABELS[item.verdict]}`}
+              tone={item.verdict === "not-verified" ? "error" : item.verdict === "inconclusive" ? "attention" : undefined}
+            />
+          </View>
+          {item.statement ? <Text style={t.body}>{item.statement}</Text> : null}
+          <Text style={t.note}>{item.evidence}</Text>
+        </View>)}
+      </Card>
+    </Section> : null}
 
     <Section title="Compact roster" count={active.length}>
       {active.length ? <Card style={s.rosterCard}>
@@ -99,7 +107,6 @@ export function TeamOverviewGroups({
         {finished.map(({ member, replacedByMemberId }) => {
           const replacement = replacedByMemberId ? memberById.get(replacedByMemberId) : undefined;
           const taskTitle = member.taskId ? taskById.get(member.taskId)?.title : undefined;
-          const isFailedOrStopped = member.status === "stopped" || member.status === "unavailable" || Boolean(member.stoppedReason);
           return <View key={member.memberId} style={s.finishedRow}>
             <View style={s.rowHead}>
               <StatusIcon kind={memberKind(member.status)} size={13} />
@@ -111,7 +118,7 @@ export function TeamOverviewGroups({
             {member.stoppedReason ? <Text style={t.warning} numberOfLines={2}>Stopped: {member.stoppedReason}</Text> : null}
             <View style={s.actions}>
               <Button compact secondary glyph="terminal" title="Open log" onPress={() => onSelectMember(member)} />
-              {replacement && isFailedOrStopped ? <Button
+              {replacement && isFailedOrStopped(member) ? <Button
                 compact
                 secondary
                 glyph="forward"
@@ -134,8 +141,7 @@ const s = StyleSheet.create({
   rowHead: { flexDirection: "row", alignItems: "center", gap: 8 },
   criterionId: { fontFamily: theme.mono, fontSize: 12, fontWeight: "700", color: theme.colors.secondaryInk },
   chips: { flexDirection: "row", flexWrap: "wrap", gap: 6 },
-  claims: { gap: 6, paddingTop: 4 },
-  claimItem: { gap: 2, paddingTop: 4, borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: theme.colors.rule },
+  claimItem: { gap: 4, paddingTop: 8 },
   rosterCard: { padding: 0, gap: 0, overflow: "hidden" },
   rosterRow: { flexDirection: "row", alignItems: "center", gap: 10, paddingHorizontal: 12, paddingVertical: 10 },
   pressed: { backgroundColor: theme.colors.secondarySurface },

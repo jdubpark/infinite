@@ -1,5 +1,5 @@
-import type { TeamEntryAuthority, TeamEntryHead, TeamEntryKind, TeamEntryPage } from "../../api/client";
-import type { TeamAcceptanceEvidence, TeamMember, TeamTask, TeamView } from "./model";
+import type { TeamEntryAuthorKind, TeamEntryAuthority, TeamEntryHead, TeamEntryKind, TeamEntryPage } from "../../api/client";
+import { ROLE_NAMES, type TeamAcceptanceEvidence, type TeamMember, type TeamRole, type TeamTask, type TeamView } from "./model";
 
 export type MobileOutcomeGroup = {
   id: string;
@@ -16,20 +16,18 @@ export type MobileOutcomeGroup = {
     label: "Provisional";
     revision: number;
   };
-  reviewerClaim?: {
-    verdict: TeamAcceptanceEvidence["verdict"];
-    evidence: string;
-    revision: number;
-    label: "Reviewer claim";
-  };
 };
 
-export function deriveMobileOutcomeGroups(team: Pick<TeamView, "revision" | "goal" | "tasks" | "assessment" | "review">): MobileOutcomeGroup[] {
+export type ReviewerAcceptanceClaim = TeamAcceptanceEvidence & {
+  statement?: string;
+  revision: number;
+};
+
+export function deriveMobileOutcomeGroups(team: Pick<TeamView, "revision" | "goal" | "tasks" | "assessment">): MobileOutcomeGroup[] {
   const record = team.goal?.record;
   if (!record?.criteria.length) return [];
   const assessmentById = new Map((team.assessment?.criteria ?? []).map(item => [item.id, item.state]));
-  const acceptanceByNumber = new Map((team.review?.acceptance ?? []).map(item => [item.criterion, item]));
-  return record.criteria.map((criterion, index) => {
+  return record.criteria.map(criterion => {
     const statement = criterion.id === "c0"
       ? (team.goal?.successCriteria?.trim() || criterion.statement)
       : criterion.statement;
@@ -42,7 +40,6 @@ export function deriveMobileOutcomeGroups(team: Pick<TeamView, "revision" | "goa
     const done = tasks.filter(task => task.status === "integrated").length;
     const total = tasks.length;
     const assessed = assessmentById.get(criterion.id);
-    const claim = acceptanceByNumber.get(index + 1);
     return {
       id: criterion.id,
       statement,
@@ -60,14 +57,19 @@ export function deriveMobileOutcomeGroups(team: Pick<TeamView, "revision" | "goa
           revision: team.assessment.revision,
         },
       } : {}),
-      ...(claim && team.review ? {
-        reviewerClaim: {
-          verdict: claim.verdict,
-          evidence: claim.evidence,
-          revision: team.review.revision,
-          label: "Reviewer claim" as const,
-        },
-      } : {}),
+    };
+  });
+}
+
+export function deriveReviewerAcceptanceClaims(team: Pick<TeamView, "brief" | "review">): ReviewerAcceptanceClaim[] {
+  if (!team.review?.acceptance?.length) return [];
+  const revision = team.review.revision;
+  return team.review.acceptance.map(item => {
+    const statement = team.brief?.acceptance[item.criterion - 1];
+    return {
+      ...item,
+      ...(statement ? { statement } : {}),
+      revision,
     };
   });
 }
@@ -154,6 +156,12 @@ export function authorityLabel(authority: TeamEntryAuthority): string {
   }
 }
 
+export function entryAuthorLabel(author: TeamEntryAuthorKind, authorRole?: TeamRole | "mission-coordinator"): string {
+  if (authorRole === "mission-coordinator") return "Mission coordinator";
+  if (authorRole) return ROLE_NAMES[authorRole] ?? authorRole;
+  return author;
+}
+
 export type FormattedEntryBody = {
   headCommit?: string;
   commit?: string;
@@ -208,7 +216,7 @@ export function formatEntryBodySummary(body: unknown): FormattedEntryBody {
   const round = typeof rawRound === "number" ? rawRound : undefined;
   const verdict = asString(pickField(body, nested, "verdict"));
   const summary = asString(pickField(body, nested, "summary"))
-    ?? asString(pickField(body, nested, "text"))
+    ?? (body.source === "answer" ? undefined : asString(pickField(body, nested, "text")))
     ?? asString(pickField(body, nested, "reason"))
     ?? asString(body.change);
   const output = typeof body.output === "string" ? body.output : undefined;

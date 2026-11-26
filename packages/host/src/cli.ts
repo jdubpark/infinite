@@ -248,7 +248,7 @@ async function attach(manager: Manager, sessionId: string) {
     try {
       while (queued.length > 0 && !inputFailed) {
         const chunk = queued[0]!;
-        await workerCall(manager.config.runDir, sessionId, {
+        await workerCall(manager.socketTarget, sessionId, {
           op: "raw",
           text: chunk.toString("utf8"),
           requestId: randomUUID(),

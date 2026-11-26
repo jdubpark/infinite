@@ -229,7 +229,8 @@ test("GoalService.idle waits for all multi-goal tick workers even when a failed 
   }
 });
 
-test("RoutineService ticks and mutates independent routines concurrently and drains on close", async () => {
+test("RoutineService ticks and mutates independent routines concurrently and drains on close", async t => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
   const root = realpathSync(mkdtempSync(join(tmpdir(), "routine-conc-")));
   const stateDir = join(root, "state");
   mkdirSync(stateDir, { recursive: true });
@@ -279,7 +280,7 @@ test("RoutineService ticks and mutates independent routines concurrently and dra
   try {
     const rA = await routines.create(makeRoutine("Routine A", "demo-a"));
     const rB = await routines.create(makeRoutine("Routine B", "demo-b"));
-    await new Promise(resolve => setTimeout(resolve, 20));
+    t.mock.timers.tick(20);
 
     const ticking = routines.tick();
     await new Promise(resolve => setTimeout(resolve, 20));
@@ -302,7 +303,7 @@ test("RoutineService ticks and mutates independent routines concurrently and dra
     assert.deepEqual(launched, ["Routine B", "Routine A"]);
 
     const rC = await routines.create(makeRoutine("Routine C", "demo-c"));
-    await new Promise(resolve => setTimeout(resolve, 20));
+    t.mock.timers.tick(20);
     holdClose = true;
     const closeTick = routines.tick();
     await new Promise(resolve => setTimeout(resolve, 15));
@@ -372,6 +373,7 @@ test("MissionService steps independent missions concurrently, serializes same-mi
   } as unknown as Manager;
   const fakeTeams = {
     useMissionReservations() {},
+    useMissionReviews() {},
     ensureMissionCapacityCeiling() { return undefined; },
     isActiveRun() { return false; },
     activeForProject() { return false; },
@@ -516,7 +518,8 @@ test("TeamService isolates per-run queues, serializes same-run actions, and drai
   }
 });
 
-test("RoutineService same-project race defers losing routine cleanly and preserves pending wakes", async () => {
+test("RoutineService same-project race defers losing routine cleanly and preserves pending wakes", async t => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
   const root = realpathSync(mkdtempSync(join(tmpdir(), "routine-project-race-")));
   const stateDir = join(root, "state");
   mkdirSync(stateDir, { recursive: true });
@@ -580,7 +583,7 @@ test("RoutineService same-project race defers losing routine cleanly and preserv
       summary: "Urgent check", detail: {}, at: new Date().toISOString(),
     };
     signalsList.push(wakeSignal);
-    await new Promise(resolve => setTimeout(resolve, 35));
+    t.mock.timers.tick(35);
 
     const ticking = routines.tick();
     await startEntered.promise;
@@ -604,7 +607,7 @@ test("RoutineService same-project race defers losing routine cleanly and preserv
       summary: "Retry signal", detail: {}, at: new Date().toISOString(),
     };
     signalsList.push(secondWake);
-    await new Promise(resolve => setTimeout(resolve, 35));
+    t.mock.timers.tick(35);
     projectBusy = false;
     forceConflictOnNext = true;
     await routines.tick();
@@ -772,6 +775,7 @@ test("HaltService.engage drains held Goal, Routine, and Mission creates and clos
     get: () => { throw new TeamError(404, "team-not-found", "missing"); },
     useGoalRecords() {},
     useMissionReservations() {},
+    useMissionReviews() {},
     ensureMissionCapacityCeiling() { return undefined; },
     isActiveRun() { return false; },
     activeForProject() { return false; },
@@ -876,6 +880,7 @@ test("MissionService.pendingProjectIds covers default checkouts of un-overridden
 
   const fakeTeams = {
     useMissionReservations() {},
+    useMissionReviews() {},
     ensureMissionCapacityCeiling() { return undefined; },
     isActiveRun() { return false; },
     activeForProject() { return false; },

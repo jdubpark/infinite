@@ -493,7 +493,7 @@ test("MissionService loads legacy settled follow-ups without synthesizing settle
   };
   writeSealed(join(stateDir, "missions", `${missionId}.sealed`), key, `mission:${missionId}`, stored);
   const config = { stateDir } as unknown as Config;
-  const service = new MissionService(config, key, {} as never, { useMissionReservations() {} } as never, {} as never);
+  const service = new MissionService(config, key, {} as never, { useMissionReservations() {}, useMissionReviews() {} } as never, {} as never);
   let reloadedService: MissionService | undefined;
   try {
     const loaded = service.peek(missionId);
@@ -507,7 +507,7 @@ test("MissionService loads legacy settled follow-ups without synthesizing settle
     await service.cancel(missionId, { requestId: UUID2, revision: 1 });
     await service.close();
 
-    reloadedService = new MissionService(config, key, {} as never, { useMissionReservations() {} } as never, {} as never);
+    reloadedService = new MissionService(config, key, {} as never, { useMissionReservations() {}, useMissionReviews() {} } as never, {} as never);
     const persisted = reloadedService.peek(missionId);
     assert.ok(persisted);
     assert.equal(persisted.status, "cancelled");

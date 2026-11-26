@@ -24,6 +24,7 @@ export type Session = {
   capabilities?: { terminalSnapshot?: 1; inputControl?: 1 };
   control?: ControlLease | null;
   runtime?: { id: string; location: string; transport: "pty" | "cmux" };
+  terminalSize?: { cols: number; rows: number };
   execution?: { location: "laptop" | "cloud"; state: "connecting" | "online" | "offline" | "preparing" | "paused"; cloudReady: boolean; checkpoint?: { id: string; capturedAt: string }; reason?: string; reconciliation?: "available" };
   attention?: Attention;
   usage?: UsageTotals;

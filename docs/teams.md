@@ -2980,7 +2980,13 @@ run. A refused request leaves the operation in place, and the next request
 looks again. A run paused during such a command accepts its first Resume after
 the command ended. A mission's release of a run whose command may still run is
 answered `team-operation-running`; the mission keeps its halt and retries, and
-a retry within 30 seconds reuses the last look.
+a retry within 30 seconds reuses the last look. A goal's or a mission's Resume
+or steer of such a run is answered `team-command-running`. The goal or mission
+keeps the request and retries it, with the same 30-second reuse. The goal's
+reason, or one event of the mission for each answer it gets, says that the
+request waits for the run's stopped command. While the look cannot tell, that
+answer names the owner's statement for the run; while the look sees the
+command's processes, the host refuses the statement.
 
 The look supports no prefix, or a `sudo` prefix whose launcher has the
 `process-census` wrapper beside it. Under any other prefix, the instance

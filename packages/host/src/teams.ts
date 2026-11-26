@@ -356,7 +356,8 @@ export class TeamService {
           stored.halt = "cancel";
           this.event(stored, "The host restarted with an unresolved operation from a cancelled team. The intent remains retained and will not be replayed.");
         } else if (stopFenced(stored)) {
-          run.status = "blocked"; stored.halt = "block";
+          run.status = "blocked";
+          stored.halt = "block";
           this.event(stored, "The host restarted while a configured command it had stopped may still run. The run keeps its reason and its record of that operation's processes.");
         } else if (obsoletePermissionResult(stored, pending)) {
           stored.pending = undefined;
@@ -1174,9 +1175,9 @@ export class TeamService {
     stored.receipts[requestId] = fingerprint;
     stored.ownerHalt = undefined;
   }
-  steer(id: string, input: Mutation, source?: SteeringSource) {
+  steer(id: string, input: Mutation, source?: SteeringSource, censusReuseMs = 0) {
     const body = { ...teamMutationSchema.parse(input), ...(source === undefined ? {} : { source }) };
-    return this.fence.take(id).then(taken => this.enqueue(id, async () => {
+    return this.fence.recent(id, censusReuseMs).then(taken => this.enqueue(id, async () => {
       const stored = this.record(id);
       if (this.replay(stored, "steer", body)) return this.view(stored);
       if (stored.deliveryAttempt || stored.run.deliveryReceipt) throw new TeamError(409, "delivery-reconciliation-required", "Inspect the recorded pull request before starting another run; steering cannot replay a started delivery.");
@@ -1413,7 +1414,7 @@ export class TeamService {
     if (left.length) stored.unfencedAnswers = left; else delete stored.unfencedAnswers;
   }
   pause(id: string, input: Action, source?: ConnectorSource) { return this.action(id, "pause", { ...teamActionSchema.parse(input), ...(source ? { source } : {}) }); }
-  resume(id: string, input: Action, source?: ConnectorSource) { const body = { ...teamActionSchema.parse(input), ...(source ? { source } : {}) }; return this.confirmed(id).then(() => this.fence.take(id)).then(taken => this.action(id, "resume", body, taken)); }
+  resume(id: string, input: Action, source?: ConnectorSource, censusReuseMs = 0) { const body = { ...teamActionSchema.parse(input), ...(source ? { source } : {}) }; return this.confirmed(id).then(() => this.fence.recent(id, censusReuseMs)).then(taken => this.action(id, "resume", body, taken)); }
   cancel(id: string, input: Action, source?: ConnectorSource) { return this.action(id, "cancel", { ...teamActionSchema.parse(input), ...(source ? { source } : {}) }); }
   processesEnded(id: string, input: TeamProcessesEnded) {
     const body = teamProcessesEndedSchema.parse(input), fingerprint = receiptDigest({ operation: "processes-ended", ...body });

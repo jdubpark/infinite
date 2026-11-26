@@ -173,3 +173,23 @@ test("parseClientArgs supports --board on team watch and rejects invalid combina
   assert.throws(() => parseClientArgs(["team", "watch", team.id, "--board", "--json"]), /either --board or --json/);
   assert.throws(() => parseClientArgs(["list", "--board"]), /--board applies to infinite team watch/);
 });
+
+test("teamBoardText renders WAIT REASONS and annotates stalled and spinner-only roster members", () => {
+  const waitingTeam = {
+    ...team,
+    members: [
+      { memberId: "m-spin", sessionId: "s-1", role: "implementer", revision: 2, status: "running", taskId: "t1", spinnerOnlySince: "2026-11-26T01:02:00.000Z" },
+      { memberId: "m-stall", sessionId: "s-2", role: "integrator", revision: 2, status: "running", taskId: "t2", stalledAt: "2026-11-26T01:04:00.000Z" },
+    ],
+    waitReasons: [
+      { kind: "spinner-only", memberId: "m-spin", summary: "Spinner redraws without screen changes." },
+      { kind: "worker-slot", taskId: "t3", summary: "Waiting for worker slot (2/2)." },
+    ],
+  };
+  const rendered = teamBoardText(waitingTeam, entries, createTeamBoardState(), null, "12:00:00", true, 100);
+  assert.match(rendered, /WAIT REASONS \(2\)/);
+  assert.match(rendered, /\[spinner-only\] Spinner redraws without screen changes\./);
+  assert.match(rendered, /\[worker-slot\] Waiting for worker slot \(2\/2\)\./);
+  assert.match(rendered, /Implementer running\(t1\) \[spinner-only\]/);
+  assert.match(rendered, /Integrator running\(t2\) \[stalled\]/);
+});

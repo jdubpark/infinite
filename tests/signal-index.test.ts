@@ -968,3 +968,25 @@ test("real worker writes segmented signals and state, survives poisoned output o
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("an automatic checkpoint inside one appendAll batch records that event's own journal size", () => {
+  const root = mkdtempSync("/tmp/inf-sigidx-batch-");
+  const key = randomBytes(32);
+  try {
+    let index: SignalIndex | undefined;
+    const events = join(root, "events");
+    const journal = new Journal(events, key, "s1", { onAppend: (event, meta) => index?.observe(event, meta) });
+    index = new SignalIndex(root, key, "s1", 0);
+    for (let i = 0; i < 99; i++) journal.append("output", { text: "x" });
+    journal.append("signal", { kind: "s" } as never);
+    for (let i = 0; i < 255; i++) journal.append("output", { text: "x" });
+    journal.appendAll("output", Array.from({ length: 10 }, () => ({ text: "y" })));
+    assert.equal(journal.seq, 365);
+    const state = readSignalIndexState(join(root, SIGNAL_INDEX_STATE_FILE), key, "s1");
+    assert.ok(state && !("disabled" in state));
+    const tip = probeJournalTip(events, state as never);
+    assert.equal(tip.kind === "error" ? -1 : tip.seq, 365);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

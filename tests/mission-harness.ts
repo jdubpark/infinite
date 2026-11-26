@@ -10,14 +10,14 @@ import { TeamError, TeamService } from "../packages/host/src/teams.js";
 import { MissionService, type ProjectGroupLookup } from "../packages/host/src/missions.js";
 import type { Config } from "../packages/host/src/types.js";
 import type { CreateTeam, NativeContinuation, TeamAssignment, TeamLineup, TeamView } from "../packages/host/src/team-types.js";
-import type { CreateMission, MissionReport } from "../packages/host/src/mission-types.js";
+import type { CreateMission, MissionLineup, MissionReport } from "../packages/host/src/mission-types.js";
 import type { MissionMessage } from "../packages/host/src/team-prompts.js";
 import type { MissionReviewDestination } from "../packages/host/src/mission-review.js";
 import { emptyRollup, type UsageRollup } from "../packages/host/src/team-usage.js";
 import { applySignal, initialAttention, screenDecision, type Attention, type Signal, type SignalEvent } from "@infinite/attention";
 
 export const git = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
-export const lineup: TeamLineup = {
+export const lineup: MissionLineup = {
   coordinator: { id: "coordinator", label: "Coordinator", provider: "claude", model: "claude-opus-5-5", effort: "xhigh", tier: "strong" },
   implementers: [{ id: "light", label: "Light worker", provider: "codex", model: "gpt-6-luna", effort: "high", tier: "light" }],
   integrator: { id: "integrator", label: "Integrator", provider: "claude", model: "claude-opus-5-5", effort: "high", tier: "strong" },

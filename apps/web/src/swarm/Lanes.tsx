@@ -15,7 +15,7 @@ export function stateWords(state: Agent["state"]): string {
 
 export function agentTitle(agent: Agent): string {
   return [ROLE_NAME[agent.role], stateWords(agent.state), agent.tool ? `tool ${agent.tool}` : "", agent.earlier ? "earlier revision" : "",
-    agent.limited ? "provider limit" : "", agent.stalled ? "stalled" : ""].filter(Boolean).join(", ");
+    agent.limited ? "provider limit" : "", agent.stalled ? "stalled" : "", agent.spinnerOnly ? "spinner-only" : ""].filter(Boolean).join(", ");
 }
 
 const HOLD_ICON = { input: CircleHelp, paused: Pause, blocked: OctagonAlert } as const;
@@ -76,7 +76,16 @@ function UnitLabel({ unit, own, model, selection, onSelect, openTeam }: Pick<Vie
       title={unit.title} onClick={() => onSelect({ kind: "unit", id: unit.id })} onDoubleClick={() => openTeam(unit.id)}>
       {deps.length > 0 && <span className="sw-dep" title={`after ${deps.join(", ")}`}>↳ </span>}{own ? unit.projectId : unit.title}
     </button>
-    <span className="sw-unit-sub sw-dim">{own ? "" : `${unit.projectId} `}r{unit.revision}{unit.goalCycle !== undefined ? ` c${unit.goalCycle}` : ""}</span>
+    <span className="sw-unit-sub-row sw-dim">
+      <span className="sw-unit-sub-meta">
+        {own ? "" : `${unit.projectId} `}r{unit.revision}{unit.goalCycle !== undefined ? ` c${unit.goalCycle}` : ""}
+      </span>
+      {unit.waitReasons.length > 0 && (
+        <span className="sw-wait-pill" title={unit.waitReasons.map(reason => reason.summary).join(" · ")}>
+          {unit.waitReasons.length === 1 ? "1 wait" : `${unit.waitReasons.length} waits`}
+        </span>
+      )}
+    </span>
   </div>;
 }
 

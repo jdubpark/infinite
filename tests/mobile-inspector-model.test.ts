@@ -10,10 +10,14 @@ import {
   entryAuthorLabel,
   filterMobileEntries,
   formatEntryBodySummary,
+  memberScreenNotices,
   mergeMobileEntries,
+  orderMobileWaitReasons,
   partitionMobileRoster,
   resolveSelectedEntryHead,
   sliceVisibleMobileEntries,
+  waitReasonLabel,
+  waitReasonTone,
 } from "../apps/mobile/src/features/teams/inspector-model.ts";
 import {
   applyMissionProgressPage,
@@ -25,7 +29,7 @@ import {
   summarizeMissionProgressChild,
 } from "../apps/mobile/src/features/board/mission-progress-model.ts";
 import type { MissionProgressPage, TeamEntryHead } from "../apps/mobile/src/api/client.ts";
-import type { TeamMember, TeamTask, TeamView } from "../apps/mobile/src/features/teams/model.ts";
+import { shortDate, type TeamMember, type TeamTask, type TeamView, type TeamWaitReason, type TeamWaitReasonKind } from "../apps/mobile/src/features/teams/model.ts";
 
 const makeTask = (id: string, status: TeamTask["status"], criteria?: string[], objectiveVersion = 3): TeamTask => ({
   id,
@@ -617,4 +621,132 @@ test("summarizeMissionProgressChild distinguishes recorded assignments, confirme
     checksTruncated: true,
   });
   assert.equal(truncatedSummary, "Implementing · recorded 2 active (2 shown, truncated) · 1 of 1 sampled worker live (1 not-sampled) · checks truncated");
+});
+
+test("waitReasonLabel and waitReasonTone map all nine wait reason kinds accurately", () => {
+  const expected: Record<TeamWaitReasonKind, { label: string; tone: "error" | "attention" | undefined }> = {
+    "owner-decision": { label: "Owner decision", tone: "attention" },
+    "provider-prompt": { label: "Provider prompt", tone: "attention" },
+    "provider-limit": { label: "Provider limit", tone: "attention" },
+    stalled: { label: "Stalled", tone: "error" },
+    "spinner-only": { label: "Spinner-only", tone: "attention" },
+    "worker-slot": { label: "Worker slot", tone: undefined },
+    dependency: { label: "Dependency", tone: undefined },
+    "integration-order": { label: "Integration order", tone: undefined },
+    "linear-sync": { label: "Linear sync", tone: undefined },
+  };
+
+  for (const kind of Object.keys(expected) as TeamWaitReasonKind[]) {
+    assert.equal(waitReasonLabel(kind), expected[kind].label);
+    assert.equal(waitReasonTone(kind), expected[kind].tone);
+  }
+});
+
+test("orderMobileWaitReasons places actionable and stall reasons ahead of scheduling waits and preserves stability", () => {
+  assert.deepEqual(orderMobileWaitReasons(undefined), []);
+  assert.deepEqual(orderMobileWaitReasons([]), []);
+
+  const input: TeamWaitReason[] = [
+    { kind: "linear-sync", summary: "Linear sync pending" },
+    { kind: "integration-order", summary: "Waiting to integrate t2", taskId: "t2" },
+    { kind: "dependency", summary: "Waiting on t1", taskId: "t2", blockedByTaskIds: ["t1"] },
+    { kind: "worker-slot", summary: "Waiting for slot 1", taskId: "t3" },
+    { kind: "provider-limit", summary: "Codex limit active", resetsAt: "2026-11-26T02:00:00.000Z" },
+    { kind: "spinner-only", summary: "Spinner-only redraws", memberId: "m-spin", since: "2026-11-26T00:10:00.000Z" },
+    { kind: "stalled", summary: "Member stalled", memberId: "m-stall", since: "2026-11-26T00:08:00.000Z" },
+    { kind: "provider-prompt", summary: "Prompt waiting", memberId: "m-prompt" },
+    { kind: "owner-decision", summary: "Decision 1", decisionId: "d1", memberId: "m-dec" },
+    { kind: "worker-slot", summary: "Waiting for slot 2", taskId: "t4" },
+  ];
+  const snapshot = input.map(item => ({ ...item }));
+  const ordered = orderMobileWaitReasons(input);
+
+  assert.deepEqual(ordered.map(item => item.kind), [
+    "owner-decision",
+    "provider-prompt",
+    "stalled",
+    "spinner-only",
+    "provider-limit",
+    "worker-slot",
+    "worker-slot",
+    "dependency",
+    "integration-order",
+    "linear-sync",
+  ]);
+  assert.deepEqual(
+    ordered.filter(item => item.kind === "worker-slot").map(item => item.summary),
+    ["Waiting for slot 1", "Waiting for slot 2"],
+  );
+  assert.deepEqual(input, snapshot);
+});
+
+test("shortDate guards empty, undefined, and invalid timestamps", () => {
+  assert.equal(shortDate(undefined), "");
+  assert.equal(shortDate(""), "");
+  assert.equal(shortDate("   "), "");
+  assert.equal(shortDate("not-a-date"), "");
+  assert.notEqual(shortDate("2026-11-26T00:12:00.000Z"), "");
+});
+
+test("spinnerOnlySince and stalledAt metadata are preserved in roster partitions and formatted into screen notices", () => {
+  const members: TeamMember[] = [
+    makeMember("m-spin", {
+      status: "running",
+      spinnerOnlySince: "2026-11-26T00:12:00.000Z",
+    }),
+    makeMember("m-stall", {
+      status: "stopped",
+      stalledAt: "2026-11-26T00:15:00.000Z",
+      stoppedReason: "No activity for 15 minutes",
+    }),
+    makeMember("m-clean", {
+      status: "running",
+    }),
+  ];
+
+  const partitioned = partitionMobileRoster(members, 2);
+  const activeSpin = partitioned.active.find(entry => entry.member.memberId === "m-spin")!.member;
+  const finishedStall = partitioned.finished.find(entry => entry.member.memberId === "m-stall")!.member;
+  assert.equal(activeSpin.spinnerOnlySince, "2026-11-26T00:12:00.000Z");
+  assert.equal(finishedStall.stalledAt, "2026-11-26T00:15:00.000Z");
+
+  assert.deepEqual(memberScreenNotices(activeSpin, iso => `fmt(${iso})`), [
+    { kind: "spinner-only", tone: "warning", text: "Spinner-only screen since fmt(2026-11-26T00:12:00.000Z)" },
+  ]);
+  assert.deepEqual(memberScreenNotices(finishedStall, iso => `fmt(${iso})`), [
+    { kind: "stalled", tone: "error", text: "Stalled since fmt(2026-11-26T00:15:00.000Z)" },
+  ]);
+
+  assert.deepEqual(
+    memberScreenNotices({ status: "running", spinnerOnlySince: "invalid-date" }),
+    [{ kind: "spinner-only", tone: "warning", text: "Spinner-only screen" }],
+  );
+  assert.deepEqual(
+    memberScreenNotices({ status: "running", stalledAt: "invalid-date" }, () => "   "),
+    [{ kind: "stalled", tone: "error", text: "Stalled" }],
+  );
+  assert.deepEqual(
+    memberScreenNotices({ status: "running", spinnerOnlySince: "2026-11-26T00:12:00.000Z" }, () => ""),
+    [{ kind: "spinner-only", tone: "warning", text: "Spinner-only screen" }],
+  );
+
+  assert.deepEqual(
+    memberScreenNotices({
+      status: "running",
+      spinnerOnlySince: "2026-11-26T00:12:00.000Z",
+      stalledAt: "2026-11-26T00:15:00.000Z",
+    }, iso => iso),
+    [
+      { kind: "stalled", tone: "error", text: "Stalled since 2026-11-26T00:15:00.000Z" },
+    ],
+  );
+  assert.deepEqual(
+    memberScreenNotices({ status: "stopped", spinnerOnlySince: "2026-11-26T00:12:00.000Z" }, iso => iso),
+    [],
+  );
+  assert.deepEqual(
+    memberScreenNotices({ status: "reported", spinnerOnlySince: "2026-11-26T00:12:00.000Z" }, iso => iso),
+    [],
+  );
+  assert.deepEqual(memberScreenNotices(members[2]!), []);
 });

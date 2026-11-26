@@ -42,8 +42,8 @@ Infinite is a TypeScript and Swift npm-workspace monorepo built around one detac
 
 ```text
 packages/
-  attention/   @infinite/attention (15 modules): pure attention reducer, terminal prompt parser,
-               hook mappers (Claude/Codex), destructive command detector, delegation gate
+  attention/   @infinite/attention (16 modules): pure attention reducer, terminal prompt parser,
+               spinner-immune screen activity, hook mappers (Claude/Codex), destructive detector, delegation gate
   remote/      @infinite/remote (13 modules): infinite-remote-v1 E2E WS cipher (HKDF + AES-GCM),
                ?since= list sync, data-only Markdown/Mermaid/diagram layouts, Understanding & Memory schemas
   host/        @infinite/host: Control API, detached PTY workers, vault/journals, encrypted SQLite
@@ -51,9 +51,9 @@ packages/
                Adaptive Routing, Replay Eval, Judge Calibration, Understanding, Usage, Laptop CLI, Relay
 apps/
   web/         @infinite/web (React + Vite): Swarm (Lanes/Wall/Graph), Decision Queue, xterm.js,
-               Sessions, Teams, Goals, Missions, Cost, Permissions, Halt, Dictation, Remote pairing
+               Sessions, Teams + Blackboard Inspector, Goals, Missions + Progress Inspector, Cost, Permissions, Halt, Dictation, Remote pairing
   mobile/      @infinite/mobile (Expo / React Native, Android-first, iOS config): Board, Sessions Brief,
-               Understand & Diagrams, Teams/Goals/Missions, Cost, Permissions, Dictation, Expo Push
+               Understand & Diagrams, Teams + Evidence Sheet, Goals, Missions + Progress Inspector, Cost, Permissions, Dictation, Expo Push
   macos/       InfiniteDesktop (SwiftUI + CryptoKit): WKWebView xterm, split panes, Files & Sync,
                Understand (Knowledge + Behavior), Cost, Resources window, native cmux Noise client
 deploy/
@@ -141,9 +141,11 @@ infinite projects
 infinite board
 infinite start "Task"
 infinite mission progress MISSION_ID
+infinite mission watch MISSION_ID
 infinite team start "Task"
 infinite team status TEAM_ID
 infinite team watch TEAM_ID
+infinite team watch TEAM_ID --board
 infinite team entries TEAM_ID
 infinite team steer TEAM_ID "Note"
 infinite team answer TEAM_ID QUESTION_ID "Choice"
@@ -154,6 +156,7 @@ infinite halt
 infinite fuse
 infinite cost
 infinite usage
+infinite usage repairs
 infinite understand check --file def.json
 ```
 
@@ -161,7 +164,7 @@ Additional CLI command families cover goals (`infinite goal`), autonomy (`infini
 
 ### Browser (`apps/web`)
 
-Opens on the read-only Swarm view (`#/swarm` Lanes, `#/swarm/wall` Tiles, `#/swarm/graph` Code Context Graph using Graphify code maps). Includes the Decision Queue (`#/decisions`, oldest-first prompts and decisions with keyboard selection), Sessions (Chat, Screen, full xterm.js Terminal, Project Files, Context), Teams, Goals, Missions, Cost, Permissions, Halt banner, Web Speech dictation cleanup, and paired remote machines over `@infinite/remote` encrypted WebSockets. Unsent drafts stay in tab memory and are never auto-sent on reconnect. See [Swarm view](docs/swarm.md).
+Opens on the read-only Swarm view (`#/swarm` Lanes, `#/swarm/wall` Tiles, `#/swarm/graph` Code Context Graph using Graphify code maps). Includes the Decision Queue (`#/decisions`, oldest-first prompts and decisions with keyboard selection), Sessions (Chat, Screen, full xterm.js Terminal, Project Files, Context), Teams (with blackboard evidence inspector and outcome groups), Goals, Missions (with live progress inspector), Cost, Permissions, Halt banner, Web Speech dictation cleanup, and paired remote machines over `@infinite/remote` encrypted WebSockets. Unsent drafts stay in tab memory and are never auto-sent on reconnect. See [Swarm view](docs/swarm.md).
 
 ### Native macOS App (`apps/macos`)
 
@@ -169,7 +172,7 @@ SwiftUI + CryptoKit desktop client (`npm run desktop:install`, requires macOS 14
 
 ### Phone App (`apps/mobile`)
 
-Expo / React Native client (Android-first with iOS build configuration). Always connects over `@infinite/remote` encrypted WebSockets (direct Tailscale Serve HTTPS or blind relay behind Cloudflare Access), storing keys in Android Keystore or iOS Keychain via `expo-secure-store`. Features Board, Sessions (Attention Brief, Conversation, Activity, Read-only Files, Screen plus steering), Understand (Current vs Planned vs Difference, Work Briefs, native SVG diagrams, offline metadata cache), Teams, Goals, Missions, Cost, Permissions, native speech dictation (`ExpoSpeechRecognition`), and optional minimal-body Expo push notifications.
+Expo / React Native client (Android-first with iOS build configuration). Always connects over `@infinite/remote` encrypted WebSockets (direct Tailscale Serve HTTPS or blind relay behind Cloudflare Access), storing keys in Android Keystore or iOS Keychain via `expo-secure-store`. Features Board, Sessions (Attention Brief, Conversation, Activity, Read-only Files, Screen plus steering), Understand (Current vs Planned vs Difference, Work Briefs, native SVG diagrams, offline metadata cache), Teams (with blackboard evidence sheet and outcome groups), Goals, Missions (with live progress inspector), Cost, Permissions, native speech dictation (`ExpoSpeechRecognition`), and optional minimal-body Expo push notifications.
 
 ```sh
 npm run android -w @infinite/mobile

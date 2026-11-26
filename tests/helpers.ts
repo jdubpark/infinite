@@ -10,12 +10,12 @@ import { readRecordedSocketPath, workerCall, type SocketTarget } from "../packag
 import { unseal } from "../packages/host/src/vault.js";
 import type { Config, Role, ControlLease } from "../packages/host/src/types.js";
 
-const HOST_STARTUP_TIMEOUT_MS = 20_000;
+const HOST_STARTUP_TIMEOUT_MS = 45_000;
 
 export const waitFor = async <T>(
   fn: () => Promise<T>,
   accepts: (value: T) => boolean,
-  timeout = 10_000,
+  timeout = 10000,
 ): Promise<T> => {
   const until = performance.now() + timeout;
   let last: T | undefined;
@@ -146,16 +146,10 @@ export async function endSessionWorkers(config: Config, started?: readonly numbe
   }
 }
 
-type HostOptions = { agents?: Config["agents"]; config?: Partial<Config>; env?: NodeJS.ProcessEnv };
-
-export function startHost(options: HostOptions = {}): Promise<Host> {
-  return startHostWithPort(options, 3);
-}
-
-async function startHostWithPort(options: HostOptions, attemptsLeft: number): Promise<Host> {
+export async function startHost(options: { agents?: Config["agents"]; config?: Partial<Config>; env?: NodeJS.ProcessEnv } = {}): Promise<Host> {
   const root = mkdtempSync(join(tmpdir(), "inf-"));
-  const port = await freePort();
-  const origin = `http://127.0.0.1:${port}`;
+  const initialPort = options.config?.port ?? await freePort();
+  let listenerOrigin = `http://127.0.0.1:${initialPort}`;
   const tokens: Record<Role, string> = {
     owner: randomBytes(32).toString("base64url"),
     controller: randomBytes(32).toString("base64url"),
@@ -166,8 +160,8 @@ async function startHostWithPort(options: HostOptions, attemptsLeft: number): Pr
   const keyFile = join(root, "key");
   writeFileSync(keyFile, randomBytes(32), { mode: 0o600 });
   const config: Config = {
-    port,
-    origin,
+    port: initialPort,
+    origin: listenerOrigin,
     keyFile,
     stateDir: join(root, "state"),
     runDir: join(root, "run"),
@@ -179,11 +173,21 @@ async function startHostWithPort(options: HostOptions, attemptsLeft: number): Pr
     agents: options.agents ?? { demo: demoProfile() },
     ...options.config,
   };
+  const syncConfigOrigin = options.config?.origin === undefined || options.config.origin === listenerOrigin;
   const configFile = join(root, "config.json");
   writeFileSync(configFile, JSON.stringify(config));
   let child: ChildProcess | undefined;
 
-  const fetchApi = apiClient(origin, tokens);
+  let client = apiClient(listenerOrigin, tokens);
+  const fetchApi: Host["fetchApi"] = (...args) => client(...args);
+  const bindPort = (nextPort: number) => {
+    const previousListener = listenerOrigin;
+    config.port = nextPort;
+    listenerOrigin = `http://127.0.0.1:${nextPort}`;
+    if (syncConfigOrigin || config.origin === previousListener) config.origin = listenerOrigin;
+    writeFileSync(configFile, JSON.stringify(config));
+    client = apiClient(listenerOrigin, tokens);
+  };
   const stopApi = async () => {
     const api = child;
     if (!api || api.exitCode !== null || api.signalCode !== null) return;
@@ -199,6 +203,10 @@ async function startHostWithPort(options: HostOptions, attemptsLeft: number): Pr
     });
     child = api;
     let diagnostics = "";
+    const stderrDone = new Promise<void>((resolveStderr) => {
+      api.stderr!.once("end", resolveStderr);
+      api.stderr!.once("close", resolveStderr);
+    });
     api.stderr!.on("data", (chunk) => {
       diagnostics += chunk;
     });
@@ -206,11 +214,14 @@ async function startHostWithPort(options: HostOptions, attemptsLeft: number): Pr
     const abortProbe = () => exited.abort();
     api.once("exit", abortProbe);
     const signal = AbortSignal.any([exited.signal, AbortSignal.timeout(HOST_STARTUP_TIMEOUT_MS)]);
-    const probe = apiClient(origin, tokens, signal);
+    const probe = apiClient(listenerOrigin, tokens, signal);
     try {
       await waitFor(async () => {
         const response = await probe("/me").catch(() => undefined);
-        if (api.exitCode !== null || api.signalCode !== null) throw new Error(diagnostics);
+        if (api.exitCode !== null || api.signalCode !== null) {
+          await Promise.race([stderrDone, new Promise((resolveTimeout) => setTimeout(resolveTimeout, 1000))]);
+          throw new Error(diagnostics || `Host exited before listening (${api.signalCode ?? api.exitCode})`);
+        }
         return response?.status ?? 0;
       }, status => status === 200, HOST_STARTUP_TIMEOUT_MS);
     } finally {
@@ -234,17 +245,23 @@ async function startHostWithPort(options: HostOptions, attemptsLeft: number): Pr
     }
   };
 
+  const canRebind = options.config?.port === undefined;
   try {
-    await start();
+    for (let attempt = 0; ; attempt++) {
+      try {
+        await start();
+        break;
+      } catch (error) {
+        if (!canRebind || attempt >= 4 || !/EADDRINUSE/.test(String(error))) throw error;
+        await stopApi();
+        bindPort(await freePort());
+      }
+    }
   } catch (error) {
     await stop();
-    const collision = `listen EADDRINUSE: address already in use 127.0.0.1:${port}`;
-    if (attemptsLeft > 1 && options.config?.port === undefined && error instanceof Error && error.message.includes(collision)) {
-      return startHostWithPort(options, attemptsLeft - 1);
-    }
     throw error;
   }
-  return { origin, root, config, tokens, fetchApi, start, stopApi, stop };
+  return { origin: listenerOrigin, root, config, tokens, fetchApi, start, stopApi, stop };
 }
 
 export async function claimControl(

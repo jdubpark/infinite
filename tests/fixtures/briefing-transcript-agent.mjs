@@ -1,22 +1,16 @@
 import { appendFileSync, existsSync, writeFileSync } from "node:fs";
-import { spawnSync } from "node:child_process";
-import { fileURLToPath } from "node:url";
+import { relay } from "../../packages/host/src/hook-relay.ts";
 
 const transcriptPath = process.argv[2];
 const releaseLateTranscript = process.argv[3];
 const sessionId = "briefing-transcript-fixture";
-const relayPath = fileURLToPath(new URL("../../packages/host/src/hook-relay.ts", import.meta.url));
-const tsxLoader = import.meta.resolve("tsx");
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
-function relay(event) {
-  const result = spawnSync(process.execPath, ["--import", tsxLoader, relayPath, "claude"], {
-    env: process.env,
-    input: JSON.stringify(event),
-    encoding: "utf8",
-    timeout: 10000,
-  });
-  if (result.error || result.status !== 0) throw result.error ?? new Error("Hook relay fixture failed.");
+async function sendHook(event) {
+  const url = process.env.INFINITE_HOOK_URL;
+  const token = process.env.INFINITE_HOOK_TOKEN;
+  if (!url || !token) throw new Error("Hook relay fixture missing hook environment.");
+  await relay("claude", JSON.stringify(event), { url, token, home: process.env.HOME });
 }
 
 function userRecord(index) {
@@ -42,11 +36,11 @@ for (let index = 0; index < 110; index++) history.push(userRecord(index), assist
 writeFileSync(transcriptPath, `${history.join("\n")}\n`);
 
 const base = { session_id: sessionId, transcript_path: transcriptPath };
-relay({ ...base, hook_event_name: "UserPromptSubmit", prompt: "Review the current change." });
-relay({ ...base, hook_event_name: "Stop", last_assistant_message: "The first turn has ended." });
+await sendHook({ ...base, hook_event_name: "UserPromptSubmit", prompt: "Review the current change." });
+await sendHook({ ...base, hook_event_name: "Stop", last_assistant_message: "The first turn has ended." });
 
 while (!existsSync(releaseLateTranscript)) await sleep(10);
 appendFileSync(transcriptPath, `${userRecord("later")}\n${assistantRecord("later", "FINAL_TRANSCRIPT_MARKER: new turn result")}\n`);
-relay({ ...base, hook_event_name: "SessionEnd", reason: "completed" });
+await sendHook({ ...base, hook_event_name: "SessionEnd", reason: "completed" });
 
 await new Promise(() => {});

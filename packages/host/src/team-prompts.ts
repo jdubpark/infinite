@@ -10,7 +10,7 @@ import { KNOWN_RULE_TEXTS } from "./team-rule-texts.js";
 import { TeamError } from "./team-workspace.js";
 import type { BlockerEvidence, TeamMember, TeamModelProfile, TeamProject, TeamRun, TeamScout, TeamTask, TeamPermissionRecoveryStep, TeamPermissionRecoveryView, TeamView } from "./team-types.js";
 import type { Provider } from "./types.js";
-import type { Mission } from "./mission-types.js";
+import type { Mission, MissionCoordinatorProvider } from "./mission-types.js";
 import { recommendationLine, type DecisionRecommendation, type QuestionRecommendation } from "./question-recommendation.js";
 const quote = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`;
 const profileSuffix = ". These are the host's configured model choices; they do not establish which backend actually served a turn. Do not switch models or change tool permissions.";
@@ -753,9 +753,8 @@ A repository-held message means a ready subtask cannot start because only paused
 After the report, stop. The host starts a new attempt when a subteam opens a decision, becomes blocked, or finishes, when a ready subtask's repository is held only by paused or blocked runs, when the owner answers or gives direction, or when one of your follow-ups comes due.`,
   ];
 }
-function missionReportingInstructions(provider: Provider) {
-  const tool = provider === "claude" ? "mcp__infinite_team__mission_report" : "the mission_report tool of the infinite_team MCP server";
-  return `You MUST submit exactly one structured report for this attempt by calling ${tool} with {"report": <one report object from above>}, optionally with a "note" string beside "report". Wait for its durable success receipt. If that tool is unavailable or permission is denied, stop and request user attention. Never use a shell command, direct HTTP, or another tool as a reporting workaround. After a successful report, stop work and wait; the host will stop this attempt.
+function missionReportingInstructions(_provider: MissionCoordinatorProvider) {
+  return `You MUST submit exactly one structured report for this attempt by calling mcp__infinite_team__mission_report with {"report": <one report object from above>}, optionally with a "note" string beside "report". Wait for its durable success receipt. If that tool is unavailable or permission is denied, stop and request user attention. Never use a shell command, direct HTTP, or another tool as a reporting workaround. After a successful report, stop work and wait; the host will stop this attempt.
 Use the note (up to 2,000 characters) for what the mission state does not show: decisions and their reasons, what you are waiting for, and what to check next. The host may continue in a new conversation that has only the mission state and your notes.`;
 }
 const clip = (text: string, max: number) => text.length > max ? `${text.slice(0, max - 3)}...` : text;
@@ -872,7 +871,7 @@ function boundedMissionPrompt(messages: MissionMessage[], build: (includedMessag
   if (Buffer.byteLength(prompt, "utf8") > MISSION_PROMPT_LIMIT_BYTES) throw new TeamError(409, "mission-prompt-too-large", "The mission state exceeds the coordinator prompt limit. Start a new mission with a consolidated objective.");
   return { prompt, includedMessageCount, shortened: false };
 }
-export function missionPromptWithMessageCount(mission: Mission, repos: MissionPromptRepo[], messages: MissionMessage[], attempt: number, provider: Provider, modelProfile: TeamModelProfile,
+export function missionPromptWithMessageCount(mission: Mission, repos: MissionPromptRepo[], messages: MissionMessage[], attempt: number, provider: MissionCoordinatorProvider, modelProfile: TeamModelProfile,
   context: MissionPromptContext) {
   const state = missionPromptState(mission, context);
   const recent = recentMissionMessages(messages, context.openChildDecisions);
@@ -899,7 +898,7 @@ export function missionPromptWithMessageCount(mission: Mission, repos: MissionPr
   return boundedMissionPrompt(recent, included => build(included, notes));
 }
 
-export function missionFollowUpPromptWithMessageCount(mission: Mission, repos: MissionPromptRepo[], messages: MissionMessage[], attempt: number, provider: Provider, _modelProfile: TeamModelProfile,
+export function missionFollowUpPromptWithMessageCount(mission: Mission, repos: MissionPromptRepo[], messages: MissionMessage[], attempt: number, provider: MissionCoordinatorProvider, _modelProfile: TeamModelProfile,
   context: MissionPromptContext) {
   const state = missionPromptState(mission, context);
   const recent = recentMissionMessages(messages, context.openChildDecisions);

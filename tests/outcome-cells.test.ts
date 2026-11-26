@@ -326,10 +326,19 @@ test("cost spreads use complete costs only", () => {
 
   const lookupList: CostLookup = sessionId => sessionId === "s1"
     ? { usd: 0, tokens: 1200, complete: false, listUsd: 0.85 }
-    : undefined;
+    : sessionId === "s-partial"
+      ? { usd: 0.4, tokens: 800, complete: true, listUsd: 0.4 }
+      : undefined;
   const fromLookup = only(buildCells([row({ provider: "claude", sessionId: "s1" })], query({ by: [] }), lookupList));
   assert.equal(fromLookup.spentUsd, null);
   assert.deepEqual(fromLookup.listUsd, { n: 1, median: 0.85, iqr: [0.85, 0.85] });
+
+  const partialAttempt = only(buildCells([
+    row({ provider: "opencode", sessionId: "s-partial", payload: { costCoverage: "partial" } }),
+  ], query({ by: [] }), lookupList));
+  assert.equal(partialAttempt.tokens, null);
+  assert.equal(partialAttempt.spentUsd, null);
+  assert.equal(partialAttempt.listUsd, null);
 });
 
 test("minutes, ratings, and times", () => {

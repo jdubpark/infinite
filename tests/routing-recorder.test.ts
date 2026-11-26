@@ -102,7 +102,7 @@ test("a shadow start writes one recorded row with both picks", () => withStore(s
     assert.equal(row.state, "recorded");
     assert.equal(row.memberId, null);
     assert.equal(row.policyDigest, routing.digest);
-    assert.equal(row.algorithmVersion, 1);
+    assert.equal(row.algorithmVersion, 3);
     assert.equal(row.rewardVersion, 1);
     assert.equal(row.point, "start");
     assert.equal(row.ordinal, 1);
@@ -591,10 +591,10 @@ function seedPointRows(store: EvidenceStore): void {
   });
 }
 
-test("a shadow pin of version 2 records the new points, and a version-1 pin records none", () => {
+test("a shadow pin of version 3 records the new points, and a version-1 pin records none", () => {
   withStore(store => {
     const shadow = pinRouting({ mode: "shadow", points: ["start", "escalation", "scout"] } as unknown as TeamRouting, "supervised", POINT_LINEUP);
-    assert.equal(shadow?.algorithmVersion, 2);
+    assert.equal(shadow?.algorithmVersion, 3);
     const run = pointRun(POINT_LINEUP, shadow, "run-shadow-points");
     const lines: string[] = [];
     const rec = recorder(store, lines);
@@ -608,7 +608,7 @@ test("a shadow pin of version 2 records the new points, and a version-1 pin reco
     assert.equal(escalation?.mode, "shadow");
     assert.equal(escalation?.state, "recorded");
     assert.equal(escalation?.coordinatorProfileId, "sonnet-escalation");
-    assert.equal(escalation?.algorithmVersion, 2);
+    assert.equal(escalation?.algorithmVersion, 3);
     assert.equal(escalation?.memberId, null);
     const [scout] = rowsOf(store, run.id, "scout-s");
     assert.equal(rowsOf(store, run.id, "scout-s").length, 1);
@@ -619,19 +619,19 @@ test("a shadow pin of version 2 records the new points, and a version-1 pin reco
     assert.equal(store.read(db => shadowProgress(db, "rehearsal")).decisions, 0);
 
     const before = countRows(store);
-    const v1 = pinRouting({ mode: "shadow", points: ["start"] } as unknown as TeamRouting, "supervised", POINT_LINEUP);
-    assert.equal(v1?.algorithmVersion, 1);
-    const old = pointRun(POINT_LINEUP, v1, "run-shadow-v1");
+    const startOnly = pinRouting({ mode: "shadow", points: ["start"] } as unknown as TeamRouting, "supervised", POINT_LINEUP);
+    assert.equal(startOnly?.algorithmVersion, 3);
+    const old = pointRun(POINT_LINEUP, startOnly, "run-shadow-start-only");
     const v1Rec = recorder(store, lines);
     assert.equal(v1Rec.routeEscalation(escalationInput(old, taskOf("task-v1"), "astra-xhigh", "sonnet-escalation")), undefined);
     assert.equal(v1Rec.routeScout(scoutInput(old, scoutOf("scout-v1", "astra-xhigh"))), undefined);
-    assert.equal(countRows(store), before, "a version-1 pin writes no row at a new point");
+    assert.equal(countRows(store), before, "a start-only pin writes no row at a new point");
     const older = pointRun(POINT_LINEUP, { ...shadow!, algorithmVersion: 1 }, "run-shadow-older");
     assert.equal(v1Rec.routeEscalation(escalationInput(older, taskOf("task-older"), "astra-xhigh", "sonnet-escalation")), undefined);
     assert.equal(v1Rec.routeScout(scoutInput(older, scoutOf("scout-older", "astra-xhigh"))), undefined);
     assert.equal(countRows(store), before, "a version-1 pin that lists the new points writes no row at them");
     const scoutOnly = pinRouting({ mode: "shadow", points: ["start", "scout"] } as unknown as TeamRouting, "supervised", POINT_LINEUP);
-    assert.equal(scoutOnly?.algorithmVersion, 2);
+    assert.equal(scoutOnly?.algorithmVersion, 3);
     const partial = pointRun(POINT_LINEUP, scoutOnly, "run-shadow-scout-only");
     assert.equal(v1Rec.routeEscalation(escalationInput(partial, taskOf("task-partial"), "astra-xhigh")), undefined);
     assert.equal(countRows(store), before, "an escalation the pin does not list writes no row");

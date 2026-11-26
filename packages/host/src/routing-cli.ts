@@ -112,6 +112,22 @@ export function routingStatusLines(status: RoutingStatus): string[] {
       : `Costs are tier defaults: light ${money(costs.lightUsd)}, strong ${money(costs.strongUsd)}, rescue ${money(costs.rescueUsd)}.`;
   const headroomText = status.headroom === "modelled" ? "Limit headroom is modelled." : "Limit headroom is not modelled.";
   lines.push(`${costText} ${headroomText} Intervals are 90% normal approximations. Coordinator-chosen history counts at half weight.`);
+  if (status.providers && Object.keys(status.providers).length > 0) {
+    const formatted = Object.entries(status.providers)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([provider, info]) => {
+        const name = clean(provider);
+        if (info.basis === "limited") return `${name} limited (pressure ${decimal(info.pressure)})`;
+        if (info.basis === "estimated" && info.headroom !== null) {
+          const pct = Math.round(info.headroom * 100);
+          const unit = info.unit ? `${clean(info.unit)}, ` : "";
+          const near = info.near ? ", near limit" : "";
+          return `${name} ${pct}% headroom (${unit}pressure ${decimal(info.pressure)}${near})`;
+        }
+        return `${name} unestimated`;
+      });
+    lines.push(`Provider headroom: ${formatted.join(" · ")}`);
+  }
   if (auto) lines.push("The router's applied choices count at full weight.");
   for (const entry of status.cells) {
     if (entry.cell.scope === "new-task") lines.push("New task (project level)");

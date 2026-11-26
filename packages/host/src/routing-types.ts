@@ -12,7 +12,7 @@ export type Identity = { provider: string; model: string; effort: string | null 
 export type RoutingEvidenceRow = Pick<OutcomeRow, "outcomeId" | "source" | "projectRef" | "areaRef" | "provider" | "model"
   | "effort" | "profileEpoch" | "kind" | "featureVersion" | "disposition" | "exclusion" | "flags" | "integrated" | "accepted"
   | "firstPass" | "held" | "endedAt" | "frozenAt">
-  & { point: "start" | "escalation"; featureMapRef: string | null; ownerScore: number | null; listUsd: number | null; promptVersion: string | null };
+  & { point: RoutingPoint; featureMapRef: string | null; ownerScore: number | null; listUsd: number | null; promptVersion: string | null };
 export type RuleRemoval = "contributor" | "reviewer-model" | "limited";
 export type CostBasis = "tier-default" | "observed";
 export type CostsBasis = "tier-default" | "observed" | "mixed";

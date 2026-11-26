@@ -1,27 +1,61 @@
+import { epochAt } from "./configuration-store.js";
 import type { EvidenceStore } from "./evidence/store.js";
 import type { EvidenceDb, EvidenceTx } from "./evidence/types.js";
+import { selectScoutEvidence } from "./outcome-store.js";
 import {
-  DECISION_BUDGET_MS, evaluateImplementer, frameOf, REQUIRED_MODULES, type AutoDecision, type AutoFailure, type Evaluated, type RouterStart,
+  DECISION_BUDGET_MS, evaluateImplementer, frameOf, identityOf, REQUIRED_MODULES, type AutoDecision, type AutoFailure, type Evaluated, type RouterStart,
 } from "./routing-auto.js";
-import { chooseScout, RESCUE_USD, screenEscalations, screenScouts, TIER_COSTS } from "./routing-choice.js";
-import { CHOSEN_WEIGHT } from "./routing-posterior.js";
+import { chooseScout, expectedCost, RESCUE_USD, screenEscalations, screenScouts, TIER_COSTS } from "./routing-choice.js";
+import { COST_HEADROOM_ALGORITHM_VERSION } from "./routing-policy.js";
+import { CHOSEN_WEIGHT, MAX_AGE_DAYS, observedCost, type RoutingTarget } from "./routing-posterior.js";
 import { decisionSeed } from "./routing-sample.js";
 import { escalationFallback, scoutFallback } from "./routing-rules.js";
 import { decisionKey, insertDecision, PAYLOAD_LIMIT_BYTES, readDecision, ROUTING_MODULE } from "./routing-store.js";
 import { taskFeatures, type FeatureMap } from "./task-features.js";
-import type { DecisionRow, RoutingPayload } from "./routing-types.js";
+import type { CostBasis, CostsBasis, DecisionRow, RoutingPayload } from "./routing-types.js";
 import type { TeamModelProfile, TeamRun, TeamScout } from "./team-types.js";
 import type { Provider } from "./types.js";
 
+const DAY_MS = 86_400_000;
+
 export type RouterEscalation = RouterStart & { ownProfileId: string | undefined; namedProfileId: string | undefined };
 export type RouterScout = { run: TeamRun; scout: TeamScout; featureMap: FeatureMap | undefined; limited: ReadonlySet<Provider> };
+
+function hasScoutEvidenceTables(db: EvidenceDb): boolean {
+  const rows = db.all<{ name: string }>("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('outcomes', 'configurations', 'profile_epochs')");
+  return rows.length === 3;
+}
 
 export function evaluateScout(db: EvidenceDb, input: RouterScout, keys: { taskKey: string; key: string }, now: string, auto: boolean): Evaluated | undefined {
   const { run, scout } = input;
   const { routing, lineup } = run;
   if (routing === undefined || lineup === undefined) throw new Error("A routed scout needs a routing pin and a lineup.");
   const features = taskFeatures({ role: "scout", paths: [] }, input.featureMap);
-  const choice = chooseScout(screenScouts(lineup, routing.knobs, input.limited));
+  const screened = screenScouts(lineup, routing.knobs, input.limited);
+  const projectRef = db.index("project", run.projectId);
+  const areaRef = db.index("area", features.area);
+  const featureMapRef = db.index("feature-map", features.featureMap);
+  const useObserved = routing.algorithmVersion >= COST_HEADROOM_ALGORITHM_VERSION && hasScoutEvidenceTables(db);
+  let costs: Map<string, { costUsd: number; basis?: CostBasis }> | undefined;
+  let costsBasis: CostsBasis = "tier-default";
+  if (useObserved) {
+    const since = new Date(Date.parse(now) - MAX_AGE_DAYS * DAY_MS).toISOString();
+    const target: RoutingTarget = { projectRef, areaRef, kind: features.kind, featureVersion: features.featureVersion, featureMapRef, point: "scout" };
+    costs = new Map<string, { costUsd: number; basis?: CostBasis }>();
+    let observedCount = 0;
+    let defaultCount = 0;
+    for (const item of screened) {
+      if ((item.removed !== undefined && item.removed !== "limited") || costs.has(item.identity)) continue;
+      const epoch = epochAt(db, item.identity, now);
+      const rows = selectScoutEvidence(db, identityOf(item.profile), since);
+      const found = expectedCost(item.profile, observedCost(rows, target, epoch, now).listUsd);
+      if (found.basis === "observed") observedCount++;
+      else defaultCount++;
+      costs.set(item.identity, found);
+    }
+    costsBasis = observedCount === 0 ? "tier-default" : defaultCount === 0 ? "observed" : "mixed";
+  }
+  const choice = chooseScout(screened, costs);
   if (choice === undefined) return undefined;
   const chosen = choice.candidates.find(candidate => candidate.profileId === choice.chosen)!;
   const row: DecisionRow = {
@@ -31,13 +65,13 @@ export function evaluateScout(db: EvidenceDb, input: RouterScout, keys: { taskKe
     taskKey: keys.taskKey,
     point: "scout",
     ordinal: 1,
-    projectRef: db.index("project", run.projectId),
+    projectRef,
     role: "scout",
-    areaRef: db.index("area", features.area),
+    areaRef,
     kind: features.kind,
     risk: features.risk,
     featureVersion: features.featureVersion,
-    featureMapRef: db.index("feature-map", features.featureMap),
+    featureMapRef,
     mode: auto ? "auto" : "shadow",
     algorithmVersion: routing.algorithmVersion,
     rewardVersion: routing.rewardVersion,
@@ -60,7 +94,7 @@ export function evaluateScout(db: EvidenceDb, input: RouterScout, keys: { taskKe
     featureMap: features.featureMap,
     coordinatorProfileId: row.coordinatorProfileId,
     knobs: routing.knobs,
-    costs: { lightUsd: TIER_COSTS.light, strongUsd: TIER_COSTS.strong, rescueUsd: RESCUE_USD, basis: "tier-default" },
+    costs: { lightUsd: TIER_COSTS.light, strongUsd: TIER_COSTS.strong, rescueUsd: RESCUE_USD, basis: costsBasis },
     headroom: "not-modelled",
     chosenWeight: CHOSEN_WEIGHT,
     current: [],

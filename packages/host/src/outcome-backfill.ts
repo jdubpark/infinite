@@ -228,7 +228,9 @@ function writeRun(store: EvidenceStore, tx: EvidenceTx, run: TeamRun, options: {
   const inserted: string[] = [];
   for (const row of result.rows) {
     if (readOutcome(tx, row.outcomeId) !== undefined) continue;
-    if (usageReady) applyOutcomeCost(tx, row, options.prices);
+    if (usageReady) {
+      try { applyOutcomeCost(tx, row, options.prices); } catch {}
+    }
     writeOutcome(tx, row);
     inserted.push(row.outcomeId);
   }

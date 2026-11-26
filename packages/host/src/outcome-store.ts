@@ -629,6 +629,13 @@ export const ROUTING_EVIDENCE_SQL = "SELECT o.outcome_id, o.source, o.project_re
   + "WHERE o.source = ? AND o.role = 'implementer' AND o.point = ? AND o.provider = ? AND o.model = ? AND o.effort IS ? "
   + "AND o.ended_at >= ? ORDER BY o.ended_at DESC, o.outcome_id DESC LIMIT ?";
 
+export const SCOUT_EVIDENCE_SQL = "SELECT o.outcome_id, o.source, o.project_ref, o.area_ref, o.provider, o.model, o.effort, "
+  + "o.profile_epoch, o.kind, o.feature_version, o.disposition, o.exclusion, o.flags, o.integrated, o.accepted, "
+  + "o.first_pass, o.held, o.ended_at, o.frozen_at, o.point, o.feature_map_ref, o.owner_score, o.list_usd, c.prompt_version "
+  + "FROM outcomes o LEFT JOIN configurations c ON c.config_id = o.config_id "
+  + "WHERE o.source = ? AND o.role = 'scout' AND o.point IS NULL AND o.provider = ? AND o.model = ? AND o.effort IS ? "
+  + "AND o.ended_at >= ? ORDER BY o.ended_at DESC, o.outcome_id DESC LIMIT ?";
+
 const ROUTING_SOURCES = ["production", "duel"] as const;
 
 export function selectRoutingEvidence(
@@ -650,6 +657,15 @@ export function selectRoutingEvidence(
       ROUTING_ROWS_PER_SOURCE,
     );
     for (const row of found) rows.push(toRoutingEvidence(row));
+  }
+  return rows.sort((a, b) => compareKeys(a.outcomeId, b.outcomeId));
+}
+
+export function selectScoutEvidence(db: EvidenceDb, identity: Identity, since: string): RoutingEvidenceRow[] {
+  const rows: RoutingEvidenceRow[] = [];
+  for (const source of ROUTING_SOURCES) {
+    const found = db.all<RoutingSql>(SCOUT_EVIDENCE_SQL, source, identity.provider, identity.model, identity.effort, since, ROUTING_ROWS_PER_SOURCE);
+    for (const row of found) rows.push({ ...toRoutingEvidence(row), point: "scout" });
   }
   return rows.sort((a, b) => compareKeys(a.outcomeId, b.outcomeId));
 }

@@ -19,11 +19,12 @@ import {
   type HeadroomUsagePoint,
 } from "../packages/host/src/routing-headroom.js";
 import { pinRouting } from "../packages/host/src/routing-policy.js";
+import { decideAutoScout } from "../packages/host/src/routing-points.js";
 import { routingStatus } from "../packages/host/src/routing-reads.js";
 import { RoutingRecorder, type RouterStart } from "../packages/host/src/routing-recorder.js";
 import { routingModule, taskDecisions } from "../packages/host/src/routing-store.js";
 import { taskFeatures } from "../packages/host/src/task-features.js";
-import type { TeamLineup, TeamModelProfile, TeamRun, TeamTask } from "../packages/host/src/team-types.js";
+import type { TeamLineup, TeamModelProfile, TeamRun, TeamScout, TeamTask } from "../packages/host/src/team-types.js";
 import type { Config, Provider } from "../packages/host/src/types.js";
 import { usageModule, writeRecord, writeSession } from "../packages/host/src/usage-store.js";
 import { writeSealed } from "../packages/host/src/vault.js";
@@ -45,6 +46,7 @@ test("ProviderLimits persists 30-day rolling limit history across restarts and l
     assert.deepEqual(legacy.history(new Date(NOW)), []);
 
     legacy.observe({ provider: "codex", limit: "usage", detectedAt: before(35 * DAY), resetsAt: after(5 * HOUR, before(35 * DAY)), sessionId: "s0", confidence: "corroborated" });
+    legacy.clear("codex", before(34 * DAY));
     legacy.observe({ provider: "codex", limit: "usage", detectedAt: before(10 * DAY), resetsAt: after(5 * HOUR, before(10 * DAY)), sessionId: "s1", confidence: "corroborated" });
     legacy.clear("codex", before(9 * DAY));
     legacy.observe({ provider: "codex", limit: "credits", detectedAt: before(4 * DAY), sessionId: "s2", confidence: "corroborated" });
@@ -440,6 +442,245 @@ test("auto start blocks exploration into a near-limit provider with basis greedy
     assert.equal(hitHeadroomGuard, true);
   } finally {
     store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("providerHeadroom keeps exactly 20% headroom outside the near-limit guard in both USD and tokens", () => {
+  const e1 = before(4 * DAY);
+  const e2 = before(2 * DAY);
+  const events: ProviderLimitEvent[] = [
+    { provider: "codex", limit: "usage", detectedAt: e1, resetsAt: after(5 * HOUR, e1), sessionId: "s1" },
+    { provider: "codex", limit: "usage", detectedAt: e2, resetsAt: after(5 * HOUR, e2), sessionId: "s2" },
+  ];
+  const exactUsd = providerHeadroom({
+    provider: "codex",
+    limited: new Set(),
+    events,
+    usage: [
+      { completedAt: before(HOUR, e1), listUsd: 100, tokens: 1000 },
+      { completedAt: before(HOUR, e2), listUsd: 100, tokens: 1000 },
+      { completedAt: before(HOUR, NOW), listUsd: 80, tokens: 800 },
+    ],
+    now: NOW,
+  });
+  assert.equal(exactUsd.basis, "estimated");
+  assert.equal(exactUsd.unit, "usd");
+  assert.equal(exactUsd.headroom, 0.2);
+  assert.equal(exactUsd.near, false);
+  assert.ok(Math.abs(exactUsd.pressure - 0.6) < 1e-12);
+
+  const justBelow = providerHeadroom({
+    provider: "codex",
+    limited: new Set(),
+    events,
+    usage: [
+      { completedAt: before(HOUR, e1), listUsd: 100, tokens: 1000 },
+      { completedAt: before(HOUR, e2), listUsd: 100, tokens: 1000 },
+      { completedAt: before(HOUR, NOW), listUsd: 80.01, tokens: 800 },
+    ],
+    now: NOW,
+  });
+  assert.equal(justBelow.near, true);
+
+  const exactTokens = providerHeadroom({
+    provider: "codex",
+    limited: new Set(),
+    events,
+    usage: [
+      { completedAt: before(HOUR, e1), listUsd: null, tokens: 100 },
+      { completedAt: before(HOUR, e2), listUsd: null, tokens: 100 },
+      { completedAt: before(HOUR, NOW), listUsd: null, tokens: 80 },
+    ],
+    now: NOW,
+  });
+  assert.equal(exactTokens.basis, "estimated");
+  assert.equal(exactTokens.unit, "tokens");
+  assert.equal(exactTokens.headroom, 0.2);
+  assert.equal(exactTokens.near, false);
+});
+
+test("readProviderHeadrooms queries only qualifying providers and never treats reportedCost as list USD", () => {
+  const dir = mkdtempSync(join(tmpdir(), "inf-headroom-filter-"));
+  const store = new EvidenceStore({ databasePath: evidenceDatabasePath(dir), vaultKey: randomBytes(32) });
+  try {
+    store.register(usageModule);
+    const e1 = before(4 * DAY);
+    const e2 = before(2 * DAY);
+    const events: ProviderLimitEvent[] = [
+      { provider: "opencode", limit: "usage", detectedAt: e1, resetsAt: after(5 * HOUR, e1), sessionId: "oc-1" },
+      { provider: "opencode", limit: "usage", detectedAt: e2, resetsAt: after(5 * HOUR, e2), sessionId: "oc-2" },
+    ];
+    store.write(tx => {
+      for (const [sid, at, tokens, reportedCost] of [
+        ["oc-1", before(HOUR, e1), 1000, 10],
+        ["oc-2", before(HOUR, e2), 1000, 10],
+        ["oc-now", before(HOUR, NOW), 850, 1],
+      ] as const) {
+        writeSession(tx, { sessionId: sid, provider: "opencode", projectId: "rehearsal", createdAt: at }, { coverage: "complete", cursor: 1, seen: 1, refused: 0, exited: true });
+        writeRecord(tx, sid, {
+          provider: "opencode",
+          providerId: "custom",
+          modelId: "unlisted-model",
+          messageId: `m-${sid}`,
+          partId: `p-${sid}`,
+          modelSource: "reported",
+          completedAt: at,
+          tokens: { input: tokens, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 },
+          reportedCost,
+        });
+      }
+      writeSession(tx, { sessionId: "cl-1", provider: "claude", projectId: "rehearsal", createdAt: before(HOUR, NOW) }, { coverage: "complete", cursor: 1, seen: 1, refused: 0, exited: true });
+      writeRecord(tx, "cl-1", {
+        provider: "claude",
+        providerId: "anthropic",
+        modelId: "unrelated-model",
+        messageId: "m-cl",
+        partId: "p-cl",
+        modelSource: "reported",
+        completedAt: before(HOUR, NOW),
+        tokens: { input: 500, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 },
+        reportedCost: 0,
+      });
+      tx.run("UPDATE usage_models SET encrypted_model='corrupt' WHERE model_ref=(SELECT model_ref FROM usage_records WHERE session_id='cl-1')");
+    });
+
+    const headrooms = store.read(db => readProviderHeadrooms(db, ["opencode", "claude"], new Set(), events, {}, NOW));
+    assert.equal(headrooms.get("claude")?.basis, "unestimated");
+    const oc = headrooms.get("opencode")!;
+    assert.equal(oc.basis, "estimated");
+    assert.equal(oc.unit, "tokens");
+    assert.ok(Math.abs(oc.headroom! - 0.15) < 1e-12);
+    assert.equal(oc.near, true);
+  } finally {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("pre-upgrade v1/v2 pins keep deterministic tier defaults and unmodelled headroom while v3 scouts use observed listUsd", () => {
+  const dir = mkdtempSync(join(tmpdir(), "inf-routing-versioning-"));
+  const store = new EvidenceStore({ databasePath: evidenceDatabasePath(dir), vaultKey: randomBytes(32) });
+  try {
+    store.register(configurationModule());
+    store.register(outcomeModule({ now: () => NOW }));
+    store.register(routingModule());
+    store.register(usageModule);
+
+    const codexLight: TeamModelProfile = { id: "codex-light", label: "Codex Light", provider: "codex", model: "gpt-light", effort: "high", tier: "light" };
+    const claudeLight: TeamModelProfile = { id: "claude-light", label: "Claude Light", provider: "claude", model: "claude-light", effort: "high", tier: "light" };
+    const claudeStrong: TeamModelProfile = { id: "claude-strong", label: "Claude Strong", provider: "claude", model: "claude-strong", effort: "high", tier: "strong" };
+    const lineup: TeamLineup = {
+      ...mixedLineup,
+      implementers: [codexLight, claudeLight, claudeStrong],
+      reviewer: { id: "rev", label: "Reviewer", provider: "claude", model: "claude-opus-rev", effort: "xhigh" },
+    };
+
+    const scoutOutcome = (id: string, profile: TeamModelProfile, listUsd: number): OutcomeRow => ({
+      ...outcomeWithCost(id, profile, "cfg-none", listUsd),
+      role: "scout",
+      disposition: "completed",
+      integrated: null,
+      accepted: null,
+      acceptance: null,
+      firstPass: null,
+      held: null,
+      frozenAt: null,
+      payload: {
+        projectId: "rehearsal",
+        taskId: "scout-x",
+        area: "(scout)",
+        featureMap: "default",
+        rounds: { run: 0, attributed: 0, unknown: 0 },
+        limitEvents: 0,
+        costCoverage: "complete",
+        listUsd,
+      },
+    });
+
+    store.write(tx => {
+      config(tx, "cfg-codex", codexLight);
+      config(tx, "cfg-claude-strong", claudeStrong);
+      for (let i = 0; i < 5; i++) {
+        writeOutcome(tx, outcomeWithCost(`imp-codex-${i}`, codexLight, "cfg-codex", 3.5));
+        writeOutcome(tx, outcomeWithCost(`imp-claude-${i}`, claudeStrong, "cfg-claude-strong", 0.1));
+        writeOutcome(tx, scoutOutcome(`sc-codex-${i}`, codexLight, 1.4));
+        writeOutcome(tx, scoutOutcome(`sc-claude-${i}`, claudeLight, 0.15));
+      }
+    });
+
+    const v3Pin = pinRouting({ mode: "auto", points: ["start", "scout"], listWeight: 1, successValueUsd: 2, headroomWeight: 1 }, "supervised", lineup, ENDED)!;
+    assert.equal(v3Pin.algorithmVersion, 3);
+    const v1Pin = { ...v3Pin, algorithmVersion: 1 };
+    const v2Pin = { ...v3Pin, algorithmVersion: 2 };
+    const rec = new RoutingRecorder({ store, now: () => NOW });
+
+    const runV1 = ({ id: "run-v1", revision: 1, projectId: "rehearsal", lineup, routing: v1Pin, tasks: [], members: [], events: [] }) as unknown as TeamRun;
+    const taskV1 = ({ id: "task-v1", title: "v1", instructions: "do it", paths: PATHS, dependsOn: [], revision: 1, status: "pending" }) as unknown as TeamTask;
+    runV1.tasks.push(taskV1);
+    rec.applyStart({ run: runV1, task: taskV1, publishHeads: false, entryTools: false, objectiveDigest: false, codeMode: false, featureMap: undefined, limited: new Set() });
+    const rowV1 = store.read(db => taskDecisions(db, "run-v1", "task-v1")).rows[0]!;
+    assert.equal(rowV1.algorithmVersion, 1);
+    assert.equal(rowV1.greedyProfileId, "codex-light");
+    assert.equal(rowV1.payload?.costs.basis, "tier-default");
+    assert.equal(rowV1.payload?.headroom, "not-modelled");
+
+    const runV3 = ({ id: "run-v3", revision: 1, projectId: "rehearsal", lineup, routing: v3Pin, tasks: [], members: [], events: [] }) as unknown as TeamRun;
+    const taskV3 = ({ id: "task-v3", title: "v3", instructions: "do it", paths: PATHS, dependsOn: [], revision: 1, status: "pending" }) as unknown as TeamTask;
+    runV3.tasks.push(taskV3);
+    rec.applyStart({ run: runV3, task: taskV3, publishHeads: false, entryTools: false, objectiveDigest: false, codeMode: false, featureMap: undefined, limited: new Set() });
+    const rowV3 = store.read(db => taskDecisions(db, "run-v3", "task-v3")).rows[0]!;
+    assert.equal(rowV3.algorithmVersion, 3);
+    assert.equal(rowV3.greedyProfileId, "claude-strong");
+    assert.equal(rowV3.payload?.costs.basis, "mixed");
+    assert.equal(rowV3.payload?.headroom, "modelled");
+
+    const scout: TeamScout = { id: "scout-1", title: "look", instructions: "look" } as unknown as TeamScout;
+    const scoutRunV2 = ({ id: "run-scout-v2", revision: 1, projectId: "rehearsal", lineup, routing: v2Pin, tasks: [], members: [], events: [] }) as unknown as TeamRun;
+    const chosenV2 = decideAutoScout(store, { run: scoutRunV2, scout, featureMap: undefined, limited: new Set() }, () => NOW, () => 0);
+    assert.equal(chosenV2?.profile.id, "codex-light");
+    const scoutRowV2 = store.read(db => taskDecisions(db, "run-scout-v2", "scout-1")).rows[0]!;
+    assert.equal(scoutRowV2.payload?.costs.basis, "tier-default");
+
+    const scoutRunV3 = ({ id: "run-scout-v3", revision: 1, projectId: "rehearsal", lineup, routing: v3Pin, tasks: [], members: [], events: [] }) as unknown as TeamRun;
+    const chosenV3 = decideAutoScout(store, { run: scoutRunV3, scout, featureMap: undefined, limited: new Set() }, () => NOW, () => 0);
+    assert.equal(chosenV3?.profile.id, "claude-light");
+    const scoutRowV3 = store.read(db => taskDecisions(db, "run-scout-v3", "scout-1")).rows[0]!;
+    assert.equal(scoutRowV3.payload?.costs.basis, "observed");
+    assert.deepEqual(scoutRowV3.payload?.candidates.map(c => [c.profileId, c.costUsd, c.costBasis]), [
+      ["codex-light", 1.4, "observed"],
+      ["claude-light", 0.15, "observed"],
+    ]);
+  } finally {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("ProviderLimits.reconcile preserves credit limits and counts repeated signals without recovery as one episode", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "inf-limit-reconcile-"));
+  const file = join(dir, "provider-limits.sealed");
+  const key = randomBytes(32);
+  try {
+    const limits = new ProviderLimits(file, key);
+    const sessions = { events: () => ({ events: [], cursor: 0, more: false }) };
+    await limits.reconcile(sessions, [
+      { id: "s-credit", provider: "codex", attention: { limit: { limit: "credits", confidence: "corroborated", since: before(2 * HOUR) } } },
+    ], new Date(NOW));
+    await limits.reconcile(sessions, [
+      { id: "s-usage-1", provider: "claude", attention: { limit: { limit: "usage", confidence: "corroborated", since: before(2 * HOUR) } } },
+    ], new Date(NOW));
+    await limits.reconcile(sessions, [
+      { id: "s-usage-1", provider: "claude", attention: { limit: { limit: "usage", confidence: "corroborated", since: before(HOUR) } } },
+    ], new Date(NOW));
+
+    const reopened = new ProviderLimits(file, key);
+    const events = reopened.history(new Date(NOW));
+    assert.deepEqual(events.map(item => [item.provider, item.limit, item.detectedAt]), [
+      ["codex", "credits", before(2 * HOUR)],
+      ["claude", "usage", before(2 * HOUR)],
+    ]);
+  } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });

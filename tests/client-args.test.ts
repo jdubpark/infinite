@@ -613,6 +613,18 @@ test("routing status and explain lines reflect observed costs, modelled headroom
   } as Partial<RoutingStatus>));
   assert.equal(mixed.at(-1), "Costs use observed list USD where available; tier defaults: light $0.40, strong $2.20, rescue $1.50. Limit headroom is modelled. Intervals are 90% normal approximations. Coordinator-chosen history counts at half weight.");
 
+  const withProviders = routingStatusLines(routingStatusFixture({
+    costs: { lightUsd: 0.4, strongUsd: 2.2, rescueUsd: 1.5, basis: "observed" },
+    headroom: "modelled",
+    providers: {
+      codex: { headroom: null, basis: "unestimated", pressure: 0, near: false },
+      claude: { headroom: 0.143, basis: "estimated", pressure: 0.714, near: true, unit: "usd" },
+      "open\x07code": { headroom: 0, basis: "limited", pressure: 1, near: true },
+    },
+    cells: [],
+  } as Partial<RoutingStatus>));
+  assert.equal(withProviders.at(-1), "Provider headroom: claude 14% headroom (usd, pressure 0.714, near limit) · codex unestimated · open code limited (pressure 1)");
+
   const withPressure = routingExplainLines(explainAnswer([explainDecision({
     payload: explainPayload([
       { profileId: "ops-light", identity: "codex/gpt/high", tier: "light", thetaMean: 0.5, thetaSd: 0.1, phiMean: 0.5, costUsd: 0.4, pressure: 0.625, greedyUtility: 0.2, sample: 0.7, sampledUtility: 0.3 },

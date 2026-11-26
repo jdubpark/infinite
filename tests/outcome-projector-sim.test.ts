@@ -10,10 +10,12 @@ import { EventOutbox, type EventProjector, type OutboxEvent } from "../packages/
 import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
 import type { EvidenceDb, RunEvent } from "../packages/host/src/evidence/types.js";
 import { outcomeProjector } from "../packages/host/src/outcome-projector.js";
+import { syncOutcomeCosts } from "../packages/host/src/outcome-cost.js";
 import { levels, rowExclusion, roundCounts, type RowState, scanGap } from "../packages/host/src/outcome-rules.js";
 import { linksOf, rowSignals } from "../packages/host/src/outcome-signals.js";
-import { OUTCOME_KINDS, outcomeModule, readSummary, runOutcomes } from "../packages/host/src/outcome-store.js";
+import { OUTCOME_KINDS, outcomeModule, readOutcome, readSummary, runOutcomes } from "../packages/host/src/outcome-store.js";
 import { runEventKey } from "../packages/host/src/run-events.js";
+import { usageModule, writeRecord, writeSession } from "../packages/host/src/usage-store.js";
 import { bump, type Counts, type Rand, rand, RunScript } from "./outcome-sim-script.js";
 
 const DEFAULT_SEEDS = 30;
@@ -411,6 +413,99 @@ test("a repair answer with no commit after a cancel settle recounts the summary'
     live.store.read(db => assert.deepEqual(readSummary(db, "run-d")!.payload.rounds, roundTotals(db, "run-d")));
   } finally {
     live?.store.close();
+    if (root !== undefined) rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("unreadable usage rows do not stall outcome projection across later runs and restarts", () => {
+  const base = "b".repeat(40), head = "c".repeat(40);
+  const prices = { "deepseek/deepseek-flash": { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 } };
+  const event = (runId: string, second: number, kind: string, parts: (string | number)[], ids: { memberId?: string; taskId?: string }, data: Row): OutboxEvent => ({
+    key: runEventKey(kind, runId, parts), runId, revision: 1, at: new Date(T0 + second * 1000).toISOString(), kind, ...ids, data: { v: 1, ...data },
+  });
+  let root: string | undefined, store: EvidenceStore | undefined;
+  const key = createHash("sha256").update("outcome-sim:corrupt-usage").digest();
+  const openStore = (path: string) => {
+    const opened = new EvidenceStore({ databasePath: path, vaultKey: Buffer.from(key) });
+    opened.register(configurationModule());
+    opened.register(outcomeModule({ now: () => DELETED_AT }));
+    opened.register(usageModule);
+    const outbox = new EventOutbox(opened);
+    outbox.registerProjector(configurationProjector());
+    outbox.registerProjector(outcomeProjector(opened, { log: () => undefined, prices }));
+    return { store: opened, outbox };
+  };
+  try {
+    root = mkdtempSync(join(tmpdir(), "infinite-outcome-corrupt-usage-"));
+    const dbPath = evidenceDatabasePath(root);
+    let active = openStore(dbPath);
+    store = active.store;
+    store.write(tx => {
+      writeSession(tx, {
+        sessionId: "sess-corrupt", provider: "opencode", projectId: "example", createdAt: new Date(T0).toISOString(),
+        team: { runId: "run-bad", memberId: "m1", taskId: "a", role: "implementer", revision: 1 },
+      }, { coverage: "complete", cursor: 1, seen: 1, refused: 0, exited: true });
+      writeRecord(tx, "sess-corrupt", {
+        provider: "opencode", providerId: "corrupt-provider", modelId: "corrupt-model", messageId: "m-bad", partId: "p-bad",
+        modelSource: "reported", completedAt: new Date(T0 + 500).toISOString(),
+        tokens: { input: 100_000, output: 50_000, reasoning: 0, cacheRead: 0, cacheWrite: 0 }, reportedCost: 0,
+      });
+      tx.run("UPDATE usage_models SET encrypted_model='corrupt-ciphertext' WHERE model_ref=(SELECT model_ref FROM usage_records WHERE session_id='sess-corrupt')");
+
+      writeSession(tx, {
+        sessionId: "sess-good", provider: "opencode", projectId: "example", createdAt: new Date(T0 + 1000).toISOString(),
+        team: { runId: "run-good", memberId: "m1", taskId: "b", role: "implementer", revision: 1 },
+      }, { coverage: "complete", cursor: 1, seen: 1, refused: 0, exited: true });
+      writeRecord(tx, "sess-good", {
+        provider: "opencode", providerId: "deepseek", modelId: "deepseek-flash", messageId: "m-good", partId: "p-good",
+        modelSource: "reported", completedAt: new Date(T0 + 1500).toISOString(),
+        tokens: { input: 1_000_000, output: 100_000, reasoning: 0, cacheRead: 0, cacheWrite: 0 }, reportedCost: 0,
+      });
+    });
+
+    const flush1 = active.outbox.flush([
+      event("run-bad", 0, "run.created", [], {}, { projectId: "example", purpose: "work" }),
+      event("run-bad", 1, "member.started", ["m1"], { memberId: "m1", taskId: "a" }, { role: "implementer", sessionId: "sess-corrupt", startedAt: new Date(T0 + 1000).toISOString(), baseCommit: base, provider: "opencode", model: "corrupt-provider/corrupt-model" }),
+      event("run-bad", 2, "task.integrated", [1, "a"], { memberId: "m1", taskId: "a" }, { commit: head, headCommit: head, baseCommit: base }),
+      event("run-good", 3, "run.created", [], {}, { projectId: "example", purpose: "work" }),
+      event("run-good", 4, "member.started", ["m1"], { memberId: "m1", taskId: "b" }, { role: "implementer", sessionId: "sess-good", startedAt: new Date(T0 + 4000).toISOString(), baseCommit: base, provider: "opencode", model: "deepseek/deepseek-flash" }),
+      event("run-good", 5, "task.integrated", [1, "b"], { memberId: "m1", taskId: "b" }, { commit: head, headCommit: head, baseCommit: base }),
+    ]);
+    assert.equal(flush1.stored, true);
+    assert.equal(flush1.refused, 0);
+
+    const beforeRestart = store.read(db => ({
+      cursor: Number(db.get<{ value: string }>("SELECT value FROM outcome_state WHERE key='last_seq'")?.value ?? "0"),
+      maxSeq: db.get<{ seq: number }>("SELECT COALESCE(MAX(seq), 0) AS seq FROM run_events")?.seq ?? 0,
+      bad: readOutcome(db, "run-bad:m1"),
+      good: readOutcome(db, "run-good:m1"),
+    }));
+    assert.equal(beforeRestart.cursor, beforeRestart.maxSeq);
+    assert.equal(beforeRestart.bad?.disposition, "integrated");
+    assert.equal(beforeRestart.bad?.payload.costCoverage, "none");
+    assert.equal(beforeRestart.bad?.payload.listUsd, undefined);
+    assert.equal(beforeRestart.good?.payload.costCoverage, "complete");
+    assert.equal(beforeRestart.good?.payload.listUsd, 1.2);
+
+    store.close();
+    active = openStore(dbPath);
+    store = active.store;
+    const afterRestart = active.outbox.flush([
+      event("run-after", 6, "run.created", [], {}, { projectId: "example", purpose: "work" }),
+      event("run-after", 7, "member.started", ["m1"], { memberId: "m1", taskId: "c" }, { role: "implementer", startedAt: new Date(T0 + 7000).toISOString(), baseCommit: base, provider: "opencode", model: "deepseek/deepseek-flash" }),
+      event("run-after", 8, "task.integrated", [1, "c"], { memberId: "m1", taskId: "c" }, { commit: head, headCommit: head, baseCommit: base }),
+    ]);
+    assert.equal(afterRestart.stored, true);
+    const afterState = store.read(db => ({
+      cursor: Number(db.get<{ value: string }>("SELECT value FROM outcome_state WHERE key='last_seq'")?.value ?? "0"),
+      maxSeq: db.get<{ seq: number }>("SELECT COALESCE(MAX(seq), 0) AS seq FROM run_events")?.seq ?? 0,
+      later: readOutcome(db, "run-after:m1"),
+    }));
+    assert.equal(afterState.cursor, afterState.maxSeq);
+    assert.equal(afterState.later?.disposition, "integrated");
+    assert.equal(syncOutcomeCosts(store, prices, { reset: true }).done, true);
+  } finally {
+    store?.close();
     if (root !== undefined) rmSync(root, { recursive: true, force: true });
   }
 });

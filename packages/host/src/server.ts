@@ -73,7 +73,7 @@ import { CellQueryRefused, type CellQuery, type CostLookup } from "./outcome-cel
 import { currentEpochs, productionRows, queryCells, queryRollup } from "./outcome-reads.js";
 import { latestAssessment, rollupMissing, type RollupTarget } from "./outcome-rollup.js";
 import { importLegacy, LegacyImportRefused } from "./outcome-import.js";
-import { sessionCostOf, syncOutcomeCosts } from "./outcome-cost.js";
+import { outcomeCostSync, sessionCostOf } from "./outcome-cost.js";
 import { legacyBatchSchema } from "./outcome-legacy.js";
 import { GoalService } from "./goals.js";
 import { RoutineService } from "./routines.js";
@@ -305,7 +305,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
     now: () => new Date().toISOString(), prices: config.usage?.prices,
   });
   backfillOutcomes();
-  const usage = new UsageService(config, key, manager, evidence); syncOutcomeCosts(evidence, config.usage?.prices);
+  const usage = new UsageService(config, key, manager, evidence); const syncCosts = outcomeCostSync(evidence, config.usage?.prices); syncCosts();
   const balances = new BalanceService(config.usage?.accounts ?? {});
   usage.useBalances(balances);
   teams.useUsage(usage);
@@ -396,7 +396,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
       const result = outbox.advance();
       if (!result.pending || result.blocked.length > 0) break;
     }
-    backfillOutcomes();
+    backfillOutcomes(); syncCosts();
   };
   let outboxTimer: NodeJS.Timeout | undefined;
   const closeEvidence = () => { baseScanner?.close(); clearInterval(evidenceSweep); clearInterval(outboxTimer); fuse.stop(); evalHost.close(); evidence.close(); };

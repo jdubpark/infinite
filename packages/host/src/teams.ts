@@ -2612,8 +2612,7 @@ export class TeamService {
       this.event(stored, `${member.title} queued in an isolated working copy.`);
     });
   }
-  private routerInput(run: TeamRun) {
-    const now = this.currentDate();
+  private routerInput(run: TeamRun, now = this.currentDate()) {
     return { publishHeads: this.publishHeadsEnabled(), entryTools: entryToolsFor(run, "implementer"), objectiveDigest: objectivePromptOf(run), codeMode: memberCodeModeExpected(this.config),
       limited: this.limits.limited(now), limitHistory: this.limits.history(now), prices: this.config.usage?.prices, featureMap: (run.handoff?.project ?? this.config.projects.find(project => project.id === run.projectId)?.team)?.features };
   }

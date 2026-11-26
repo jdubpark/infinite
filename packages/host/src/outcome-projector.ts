@@ -62,7 +62,9 @@ type Features = { area: string; kind: string | null; risk: string; featureVersio
 type Ctx = { tx: EvidenceTx; store: EvidenceStore; event: RunEvent; log: (line: string) => void; prices?: UsageConfig["prices"]; usageReady: boolean };
 
 function saveWithCost(ctx: Ctx, row: OutcomeRow): void {
-  if (ctx.usageReady && row.disposition !== "open") applyOutcomeCost(ctx.tx, row, ctx.prices);
+  if (ctx.usageReady && row.disposition !== "open") {
+    try { applyOutcomeCost(ctx.tx, row, ctx.prices); } catch {}
+  }
   saveOutcomeRow(ctx.tx, row);
 }
 

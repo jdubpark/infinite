@@ -3,7 +3,7 @@ import { join } from "node:path";
 import type { Config, Provider, SessionPurpose } from "./types.js";
 import type { Manager } from "./manager.js";
 import { writeSealed, unseal } from "./vault.js";
-import { accountOf, periodStart, priceUsage, sumUsage, type Pricing, type UsageRecord, type UsageTokens, type UsageTotals } from "./usage.js";
+import { accountOf, listPriceUsage, periodStart, priceUsage, sumUsage, type Pricing, type UsageRecord, type UsageTokens, type UsageTotals } from "./usage.js";
 import { usagePlanSchema, type AccountView, type Balance, type BriefingUsage, type Money, type TaskUsage, type UsageResolvers } from "./usage-api.js";
 import { EvidenceError } from "./evidence/types.js";
 import type { EvidenceStore } from "./evidence/store.js";
@@ -11,7 +11,7 @@ import type { EvidenceTx } from "./evidence/types.js";
 import { OUTCOMES_MODULE } from "./outcome-store.js";
 import { refreshOutcomeCostsForSessions } from "./outcome-cost.js";
 import {
-  SESSION_PURPOSES, combineCoverage, importLedger, importState, ledgerRecord, readBriefings, readRecords, readSessions, usageModule, writeBriefing, writeRecord, writeSession,
+  SESSION_PURPOSES, combineCoverage, importLedger, importState, ledgerRecord, readBriefings, readRecords, readSessions, usageModule, writeBriefing, writeRecordWithOwner, writeSession,
   type LedgerCoverage, type LedgerCoverageReason, type LedgerHeader, type LedgerState, type SealedLedger, type StoredSession,
 } from "./usage-store.js";
 
@@ -212,12 +212,32 @@ export class UsageService {
             const next: Row = { exited: closes(!page.more, journaled), lastActiveAt, cursor: page.cursor,
               seen: current.seen + seen, refused: current.refused + refused, ...(journaled ? { journaled } : {}) };
             const key = keyed(next);
-            if (key !== saved) {
+            if (key !== saved || records.length > 0) {
               const written = this.write(tx => {
                 if (!writeSession(tx, header, stateOf(next))) return false;
-                for (const record of records) writeRecord(tx, session.id, record);
+                const owners = new Set<string>([session.id]);
+                for (const record of records) {
+                  const res = writeRecordWithOwner(tx, session.id, record);
+                  if (res.status !== "kept") owners.add(res.ownerSessionId);
+                }
                 if (this.store.status().modules[OUTCOMES_MODULE] === "ready") {
-                  refreshOutcomeCostsForSessions(tx, [{ sessionId: session.id, runId: header.team?.runId, memberId: header.team?.memberId, exited: next.exited }], this.config.usage?.prices);
+                  const targets: { sessionId: string; runId?: string; memberId?: string; exited?: boolean }[] = [];
+                  for (const ownerId of owners) {
+                    if (ownerId === session.id) {
+                      targets.push({ sessionId: session.id, runId: header.team?.runId, memberId: header.team?.memberId, exited: next.exited });
+                      continue;
+                    }
+                    const meta = tx.get<{ run_id: string | null; member_id: string | null; exited: number }>(
+                      "SELECT run_id, member_id, exited FROM usage_sessions WHERE session_id=?", ownerId,
+                    );
+                    targets.push({
+                      sessionId: ownerId,
+                      ...(meta?.run_id ? { runId: meta.run_id } : {}),
+                      ...(meta?.member_id ? { memberId: meta.member_id } : {}),
+                      exited: meta?.exited === 1,
+                    });
+                  }
+                  refreshOutcomeCostsForSessions(tx, targets, this.config.usage?.prices);
                 }
                 return true;
               });
@@ -328,7 +348,7 @@ export class UsageService {
     return record.provider === "opencode" ? priceUsage(record, this.config.usage?.prices) : { cost: 0, pricing: "unknown" };
   }
   private listMoney(records: UsageRecord[]): Money {
-    return this.money(records.map(record => priceUsage(record, this.config.usage?.prices)));
+    return this.money(records.map(record => listPriceUsage(record, this.config.usage?.prices)));
   }
   private priced(records: UsageRecord[]) {
     return records.map(record => ({ ...this.price(record), tokens: record.tokens }));

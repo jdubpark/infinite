@@ -4,7 +4,7 @@ import { median } from "./outcome-cells.js";
 import type { ProviderLimitEvent } from "./provider-limits.js";
 import type { ProviderHeadroom } from "./routing-types.js";
 import type { Provider } from "./types.js";
-import { priceUsage } from "./usage.js";
+import { listPriceUsage } from "./usage.js";
 import { readRecords } from "./usage-store.js";
 
 export const SHORT_WINDOW_MS = 5 * 3_600_000;
@@ -14,6 +14,7 @@ export const LIMIT_LOOKBACK_MS = 30 * 86_400_000;
 export const MIN_LIMIT_EVENTS = 2;
 export const PRESSURE_KNEE = 0.5;
 export const NEAR_HEADROOM = 0.2;
+const MICRO_DOLLARS = 1_000_000;
 
 export type HeadroomUsagePoint = {
   completedAt: string;
@@ -21,7 +22,8 @@ export type HeadroomUsagePoint = {
   tokens: number;
 };
 
-type ParsedPoint = { at: number; listUsd: number | null; tokens: number };
+type ParsedPoint = { at: number; microUsd: number | null; tokens: number };
+type PrefixIndex = { times: number[]; microUsd: number[]; tokens: number[]; unpriced: number[] };
 
 export function limitPressure(headroom: number | null | undefined): number {
   if (headroom === null || headroom === undefined || !Number.isFinite(headroom)) return 0;
@@ -42,24 +44,60 @@ function windowClass(detectedMs: number, resetsAt?: string): "short" | "long" {
   return delta >= 0 && delta <= SHORT_RESET_MAX_MS ? "short" : "long";
 }
 
+function buildIndex(points: readonly ParsedPoint[]): PrefixIndex {
+  const sorted = [...points].sort((a, b) => a.at - b.at);
+  const count = sorted.length;
+  const times = new Array<number>(count);
+  const microUsd = new Array<number>(count + 1);
+  const tokens = new Array<number>(count + 1);
+  const unpriced = new Array<number>(count + 1);
+  microUsd[0] = 0;
+  tokens[0] = 0;
+  unpriced[0] = 0;
+  for (let i = 0; i < count; i++) {
+    const point = sorted[i]!;
+    times[i] = point.at;
+    microUsd[i + 1] = microUsd[i]! + (point.microUsd ?? 0);
+    tokens[i + 1] = tokens[i]! + point.tokens;
+    unpriced[i + 1] = unpriced[i]! + (point.microUsd === null ? 1 : 0);
+  }
+  return { times, microUsd, tokens, unpriced };
+}
+
+function upperBound(sorted: readonly number[], target: number): number {
+  let lo = 0;
+  let hi = sorted.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (sorted[mid]! <= target) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+
 function classHeadroom(
   eventTimes: readonly number[],
   windowMs: number,
-  points: readonly ParsedPoint[],
+  index: PrefixIndex,
   nowMs: number,
-): { headroom: number; unit: "usd" | "tokens" } | undefined {
+): { headroom: number; near: boolean; unit: "usd" | "tokens" } | undefined {
   if (eventTimes.length < MIN_LIMIT_EVENTS) return undefined;
-  const sliceOf = (endMs: number) => points.filter(point => point.at > endMs - windowMs && point.at <= endMs);
-  const eventSlices = eventTimes.map(sliceOf);
-  const currentSlice = sliceOf(nowMs);
-  const allPoints = [...eventSlices.flat(), ...currentSlice];
-  const useUsd = allPoints.every(point => point.listUsd !== null && Number.isFinite(point.listUsd));
-  const sumOf = (slice: readonly ParsedPoint[]) => slice.reduce((sum, point) => sum + (useUsd ? point.listUsd! : point.tokens), 0);
-  const ceiling = median(eventSlices.map(sumOf));
+  const rangeOf = (endMs: number): [number, number] => [
+    upperBound(index.times, endMs - windowMs),
+    upperBound(index.times, endMs),
+  ];
+  const eventRanges = eventTimes.map(rangeOf);
+  const currentRange = rangeOf(nowMs);
+  const useUsd = index.unpriced[currentRange[1]] === index.unpriced[currentRange[0]]
+    && eventRanges.every(([lo, hi]) => index.unpriced[hi] === index.unpriced[lo]);
+  const totals = useUsd ? index.microUsd : index.tokens;
+  const ceiling = median(eventRanges.map(([lo, hi]) => totals[hi]! - totals[lo]!));
   if (ceiling === null || ceiling <= 0) return undefined;
-  const used = sumOf(currentSlice);
-  const headroom = Math.min(1, Math.max(0, 1 - used / ceiling));
-  return { headroom, unit: useUsd ? "usd" : "tokens" };
+  const used = totals[currentRange[1]]! - totals[currentRange[0]]!;
+  const remaining = Math.max(0, ceiling - used);
+  const headroom = Math.min(1, remaining / ceiling);
+  const near = Math.round(remaining * 2) * 5 < Math.round(ceiling * 2);
+  return { headroom, near, unit: useUsd ? "usd" : "tokens" };
 }
 
 export function providerHeadroom(input: {
@@ -90,19 +128,26 @@ export function providerHeadroom(input: {
   const points: ParsedPoint[] = [];
   for (const item of input.usage) {
     const at = Date.parse(item.completedAt);
-    if (Number.isFinite(at)) points.push({ at, listUsd: item.listUsd, tokens: item.tokens });
+    if (!Number.isFinite(at)) continue;
+    const microUsd = item.listUsd !== null && Number.isFinite(item.listUsd) && item.listUsd >= 0
+      ? Math.round(item.listUsd * MICRO_DOLLARS)
+      : null;
+    points.push({ at, microUsd, tokens: item.tokens });
   }
+  const index = buildIndex(points);
   const estimates = [
-    classHeadroom(shortTimes, SHORT_WINDOW_MS, points, nowMs),
-    classHeadroom(longTimes, LONG_WINDOW_MS, points, nowMs),
+    classHeadroom(shortTimes, SHORT_WINDOW_MS, index, nowMs),
+    classHeadroom(longTimes, LONG_WINDOW_MS, index, nowMs),
   ].filter((value): value is NonNullable<typeof value> => value !== undefined);
   if (estimates.length === 0) return { headroom: null, basis: "unestimated", pressure: 0, near: false };
-  const lowest = estimates.reduce((best, item) => (item.headroom < best.headroom ? item : best));
+  const lowest = estimates.reduce((best, item) => (
+    item.headroom < best.headroom || (item.headroom === best.headroom && item.near && !best.near) ? item : best
+  ));
   return {
     headroom: lowest.headroom,
     basis: "estimated",
     pressure: limitPressure(lowest.headroom),
-    near: isNearLimit(lowest.headroom),
+    near: lowest.near,
     unit: lowest.unit,
   };
 }
@@ -155,9 +200,13 @@ export function readProviderHeadrooms(
   }
 
   const byProvider = new Map<Provider, HeadroomUsagePoint[]>();
-  const records = readRecords(db, { from: new Date(earliest).toISOString(), to: new Date(nowMs + 1).toISOString() });
+  const records = readRecords(db, {
+    providers: needUsage,
+    from: new Date(earliest).toISOString(),
+    to: new Date(nowMs + 1).toISOString(),
+  });
   for (const { record } of records) {
-    const priced = priceUsage(record, prices);
+    const priced = listPriceUsage(record, prices);
     const { input, output, reasoning, cacheRead, cacheWrite } = record.tokens;
     const list = byProvider.get(record.provider) ?? [];
     list.push({

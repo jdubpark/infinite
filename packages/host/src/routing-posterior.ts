@@ -1,10 +1,10 @@
 import { rowUse } from "./outcome-cells.js";
-import type { Beta, LevelName, LevelRecord, ProfilePosterior, RoutingEvidenceRow } from "./routing-types.js";
+import type { Beta, LevelName, LevelRecord, ProfilePosterior, RoutingEvidenceRow, RoutingPoint } from "./routing-types.js";
 
 export const HALF_LIFE_DAYS = 30, MAX_AGE_DAYS = 180, LEVEL_STRENGTH = 20, EARLIER_MASS = 10, MIN_COST_ROWS = 5;
 export const CHOSEN_WEIGHT = 0.5;
 
-export type RoutingTarget = { projectRef: string; areaRef: string; kind: string | null; featureVersion: number; featureMapRef: string; point: "start" | "escalation" };
+export type RoutingTarget = { projectRef: string; areaRef: string; kind: string | null; featureVersion: number; featureMapRef: string; point: RoutingPoint };
 export type CurrentConfig = { epoch: number; promptVersion: string };
 export type Observation = { reward?: { r: number; w: number }; rescue?: { x: 0 | 1; w: number } };
 export type ObservedCost = { listUsd: number | null; level: LevelName | "none"; rows: number };

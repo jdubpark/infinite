@@ -228,7 +228,7 @@ test("computeOutcomeCost and syncOutcomeCosts persist listUsd for complete price
       { costCoverage: "partial" },
     );
 
-    assert.equal(syncOutcomeCosts(store, PRICES), 4);
+    assert.deepEqual(syncOutcomeCosts(store, PRICES), { updated: 4, scanned: 4, done: true });
     const updated = store.read(db => ({
       metered: readOutcome(db, "run-1:m1"),
       sub: readOutcome(db, "run-2:m1"),
@@ -450,6 +450,232 @@ test("outcomeModule v4 to v5 migration backfills list_usd from complete payloads
         .map(item => [item.outcome_id, item.list_usd]),
     ));
     assert.deepEqual(migrated, { "r1:m1": 0.65, "r2:m1": null, "r3:m1": null });
+  } finally {
+    store?.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("provider-reported spend is never promoted to listUsd, and mixed-coverage multi-session attempts stay partial", () => {
+  const dir = mkdtempSync(join(tmpdir(), "inf-outcome-cost-distinction-"));
+  const key = randomBytes(32);
+  const store = new EvidenceStore({ databasePath: evidenceDatabasePath(dir), vaultKey: key });
+  try {
+    store.register(configurationModule());
+    store.register(outcomeModule({ now: () => NOW }));
+    const usage = new UsageService({ stateDir: dir, usage: { prices: PRICES, accounts: {} } } as unknown as Config, key, {} as Manager, store);
+
+    store.write(tx => {
+      writeSession(tx, {
+        sessionId: "sess-reported",
+        provider: "opencode",
+        projectId: "example",
+        createdAt: "2026-11-15T11:00:00.000Z",
+        team: { runId: "run-rep", memberId: "m1", taskId: "t-rep", role: "implementer", revision: 1 },
+      }, { coverage: "complete", cursor: 1, seen: 1, refused: 0, exited: true });
+      writeRecord(tx, "sess-reported", usageRecord({ modelId: "unlisted-model", reportedCost: 0.75 }));
+
+      writeSession(tx, {
+        sessionId: "sess-multi-a",
+        provider: "opencode",
+        projectId: "example",
+        createdAt: "2026-11-15T11:00:00.000Z",
+        team: { runId: "run-multi", memberId: "m1", taskId: "t-multi", role: "implementer", revision: 1 },
+      }, { coverage: "complete", cursor: 1, seen: 1, refused: 0, exited: true });
+      writeRecord(tx, "sess-multi-a", usageRecord({}));
+      writeSession(tx, {
+        sessionId: "sess-multi-b",
+        provider: "opencode",
+        projectId: "example",
+        createdAt: "2026-11-15T11:05:00.000Z",
+        team: { runId: "run-multi", memberId: "m1", taskId: "t-multi", role: "implementer", revision: 1 },
+      }, { coverage: "none", reason: "unsupported", cursor: 0, seen: 0, refused: 0, exited: true });
+
+      writeOutcome(tx, sampleOutcome({ outcomeId: "run-rep:m1", runId: "run-rep", sessionId: "sess-reported", provider: "opencode" }));
+      writeOutcome(tx, sampleOutcome({ outcomeId: "run-multi:m1", runId: "run-multi", sessionId: "sess-multi-a", provider: "opencode" }));
+    });
+
+    assert.deepEqual(
+      store.read(db => computeOutcomeCost(db, { runId: "run-rep", memberId: "m1", sessionId: "sess-reported", provider: "opencode" }, PRICES)),
+      { costCoverage: "partial", spentUsd: 0.75 },
+    );
+    assert.deepEqual(
+      store.read(db => computeOutcomeCost(db, { runId: "run-multi", memberId: "m1", sessionId: "sess-multi-a", provider: "opencode" }, PRICES)),
+      { costCoverage: "partial" },
+    );
+
+    assert.deepEqual(syncOutcomeCosts(store, PRICES), { updated: 2, scanned: 2, done: true });
+    const rows = store.read(db => ({
+      rep: readOutcome(db, "run-rep:m1"),
+      multi: readOutcome(db, "run-multi:m1"),
+      sql: Object.fromEntries(db.all<{ outcome_id: string; list_usd: number | null }>("SELECT outcome_id, list_usd FROM outcomes").map(r => [r.outcome_id, r.list_usd])),
+    }));
+    assert.equal(rows.rep?.payload.costCoverage, "partial");
+    assert.equal(rows.rep?.payload.listUsd, undefined);
+    assert.equal(rows.rep?.payload.spentUsd, 0.75);
+    assert.equal(rows.multi?.payload.costCoverage, "partial");
+    assert.equal(rows.multi?.payload.listUsd, undefined);
+    assert.deepEqual(rows.sql, { "run-rep:m1": null, "run-multi:m1": null });
+
+    const session = usage.session("sess-reported");
+    assert.equal(session.measured, true);
+    if (session.measured) {
+      assert.equal(session.cost, 0.75);
+      assert.equal(session.pricing.provider, 1);
+      assert.deepEqual(session.list, { usd: 0, unpriced: 1 });
+    }
+  } finally {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("replaying an enlarged usage record refreshes the original owner's already-costed outcome", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "inf-outcome-replay-owner-"));
+  const key = randomBytes(32);
+  const store = new EvidenceStore({ databasePath: evidenceDatabasePath(dir), vaultKey: key });
+  try {
+    store.register(configurationModule());
+    store.register(outcomeModule({ now: () => NOW }));
+    const eventsBySession: Record<string, { seq: number; type: string; at: string; data: Record<string, unknown> }[]> = {
+      "sess-orig": [
+        {
+          seq: 1,
+          type: "usage",
+          at: "2026-11-15T11:10:00.000Z",
+          data: {
+            kind: "usage",
+            provider: "claude",
+            providerId: "anthropic",
+            modelId: "claude-sonnet",
+            messageId: "shared-msg",
+            partId: "p1",
+            modelSource: "reported",
+            completedAt: "2026-11-15T11:10:00.000Z",
+            tokens: { input: 500_000, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 },
+            reportedCost: 0,
+          },
+        },
+        {
+          seq: 2,
+          type: "usage-coverage",
+          at: "2026-11-15T11:11:00.000Z",
+          data: { coverage: "complete", finalDrain: "complete" },
+        },
+      ],
+      "sess-replay": [],
+    };
+    const listed: UsageSessionRow[] = [
+      {
+        id: "sess-orig",
+        provider: "claude",
+        projectId: "example",
+        createdAt: "2026-11-15T11:00:00.000Z",
+        lastActiveAt: "2026-11-15T11:11:00.000Z",
+        status: "exited",
+        team: { runId: "run-orig", memberId: "m1", taskId: "t-orig", role: "implementer", revision: 1 },
+      } as unknown as UsageSessionRow,
+    ];
+    const manager = {
+      list: async () => listed,
+      events: (id: string, after: number) => {
+        const list = (eventsBySession[id] ?? []).filter(entry => entry.seq > after);
+        return { events: list, cursor: list.at(-1)?.seq ?? after, more: false };
+      },
+    } as unknown as Manager;
+    const usage = new UsageService({ stateDir: dir, usage: { prices: PRICES, accounts: {} } } as unknown as Config, key, manager, store);
+
+    store.write(tx => {
+      writeOutcome(tx, sampleOutcome({ outcomeId: "run-orig:m1", runId: "run-orig", sessionId: "sess-orig", provider: "claude", model: "claude-sonnet" }));
+    });
+    await usage.tick();
+    assert.equal(store.read(db => readOutcome(db, "run-orig:m1")?.payload.listUsd), 1.5);
+
+    eventsBySession["sess-replay"] = [
+      {
+        seq: 1,
+        type: "usage",
+        at: "2026-11-15T11:20:00.000Z",
+        data: {
+          kind: "usage",
+          provider: "claude",
+          providerId: "anthropic",
+          modelId: "claude-sonnet",
+          messageId: "shared-msg",
+          partId: "p1",
+          modelSource: "reported",
+          completedAt: "2026-11-15T11:10:00.000Z",
+          tokens: { input: 1_000_000, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 },
+          reportedCost: 0,
+        },
+      },
+      {
+        seq: 2,
+        type: "usage-coverage",
+        at: "2026-11-15T11:21:00.000Z",
+        data: { coverage: "complete", finalDrain: "complete" },
+      },
+    ];
+    listed.push({
+      id: "sess-replay",
+      provider: "claude",
+      projectId: "example",
+      createdAt: "2026-11-15T11:15:00.000Z",
+      lastActiveAt: "2026-11-15T11:21:00.000Z",
+      status: "exited",
+      team: { runId: "run-replay", memberId: "m1", taskId: "t-replay", role: "implementer", revision: 1 },
+    } as unknown as UsageSessionRow);
+
+    await usage.tick();
+    assert.equal(store.read(db => readOutcome(db, "run-orig:m1")?.payload.listUsd), 3);
+    assert.equal(
+      store.read(db => db.get<{ list_usd: number | null }>("SELECT list_usd FROM outcomes WHERE outcome_id='run-orig:m1'")?.list_usd),
+      3,
+    );
+  } finally {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("syncOutcomeCosts pages past unpriceable rows across batches and restarts", () => {
+  const dir = mkdtempSync(join(tmpdir(), "inf-outcome-cost-paging-"));
+  const key = randomBytes(32);
+  const path = evidenceDatabasePath(dir);
+  let store: EvidenceStore | undefined;
+  try {
+    store = new EvidenceStore({ databasePath: path, vaultKey: key });
+    store.register(configurationModule());
+    store.register(outcomeModule({ now: () => NOW }));
+    store.register(usageModule);
+
+    store.write(tx => {
+      for (const id of ["run-1", "run-2", "run-3"]) {
+        writeOutcome(tx, sampleOutcome({ outcomeId: `${id}:m1`, runId: id, sessionId: `missing-${id}` }));
+      }
+      writeSession(tx, {
+        sessionId: "sess-4",
+        provider: "opencode",
+        projectId: "example",
+        createdAt: "2026-11-15T11:00:00.000Z",
+        team: { runId: "run-4", memberId: "m1", taskId: "task-4", role: "implementer", revision: 1 },
+      }, { coverage: "complete", cursor: 1, seen: 1, refused: 0, exited: true });
+      writeRecord(tx, "sess-4", usageRecord({}));
+      writeOutcome(tx, sampleOutcome({ outcomeId: "run-4:m1", runId: "run-4", sessionId: "sess-4" }));
+    });
+
+    assert.deepEqual(syncOutcomeCosts(store, PRICES, { limit: 2 }), { updated: 0, scanned: 2, done: false });
+    assert.equal(store.read(db => readOutcome(db, "run-4:m1")?.payload.listUsd), undefined);
+
+    store.close();
+    store = new EvidenceStore({ databasePath: path, vaultKey: key });
+    store.register(configurationModule());
+    store.register(outcomeModule({ now: () => NOW }));
+    store.register(usageModule);
+
+    assert.deepEqual(syncOutcomeCosts(store, PRICES, { limit: 2 }), { updated: 1, scanned: 2, done: false });
+    assert.equal(store.read(db => readOutcome(db, "run-4:m1")?.payload.listUsd), 1.2);
+    assert.deepEqual(syncOutcomeCosts(store, PRICES, { limit: 2 }), { updated: 0, scanned: 0, done: true });
   } finally {
     store?.close();
     rmSync(dir, { recursive: true, force: true });

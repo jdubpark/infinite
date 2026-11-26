@@ -4,14 +4,22 @@ import { EvidenceError, type EvidenceDb, type EvidenceTx } from "./evidence/type
 import { isMetered, type SessionCost } from "./outcome-cells.js";
 import { OUTCOMES_MODULE, readOutcome, writeOutcome, type OutcomeRow } from "./outcome-store.js";
 import type { UsageCoverage } from "./transcript-usage.js";
-import { priceUsage, sumUsage } from "./usage.js";
+import { listPriceUsage, priceUsage, sumUsage } from "./usage.js";
 import type { SessionUsage, UnmeasuredUsage } from "./usage-service.js";
-import { combineCoverage, readRecords, usageModule, type LedgerCoverageReason } from "./usage-store.js";
+import { readRecords, usageModule, type LedgerCoverageReason } from "./usage-store.js";
+
+const COST_SYNC_CURSOR = "cost_sync_cursor";
 
 export type ObservedOutcomeCost = {
   costCoverage: "none" | "partial" | "complete";
   listUsd?: number;
   spentUsd?: number;
+};
+
+export type CostSyncResult = {
+  updated: number;
+  scanned: number;
+  done: boolean;
 };
 
 type UsageSessionMeta = {
@@ -58,24 +66,22 @@ export function computeOutcomeCost(
   prices?: UsageConfig["prices"],
 ): ObservedOutcomeCost {
   const sessions = usageSessionsFor(db, row);
-  if (sessions.length === 0) return { costCoverage: "none" };
-  const combined = combineCoverage(sessions.map(session => ({
-    coverage: session.coverage,
-    ...(session.coverage_reason === null ? {} : { coverageReason: session.coverage_reason }),
-  })));
-  if (combined.coverage === "none") return { costCoverage: "none" };
-  const measuredIds = sessions.filter(session => session.coverage !== "none").map(session => session.session_id);
-  const records = readRecords(db, { sessionIds: measuredIds });
+  if (sessions.length === 0 || sessions.every(session => session.coverage === "none")) return { costCoverage: "none" };
+  if (sessions.some(session => session.coverage !== "complete")) return { costCoverage: "partial" };
+  const records = readRecords(db, { sessionIds: sessions.map(session => session.session_id) });
   if (records.length === 0) return { costCoverage: "none" };
-  const priced = records.map(({ record }) => ({ ...priceUsage(record, prices), tokens: record.tokens }));
-  const totals = sumUsage(priced);
-  if (combined.coverage !== "complete" || totals.pricing.unknown > 0) {
-    return { costCoverage: "partial" };
+  const listed = sumUsage(records.map(({ record }) => ({ ...listPriceUsage(record, prices), tokens: record.tokens })));
+  const metered = isMetered(row.provider)
+    ? sumUsage(records.map(({ record }) => ({ ...priceUsage(record, prices), tokens: record.tokens })))
+    : undefined;
+  const spent = metered !== undefined && metered.pricing.unknown === 0 ? metered.cost : undefined;
+  if (listed.pricing.unknown > 0) {
+    return { costCoverage: "partial", ...(spent === undefined ? {} : { spentUsd: spent }) };
   }
   return {
     costCoverage: "complete",
-    listUsd: totals.cost,
-    ...(isMetered(row.provider) ? { spentUsd: totals.cost } : {}),
+    listUsd: listed.cost,
+    ...(spent === undefined ? {} : { spentUsd: spent }),
   };
 }
 
@@ -111,13 +117,16 @@ export function refreshOutcomeCostsForSessions(
   }
   let updated = 0;
   for (const [id, exited] of seen) {
-    let row: OutcomeRow | undefined;
-    try { row = readOutcome(tx, id); } catch { continue; }
-    if (!row || row.source === "legacy") continue;
-    if (row.disposition === "open" && !exited) continue;
-    if (applyOutcomeCost(tx, row, prices)) {
-      writeOutcome(tx, row);
-      updated++;
+    try {
+      const row = readOutcome(tx, id);
+      if (!row || row.source === "legacy") continue;
+      if (row.disposition === "open" && !exited) continue;
+      if (applyOutcomeCost(tx, row, prices)) {
+        writeOutcome(tx, row);
+        updated++;
+      }
+    } catch {
+      continue;
     }
   }
   return updated;
@@ -126,27 +135,58 @@ export function refreshOutcomeCostsForSessions(
 export function syncOutcomeCosts(
   store: EvidenceStore,
   prices?: UsageConfig["prices"],
-  options?: { limit?: number },
-): number {
+  options?: { limit?: number; reset?: boolean },
+): CostSyncResult {
   const modules = store.status().modules;
-  if (modules[OUTCOMES_MODULE] !== "ready" || modules[usageModule.name] !== "ready") return 0;
+  if (modules[OUTCOMES_MODULE] !== "ready" || modules[usageModule.name] !== "ready") {
+    return { updated: 0, scanned: 0, done: false };
+  }
   const limit = options?.limit !== undefined && Number.isFinite(options.limit) ? Math.max(1, Math.floor(options.limit)) : 500;
-  let updated = 0;
+  let result: CostSyncResult = { updated: 0, scanned: 0, done: false };
   store.tryWrite(tx => {
+    const after = options?.reset
+      ? ""
+      : (tx.get<{ value: string }>("SELECT value FROM outcome_state WHERE key=?", COST_SYNC_CURSOR)?.value ?? "");
     const ids = tx.all<{ outcome_id: string }>(
-      "SELECT outcome_id FROM outcomes WHERE source <> 'legacy' AND disposition <> 'open' AND list_usd IS NULL "
-      + "AND (session_id IS NOT NULL OR run_id IS NOT NULL) ORDER BY ended_at DESC, outcome_id DESC LIMIT ?",
+      "SELECT outcome_id FROM outcomes WHERE outcome_id > ? AND source <> 'legacy' AND disposition <> 'open' AND list_usd IS NULL "
+      + "AND (session_id IS NOT NULL OR run_id IS NOT NULL) ORDER BY outcome_id ASC LIMIT ?",
+      after,
       limit,
     );
+    let updated = 0;
     for (const { outcome_id: id } of ids) {
-      let row: OutcomeRow | undefined;
-      try { row = readOutcome(tx, id); } catch { continue; }
-      if (!row || row.source === "legacy") continue;
-      if (applyOutcomeCost(tx, row, prices)) {
-        writeOutcome(tx, row);
-        updated++;
+      try {
+        const row = readOutcome(tx, id);
+        if (!row || row.source === "legacy") continue;
+        if (applyOutcomeCost(tx, row, prices)) {
+          writeOutcome(tx, row);
+          updated++;
+        }
+      } catch {
+        continue;
       }
     }
+    const done = ids.length < limit;
+    const nextCursor = done ? "" : ids.at(-1)!.outcome_id;
+    tx.run(
+      "INSERT INTO outcome_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+      COST_SYNC_CURSOR,
+      nextCursor,
+    );
+    result = { updated, scanned: ids.length, done };
   });
-  return updated;
+  return result;
+}
+
+export function outcomeCostSync(
+  store: EvidenceStore,
+  prices?: UsageConfig["prices"],
+  options?: { limit?: number },
+): () => void {
+  let done = false;
+  return () => {
+    if (done) return;
+    const step = syncOutcomeCosts(store, prices, options);
+    if (step.done) done = true;
+  };
 }

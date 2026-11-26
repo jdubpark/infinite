@@ -168,7 +168,8 @@ function summarize(key: Record<string, string>, rows: readonly OutcomeRow[], que
 
   const tokens: number[] = [], usd: number[] = [], listUsd: number[] = [], minutes: number[] = [];
   for (const { row } of counted) {
-    const raw = cost !== undefined && row.sessionId ? cost(row.sessionId) : undefined;
+    const partialAttempt = row.payload.costCoverage === "partial";
+    const raw = !partialAttempt && cost !== undefined && row.sessionId ? cost(row.sessionId) : undefined;
     const found = raw?.complete ? raw : undefined;
     if (found !== undefined) {
       tokens.push(found.tokens);
@@ -176,7 +177,7 @@ function summarize(key: Record<string, string>, rows: readonly OutcomeRow[], que
     }
     if (row.payload.costCoverage === "complete" && typeof row.payload.listUsd === "number" && Number.isFinite(row.payload.listUsd)) {
       listUsd.push(row.payload.listUsd);
-    } else if (raw?.listUsd !== undefined && Number.isFinite(raw.listUsd)) {
+    } else if (!partialAttempt && raw?.listUsd !== undefined && Number.isFinite(raw.listUsd)) {
       listUsd.push(raw.listUsd);
     }
     const rowMinute = rowMinutes(row);

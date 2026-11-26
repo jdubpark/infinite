@@ -234,7 +234,7 @@ export function writeSession(tx: EvidenceTx, header: LedgerHeader, state: Ledger
 type Stored = { session_id?: string; input: number; output: number; reasoning: number; cache_read: number; cache_write: number; cache_write_1h: number };
 const total = (row: Stored) => row.input + row.output + row.reasoning + row.cache_read + row.cache_write;
 
-export function writeRecord(tx: EvidenceTx, sessionId: string, record: UsageRecord): "inserted" | "replaced" | "kept" {
+export function writeRecordWithOwner(tx: EvidenceTx, sessionId: string, record: UsageRecord): { status: "inserted" | "replaced" | "kept"; ownerSessionId: string } {
   const checked = ledgerRecord(record);
   if (!checked) throw new TypeError("A usage record must pass ledgerRecord before it is stored.");
   if (!tx.get("SELECT 1 AS found FROM usage_sessions WHERE session_id=?", sessionId)) throw new Error("The usage session row must exist before its records");
@@ -244,18 +244,22 @@ export function writeRecord(tx: EvidenceTx, sessionId: string, record: UsageReco
     input: checked.tokens.input, output: checked.tokens.output, reasoning: checked.tokens.reasoning,
     cache_read: checked.tokens.cacheRead, cache_write: checked.tokens.cacheWrite, cache_write_1h: checked.cacheWrite1h ?? 0,
   };
+  const owner = prior && checked.provider !== "opencode" ? prior.session_id as string : sessionId;
   if (prior && checked.provider !== "opencode") {
     const larger = total(next) !== total(prior) ? total(next) > total(prior)
       : next.reasoning !== prior.reasoning ? next.reasoning > prior.reasoning
         : next.cache_write_1h > prior.cache_write_1h;
-    if (!larger) return "kept";
+    if (!larger) return { status: "kept", ownerSessionId: owner };
   }
   const modelRef = ensureModel(tx, checked.providerId, checked.modelId);
-  const owner = prior && checked.provider !== "opencode" ? prior.session_id as string : sessionId;
   tx.run(upsert("usage_records", RECORD_COLUMNS, "record_key"), key, checked.provider, owner, checked.completedAt, modelRef,
     checked.modelSource, next.input, next.output, next.reasoning, next.cache_read, next.cache_write, next.cache_write_1h,
     checked.reportedCost, checked.secondary ? 1 : 0);
-  return prior ? "replaced" : "inserted";
+  return { status: prior ? "replaced" : "inserted", ownerSessionId: owner };
+}
+
+export function writeRecord(tx: EvidenceTx, sessionId: string, record: UsageRecord): "inserted" | "replaced" | "kept" {
+  return writeRecordWithOwner(tx, sessionId, record).status;
 }
 
 export function writeBriefing(tx: EvidenceTx, key: string, projectId: string, at: string, record?: UsageRecord): void {
@@ -317,13 +321,18 @@ export function readSessions(db: EvidenceDb): StoredSession[] {
   });
 }
 
-export function readRecords(db: EvidenceDb, filter: { sessionIds?: string[]; from?: string; to?: string } = {}): { sessionId: string; record: UsageRecord }[] {
+export function readRecords(db: EvidenceDb, filter: { sessionIds?: string[]; providers?: readonly Provider[]; from?: string; to?: string } = {}): { sessionId: string; record: UsageRecord }[] {
   const where: string[] = [];
   const params: SQLInputValue[] = [];
   if (filter.sessionIds) {
     if (filter.sessionIds.length === 0) return [];
     where.push(`session_id IN (${filter.sessionIds.map(() => "?").join(", ")})`);
     params.push(...filter.sessionIds);
+  }
+  if (filter.providers) {
+    if (filter.providers.length === 0) return [];
+    where.push(`provider IN (${filter.providers.map(() => "?").join(", ")})`);
+    params.push(...filter.providers);
   }
   if (filter.from !== undefined) {
     const from = isoTime(filter.from);

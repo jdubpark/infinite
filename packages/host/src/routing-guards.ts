@@ -13,6 +13,7 @@ export function guardExploration(choice: Choice, guards: ExploreGuards,
   let basis: Basis | undefined;
   if (guards.pausedAt !== null) basis = "greedy-paused";
   else if (guards.spareAttempts < knobs.minSpareAttempts) basis = "greedy-budget";
+  else if (guards.nearLimit) basis = "greedy-headroom";
   else if (!shareAllows(guards.share, knobs.maxExploreShare)) basis = "greedy-share";
   if (basis === undefined) return choice;
   return { ...choice, chosen: choice.greedy, explore: false, basis };

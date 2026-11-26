@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { RESCUE_USD, TIER_COSTS, choose, chooseScout, screen, screenEscalations, screenProfiles, screenScouts, tierCost, utility, type Scored, type Screened } from "../packages/host/src/routing-choice.js";
+import { RESCUE_USD, TIER_COSTS, choose, chooseScout, expectedCost, screen, screenEscalations, screenProfiles, screenScouts, tierCost, utility, type Scored, type Screened } from "../packages/host/src/routing-choice.js";
 import { ROUTING_DEFAULTS } from "../packages/host/src/routing-policy.js";
 import { betaSample, candidateSeed, decisionSeed } from "../packages/host/src/routing-sample.js";
 import type { Beta, ProfilePosterior, RoutingKnobs, RoutingPoint, TeamRunRouting } from "../packages/host/src/routing-types.js";
@@ -350,4 +350,79 @@ test("coverage agrees with the router's screen at both new points", () => {
   }
   assert.ok(escalationCovered.includes(true) && escalationCovered.includes(false));
   assert.ok(scoutCovered.includes(true) && scoutCovered.includes(false));
+});
+
+test("expectedCost and utility prefer observed listUsd over tier defaults and fall back when null", () => {
+  const light = codex("light", "m-light");
+  const strong: TeamModelProfile = { ...codex("strong", "m-strong"), tier: "strong" };
+  assert.deepEqual(expectedCost(light, 0.12), { costUsd: 0.12, basis: "observed" });
+  assert.deepEqual(expectedCost(strong, 0), { costUsd: 0, basis: "observed" });
+  assert.deepEqual(expectedCost(light, null), { costUsd: TIER_COSTS.light, basis: "tier-default" });
+  assert.deepEqual(expectedCost(strong, undefined), { costUsd: TIER_COSTS.strong, basis: "tier-default" });
+  assert.deepEqual(expectedCost(strong, -1), { costUsd: TIER_COSTS.strong, basis: "tier-default" });
+  assert.deepEqual(expectedCost(strong, Number.NaN), { costUsd: TIER_COSTS.strong, basis: "tier-default" });
+
+  const policy = knobs({ successValueUsd: 2, listWeight: 1, headroomWeight: 0 });
+  const observed = utility({ theta: 0.5, phi: 1, costUsd: TIER_COSTS.strong, listUsd: 0.2 }, policy, "normal");
+  const fallback = utility({ theta: 0.5, phi: 1, costUsd: TIER_COSTS.strong, listUsd: null }, policy, "normal");
+  assert.equal(round2(observed), 0.8);
+  assert.equal(round2(fallback), -1.2);
+});
+
+test("utility subtracts provider headroom pressure below the knee in normal and elevated risk", () => {
+  const policy = knobs({ successValueUsd: 2, listWeight: 0, headroomWeight: 1 });
+  const base = utility({ theta: 1, phi: 1, costUsd: 0, headroom: null }, policy, "normal");
+  assert.equal(base, 2);
+  assert.equal(utility({ theta: 1, phi: 1, costUsd: 0, headroom: 0.5 }, policy, "normal"), 2);
+  assert.equal(utility({ theta: 1, phi: 1, costUsd: 0, headroom: 0.75 }, policy, "normal"), 2);
+  assert.equal(round2(utility({ theta: 1, phi: 1, costUsd: 0, headroom: 0.25 }, policy, "normal")), 1);
+  assert.equal(round2(utility({ theta: 1, phi: 1, costUsd: 0, headroom: 0 }, policy, "normal")), 0);
+  assert.equal(round2(utility({ theta: 1, phi: 1, costUsd: 0, headroom: 0.25 }, { ...policy, headroomWeight: 0 }, "normal")), 2);
+  assert.equal(round2(utility({ theta: 1, phi: 1, costUsd: 0, headroom: 0.25 }, { ...policy, headroomWeight: 0.5 }, "elevated")), 4.5);
+});
+
+test("choose and chooseScout use observed listUsd and headroom pressure", () => {
+  const light = codex("light-a", "m-a");
+  const strong: TeamModelProfile = { ...codex("strong-b", "m-b"), tier: "strong" };
+  const policy = knobs({ successValueUsd: 2, listWeight: 1, headroomWeight: 1 });
+  const screened = screen(lineupWith([light, strong]), policy, new Set<Provider>());
+
+  const byObserved = new Map<string, Scored>([
+    [screened[0]!.identity, { profile: light, identity: screened[0]!.identity, posterior: posterior(beta(5, 5), beta(5, 5)), costUsd: TIER_COSTS.light, listUsd: 2.5, costBasis: "observed" }],
+    [screened[1]!.identity, { profile: strong, identity: screened[1]!.identity, posterior: posterior(beta(5, 5), beta(5, 5)), costUsd: TIER_COSTS.strong, listUsd: 0.15, costBasis: "observed" }],
+  ]);
+  const costFlip = choose(screened, byObserved, policy, "normal", "seed-cost")!;
+  assert.equal(costFlip.greedy, "strong-b");
+  assert.deepEqual(costFlip.candidates.map(c => [c.profileId, c.costUsd, c.costBasis]), [
+    ["light-a", 2.5, "observed"],
+    ["strong-b", 0.15, "observed"],
+  ]);
+
+  const byHeadroom = new Map<string, Scored>([
+    [screened[0]!.identity, {
+      profile: light, identity: screened[0]!.identity, posterior: posterior(beta(8, 2), beta(9, 1)), costUsd: 0.4, costBasis: "tier-default",
+      headroom: { headroom: 0.1, basis: "estimated", pressure: 0.8, near: true, unit: "usd" },
+    }],
+    [screened[1]!.identity, {
+      profile: strong, identity: screened[1]!.identity, posterior: posterior(beta(7, 3), beta(9, 1)), costUsd: 0.4, costBasis: "tier-default",
+      headroom: { headroom: 0.9, basis: "estimated", pressure: 0, near: false, unit: "usd" },
+    }],
+  ]);
+  const headroomFlip = choose(screened, byHeadroom, policy, "normal", "seed-headroom")!;
+  assert.equal(headroomFlip.greedy, "strong-b");
+  assert.deepEqual(headroomFlip.candidates.map(c => [c.profileId, c.headroom, c.headroomBasis, c.pressure]), [
+    ["light-a", 0.1, "estimated", 0.8],
+    ["strong-b", 0.9, "estimated", 0],
+  ]);
+
+  const scoutScreened = screenProfiles([light, strong], POINT_LINEUP, policy, new Set<Provider>());
+  const scoutChoice = chooseScout(scoutScreened, new Map([
+    [scoutScreened[0]!.identity, { costUsd: 1.8, basis: "observed" }],
+    [scoutScreened[1]!.identity, { costUsd: 0.1, basis: "observed" }],
+  ]))!;
+  assert.equal(scoutChoice.chosen, "strong-b");
+  assert.deepEqual(scoutChoice.candidates.map(c => [c.profileId, c.costUsd, c.costBasis]), [
+    ["light-a", 1.8, "observed"],
+    ["strong-b", 0.1, "observed"],
+  ]);
 });

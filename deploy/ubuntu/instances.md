@@ -582,6 +582,9 @@ without recording credentials.
    state, provider homes, workspaces, writable queue and output directories,
    and individual config and key files. Use specific roots for the first
    instance since the common encrypted mount also contains its peers.
+   Add an optional `retiredPaths` array on an instance entry for retired local
+   caches (such as a locked-down `0700` or `0600` directory or file owned by
+   `root` that must remain inaccessible to every instance account).
    Run the read-only verifier as root on the Linux host.
 
    ```sh
@@ -591,12 +594,15 @@ without recording credentials.
    A pass confirms distinct non-root account IDs and checks the declared
    roots for overlapping paths, inodes and bind-mount mappings. An account
    in the owning instance must be able to read each listed file or read and
-   traverse each listed directory. For every peer, the kernel must deny
-   read, write and execute or traverse access to each listed root. Keep the
-   count-only success receipt with the private inventory. The shared kernel
-   and privileged operators remain trusted. Verify key uniqueness, browser
-   sessions, provider and API credentials, source audiences and destinations
-   separately.
+   traverse each listed directory in `paths`. For every peer, the kernel must
+   deny read, write and execute or traverse access to each listed root. For
+   every `retiredPaths` entry, the target must be owned by `root` with no group
+   or world mode bits (`0700`/`0600` or tighter), and the kernel must deny
+   read, write and execute or traverse access to every owning and peer account.
+   Keep the count-only success receipt with the private inventory. The shared
+   kernel and privileged operators remain trusted. Verify key uniqueness,
+   browser sessions, provider and API credentials, source audiences and
+   destinations separately.
    [Boundary verifier](verify-instance-boundaries.py)
 
    Install the root-owned verifier at `/usr/local/libexec/infinite-verify-instance-boundaries`

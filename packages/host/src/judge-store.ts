@@ -56,8 +56,9 @@ export type NewCalibration = Pick<CalibrationRow, "calibrationId" | "requestId" 
   | "judgeMinutes" | "createdAt" | "expiresAt" | "payload">;
 export type CalibrationEnd = { status: Exclude<CalibrationStatus, "running">; reason: string | null; state: CalibrationState | null;
   counted: number; correct: number; agree: number; accuracy: number | null; lowerBound: number | null; swapAgreement: number | null };
-export type CalibrationWait = "halt" | "host-load" | "eval-identity" | "grader" | "another-job" | "another-judgement" | "provider-limit"
-  | "session-slots" | "mirror" | "start-up" | Exclude<Extract<SourceResult, { kind: "environment" }>["cause"], "halted">;
+export type CalibrationWait = "halt" | "host-load" | "eval-identity" | "grader" | "another-job" | "another-judgement" | "spend-fuse"
+  | "provider-limit" | "provider-budget" | "budget-unmeasurable" | "session-slots" | "mirror" | "start-up"
+  | Exclude<Extract<SourceResult, { kind: "environment" }>["cause"], "halted">;
 export type CalibrationView = { calibrationId: string; profileId: string; profileEpoch: number; promptVersion: string;
   status: CalibrationRow["status"]; reason: string | null; state: "ok" | "not-ok" | null;
   pairs: { planned: number; counted: number; correct: number; perProject: { projectId: string; pairs: number }[] };
@@ -204,6 +205,10 @@ export function dropJudgement(tx: EvidenceTx, judgementId: string, reason: strin
 
 export function releaseJudgement(tx: EvidenceTx, judgementId: string): boolean {
   return tx.run("DELETE FROM judge_judgements WHERE judgement_id=? AND state='preparing'", judgementId).changes === 1;
+}
+
+export function releaseUnstartedJudgement(tx: EvidenceTx, judgementId: string): boolean {
+  return tx.run("DELETE FROM judge_judgements WHERE judgement_id=? AND state IN ('preparing', 'live') AND session_id IS NULL", judgementId).changes === 1;
 }
 
 export function clearJudgementSession(tx: EvidenceTx, judgementId: string, cost?: JudgementCost): void {

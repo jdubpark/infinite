@@ -1,6 +1,46 @@
 import type { UsageConfig } from "./config.js";
 import { PRICE_CATALOG, type CatalogPrice } from "./price-catalog.js";
 
+export type UsagePeriod = "day" | "week" | "month";
+export type ProviderSpendUnmeasurableReason =
+  | "ledger-unavailable"
+  | "reconciliation-pending"
+  | "reconciliation-stale"
+  | "provider-unmeasured"
+  | "recording-error"
+  | "unmeasured-sessions"
+  | "partial-sessions"
+  | "unpriced-records"
+  | "read-failed"
+  | "ingestion-incomplete"
+  | "invalid-measurement";
+export type ProviderSpendSnapshot =
+  | {
+      measured: true;
+      provider: "claude" | "codex" | "grok" | "opencode" | "demo";
+      projectId?: string;
+      period: { kind: UsagePeriod; start: string; end: string };
+      usd: number;
+      tokens: UsageTokens;
+      messages: number;
+      unpriced: 0;
+      unmeasuredSessions: 0;
+      partialSessions: 0;
+    }
+  | {
+      measured: false;
+      provider: "claude" | "codex" | "grok" | "opencode" | "demo";
+      projectId?: string;
+      period: { kind: UsagePeriod; start: string; end: string };
+      reason: ProviderSpendUnmeasurableReason;
+      usd?: number;
+      tokens?: UsageTokens;
+      messages?: number;
+      unpriced?: number;
+      unmeasuredSessions?: number;
+      partialSessions?: number;
+    };
+
 export interface UsageTokens { input: number; output: number; reasoning: number; cacheRead: number; cacheWrite: number }
 export interface UsageRecord {
   provider: "opencode" | "claude" | "codex";
@@ -21,22 +61,27 @@ export interface UsageTotals { cost: number; tokens: UsageTokens; messages: numb
 
 const MICRO_DOLLARS_PER_DOLLAR = 1_000_000;
 
-export function priceUsage(record: UsageRecord, prices: UsageConfig["prices"] | undefined, catalog: Record<string, CatalogPrice> = PRICE_CATALOG): { cost: number; pricing: Pricing } {
+export function listPriceUsage(record: UsageRecord, prices: UsageConfig["prices"] | undefined, catalog: Record<string, CatalogPrice> = PRICE_CATALOG): { cost: number; pricing: "configured" | "catalog" | "unknown" } {
   if (record.modelSource === "unknown") return { cost: 0, pricing: "unknown" };
+  if (record.provider === "codex" && record.tokens.cacheWrite > 0) return { cost: 0, pricing: "unknown" };
   const key = `${record.providerId}/${record.modelId}`;
   const configured = prices?.[key], catalogPrice = catalog[key], price = configured ?? catalogPrice;
-  if (price) {
-    const { tokens } = record;
-    const date = new Date(record.completedAt);
-    const peak = !configured && catalogPrice?.peak && catalogPrice.peak.days.includes(date.getUTCDay()) && catalogPrice.peak.hoursUtc.some(([start, end]) => date.getUTCHours() >= start && date.getUTCHours() < end);
-    const multiplier = peak && catalogPrice?.peak ? catalogPrice.peak.multiplier : 1;
-    const microDollars = (tokens.input * price.input
-      + (tokens.output + tokens.reasoning) * price.output
-      + tokens.cacheRead * (price.cacheRead ?? price.input)
-      + tokens.cacheWrite * (price.cacheWrite ?? price.input)) * multiplier;
-    return { cost: Math.round(microDollars) / MICRO_DOLLARS_PER_DOLLAR, pricing: configured ? "configured" : "catalog" };
-  }
-  if (record.reportedCost > 0) return { cost: record.reportedCost, pricing: "provider" };
+  if (!price) return { cost: 0, pricing: "unknown" };
+  const { tokens } = record;
+  const date = new Date(record.completedAt);
+  const peak = !configured && catalogPrice?.peak && catalogPrice.peak.days.includes(date.getUTCDay()) && catalogPrice.peak.hoursUtc.some(([start, end]) => date.getUTCHours() >= start && date.getUTCHours() < end);
+  const multiplier = peak && catalogPrice?.peak ? catalogPrice.peak.multiplier : 1;
+  const microDollars = (tokens.input * price.input
+    + (tokens.output + tokens.reasoning) * price.output
+    + tokens.cacheRead * (price.cacheRead ?? price.input)
+    + tokens.cacheWrite * (price.cacheWrite ?? price.input)) * multiplier;
+  return { cost: Math.round(microDollars) / MICRO_DOLLARS_PER_DOLLAR, pricing: configured ? "configured" : "catalog" };
+}
+
+export function priceUsage(record: UsageRecord, prices: UsageConfig["prices"] | undefined, catalog: Record<string, CatalogPrice> = PRICE_CATALOG): { cost: number; pricing: Pricing } {
+  const listed = listPriceUsage(record, prices, catalog);
+  if (listed.pricing !== "unknown") return listed;
+  if (record.modelSource !== "unknown" && record.reportedCost > 0) return { cost: record.reportedCost, pricing: "provider" };
   return { cost: 0, pricing: "unknown" };
 }
 
@@ -50,7 +95,7 @@ function glob(pattern: string, value: string) {
   return new RegExp(`^${escaped}$`).test(value);
 }
 
-export function periodStart(period: "day" | "week" | "month", now: Date): Date {
+export function periodStart(period: UsagePeriod, now: Date): Date {
   const year = now.getUTCFullYear();
   const month = now.getUTCMonth();
   const day = now.getUTCDate();
@@ -58,6 +103,12 @@ export function periodStart(period: "day" | "week" | "month", now: Date): Date {
   if (period === "day") return new Date(Date.UTC(year, month, day));
   const daysSinceMonday = (now.getUTCDay() + 6) % 7;
   return new Date(Date.UTC(year, month, day - daysSinceMonday));
+}
+
+export function periodEnd(period: UsagePeriod, start: Date): Date {
+  return period === "month"
+    ? new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth() + 1, 1))
+    : new Date(start.getTime() + (period === "week" ? 7 : 1) * 86_400_000);
 }
 
 export function sumUsage(rows: { cost: number; pricing: Pricing; tokens: UsageTokens }[]): UsageTotals {

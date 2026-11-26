@@ -10,6 +10,7 @@ import {
   type EvalIdentityState,
   type EvalJobView,
   type EvalOrigin,
+  type EvalProviderBudgetStatus,
   type EvalState,
   type EvalSummary,
   type GraderState,
@@ -40,7 +41,7 @@ export type SummaryInput = {
   graderVersion: number | null;
   evalIdentity: EvalIdentityState;
   evalIdentityLastProbe?: { state: EvalIdentityState; at: string } | null;
-  trials: { today: number; dailyCap: number | null };
+  trials: { today: number; dailyCap: number | null; budgets?: EvalProviderBudgetStatus[] };
   jobs: EvalJobView[];
   now: string;
 };
@@ -80,7 +81,11 @@ export function evalSummary(store: EvidenceStore, input: SummaryInput): EvalSumm
     coverage: coverageOf(store, project, counted.validCaptured, days, now),
     grader: { state: input.grader, version: input.graderVersion },
     evalIdentity: { state: input.evalIdentity, ...(input.evalIdentityLastProbe !== undefined ? { lastProbe: input.evalIdentityLastProbe } : {}) },
-    trials: { today: input.trials.today, dailyCap: input.trials.dailyCap },
+    trials: {
+      today: input.trials.today,
+      dailyCap: input.trials.dailyCap,
+      ...(input.trials.budgets !== undefined ? { budgets: input.trials.budgets } : {}),
+    },
     jobs: input.jobs.slice(0, SUMMARY_JOBS),
   };
 }

@@ -2,7 +2,9 @@ import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
 import { judgePromptVersion, profileIdentityKey } from "./config-identity.js";
 import { epochAt } from "./configuration-store.js";
+import { evaluateFuse, evaluateProviderBudget, type EvalBudgetSource } from "./eval-budget.js";
 import { calibrationPairs } from "./eval-calibration.js";
+import { EVAL_PROVIDERS, isEvalProvider, providerBudgetConstraints } from "./eval-config.js";
 import { JOB_EXPIRY_DAYS_MAX } from "./eval-jobs.js";
 import { trialProfileKey } from "./eval-trial-rules.js";
 import { TRIAL_SLOTS_FREE_MIN, type TrialGates } from "./eval-trial-jobs.js";
@@ -16,12 +18,12 @@ import {
 import { labelDraw } from "./judge-package.js";
 import {
   activeCalibration, calibrationJudgements, calibrationViews, dropJudgement, finishCalibration, finishJudgement, insertCalibration,
-  insertJudgement, liveJudgements, readCalibration, releaseJudgement, startJudgement, sweepJudge, type CalibrationEnd, type CalibrationPairRef, type CalibrationRow,
+  insertJudgement, liveJudgements, readCalibration, releaseJudgement, releaseUnstartedJudgement, startJudgement, sweepJudge, type CalibrationEnd, type CalibrationPairRef, type CalibrationRow,
   type CalibrationView, type CalibrationWait, type JudgementRow,
 } from "./judge-store.js";
 import { JUDGE_VOID_ENDINGS, type Judgement, type JudgeEnding } from "./judge-types.js";
 import type { TeamModelProfile } from "./team-types.js";
-import type { Config } from "./types.js";
+import type { Config, Provider } from "./types.js";
 
 export const CALIBRATION_PAGE = 20, CALIBRATION_MINUTES_DEFAULT = 10, CALIBRATION_MINUTES_MIN = 2, CALIBRATION_MINUTES_MAX = 30;
 const DAY_MS = 86_400_000;
@@ -47,13 +49,16 @@ export type JudgementOutcome = { ending: JudgeEnding; judgement?: Judgement; ses
   | { dropped: "patch-missing" | "source-skipped" | "not-isolated" | "package-too-large" };
 
 type Start = Extract<NextJudgement, { kind: "start" }>;
-type Options = { store: EvidenceStore; config: Pick<Config, "projects" | "eval" | "teams">; now: () => string };
+type Options = { store: EvidenceStore; config: Pick<Config, "projects" | "eval" | "teams" | "usage">; now: () => string; budget?: EvalBudgetSource };
 type Pair = { kind: "pending"; ordering: 0 | 1; attempt: number } | { kind: "dropped" } | { kind: "done"; first: OrderingResult; second: OrderingResult };
 type Pins = { judgeKey: string; epoch: number; promptVersion: string };
 
 const refuse = (status: CalibrationRefusal["status"], code: CalibrationRefusal["code"]): CalibrationRefusal => ({ status, code });
 const IDLE: NextJudgement = { kind: "idle" };
 const isVoid = (ending: JudgeEnding | null) => ending !== null && JUDGE_VOID_ENDINGS.includes(ending);
+const JUDGE_WAITS_ONLY: ReadonlySet<CalibrationWait> = new Set<CalibrationWait>([
+  "halt", "mirror", "spend-fuse", "provider-limit", "provider-budget", "budget-unmeasurable",
+]);
 
 function stableUuid(seed: string): string {
   const h = createHash("sha256").update(seed).digest("hex");
@@ -105,8 +110,9 @@ function modelOf(db: EvidenceDb, trialId: string): { provider: string; model: st
 
 export class JudgeCalibrations {
   private readonly store: EvidenceStore;
-  private readonly config: Pick<Config, "projects" | "eval" | "teams">;
+  private readonly config: Pick<Config, "projects" | "eval" | "teams" | "usage">;
   private readonly now: () => string;
+  private readonly budget: EvalBudgetSource | undefined;
   private waiting: CalibrationWait | null = null;
   private released = { id: "", count: 0 };
 
@@ -114,6 +120,7 @@ export class JudgeCalibrations {
     this.store = options.store;
     this.config = options.config;
     this.now = options.now;
+    this.budget = options.budget;
   }
 
   create(body: unknown): { calibration: CalibrationView } | CalibrationRefusal {
@@ -129,7 +136,7 @@ export class JudgeCalibrations {
     if (this.config.eval?.member?.agents?.[judge.provider] === undefined) return refuse(409, "judge-launch-missing");
     const early = this.store.read(db => this.replayOrActive(db, request));
     if (early !== undefined) return "replay" in early ? this.viewOrRefusal(early.replay) : early;
-    const projects = this.poolOf(request.projects);
+    const projects = this.poolOf(request.projects, judge);
     if (projects === undefined) return refuse(409, "eval-config-incomplete");
     const pairs = this.select(judge, projects, request.pairs ?? CALIBRATION_DEFAULT_PAIRS);
     const count = pairs.list.length;
@@ -191,7 +198,7 @@ export class JudgeCalibrations {
   }
 
   release(judgementId: string, reason: CalibrationWait): void {
-    const count = this.released.id === judgementId ? this.released.count + 1 : 1;
+    const count = JUDGE_WAITS_ONLY.has(reason) ? 0 : this.released.id === judgementId ? this.released.count + 1 : 1;
     const last = count >= CALIBRATION_RELEASES;
     const running = this.store.write(tx => {
       const row = tx.get<{ calibration_id: string }>("SELECT calibration_id FROM judge_judgements WHERE judgement_id = ? AND state = 'preparing'", judgementId);
@@ -200,9 +207,25 @@ export class JudgeCalibrations {
       return activeCalibration(tx)?.calibrationId === row.calibration_id;
     });
     if (running === undefined) return;
-    this.released = last ? { id: "", count: 0 } : { id: judgementId, count };
+    this.released = last || count === 0 ? { id: "", count: 0 } : { id: judgementId, count };
     if (last) this.finish(judgementId, { ending: "void-host", sessionId: null });
     if (running) this.waiting = reason;
+  }
+
+  releaseLive(judgementId: string, reason: CalibrationWait): void {
+    const running = this.store.write(tx => {
+      const row = tx.get<{ calibration_id: string }>("SELECT calibration_id FROM judge_judgements WHERE judgement_id = ? AND state IN ('preparing', 'live') AND session_id IS NULL", judgementId);
+      if (row === undefined) return undefined;
+      releaseUnstartedJudgement(tx, judgementId);
+      return activeCalibration(tx)?.calibrationId === row.calibration_id;
+    });
+    if (running) this.waiting = reason;
+  }
+
+  launchWait(projectId: string, judge: TeamModelProfile, limited?: ReadonlySet<Provider>): CalibrationWait | undefined {
+    const fuse = evaluateFuse(this.budget?.fuseCheck, projectId);
+    if (fuse.state === "halted") return "halt";
+    return this.spendWait(projectId, judge, fuse.state === "open", limited, this.now());
   }
 
   begin(start: Start): "inserted" | "exists" {
@@ -263,10 +286,20 @@ export class JudgeCalibrations {
     return activeCalibration(db) === undefined ? undefined : refuse(409, "calibration-active");
   }
 
-  private poolOf(named: readonly string[] | undefined): string[] | undefined {
-    const withEval = new Set(this.config.projects.filter(project => project.team?.eval !== undefined).map(project => project.id));
-    if (named === undefined) return [...withEval].sort();
-    return named.every(id => withEval.has(id)) ? [...named].sort() : undefined;
+  private judgeCovered(project: Config["projects"][number], judge: TeamModelProfile): boolean {
+    const eval_ = project.team?.eval;
+    if (eval_ === undefined) return false;
+    if (eval_.trialsPerDay !== undefined) return true;
+    const hasUsdBudget = Object.keys(eval_.providerBudgets ?? {}).length > 0
+      || (this.config.usage?.budgets !== undefined && EVAL_PROVIDERS.some(provider => this.config.usage?.budgets?.[provider] !== undefined));
+    if (!hasUsdBudget && this.budget === undefined) return true;
+    return isEvalProvider(judge.provider) && providerBudgetConstraints(judge.provider, eval_.providerBudgets, this.config.usage?.budgets).length > 0;
+  }
+
+  private poolOf(named: readonly string[] | undefined, judge: TeamModelProfile): string[] | undefined {
+    const covered = new Set(this.config.projects.filter(project => this.judgeCovered(project, judge)).map(project => project.id));
+    if (named === undefined) return [...covered].sort();
+    return named.every(id => covered.has(id)) ? [...named].sort() : undefined;
   }
 
   private select(judge: TeamModelProfile, projects: readonly string[], want: number): { list: CalibrationPairRef[]; perProject: { projectId: string; pairs: number }[] } {
@@ -346,7 +379,7 @@ export class JudgeCalibrations {
     }
     const pending = states[index] as Extract<Pair, { kind: "pending" }>;
     const pair = row.payload.pairs[index] as CalibrationPairRef;
-    const wait = this.waitReason(tx, gates, judge, pair.projectId, rows);
+    const wait = this.waitReason(tx, gates, judge, pair.projectId, rows, at);
     if (wait !== undefined) return { kind: "wait", reason: wait };
     const draw = labelDraw(`${row.calibrationId}:${index}`) === 0;
     return { kind: "slots", start: {
@@ -357,14 +390,30 @@ export class JudgeCalibrations {
     } };
   }
 
-  private waitReason(db: EvidenceDb, gates: TrialGates, judge: TeamModelProfile, projectId: string, rows: readonly JudgementRow[]): CalibrationWait | undefined {
+  private spendWait(projectId: string, judge: TeamModelProfile, fuseOpen: boolean, limited: ReadonlySet<Provider> | undefined, at: string): CalibrationWait | undefined {
+    if (fuseOpen) return "spend-fuse";
+    if (limited?.has(judge.provider)) return "provider-limit";
+    const project = this.config.projects.find(item => item.id === projectId);
+    if (project?.team?.eval === undefined) return this.budget === undefined ? undefined : "budget-unmeasurable";
+    if (!this.judgeCovered(project, judge)) return "budget-unmeasurable";
+    if (isEvalProvider(judge.provider)) {
+      const constraints = providerBudgetConstraints(judge.provider, project.team.eval.providerBudgets, this.config.usage?.budgets);
+      const verdict = evaluateProviderBudget(judge.provider, projectId, constraints, this.budget?.providerSpend, new Date(at));
+      if (verdict.state === "exceeded") return "provider-budget";
+      if (verdict.state === "unmeasurable") return "budget-unmeasurable";
+    }
+    return undefined;
+  }
+
+  private waitReason(db: EvidenceDb, gates: TrialGates, judge: TeamModelProfile, projectId: string, rows: readonly JudgementRow[], at: string): CalibrationWait | undefined {
     if (gates.halted(projectId)) return "halt";
+    const fuse = evaluateFuse(this.budget?.fuseCheck, projectId);
+    if (fuse.state === "halted") return "halt";
     if (gates.hostLoadHeld) return "host-load";
     if (gates.identity.state !== "ready" || this.config.eval?.member?.agents?.[judge.provider] === undefined) return "eval-identity";
     if (gates.grader.state !== "ready") return "grader";
     if (gates.trialLive) return "another-job";
     if (liveJudgements(db).length > 0 || rows.some(row => row.state === "preparing" || row.state === "live")) return "another-judgement";
-    if (gates.limited.has(judge.provider)) return "provider-limit";
-    return undefined;
+    return this.spendWait(projectId, judge, fuse.state === "open", gates.limited, at);
   }
 }

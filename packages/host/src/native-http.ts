@@ -1,5 +1,6 @@
 import { request as httpRequest, type IncomingMessage, type ServerResponse } from "node:http";
 import { request as httpsRequest } from "node:https";
+import { replyDeadline } from "./deadline.js";
 
 export const NATIVE_HTTP_BODY = 8 * 1024 * 1024;
 
@@ -34,8 +35,9 @@ export function proxyNativeHttp(req: IncomingMessage, res: ServerResponse, url: 
     res.writeHead(response.statusCode ?? 502, { "Content-Type": response.headers["content-type"] ?? "application/json", "Cache-Control": "no-store", "X-Accel-Buffering": "no" });
     response.on("error", () => res.destroy()); response.pipe(res);
   });
-  const timeout = setTimeout(() => upstream.destroy(new Error("Native connection timed out")), 15000);
-  upstream.once("response", () => clearTimeout(timeout));
+  let answered = false;
+  const timeout = replyDeadline(15000, () => { if (!answered) upstream.destroy(new Error("Native connection timed out")); });
+  upstream.once("response", () => { answered = true; clearTimeout(timeout); });
   upstream.on("error", () => {
     clearTimeout(timeout);
     if (!res.headersSent) { res.writeHead(502); res.end(JSON.stringify({ error: "Native connection unavailable; inspect the session before retrying input" })); }

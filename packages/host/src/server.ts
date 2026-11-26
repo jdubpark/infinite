@@ -56,7 +56,7 @@ import { lineupProfiles } from "./team-types.js";
 import { Blackboard } from "./evidence/blackboard.js";
 import { ENTRY_KINDS } from "./evidence/entry-types.js";
 import { usagePlanSchema } from "./usage-api.js";
-import { registerRepairMetricsRoute } from "./repair-metrics-routes.js";
+import { registerInterruptedTaskMetricsRoute, registerRepairMetricsRoute } from "./repair-metrics-routes.js";
 import { TeamService, TeamError } from "./teams.js";
 import { readDecisionQueue } from "./decision-queue-read.js";
 import { objectiveRoutes } from "./objective-routes.js";
@@ -73,7 +73,7 @@ import { CellQueryRefused, type CellQuery, type CostLookup } from "./outcome-cel
 import { currentEpochs, productionRows, queryCells, queryRollup } from "./outcome-reads.js";
 import { latestAssessment, rollupMissing, type RollupTarget } from "./outcome-rollup.js";
 import { importLegacy, LegacyImportRefused } from "./outcome-import.js";
-import { sessionCostOf } from "./outcome-cost.js";
+import { outcomeCostSync, sessionCostOf } from "./outcome-cost.js";
 import { legacyBatchSchema } from "./outcome-legacy.js";
 import { GoalService } from "./goals.js";
 import { RoutineService } from "./routines.js";
@@ -272,8 +272,8 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
       lateReceipts();
     },
   });
-  outbox.registerProjector(outcomeProjector(evidence));
-  const evalHost: EvalHost = new EvalHost({ config, store: evidence, source: projectSource, hostLoad: manager.hostLoad, halt: () => halt, runs: () => teams.understandingRecords(), teams: () => teams, sessions: manager, cost: sessionId => sessionCostOf(usage.session(sessionId)) });
+  outbox.registerProjector(outcomeProjector(evidence, { prices: config.usage?.prices }));
+  const evalHost: EvalHost = new EvalHost({ config, store: evidence, source: projectSource, hostLoad: manager.hostLoad, halt: () => halt, runs: () => teams.understandingRecords(), teams: () => teams, sessions: manager, cost: sessionId => sessionCostOf(usage.session(sessionId)), usage: () => usage, fuse: () => gate });
   const fuse = new FuseService({ config, key, store: evidence, sessionExists: id => {
     try { manager.meta(id); return true; } catch (error) { return (error as NodeJS.ErrnoException).code !== "ENOENT"; }
   } });
@@ -282,7 +282,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
     source: projectSource,
     graphs: repositoryGraphs,
     events: outbox,
-    capture: evalHost.capture,
+    capture: evalHost.capture, replayLaunchGate: input => evalHost.replayLaunchWait(input),
     entries: blackboard, ...(options.processCensus ? { processes: options.processCensus } : {}),
     delivery: deliveryPort(evidence),
     onMerged: id => {
@@ -299,16 +299,16 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
   });
   teams.useEvidence(evidence);
   lateReceipts = () => { void teams.settleReceipts().catch(() => {}); };
-  teams.useRouter(new RoutingRecorder({ store: evidence }));
+  const router = new RoutingRecorder({ store: evidence }); teams.useRouter(router);
   const backfillOutcomes = outcomeBackfill(evidence, () => teams.understandingRecords(), {
     mapOf: projectId => config.projects.find(project => project.id === projectId)?.team?.features,
-    now: () => new Date().toISOString(),
+    now: () => new Date().toISOString(), prices: config.usage?.prices,
   });
   backfillOutcomes();
-  const usage = new UsageService(config, key, manager, evidence);
+  const usage = new UsageService(config, key, manager, evidence); const syncCosts = outcomeCostSync(evidence, config.usage?.prices); syncCosts();
   const balances = new BalanceService(config.usage?.accounts ?? {});
   usage.useBalances(balances);
-  teams.useUsage(usage);
+  teams.useUsage(usage); const refreshHeadrooms = () => router.refreshHeadrooms(config.teams?.lineup, teams.providerLimitHistory(), config.usage?.prices); refreshHeadrooms(); usage.onUpdated(refreshHeadrooms); teams.onLimitsChanged(refreshHeadrooms);
   const goals = new GoalService(config, key, teams, linear);
   lateReceipts = () => { void teams.settleReceipts().then(() => goals.syncReceipts()).catch(() => {}); };
   ownerServices.goals = goals;
@@ -396,7 +396,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
       const result = outbox.advance();
       if (!result.pending || result.blocked.length > 0) break;
     }
-    backfillOutcomes();
+    backfillOutcomes(); syncCosts();
   };
   let outboxTimer: NodeJS.Timeout | undefined;
   const closeEvidence = () => { baseScanner?.close(); clearInterval(evidenceSweep); clearInterval(outboxTimer); fuse.stop(); evalHost.close(); evidence.close(); };
@@ -798,6 +798,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
   const usageUnavailable = { error: "The usage ledger is unavailable" };
   const ledgerUnavailable = (error: unknown) => error instanceof EvidenceError && error.code === "unavailable";
   const requireLedger = () => { if (!usage.readable()) throw new EvidenceError("unavailable", "The usage ledger is unavailable."); };
+  registerInterruptedTaskMetricsRoute(app, { runs: filter => teams.interruptedTaskRuns(filter), evidence });
   app.use("/api/usage", (_req, res, next) => usage.available() ? next() : void res.status(503).json(usageUnavailable));
   app.get("/api/usage", (_req, res) => res.json(usage.summary()));
   app.get("/api/evidence/status", (_req, res) => res.json(evidence.describe()));
@@ -880,7 +881,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
   app.get("/api/usage/daily", (req, res, next) => { try { const query = z.object({ days: z.coerce.number().int().min(1).max(366).default(30), tz: z.string().default("UTC"), project: z.string().optional() }).strict().parse(req.query); return void res.json(usage.daily({ days: query.days, tz: query.tz, projectId: query.project })); } catch (error) { if (error instanceof RangeError) return void res.status(400).json({ error: "Invalid timezone or day range" }); return next(error); } });
   app.get("/api/usage/projects", (req, res, next) => { try { const query = z.object({ tz: z.string().default("UTC") }).strict().parse(req.query); return void res.json(usage.projects({ tz: query.tz })); } catch (error) { if (error instanceof RangeError) return void res.status(400).json({ error: "Invalid timezone" }); return next(error); } });
   app.get("/api/usage/projects/:id", (req, res, next) => { try { const query = z.object({ tz: z.string().default("UTC") }).strict().parse(req.query), result = usage.project(String(req.params.id), { tz: query.tz }); if (!result) return void res.status(404).json({ error: "Project usage not found" }); return void res.json(result); } catch (error) { if (error instanceof RangeError) return void res.status(400).json({ error: "Invalid timezone" }); return next(error); } });
-  registerRepairMetricsRoute(app, { runs: filter => teams.repairMetricsRuns(filter), interruptedRuns: () => teams.understandingRecords(), memberUsage: (runId, memberId) => usage.memberFinal(runId, memberId), evidence, readable: () => usage.readable() });
+  registerRepairMetricsRoute(app, { runs: filter => teams.repairMetricsRuns(filter), memberUsage: (runId, memberId) => usage.memberFinal(runId, memberId), evidence, readable: () => usage.readable() });
   app.put("/api/usage/accounts/:id/plan", requireRole(["owner"]), (req, res) => {
     const accounts = config.usage?.accounts, accountId = String(req.params.id);
     const account = accounts && Object.hasOwn(accounts, accountId) ? accounts[accountId] : undefined;
@@ -1011,7 +1012,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
   app.get("/api/goals", (_req, res) => res.json({ goals: goals.list() }));
   app.get("/api/goals/:id", (req, res) => res.json(goals.get(id.parse(req.params.id))));
   objectiveRoutes(app, { goals, teams }, requireRole(["owner", "controller", "viewer"]), requireRole(["owner"]));
-  routingRoutes(app, { evidence, config: () => config, teams }, requireRole(["owner", "controller", "viewer"]), requireRole(["owner"]));
+  routingRoutes(app, { evidence, config: () => config, teams, headroomCache: router.headroomCache }, requireRole(["owner", "controller", "viewer"]), requireRole(["owner"]));
   evalHost.routes(app, requireRole(["owner", "controller", "viewer"]), requireRole(["owner"]));
   app.get("/api/routines", (_req, res) => res.json({ routines: routines.list() }));
   app.get("/api/routines/:id", (req, res) => res.json(routines.get(id.parse(req.params.id))));
@@ -1321,10 +1322,8 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
     return res.json(await startInProject(body.projectId, () => teams.create(body)));
   });
   const standaloneTeam = (value: unknown, allowOrphanedBlockedCancel = false) => {
-    const teamId = id.parse(value);
-    const team = teams.get(teamId);
-    if (allowOrphanedBlockedCancel && team.status === "blocked") {
-      if (goals.ownsActiveTeam(teamId)) throw new TeamError(409, "goal-owned-team", "Control this feature from its goal. Team decisions can still be answered here.");
+    const teamId = id.parse(value), team = teams.get(teamId);
+    if (allowOrphanedBlockedCancel && !team.goal && team.status === "blocked") {
       if (missions.ownsActiveSubteam(teamId)) throw new TeamError(409, "mission-owned-team", "Control this subteam from its mission.");
       return teamId;
     }
@@ -1352,8 +1351,10 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
     res.json(await (teams.get(teamId).goal ? goals.answer(teamId, decisionId, body) : teams.answer(teamId, decisionId, body)));
   });
   for (const action of ["pause", "resume", "cancel"] as const) {
-    app.post(`/api/teams/:id/${action}`, requireRole(["owner"]), async (req, res) =>
-      res.json(await teams[action](standaloneTeam(req.params.id, action === "cancel"), teamActionSchema.parse(req.body))));
+    app.post(`/api/teams/:id/${action}`, requireRole(["owner"]), async (req, res) => {
+      const teamId = id.parse(req.params.id);
+      res.json(await (action === "cancel" && teams.get(teamId).goal && !missions.ownsActiveSubteam(teamId) ? goals.cancelReleasedRun(teamId, teamActionSchema.parse(req.body)) : teams[action](standaloneTeam(teamId, action === "cancel"), teamActionSchema.parse(req.body))));
+    });
   }
   app.get("/api/machine/resources", async (_req, res) => res.json(await desktopResources.sample()));
   app.post("/api/projects/resolve", requireRole(["owner"]), requireOwnerCli, (req, res) => {

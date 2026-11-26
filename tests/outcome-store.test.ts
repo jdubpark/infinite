@@ -591,7 +591,7 @@ test("a version 1 store migrates in place", () => {
       .map(table => table.name);
     for (const table of ["outcome_signals", "base_scans", "base_scan_state"]) assert.ok(tables.includes(table), table);
     const stored = store.read(db => db.get<{ version: number }>("SELECT version FROM schema_modules WHERE name='outcomes'"));
-    assert.equal(stored?.version, 4);
+    assert.equal(stored?.version, 5);
     const columns = store.read(db => db.all<{ name: string }>("SELECT name FROM pragma_table_info('outcomes')"))
       .map(column => column.name);
     const summaryColumns = store.read(db => db.all<{ name: string }>("SELECT name FROM pragma_table_info('run_summaries')"))
@@ -922,7 +922,7 @@ test("a version 2 store migrates to version 3 and indexes goals and missions", (
       summaries: db.all("SELECT * FROM run_summaries ORDER BY run_id"),
     }));
     const withoutRefs = (row: Record<string, unknown>) => {
-      const { goal_ref: _goal, mission_ref: _mission, point: _point, feature_map_ref: _featureMap, owner_score: _score, ...rest } = row;
+      const { goal_ref: _goal, mission_ref: _mission, point: _point, feature_map_ref: _featureMap, owner_score: _score, list_usd: _listUsd, ...rest } = row;
       return { ...rest };
     };
     assert.equal(later.outcomes.length, earlier.outcomes.length);
@@ -932,7 +932,7 @@ test("a version 2 store migrates to version 3 and indexes goals and missions", (
     const stored = store.read(db => db.get<{ version: number; read_version: number }>(
       "SELECT version, read_version FROM schema_modules WHERE name='outcomes'",
     ));
-    assert.deepEqual({ ...stored }, { version: 4, read_version: 2 });
+    assert.deepEqual({ ...stored }, { version: 5, read_version: 2 });
 
     const refs = store.read(db => ({
       goal: db.index("goal", GOAL),
@@ -1323,7 +1323,7 @@ test("a version 3 store migrates to version 4 and fills the routing columns", ()
     assert.equal(store.status().modules.outcomes, "ready");
     const later = store.read(db => db.all("SELECT * FROM outcomes ORDER BY outcome_id"));
     const withoutRouting = (row: Record<string, unknown>) => {
-      const { point: _point, feature_map_ref: _featureMap, owner_score: _score, ...rest } = row;
+      const { point: _point, feature_map_ref: _featureMap, owner_score: _score, list_usd: _listUsd, ...rest } = row;
       return { ...rest };
     };
     assert.equal(later.length, earlier.length);
@@ -1331,7 +1331,7 @@ test("a version 3 store migrates to version 4 and fills the routing columns", ()
     const stored = store.read(db => db.get<{ version: number; read_version: number }>(
       "SELECT version, read_version FROM schema_modules WHERE name='outcomes'",
     ));
-    assert.deepEqual({ ...stored }, { version: 4, read_version: 2 });
+    assert.deepEqual({ ...stored }, { version: 5, read_version: 2 });
 
     const migrated = store.read(db => ({
       featureMap: db.index("feature-map", "map-1"),
@@ -1602,7 +1602,7 @@ test("a route read maps every column, includes rows ended at since, and sorts by
       outcomeId: "run-z:m1", source: "production", projectRef: read.project, areaRef: read.area, provider: "opencode", model: "model-one",
       effort: "high", profileEpoch: 2, kind: "bugfix", featureVersion: 3, disposition: "integrated", exclusion: null,
       flags: ["same-model-review"], integrated: 1, accepted: 0, firstPass: 0, held: 1, endedAt: ROUTE_SINCE, frozenAt: T_IN,
-      point: "start", featureMapRef: read.map2, ownerScore: 5, promptVersion: "pv-1",
+      point: "start", featureMapRef: read.map2, ownerScore: 5, listUsd: null, promptVersion: "pv-1",
     });
     assert.equal(read.rows[0]!.featureMapRef, read.map1);
   } finally {

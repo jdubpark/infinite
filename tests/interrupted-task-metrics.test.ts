@@ -10,7 +10,7 @@ import { EventOutbox } from "../packages/host/src/evidence/outbox.js";
 import { EvidenceError, type RunEvent } from "../packages/host/src/evidence/types.js";
 import { computeInterruptedTaskMetrics, type InterruptedTaskReport } from "../packages/host/src/interrupted-task-metrics.js";
 import { formatInterruptedTaskReport, handleUsageInterruptedCommand } from "../packages/host/src/repair-metrics-cli.js";
-import { registerRepairMetricsRoute } from "../packages/host/src/repair-metrics-routes.js";
+import { registerInterruptedTaskMetricsRoute } from "../packages/host/src/repair-metrics-routes.js";
 import type { TeamContinuation, TeamMember, TeamRun, TeamTask } from "../packages/host/src/team-types.js";
 import { TeamService } from "../packages/host/src/teams.js";
 import { prepareMemberWorkspace } from "../packages/host/src/team-workspace.js";
@@ -428,9 +428,8 @@ test("GET /api/usage/interrupted-tasks validates query and maps unavailable evid
   });
   const app = express();
   let evidenceDown = false;
-  registerRepairMetricsRoute(app, {
+  registerInterruptedTaskMetricsRoute(app, {
     runs: () => [run],
-    memberUsage: () => ({ measured: false, coverage: "none" }),
     events: () => {
       if (evidenceDown) throw new EvidenceError("unavailable", "down");
       return [
@@ -474,9 +473,8 @@ test("GET /api/usage/interrupted-tasks validates query and maps unavailable evid
   }
 
   const missingEventsApp = express();
-  registerRepairMetricsRoute(missingEventsApp, {
+  registerInterruptedTaskMetricsRoute(missingEventsApp, {
     runs: () => [],
-    memberUsage: () => ({ measured: false, coverage: "none" }),
   });
   const missingServer = missingEventsApp.listen(0, "127.0.0.1");
   await new Promise<void>(resolve => missingServer.once("listening", resolve));
@@ -891,12 +889,9 @@ test("GET /api/usage/interrupted-tasks paginates real EvidenceStore events indep
     });
 
     const app = express();
-    registerRepairMetricsRoute(app, {
-      runs: () => [],
-      interruptedRuns: () => [run],
-      memberUsage: () => ({ measured: false, coverage: "none" }),
+    registerInterruptedTaskMetricsRoute(app, {
+      runs: () => [run],
       evidence: store,
-      readable: () => false,
       now: () => NOW_MS,
     });
     const server = app.listen(0, "127.0.0.1");

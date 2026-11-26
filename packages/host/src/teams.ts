@@ -115,7 +115,7 @@ export type PendingOperation = { id: string; kind: "prepare" | "member" | "resul
 };
 type OperationCensus = { pendingId: string; at: string; state: "running" | "in-use" | "ended" | "unknown"; recorded?: number; using?: number; detail?: string };
 const WITNESS_SAVE_MS = 200;
-type OperationRecorder = { pendingId: string; inFlight: number; sampling?: true; save?: NodeJS.Timeout };
+type OperationRecorder = { pendingId: string; inFlight: number; spawning: number; sampling?: true; save?: NodeJS.Timeout };
 export type Stored = {
   run: TeamRun; fingerprint: string; receipts: Record<string, string>; prepared: boolean; root?: string; anchor?: string;
   goalPlanCorrectionRevision?: number;
@@ -1183,7 +1183,7 @@ export class TeamService {
       if (!receipt) return this.view(stored);
       if (stored.run.pullRequest && !pullRequestBranch(stored.run)) await this.reviewFeedback.resolveLegacyPullRequestBranch(stored);
       this.commands.get(id)?.abort();
-      await this.invalidatePermissionDecisions(stored, "The team revision changed before the permission request could be answered.");
+      await this.invalidatePermissionDecisions(stored, "A steer started before the permission request could be answered.");
       this.recordReceipt(stored, body.requestId, receipt);
       this.fence.lift(stored);
       if (stored.run.recovery && stored.run.recovery.status !== "exhausted") {
@@ -1492,7 +1492,7 @@ export class TeamService {
   }
   private async resumeRun(stored: Stored, inPlace = false, record?: () => void) {
     const run = stored.run;
-    if (!inPlace) await this.invalidatePermissionDecisions(stored, "The team resumed under a new revision.");
+    if (!inPlace) await this.invalidatePermissionDecisions(stored, "A resume started before the permission request could be answered.");
     record?.();
     if (inPlace) { run.status = "needs-input"; run.reason = undefined; return; }
     run.revision++; run.tasks = []; run.review = undefined; run.round = 0; stored.checkHead = undefined;
@@ -1735,23 +1735,28 @@ export class TeamService {
     }
   }
   private commandRecorder(stored: Stored, id: string): CommandScope {
-    const recorder: OperationRecorder = { pendingId: id, inFlight: 0 };
+    const recorder: OperationRecorder = { pendingId: id, inFlight: 0, spawning: 0 };
     this.recorders.set(stored.run.id, recorder);
     const settle = () => { recorder.inFlight--; this.saveWitnessSoon(stored, recorder); };
+    const failed = () => new TeamError(409, "command-unavailable", "The team operation failed; the command was not started.");
     this.saveWitnessSoon(stored, recorder);
     return {
       starting: () => {
+        if (this.intent(stored, id)?.failure) return Promise.reject(failed());
         recorder.inFlight++;
+        recorder.spawning++;
         if (this.intent(stored, id)?.recording) return undefined;
         return this.enqueue(stored.run.id, () => {
           if (this.closed) throw new TeamError(409, "command-unavailable", "The host is stopping; the command was not started.");
           const pending = this.intent(stored, id);
+          if (pending?.failure) throw failed();
           if (!pending || pending.recording) return;
           pending.recording = true;
           try { this.save(stored); } catch (error) { delete pending.recording; throw error; }
-        }).catch(error => { recorder.inFlight--; throw error; });
+        }).catch(error => { recorder.inFlight--; recorder.spawning--; throw error; });
       },
       started: pid => {
+        recorder.spawning--;
         const witness = this.intent(stored, id)?.witness;
         if (pid === undefined || !witness) { settle(); return; }
         if (process.platform !== "win32") recordCommand(witness, pid);
@@ -1833,9 +1838,10 @@ export class TeamService {
       this.save(stored);
     }), error => this.enqueue(stored.run.id, () => {
       if (this.closed || stored.pending?.id !== pending.id) return;
+      this.commands.get(stored.run.id)?.abort();
       this.commands.delete(stored.run.id);
-      const failed = stored.pending;
-      if (this.recorderOf(stored, failed)?.inFlight === 0) delete failed.recording;
+      const failed = stored.pending, recorder = this.recorderOf(stored, failed);
+      if (recorder?.spawning === 0 && (process.platform !== "win32" || recorder.inFlight === 0)) delete failed.recording;
       failed.failure = { code: error instanceof TeamError ? error.code : "workspace-operation-failed",
         reason: error instanceof Error ? error.message : "A team workspace operation failed.", at: timestamp() };
       this.save(stored);

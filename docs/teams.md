@@ -436,10 +436,19 @@ workspaces unless the host looks and finds no process of that operation.
 Such a cancelled run's workspaces are removed after `cancelledMinutes` only when
 a look taken at that moment, in two passes, finds neither kind of process
 described below. The host records each command an
-operation starts, as the leader of its own session and process group, and while
+operation starts, as the leader of its own session and process group, in the
+step that starts it, and while
 the operation runs it samples the process table for descendants that moved to
 other sessions or groups. The saved intent says that this record may be
-incomplete from before a command starts until a save holds it. While such a run
+incomplete from before a command starts until a save holds it. When an
+operation fails, the host ends the operation's commands that are still running,
+as a halt does, and refuses the commands that have not started: one that the
+operation asks for later, and one that was still waiting for its turn to start.
+Such a command is refused at its turn or, when its turn came before the failure,
+just before its start, because its stop came first. The saved failure holds
+every command that has started, so it marks the record incomplete only while a
+command is still starting, not while the host still reads a command's start
+time. While such a run
 is blocked, paused or cancelled with no command of its own running, the host looks at most
 every ten minutes for processes that match the record, and for any process of
 the host account or of the account that runs team commands that uses the run
@@ -453,7 +462,14 @@ run keeps its workspaces and stays blocked: when a look finds a process; when it
 cannot finish; when a process of those accounts refuses inspection; when the
 record overflowed; or when an earlier API process stopped while the record was
 marked incomplete and the host has not rebooted since. In the last four cases
-the host says it cannot tell. The host never signals or stops a process it
+the host says it cannot tell. Earlier versions also marked a failure's record
+incomplete while the host still read a command's start time. A run that such a
+version left marked this way is held as above until the host boots again: only
+a reboot lets the retention policy close it. Its events say that the host cannot
+tell whether the interrupted operation left processes, because "the host stopped
+while the operation was starting a command, so its record of the operation's
+processes may be incomplete".
+The host never signals or stops a process it
 finds. The look has stated limits: it does not inspect other accounts or a
 process that left its recorded session and group and no longer uses the run
 directory, and it is evidence about left-over processes, not a defense against
@@ -2923,7 +2939,9 @@ block or a host stop) ends the command in one of two ways. Without a command
 prefix the host kills the command's process group at once. Under a command
 prefix the host sends SIGTERM to the process group, and SIGKILL five seconds
 later if that process still runs, because a prefix such as `sudo` passes on the
-signals it can catch and cannot pass on SIGKILL. Once that process has exited, the host sends
+signals it can catch and cannot pass on SIGKILL. A command whose stop comes
+before its start, for example while it waits for its turn to start, is never
+started: it returns as interrupted, with no output. Once that process has exited, the host sends
 no signal to anything the command started: the group may be empty by then, and
 its id may already belong to an unrelated process. The host reads output that is
 still open for at most one second. It then reads what the pipes already hold:

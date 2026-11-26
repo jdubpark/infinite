@@ -8,7 +8,12 @@ import { join } from "node:path";
 import { hashToken } from "../packages/host/src/config.js";
 import type { EvidenceStore } from "../packages/host/src/evidence/store.js";
 import type { RunEvent } from "../packages/host/src/evidence/types.js";
-import { computeInterruptedTaskMetrics, type InterruptedTaskReport } from "../packages/host/src/interrupted-task-metrics.js";
+import {
+  computeInterruptedTaskMetrics,
+  runMayHaveInterruptedWork,
+  snapshotInterruptedRun,
+  type InterruptedTaskReport,
+} from "../packages/host/src/interrupted-task-metrics.js";
 import { createApp } from "../packages/host/src/server.js";
 import type { TeamContinuation, TeamMember, TeamRun, TeamTask } from "../packages/host/src/team-types.js";
 import type { Config } from "../packages/host/src/types.js";
@@ -112,7 +117,7 @@ function seedBlockedRun(
     blockCode: options.code,
     createdAt: options.at,
     updatedAt: options.at,
-    ...(options.replay ? { replay: true } : {}),
+    ...(options.replay ? { replay: { jobId: "j-reg", trialId: "tr-reg", purpose: "replay" as const } } : {}),
     tasks: [
       makeTask("t-src", "running", [], 1),
       makeTask("t-other", "pending", [], 1),
@@ -338,4 +343,185 @@ test("GET /api/usage/interrupted-tasks does not call teams.understandingRecords 
     assert.deepEqual(body.samples.map(sample => sample.runId), [targetRun.id]);
     assert.equal(understandingRecordsCalls, 0);
   });
+});
+
+test("runMayHaveInterruptedWork filters window, replay, and project while retaining cancelled runs and snapshotInterruptedRun strips unrelated payload fields", () => {
+  const cutoffMs = Date.parse("2026-11-20T00:00:00.000Z");
+  const inWindowCancelled = makeRun({
+    id: "run-cancelled-rev1",
+    projectId: "proj-alpha",
+    revision: 1,
+    status: "cancelled",
+    createdAt: "2026-11-25T09:00:00.000Z",
+    updatedAt: "2026-11-25T10:00:00.000Z",
+    tasks: [makeTask("t1", "running", ["t0"]), makeTask("t2", "pending")],
+    members: [makeMember({ runId: "run-cancelled-rev1", memberId: "m1", role: "implementer", revision: 1, taskId: "t1", prompt: "large-prompt" })],
+    checks: [{ revision: 1, round: 1, headCommit: COMMIT_A, startedAt: "2026-11-25T09:30:00.000Z", finishedAt: "2026-11-25T09:31:00.000Z", status: "failed", output: "failed", command: { command: "npm", args: ["test"] } }],
+    events: [{ at: "2026-11-25T09:45:00.000Z", text: "Blocked then cancelled" }],
+    continuations: [
+      {
+        revision: 1,
+        requestId: "req-strip",
+        at: "2026-11-25T09:50:00.000Z",
+        reason: "Automatic PM recovery after agent-question: Confirm?",
+        headCommit: COMMIT_A,
+        tasks: [makeTask("t1", "running", ["t0"])],
+      },
+    ],
+  });
+  const oldRun = makeRun({
+    id: "run-old",
+    projectId: "proj-alpha",
+    status: "blocked",
+    createdAt: "2026-11-01T00:00:00.000Z",
+    updatedAt: "2026-11-02T00:00:00.000Z",
+    continuations: [{ revision: 1, requestId: "req-old", at: "2026-11-02T00:00:00.000Z", reason: "old", headCommit: COMMIT_A, tasks: [] }],
+  });
+  const oldUpdatedRecentContinuation = makeRun({
+    id: "run-recent-cont",
+    projectId: "proj-alpha",
+    createdAt: "2026-11-01T00:00:00.000Z",
+    updatedAt: "2026-11-02T00:00:00.000Z",
+    continuations: [{ revision: 1, requestId: "req-new", at: "2026-11-22T00:00:00.000Z", reason: "recent", headCommit: COMMIT_A, tasks: [] }],
+  });
+  const replayRun = makeRun({
+    id: "run-replay",
+    projectId: "proj-alpha",
+    replay: { jobId: "j-reg", trialId: "tr-reg", purpose: "replay" },
+    updatedAt: "2026-11-25T10:00:00.000Z",
+  });
+  const otherProjectRun = makeRun({ id: "run-beta", projectId: "proj-beta", updatedAt: "2026-11-25T10:00:00.000Z" });
+  const unparseableRun = makeRun({
+    id: "run-unparseable",
+    projectId: "proj-alpha",
+    createdAt: "not-a-date",
+    updatedAt: "also-bad",
+    continuations: [{ revision: 1, requestId: "req-old-cont", at: "2026-11-02T00:00:00.000Z", reason: "old", headCommit: COMMIT_A, tasks: [] }],
+  });
+
+  assert.equal(runMayHaveInterruptedWork(inWindowCancelled, { projectId: "proj-alpha", cutoffMs }), true);
+  assert.equal(runMayHaveInterruptedWork(oldRun, { projectId: "proj-alpha", cutoffMs }), false);
+  assert.equal(runMayHaveInterruptedWork(oldUpdatedRecentContinuation, { projectId: "proj-alpha", cutoffMs }), true);
+  assert.equal(runMayHaveInterruptedWork(replayRun, { projectId: "proj-alpha", cutoffMs }), false);
+  assert.equal(runMayHaveInterruptedWork(otherProjectRun, { projectId: "proj-alpha", cutoffMs }), false);
+  assert.equal(runMayHaveInterruptedWork(unparseableRun, { projectId: "proj-alpha", cutoffMs }), true);
+
+  const snapshot = snapshotInterruptedRun(inWindowCancelled);
+  assert.equal(snapshot.id, "run-cancelled-rev1");
+  assert.equal(snapshot.status, "cancelled");
+  assert.equal("checks" in snapshot, false);
+  assert.equal("events" in snapshot, false);
+  assert.equal("decisions" in snapshot, false);
+  assert.equal("objective" in snapshot, false);
+  assert.equal("prompt" in snapshot.members[0]!, false);
+  assert.equal("instructions" in snapshot.tasks[0]!, false);
+  assert.equal("requestId" in snapshot.continuations![0]!, false);
+  inWindowCancelled.tasks[0]!.dependsOn.push("mutated");
+  assert.deepEqual(snapshot.tasks[0]!.dependsOn, ["t0"]);
+
+  const replaySnapshot = snapshotInterruptedRun(replayRun);
+  assert.deepEqual(replaySnapshot.replay, { jobId: "j-reg", trialId: "tr-reg", purpose: "replay" });
+  assert.notEqual(replaySnapshot.replay, replayRun.replay);
+});
+
+test("recovery event deduplication is order-independent, rejects non-positive fromRevision, and aligns fallback window with snapshot", () => {
+  const continuation: TeamContinuation = {
+    revision: 1,
+    requestId: "req-edge",
+    at: "2026-11-25T10:00:00.000Z",
+    reason: "Automatic PM recovery after agent-question: Confirm?",
+    headCommit: COMMIT_A,
+    tasks: [makeTask("t-src", "running", [], 1), makeTask("t-other", "pending", [], 1)],
+  };
+  const makeRev2Run = (id: string, continuations: TeamContinuation[] = [continuation]) => makeRun({
+    id,
+    revision: 2,
+    continuations,
+    members: [makeMember({ runId: id, memberId: "m-src", role: "implementer", revision: 1, taskId: "t-src" })],
+  });
+  const validEvent = (runId: string, seq = 1) => makeEvent({
+    seq,
+    runId,
+    revision: 2,
+    at: "2026-11-25T10:00:00.000Z",
+    kind: "run.revision-advanced",
+    data: { v: 1, cause: "automatic-recovery", fromRevision: 1, baseChanged: false, sourceCode: "agent-question", sourceMemberId: "m-src" },
+  });
+  const malformedEvent = (runId: string, options: { seq?: number; at?: string; fromRevision?: number } = {}) => makeEvent({
+    seq: options.seq ?? 2,
+    runId,
+    revision: 2,
+    at: options.at ?? "2026-11-25T10:00:00.000Z",
+    kind: "run.revision-advanced",
+    data: {
+      v: 1,
+      cause: "automatic-recovery",
+      ...(options.fromRevision === undefined ? {} : { fromRevision: options.fromRevision }),
+      baseChanged: false,
+      sourceCode: "agent-question",
+    },
+  });
+
+  const malformedFirst = computeInterruptedTaskMetrics(
+    [makeRev2Run("run-order-1")],
+    () => [malformedEvent("run-order-1", { seq: 1 }), validEvent("run-order-1", 2)],
+    { now: NOW_MS },
+  );
+  const validFirst = computeInterruptedTaskMetrics(
+    [makeRev2Run("run-order-2")],
+    () => [validEvent("run-order-2", 1), malformedEvent("run-order-2", { seq: 2 })],
+    { now: NOW_MS },
+  );
+  const duplicateValid = computeInterruptedTaskMetrics(
+    [makeRev2Run("run-dup-valid")],
+    () => [validEvent("run-dup-valid", 1), validEvent("run-dup-valid", 2)],
+    { now: NOW_MS },
+  );
+  for (const report of [malformedFirst, validFirst, duplicateValid]) {
+    assert.equal(report.recoveriesCounted, 1);
+    assert.equal(report.unknownRecoveries, 0);
+    assert.equal(report.interruptedTasksTotal, 1);
+  }
+
+  for (const invalidFrom of [0, -1]) {
+    const id = `run-from-${invalidFrom}`;
+    const report = computeInterruptedTaskMetrics(
+      [makeRev2Run(id)],
+      () => [malformedEvent(id, { fromRevision: invalidFrom })],
+      { now: NOW_MS },
+    );
+    assert.equal(report.recoveriesCounted, 0);
+    assert.equal(report.unknownRecoveries, 1);
+    const unknowns = report.samples.filter(sample => sample.kind === "recovery" && sample.unknown === true);
+    assert.equal(unknowns.length, 1);
+    assert.equal(unknowns[0]?.unknownReason, "missing-from-revision");
+    assert.equal(unknowns[0]?.revision, 1);
+  }
+
+  const oldEventInWindowContinuation = computeInterruptedTaskMetrics(
+    [makeRev2Run("run-window-cont")],
+    () => [malformedEvent("run-window-cont", { at: "2026-10-01T00:00:00.000Z" })],
+    { now: NOW_MS, days: 30 },
+  );
+  assert.equal(oldEventInWindowContinuation.unknownRecoveries, 1);
+  assert.equal(oldEventInWindowContinuation.samples[0]?.unknownReason, "missing-from-revision");
+  assert.equal(oldEventInWindowContinuation.samples[0]?.at, continuation.at);
+
+  const inWindowEventOldContinuation = computeInterruptedTaskMetrics(
+    [makeRev2Run("run-window-old-cont", [{ ...continuation, at: "2026-10-01T00:00:00.000Z" }])],
+    () => [malformedEvent("run-window-old-cont", { at: "2026-11-25T10:00:00.000Z" })],
+    { now: NOW_MS, days: 30 },
+  );
+  assert.equal(inWindowEventOldContinuation.unknownRecoveries, 0);
+
+  const oldThenRecentNoSnapshot = computeInterruptedTaskMetrics(
+    [makeRev2Run("run-old-then-recent", [])],
+    () => [
+      malformedEvent("run-old-then-recent", { seq: 1, at: "2026-10-01T00:00:00.000Z" }),
+      malformedEvent("run-old-then-recent", { seq: 2, at: "2026-11-25T10:00:00.000Z" }),
+    ],
+    { now: NOW_MS, days: 30 },
+  );
+  assert.equal(oldThenRecentNoSnapshot.unknownRecoveries, 1);
+  assert.equal(oldThenRecentNoSnapshot.samples[0]?.at, "2026-11-25T10:00:00.000Z");
 });

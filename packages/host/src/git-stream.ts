@@ -14,12 +14,9 @@ export type GitStreamRead =
 export const BLOB_MAX_BYTES = 1_048_576, BLOB_READ_MS = 30_000, BLOB_RELEASE_MS = 1_000, BLOB_PATH_CHARS = 300;
 const STDERR_MAX_BYTES = 4_096;
 const MISSING_REF_FATAL = /^fatal:\s*(?:bad object\b|bad revision\b|ambiguous argument\b.*\bunknown revision\b|invalid object name\b|not a valid object name\b|could not parse object\b)/i;
-const SINGLE_REVISION_FATAL = /^fatal:\s*needed a single revision$/i;
 
-export type MissingRefCheck = { refs: readonly string[]; allowSingleRevision?: boolean };
-
-function isMissingRefStderr(stderr: string, check: MissingRefCheck | undefined): boolean {
-  if (check === undefined) return false;
+function isMissingRefStderr(stderr: string, refs: readonly string[] | undefined): boolean {
+  if (refs === undefined || refs.length === 0) return false;
   const lines = stderr.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
   let lastFatal: string | undefined;
   for (let index = lines.length - 1; index >= 0; index--) {
@@ -28,10 +25,7 @@ function isMissingRefStderr(stderr: string, check: MissingRefCheck | undefined):
       break;
     }
   }
-  if (lastFatal === undefined) return false;
-  if (check.allowSingleRevision && SINGLE_REVISION_FATAL.test(lastFatal)) return true;
-  if (!MISSING_REF_FATAL.test(lastFatal)) return false;
-  return check.refs.length === 0 || check.refs.some(ref => lastFatal.includes(ref));
+  return lastFatal !== undefined && MISSING_REF_FATAL.test(lastFatal) && refs.some(ref => lastFatal.includes(ref));
 }
 
 export function stopGroup(child: ChildProcess): boolean {
@@ -48,11 +42,11 @@ export type GitStreamInput = {
   cwd: string; args: readonly string[]; prefix: TeamCommand | undefined; maxBytes: number; timeoutMs: number; signal: AbortSignal;
   stop: (child: ChildProcess) => boolean; releaseMs: number; env?: Record<string, string>;
   decided?: (read: GitStreamRead) => void;
-  missingRef?: MissingRefCheck;
+  missingRefs?: readonly string[];
 };
 
 export function readGitStream(input: GitStreamInput): Promise<GitStreamRead> {
-  const { cwd, args, prefix, maxBytes, timeoutMs, signal, stop, releaseMs, env, decided: report, missingRef } = input;
+  const { cwd, args, prefix, maxBytes, timeoutMs, signal, stop, releaseMs, env, decided: report, missingRefs } = input;
   if (signal.aborted) return Promise.resolve({ state: "failed" });
   return new Promise(resolveRead => {
     let child: ChildProcess;
@@ -127,7 +121,7 @@ export function readGitStream(input: GitStreamInput): Promise<GitStreamRead> {
         return;
       }
       const stderr = stderrTail.toString("utf8");
-      finish(exitCode === 128 && closeSignal === null && isMissingRefStderr(stderr, missingRef) ? { state: "missing" } : { state: "failed" });
+      finish(exitCode === 128 && closeSignal === null && isMissingRefStderr(stderr, missingRefs) ? { state: "missing" } : { state: "failed" });
     });
   });
 }

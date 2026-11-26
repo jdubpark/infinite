@@ -449,6 +449,13 @@ test("patch reads distinguish empty diffs, missing refs, and repository errors",
     writeFileSync(unrelatedFatalScript, "#!/bin/sh\nprintf \"fatal: bad revision 'HEAD'\\n\" >&2\nexit 128\n");
     const unrelatedFatal = captureGit(() => ({ command: "/bin/sh", args: [unrelatedFatalScript] }));
     assert.deepEqual(await unrelatedFatal.patch(dir, from, to), { state: "failed" });
+    assert.equal(await unrelatedFatal.sameTree(dir, from, to), "failed");
+
+    const unattributedScript = join(dir, "unattributed-fatal.sh");
+    writeFileSync(unattributedScript, "#!/bin/sh\nprintf 'fatal: Needed a single revision\\n' >&2\nexit 128\n");
+    const unattributed = captureGit(() => ({ command: "/bin/sh", args: [unattributedScript] }));
+    assert.equal(await unattributed.sameTree(dir, from, to), "failed");
+    assert.deepEqual(await unattributed.patch(dir, from, to), { state: "failed" });
   } finally {
     rmSync(dir, { recursive: true, force: true });
     rmSync(nonRepo, { recursive: true, force: true });

@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 import { HANDOFF_INSTRUCTIONS, handoffRequestSchema } from "./handoff-types.js";
 import { submitHandoff } from "./handoff-report-client.js";
-import { resolve } from "node:path";
+import { existsSync, realpathSync } from "node:fs";
+import { basename, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { teamReportSchema } from "./team-types.js";
@@ -159,7 +160,9 @@ export async function runTeamMcp() {
   }
   if (pending.length) { await error(null, -32700, "Incomplete MCP frame; each message must end with a newline."); process.exitCode = 1; }
 }
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+const entry = process.argv[1] ? resolve(process.argv[1]) : undefined;
+const self = fileURLToPath(import.meta.url);
+if (/^team-mcp\.(?:js|ts)$/.test(basename(self)) && entry && existsSync(entry) && existsSync(self) && realpathSync(entry) === realpathSync(self)) {
   runTeamMcp().catch(() => {
     process.stderr.write("The team MCP transport stopped without confirming the pending request.\n");
     process.exitCode = 1;

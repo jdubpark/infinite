@@ -223,7 +223,8 @@ export function recordClaudeTrustAsync(configPath: string, cwd: string, lockWait
 }
 
 const entry = process.argv[1] ? resolve(process.argv[1]) : undefined;
-if (entry && existsSync(entry) && realpathSync(entry) === fileURLToPath(import.meta.url)) {
+const self = fileURLToPath(import.meta.url);
+if (/^workspace-trust\.(?:js|ts)$/.test(basename(self)) && entry && existsSync(entry) && existsSync(self) && realpathSync(entry) === realpathSync(self)) {
   const requested = process.env.INFINITE_TRUSTED_WORKSPACE;
   const home = process.env.HOME;
   if (process.argv[2] !== "claude" || process.argv.length !== 3 || !requested || !home) {

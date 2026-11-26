@@ -152,6 +152,78 @@ test("GoalService processes independent goals concurrently, serializes same-goal
     await closing;
     assert.equal(closedDone, true);
   } finally {
+    extendGate.resolve();
+    secondGate.resolve();
+    await goals.close();
+    f.close();
+  }
+});
+
+test("GoalService.idle waits for all multi-goal tick workers even when a failed goal's save throws", async () => {
+  const f = schedulerFixture();
+  const siblingGate = deferred();
+  const firstEntered = deferred();
+  let siblingsEntered = 0;
+  const createdIds = new Set<string>();
+  let failingId = "";
+  let restoreWrite: (() => void) | undefined;
+  const fakeTeams = {
+    goalIdOf: () => undefined,
+    get: () => { throw new TeamError(404, "team-not-found", "missing"); },
+    createForGoal: async (request: { requestId: string; title: string }, context: { id: string }) => {
+      if (request.title.startsWith("Failing goal")) {
+        restoreWrite = f.blockRecordWrites("goal", failingId);
+        firstEntered.resolve();
+        throw new Error("create failed");
+      }
+      siblingsEntered++;
+      await siblingGate.promise;
+      createdIds.add(context.id);
+      return {
+        id: request.requestId, status: "running", createdAt: new Date().toISOString(), members: [],
+        usage: { total: { cost: 0, tokens: 0, messages: 0, pricing: { catalog: 0, unknown: 0 } }, byProfile: {}, byProvider: {}, unmeasuredMembers: 0 },
+      };
+    },
+  } as unknown as TeamService;
+  const config = {
+    ...f.config,
+    teams: { ...f.config.teams, lineup },
+    projects: [{ id: "fixture", name: "Fixture", path: f.workspace, team: { checks: [{ command: process.execPath, args: ["-e", "0"] }] } }],
+  } as Config;
+  const goals = new GoalService(config, f.key, fakeTeams);
+  try {
+    const failing = await goals.create({
+      requestId: randomUUID(), projectId: "fixture", title: "Failing goal", objective: "Fail on launch",
+      successCriteria: "Checks pass", nonGoals: ["No unrelated edits"], allowedPaths: ["src"],
+      evidence: ["Spec"], maxRuns: 1, maxMinutes: 10, maxMembers: 4,
+    });
+    failingId = failing.id;
+    const siblings: string[] = [];
+    for (let i = 0; i < 9; i++) {
+      const created = await goals.create({
+        requestId: randomUUID(), projectId: "fixture", title: `Sibling goal ${i}`, objective: `Work ${i}`,
+        successCriteria: "Checks pass", nonGoals: ["No unrelated edits"], allowedPaths: ["src"],
+        evidence: ["Spec"], maxRuns: 1, maxMinutes: 10, maxMembers: 4,
+      });
+      siblings.push(created.id);
+    }
+    goals.start();
+    let idleDone = false;
+    const idling = goals.idle().then(() => { idleDone = true; });
+    await firstEntered.promise;
+    for (let i = 0; i < 50 && siblingsEntered < 8; i++) {
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    assert.equal(siblingsEntered, 8);
+    assert.equal(idleDone, false, "idle waits while sibling workers remain in flight after a save failure");
+    siblingGate.resolve();
+    await idling;
+    assert.equal(idleDone, true);
+    assert.equal(createdIds.size, 9);
+    for (const id of siblings) assert.ok(goals.get(id).activeTeamId, `sibling ${id} launched`);
+  } finally {
+    siblingGate.resolve();
+    restoreWrite?.();
     await goals.close();
     f.close();
   }

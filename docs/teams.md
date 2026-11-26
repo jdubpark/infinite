@@ -672,7 +672,7 @@ Promotion codes. The ledger's decision rule runs first, then the facts, in this 
 | `same-model-review` | The approving review ran on the same model as the work. |
 | `not-accepted` | The ledger counts the attempt as not accepted. |
 | `acceptance-unknown` | The ledger cannot tell whether the attempt was accepted. |
-| `patch-missing` | A patch commit/ref is missing. |
+| `patch-missing` | A patch commit/ref is missing (pre-upgrade partial rows created before empty/failed patch reads were split can also settle here; newly read failures record `capture-failed`). |
 | `reference-unknown` | The approval read is missing, or the later-change list was too wide. |
 | `reference-ambiguous` | A later commit of the run changed a reference file. |
 | `base-not-proven` | Form 3 did not prove that the anchor is on the mirror's branch. |

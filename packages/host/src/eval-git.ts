@@ -1,5 +1,5 @@
 import type { ChildProcess } from "node:child_process";
-import type { BaseRead, CaptureGit, NameRead, PatchRead } from "./eval-types.js";
+import type { BaseRead, CaptureGit, NameRead, PatchRead, TreeCompare } from "./eval-types.js";
 import { COMMIT_ID } from "./outcome-hold.js";
 import type { TeamCommand } from "./team-types.js";
 import { teamCommand, teamGitArgs } from "./team-workspace.js";
@@ -7,6 +7,7 @@ import { readGitStream, stopGroup } from "./git-stream.js";
 
 export const PATCH_MAX_BYTES = 1_048_576, CAPTURE_READ_MS = 30_000;
 export const CAPTURE_RELEASE_MS = 1_000;
+const TREE_OID_MAX_BYTES = 128;
 
 export function patchArgs(from: string, to: string): string[] {
   if (!COMMIT_ID.test(from) || !COMMIT_ID.test(to)) throw new TypeError("A capture patch needs two full commit ids.");
@@ -33,7 +34,41 @@ function readPatch(
   } catch {
     return Promise.resolve({ state: "failed" });
   }
-  return readGitStream({ cwd, args, prefix, maxBytes: PATCH_MAX_BYTES, timeoutMs, signal, stop, releaseMs, env: { LC_ALL: "C" } });
+  return readGitStream({ cwd, args, prefix, maxBytes: PATCH_MAX_BYTES, timeoutMs, signal, stop, releaseMs, env: { LC_ALL: "C" }, missingRef: { refs: [from, to] } });
+}
+
+async function readTreeOid(
+  cwd: string,
+  commit: string,
+  prefix: TeamCommand | undefined,
+  timeoutMs: number,
+  signal: AbortSignal,
+  stop: (child: ChildProcess) => boolean,
+  releaseMs: number,
+): Promise<{ state: "read"; oid: string } | { state: "missing" } | { state: "failed" }> {
+  if (!COMMIT_ID.test(commit) || signal.aborted) return { state: "failed" };
+  let args: string[];
+  try {
+    args = teamGitArgs(cwd, ["rev-parse", "--verify", `${commit}^{tree}`]);
+  } catch {
+    return { state: "failed" };
+  }
+  const read = await readGitStream({
+    cwd,
+    args,
+    prefix,
+    maxBytes: TREE_OID_MAX_BYTES,
+    timeoutMs,
+    signal,
+    stop,
+    releaseMs,
+    env: { LC_ALL: "C" },
+    missingRef: { refs: [commit], allowSingleRevision: true },
+  });
+  if (read.state === "missing") return { state: "missing" };
+  if (read.state !== "read") return { state: "failed" };
+  const oid = read.bytes.toString("utf8").trim();
+  return COMMIT_ID.test(oid) ? { state: "read", oid } : { state: "failed" };
 }
 
 export function captureGit(
@@ -47,6 +82,14 @@ export function captureGit(
   return {
     patch(cwd, from, to) {
       return readPatch(cwd, from, to, prefix(), timeoutMs, signal, stop, releaseMs);
+    },
+    async sameTree(cwd, from, to): Promise<TreeCompare> {
+      const commandPrefix = prefix();
+      const first = await readTreeOid(cwd, from, commandPrefix, timeoutMs, signal, stop, releaseMs);
+      if (first.state !== "read") return first.state;
+      const second = await readTreeOid(cwd, to, commandPrefix, timeoutMs, signal, stop, releaseMs);
+      if (second.state !== "read") return second.state;
+      return first.oid === second.oid ? "same" : "different";
     },
     close() {
       controller.abort();

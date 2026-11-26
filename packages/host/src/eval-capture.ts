@@ -14,6 +14,7 @@ import {
   type NameRead,
   type PatchRead,
   type ReconcileResult,
+  type TreeCompare,
 } from "./eval-types.js";
 import { outcomeId } from "./outcome-projector.js";
 import { OUTCOMES_MODULE, readOutcome, type OutcomeRow } from "./outcome-store.js";
@@ -330,11 +331,18 @@ export class TaskCapture implements CaptureSink {
       );
       if (read.state === "too-large") return { kind: "reject", reason: "patch-too-large" };
       if (read.state === "failed") return { kind: "reject", reason: "capture-failed" };
-      baseDelta = read.state === "read"
-        ? { state: "stored", bytes: read.bytes }
-        : read.state === "empty"
-          ? { state: "stored", bytes: Buffer.alloc(0) }
-          : { state: "missing" };
+      if (read.state === "missing") baseDelta = { state: "missing" };
+      else if (read.state === "empty" || read.bytes.length === 0) {
+        const trees = await this.bounded<TreeCompare>(
+          () => this.git.sameTree(workspace, start.anchorCommit, start.memberBaseCommit),
+          "failed",
+        );
+        if (trees === "same") baseDelta = { state: "stored", bytes: Buffer.alloc(0) };
+        else if (trees === "missing") baseDelta = { state: "missing" };
+        else return { kind: "reject", reason: "capture-failed" };
+      } else {
+        baseDelta = { state: "stored", bytes: read.bytes };
+      }
     }
 
     const reference = await this.bounded<PatchRead>(

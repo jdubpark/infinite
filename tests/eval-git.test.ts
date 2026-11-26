@@ -417,10 +417,38 @@ test("patch reads distinguish empty diffs, missing refs, and repository errors",
     assert.deepEqual(await git.patch(dir, from, missingSha), { state: "missing" });
     assert.deepEqual(await git.patch(nonRepo, from, to), { state: "failed" });
 
+    assert.equal(await git.sameTree(dir, from, equalTree), "same");
+    assert.equal(await git.sameTree(dir, from, to), "different");
+    assert.equal(await git.sameTree(dir, missingSha, to), "missing");
+    assert.equal(await git.sameTree(dir, from, missingSha), "missing");
+    assert.equal(await git.sameTree(nonRepo, from, to), "failed");
+
     const silentScript = join(dir, "silent.sh");
     writeFileSync(silentScript, "#!/bin/sh\nexit 0\n");
     const silent = captureGit(() => ({ command: "/bin/sh", args: [silentScript] }));
     assert.deepEqual(await silent.patch(dir, from, to), { state: "empty" });
+    assert.equal(await silent.sameTree(dir, from, equalTree), "failed");
+
+    const noisyScript = join(dir, "noisy-stderr.sh");
+    writeFileSync(noisyScript, `#!/bin/sh\ni=0\nwhile [ "$i" -lt 120 ]; do\n  printf 'prefix-log-line-0123456789012345678901234567890123456789\\n' >&2\n  i=$((i + 1))\ndone\nshift\nexec git "$@"\n`);
+    const noisy = captureGit(() => ({ command: "/bin/sh", args: [noisyScript] }));
+    assert.deepEqual(await noisy.patch(dir, missingSha, to), { state: "missing" });
+    assert.equal(await noisy.sameTree(dir, missingSha, to), "missing");
+
+    const warnOnlyScript = join(dir, "warn-only.sh");
+    writeFileSync(warnOnlyScript, `#!/bin/sh\nprintf 'warning: path bad revision %s\\n' '${from}' >&2\nexit 128\n`);
+    const warnOnly = captureGit(() => ({ command: "/bin/sh", args: [warnOnlyScript] }));
+    assert.deepEqual(await warnOnly.patch(dir, from, to), { state: "failed" });
+
+    const warnBeforeFatalScript = join(dir, "warn-before-fatal.sh");
+    writeFileSync(warnBeforeFatalScript, `#!/bin/sh\nprintf 'warning: bad revision %s\\nfatal: not a git repository\\n' '${from}' >&2\nexit 128\n`);
+    const warnBeforeFatal = captureGit(() => ({ command: "/bin/sh", args: [warnBeforeFatalScript] }));
+    assert.deepEqual(await warnBeforeFatal.patch(dir, from, to), { state: "failed" });
+
+    const unrelatedFatalScript = join(dir, "unrelated-fatal.sh");
+    writeFileSync(unrelatedFatalScript, "#!/bin/sh\nprintf \"fatal: bad revision 'HEAD'\\n\" >&2\nexit 128\n");
+    const unrelatedFatal = captureGit(() => ({ command: "/bin/sh", args: [unrelatedFatalScript] }));
+    assert.deepEqual(await unrelatedFatal.patch(dir, from, to), { state: "failed" });
   } finally {
     rmSync(dir, { recursive: true, force: true });
     rmSync(nonRepo, { recursive: true, force: true });

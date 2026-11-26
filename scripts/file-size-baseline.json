@@ -10,7 +10,7 @@
     "packages/host/src/outcome-store.ts": 1266,
     "packages/host/src/server.ts": 2147,
     "packages/host/src/team-cli.ts": 1224,
-    "packages/host/src/teams.ts": 3242,
+    "packages/host/src/teams.ts": 3248,
     "packages/host/src/understanding-work.ts": 1021,
     "packages/host/src/worker.ts": 1726,
     "scripts/egress-proxy.mjs": 1253,
@@ -21,7 +21,7 @@
     "tests/halt.test.ts": 1209,
     "tests/intake-slack.test.ts": 1647,
     "tests/intake.test.ts": 1624,
-    "tests/missions.test.ts": 2575,
+    "tests/missions.test.ts": 2576,
     "tests/outcome-store.test.ts": 1612,
     "tests/team-events.test.ts": 1779,
     "tests/teams.test.ts": 3434

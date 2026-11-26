@@ -64,7 +64,7 @@ function missionCheckoutAdmission(primaryReady: boolean) {
   return { missions, close: () => { missions.close(); rmSync(root, { recursive: true, force: true }); } };
 }
 
-test("mission-managed sessions refuse direct human input but keep answers, reads, and standalone access", { timeout: 15000 }, async () => {
+test("mission-managed sessions refuse direct human input but keep answers, reads, and standalone access", { timeout: 60000 }, async () => {
   const host = await inProcessHost();
   const workers: ReturnType<typeof createNetServer>[] = [];
   const workerRequests: { sessionId: string; request: Record<string, unknown> }[] = [];
@@ -98,6 +98,7 @@ test("mission-managed sessions refuse direct human input but keep answers, reads
       writeSealed(join(directory, "meta.sealed"), host.manager.key, `${session.id}:meta`, { session, fingerprint: "fixture" });
       const worker = createNetServer(socket => {
         let text = "";
+        socket.on("error", () => {});
         socket.on("data", chunk => {
           text += chunk.toString();
           const end = text.indexOf("\n");

@@ -2,13 +2,18 @@ import { isAbsolute } from "node:path";
 import { z } from "zod";
 import { ID_RE, ownedPathSchemaFor, teamCommandSchema, type TeamCommand } from "./schema-primitives.js";
 import type { TeamModelProfile } from "./team-types.js";
-import { agentProfileSchema } from "./types.js";
+import { agentProfileSchema, type Provider } from "./types.js";
 
 export const EVAL_RETENTION_DAYS_DEFAULT = 365;
 export const GRADING_PATHS_MAX = 64;
 export const GUARD_CHECKS_MAX = 8;
 export const GRADER_CANARIES_MAX = 32;
 export const TRIALS_PER_DAY_MAX = 50;
+export const EVAL_BUDGET_USD_MAX = 100_000;
+export const EVAL_BUDGET_PERIODS = ["day", "week", "month"] as const;
+export type EvalBudgetPeriod = typeof EVAL_BUDGET_PERIODS[number];
+export const EVAL_PROVIDERS = ["claude", "codex", "opencode"] as const;
+export type EvalProvider = typeof EVAL_PROVIDERS[number];
 export const TRIAL_MINUTES_DEFAULT = 45;
 export const TRIAL_MINUTES_MIN = 10;
 export const TRIAL_MINUTES_MAX = 240;
@@ -34,6 +39,18 @@ const focusedTest = teamCommandSchema
   .refine(test => test.args.filter(arg => arg === FILES_PLACEHOLDER).length === 1 && countOf(test.args.join("\0"), FILES_PLACEHOLDER) === 1, "Use {files} as exactly one whole argument")
   .refine(test => countOf(test.args.join("\0"), REPORT_PLACEHOLDER) === 1, "Use {report} exactly once in the arguments");
 
+export const evalProviderBudgetSchema = z.object({
+  usd: z.number().finite().min(0).max(EVAL_BUDGET_USD_MAX),
+  period: z.enum(EVAL_BUDGET_PERIODS).default("day"),
+}).strict();
+export type EvalProviderBudget = z.infer<typeof evalProviderBudgetSchema>;
+
+export const evalProviderBudgetsSchema = z.partialRecord(
+  z.enum(EVAL_PROVIDERS),
+  evalProviderBudgetSchema,
+).refine(budgets => Object.keys(budgets).length > 0, "Configure at least one provider budget");
+export type EvalProviderBudgets = z.infer<typeof evalProviderBudgetsSchema>;
+
 export const evalProjectSchema = z.object({
   capture: z.boolean().optional(),
   testPaths: z.object({
@@ -47,6 +64,7 @@ export const evalProjectSchema = z.object({
   focusedTest: focusedTest.optional(),
   reportFormat: z.enum(["junit", "tap"]).optional(),
   guardChecks: z.array(teamCommandSchema).max(GUARD_CHECKS_MAX).optional(),
+  providerBudgets: evalProviderBudgetsSchema.optional(),
   trialsPerDay: z.number().int().min(1).max(TRIALS_PER_DAY_MAX).optional(),
   trialMinutes: z.number().int().min(TRIAL_MINUTES_MIN).max(TRIAL_MINUTES_MAX).optional(),
 }).strict();
@@ -130,22 +148,60 @@ export function validationSettings(project: { source?: { mode: string }; team?: 
   };
 }
 
-export type TrialSettings = ValidationSettings & { trialsPerDay: number; trialMinutes: number; candidateProfiles: TeamModelProfile[] };
+export type HostUsageBudgets = Partial<Record<Provider, { usd: number; period?: EvalBudgetPeriod }>>;
+export type TrialBudgetConstraint = { source: "project" | "host"; usd: number; period: EvalBudgetPeriod };
+export type TrialSettings = ValidationSettings & {
+  trialsPerDay: number | null;
+  providerBudgets: EvalProviderBudgets;
+  trialMinutes: number;
+  candidateProfiles: TeamModelProfile[];
+};
 
 type TrialProject = { source?: { mode: string }; team?: { eval?: EvalProjectSettings & { candidateProfiles?: TeamModelProfile[] }; checks?: { command: string; args: string[] }[]; setup?: { command: string; args: string[] } } } | undefined;
 
-export function trialSettings(project: TrialProject):
-  { settings: TrialSettings } | { missing: "source" | "focusedTest" | "reportFormat" | "trialsPerDay" } {
+export function isEvalProvider(provider: string): provider is EvalProvider {
+  return provider === "claude" || provider === "codex" || provider === "opencode";
+}
+
+export function providerBudgetConstraints(
+  provider: EvalProvider,
+  projectBudgets: EvalProviderBudgets | undefined,
+  hostBudgets: HostUsageBudgets | undefined,
+): TrialBudgetConstraint[] {
+  const constraints: TrialBudgetConstraint[] = [];
+  const projectBudget = projectBudgets?.[provider];
+  if (projectBudget !== undefined) constraints.push({ source: "project", usd: projectBudget.usd, period: projectBudget.period ?? "day" });
+  const hostBudget = hostBudgets?.[provider];
+  if (hostBudget !== undefined) constraints.push({ source: "host", usd: hostBudget.usd, period: hostBudget.period ?? "month" });
+  return constraints;
+}
+
+export function hasTrialBudgetFor(
+  provider: EvalProvider,
+  settings: Pick<TrialSettings, "trialsPerDay" | "providerBudgets">,
+  hostBudgets: HostUsageBudgets | undefined,
+): boolean {
+  return providerBudgetConstraints(provider, settings.providerBudgets, hostBudgets).length > 0
+    || settings.trialsPerDay !== null;
+}
+
+export function trialSettings(project: TrialProject, hostBudgets?: HostUsageBudgets):
+  { settings: TrialSettings } | { missing: "source" | "focusedTest" | "reportFormat" | "budget" } {
   const validation = validationSettings(project);
   if ("missing" in validation) return validation;
   const eval_ = project?.team?.eval;
-  if (eval_?.trialsPerDay === undefined) return { missing: "trialsPerDay" };
+  const providerBudgets = eval_?.providerBudgets ?? {};
+  const trialsPerDay = eval_?.trialsPerDay ?? null;
+  const hasProjectBudget = Object.keys(providerBudgets).length > 0;
+  const hasHostBudget = hostBudgets !== undefined && EVAL_PROVIDERS.some(provider => hostBudgets[provider] !== undefined);
+  if (!hasProjectBudget && !hasHostBudget && trialsPerDay === null) return { missing: "budget" };
   return {
     settings: {
       ...validation.settings,
-      trialsPerDay: eval_.trialsPerDay,
-      trialMinutes: eval_.trialMinutes ?? TRIAL_MINUTES_DEFAULT,
-      candidateProfiles: eval_.candidateProfiles ?? [],
+      trialsPerDay,
+      providerBudgets,
+      trialMinutes: eval_?.trialMinutes ?? TRIAL_MINUTES_DEFAULT,
+      candidateProfiles: eval_?.candidateProfiles ?? [],
     },
   };
 }

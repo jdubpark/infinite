@@ -33,7 +33,6 @@ import {
   type Signal,
   type SignalData,
   type SignalEvent,
-  detectLimit,
 } from "@infinite/attention";
 import { Journal, writeSealed } from "./vault.js";
 import { ensureSocketDir, socketPath } from "./ipc.js";
@@ -60,12 +59,12 @@ import { TerminalSnapshots } from "./terminal-snapshot.js";
 import { DEFAULT_TERMINAL_SIZE, isPtyTerminalSize, TERMINAL_SIZE_INDEX_FILE, TerminalBarrier, TerminalSizeIndex } from "./terminal-size.js";
 import { ptyTails } from "./pty-tail.js";
 import { SignalIndex } from "./signal-index.js";
-import { startNativeCodex, validateNativeCodexArgs } from "./native-codex.js";
+import { CODEX_ENVIRONMENT_STATE_FILE, nativeCodexObserverArgs, prepareCodexWorkerExecution, startNativeCodex } from "./native-codex.js";
 import { startNativeOpenCode, validateNativeOpenCodeArgs } from "./native-opencode.js";
 import { createExecutorTunnel, type ExecutorTunnel } from "./executor-tunnel.js";
 import { JsonLineAssembler, toolFromRunLine, usageFromRunLine } from "./opencode-usage.js";
 import { createHybridWorkspace } from "./hybrid-workspace.js";
-import { WorkerScreenActivity } from "./worker-screen-activity.js";
+import { WorkerLimitWatch, WorkerScreenActivity } from "./worker-screen-activity.js";
 import { normalizeWorkerControlRequest, resolveBootstrapExecutionIdentity, teamAnswerWorkerRequestSchema, workerControlRequestSchema, workerWorkspaceExportRequestSchema,
   type Bootstrap,
   type ControlActor,
@@ -127,6 +126,7 @@ let state: WorkerState = {
 };
 let child: ReturnType<typeof spawn> | undefined;
 let native: Awaited<ReturnType<typeof startNativeCodex>> | Awaited<ReturnType<typeof startNativeOpenCode>> | undefined;
+let nativeRestartHold = false;
 let executor: ExecutorTunnel | undefined;
 let hybrid: Awaited<ReturnType<typeof createHybridWorkspace>> | undefined;
 terminal.onData((data) => {
@@ -241,11 +241,8 @@ function record(
     data as unknown as Record<string, unknown>,
   ) as unknown as SignalEvent;
   publish(applySignal(attention, event));
-  if (recoveryTurnEnd(data) || (signal.kind === "notice" && signal.type === "quota_auto_resume_fired")) {
-    limitEpisode = undefined;
-    limitWatch = undefined;
-    screenLimitSuppressed = true;
-  }
+  if (signal.kind === "turn-end") screenActivity.markTurnEnd(screen().split("\n"), provider, Date.parse(event.at));
+  if (recoveryTurnEnd(data) || (signal.kind === "notice" && signal.type === "quota_auto_resume_fired")) limitTracker.reset();
   return event;
 }
 
@@ -446,82 +443,16 @@ async function onHook(route: HookRoute, body: unknown, run?: string): Promise<Ho
       hookPromptWhileOpen(attention.prompt, signal.prompt, agent);
       continue;
     }
-    if (signal.kind === "provider-limit") recordLimitFromHook(signal, agent);
+    if (signal.kind === "provider-limit") limitTracker.fromHook(signal, agent);
     else record(signal, "hook", agent);
   }
   return reply;
 }
 
 const screenActivity = new WorkerScreenActivity(config.attention.idleAfterMs);
+const limitTracker = new WorkerLimitWatch(provider, config.attention.limitConfirmMs, (signal, source, agent) => record(signal, source, agent));
 let missCount = 0;
 let answering: number | undefined;
-
-let limitWatch: { source: "hook" | "screen"; firstAt: number; checks: number; corroborated: boolean } | undefined;
-let screenLimitSuppressed = false;
-let limitEpisode: { single?: "hook" | "screen"; corroborated: boolean; misses: number; resetsAt?: string } | undefined;
-type LimitSignal = Extract<Signal, { kind: "provider-limit" }>;
-function recordLimit(signal: LimitSignal, source: SignalData["source"], agent?: { id: string; type: string }) {
-  const episode = (limitEpisode ??= { corroborated: false, misses: 0 });
-  episode.misses = 0;
-  episode.resetsAt = signal.resetsAt ?? episode.resetsAt;
-  if (episode.resetsAt) signal = { ...signal, resetsAt: episode.resetsAt };
-  if (signal.confidence === "corroborated") {
-    if (episode.corroborated) return;
-    episode.corroborated = true;
-  } else {
-    if (episode.single || episode.corroborated) return;
-    episode.single = source === "hook" ? "hook" : "screen";
-  }
-  record(signal, source, agent);
-}
-function recordLimitFromHook(signal: LimitSignal, agent?: { id: string; type: string }) {
-  if (signal.confidence === "corroborated") {
-    limitWatch = undefined;
-    recordLimit(signal, "hook", agent);
-    return;
-  }
-  if (limitEpisode?.single === "screen" && !limitEpisode.corroborated) {
-    limitWatch = undefined;
-    recordLimit({ ...signal, confidence: "corroborated" }, "hook", agent);
-    return;
-  }
-  const fresh = !limitEpisode?.single && !limitEpisode?.corroborated;
-  recordLimit(signal, "hook", agent);
-  if (fresh) limitWatch = { source: "hook", firstAt: Date.now(), checks: 0, corroborated: false };
-}
-function watchLimit(lines: string[], nowMs: number, freshOutput: boolean) {
-  const found = detectLimit(lines, provider, new Date(nowMs));
-  const watch = limitWatch;
-  if (!found) {
-    screenLimitSuppressed = false;
-    if (watch?.source === "screen" || (watch && ++watch.checks > 2)) limitWatch = undefined;
-    if (!limitWatch && limitEpisode && ++limitEpisode.misses >= 3) limitEpisode = undefined;
-    return;
-  }
-  if (screenLimitSuppressed) return;
-  if (limitEpisode) limitEpisode.misses = 0;
-  const observed = { kind: "provider-limit" as const, limit: found.limit, message: found.message, ...(found.resetsAt ? { resetsAt: found.resetsAt } : {}) };
-  if (watch?.source === "hook") {
-    limitWatch = undefined;
-    recordLimit({ ...observed, confidence: "corroborated" }, "screen");
-    return;
-  }
-  if (!watch) {
-    recordLimit({ ...observed, confidence: "single-source" }, "screen");
-    if (provider === "codex") limitWatch = { source: "screen", firstAt: nowMs, checks: 1, corroborated: false };
-    return;
-  }
-  if (freshOutput) {
-    limitWatch = { source: "screen", firstAt: nowMs, checks: 1, corroborated: watch.corroborated };
-    return;
-  }
-  if (watch.corroborated) return;
-  watch.checks++;
-  if (watch.checks >= 3 && nowMs - watch.firstAt >= config.attention.limitConfirmMs) {
-    recordLimit({ ...observed, confidence: "corroborated" }, "screen");
-    watch.corroborated = true;
-  }
-}
 
 function checkScreen() {
   if (state.status !== "running" || permissionChannel?.waiting()) return;
@@ -532,7 +463,7 @@ function checkScreen() {
     const at = new Date(nowMs).toISOString();
     const activity = screenActivity.evaluate(attention, lines, provider, isIdleScreen(lines, provider), nowMs);
     if (activity.changed) publish(activity.attention);
-    watchLimit(lines, nowMs, activity.substantiveChange);
+    limitTracker.watch(lines, nowMs, activity.displayChanged);
     let decision = screenDecision(attention, detected, activity.idle, activity.freshOutput, at);
     const open = attention.prompt;
     const replaced =
@@ -680,6 +611,7 @@ function deliver(
   checkControl(request);
   if (handoffReceipt && request.op !== "stop") throw new Error("This session yielded to a team; further input is disabled");
   if (permissionChannel?.waiting() && request.op !== "stop") throw new Refusal("prompt-open");
+  if (nativeRestartHold && request.op !== "stop") throw new Refusal("unsupported");
   if (state.status !== "running" || !child)
     throw new Error("Session is not running");
   if (
@@ -708,6 +640,7 @@ function deliver(
   };
   receipts.set(request.requestId, receipt);
   let retireWaiting = false;
+  let endFencedNative = false;
   if (request.op === "input") {
     child.write(
       terminal.modes.bracketedPasteMode
@@ -728,7 +661,10 @@ function deliver(
       }[request.key],
     );
   } else if (permissionChannel?.waiting()) retireWaiting = true;
-  else {
+  else if (nativeRestartHold) {
+    transcriptWatch.stopRequested();
+    endFencedNative = true;
+  } else {
     transcriptWatch.stopRequested();
     child.kill("SIGTERM");
   }
@@ -741,6 +677,7 @@ function deliver(
   receipt.seq = result.seq;
   refreshControl(request);
   if (retireWaiting) permissionChannel!.retire("stopped");
+  if (endFencedNative) endSession?.();
   return publicReceipt(receipt);
 }
 
@@ -752,10 +689,11 @@ type RefusalCode =
   | "text-not-accepted"
   | "control-busy"
   | "control-lost"
-  | "snapshot-unavailable";
+  | "snapshot-unavailable"
+  | "resize-refused";
 class Refusal extends Error {
-  constructor(readonly code: RefusalCode) {
-    super(code);
+  constructor(readonly code: RefusalCode, message: string = code) {
+    super(message);
   }
 }
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -1311,8 +1249,11 @@ const server = createServer((socket) => {
         if (!isPtyTerminalSize(request.cols, request.rows)) throw new Error("Invalid terminal size");
         result = await serialize(async () => {
           checkControl(request);
+          let drainRefused = false;
           await withTerminalBarrier(() => {
+            if (screenActivity.hasPendingRawOutput()) checkScreen();
             terminal.resize(request.cols, request.rows);
+            screenActivity.rebaseline(screen().split("\n"), provider);
             const terminalSize = { cols: terminal.cols, rows: terminal.rows };
             if (state.terminalSize?.cols !== terminalSize.cols || state.terminalSize?.rows !== terminalSize.rows) {
               state = { ...state, terminalSize };
@@ -1324,8 +1265,9 @@ const server = createServer((socket) => {
           }, () => {
             child?.resize(request.cols, request.rows);
           }, () => {
+            drainRefused = true;
             child?.resize(terminal.cols, terminal.rows);
-          });
+          }).catch(error => { throw drainRefused ? new Refusal("resize-refused", (error as Error).message) : error; });
           return { ok: true };
         });
       } else if (request.op === "answer") {
@@ -1521,8 +1463,11 @@ server.listen(workerSocket, async () => {
       config.codeMode,
       session.runtime?.nativeUi ? 0 : session.nativeArgs?.length,
     );
+    let restartNativeObserver: ((restoredThreadId: string) => void) | undefined;
     if (session.runtime?.nativeUi === "codex") {
+      let codexRecovery: ReturnType<typeof prepareCodexWorkerExecution> | undefined;
       if (session.workspace) {
+        codexRecovery = prepareCodexWorkerExecution({ file: join(dir, CODEX_ENVIRONMENT_STATE_FILE), key, scope: `${session.id}:codex-environments`, workspace: session.workspace, resumeThreadId: session.resumeNativeSession?.id });
         hybrid = await createHybridWorkspace({
           workspace: session.workspace, directory: join(dir, "workspace"), sharedPoolDirectory: join(stateDir, "workspace-pool"),
           command: profile.command, commandArgs: profile.args, egress: egress.env,
@@ -1539,11 +1484,9 @@ server.listen(workerSocket, async () => {
           },
         });
         executor = await createExecutorTunnel({
-          cwd: session.workspace.cwd,
-          onConnection: online => hybrid?.connection(online),
-          onControl: (method, params) => hybrid!.control(method, params),
-          onActivity: activity => hybrid?.activity(activity),
-          record: data => { append("lifecycle", { executor: data }); },
+          cwd: session.workspace.cwd, ...(codexRecovery.environmentId ? { environmentId: codexRecovery.environmentId } : {}),
+          onConnection: online => hybrid?.connection(online), onControl: (method, params) => hybrid!.control(method, params),
+          onActivity: activity => hybrid?.activity(activity), record: data => { append("lifecycle", { executor: data }); },
         });
         persist();
         let timeout: ReturnType<typeof setTimeout> | undefined;
@@ -1555,8 +1498,22 @@ server.listen(workerSocket, async () => {
       }
       native = await startNativeCodex({
         profile, cwd: session.cwd, env,
-        ...(executor && session.workspace ? { execution: { ...executor.environment, roots: session.workspace.roots } } : {}),
+        ...(executor && session.workspace && codexRecovery ? { execution: { ...executor.environment, roots: session.workspace.roots }, environmentState: codexRecovery.environmentState, ...(codexRecovery.resumeThreadId ? { resumeThreadId: codexRecovery.resumeThreadId } : {}) } : {}),
         onExecutionUnavailable: () => hybrid?.providerReady(false),
+        onProviderRestart: (phase, restoredThreadId) => {
+          if (phase === "restarting") {
+            nativeRestartHold = true;
+          } else if (phase === "restored" && restoredThreadId) {
+            hybrid?.providerReady(native && "supportsExecutionSelection" in native ? native.supportsExecutionSelection : false);
+            restartNativeObserver?.(restoredThreadId);
+            nativeRestartHold = false;
+          } else {
+            nativeRestartHold = true;
+            hybrid?.providerReady(false);
+            append("lifecycle", { providerRestarted: true, fenced: true });
+            persist();
+          }
+        },
         noAltScreen: (session.nativeArgs ?? []).includes("--no-alt-screen"),
         checkControl: (authority) => {
           if (state.status !== "running" || !authority.actor || !authority.leaseId) throw new Refusal("control-lost");
@@ -1568,7 +1525,7 @@ server.listen(workerSocket, async () => {
         },
         onExit: () => { child?.kill("SIGTERM"); },
         onSignal: (signal) => {
-          if (signal.kind === "provider-limit") { limitWatch = undefined; recordLimit(signal, "protocol"); } else record(signal, "protocol");
+          if (signal.kind === "provider-limit") limitTracker.fromProtocol(signal); else record(signal, "protocol");
         },
         onMessage: (message) => { recordMessages([message]); },
         record: (method) => { append("input-intent", { op: "native", method }); },
@@ -1576,7 +1533,7 @@ server.listen(workerSocket, async () => {
       hybrid?.providerReady(native.supportsExecutionSelection);
       env.INFINITE_NATIVE_TOKEN = native.observerToken;
       launch = { command: profile.command, args: [...profile.args, "--remote", native.url,
-        "--remote-auth-token-env", "INFINITE_NATIVE_TOKEN", ...validateNativeCodexArgs(session.nativeArgs ?? [], config.prompt, Boolean(session.workspace))] };
+        "--remote-auth-token-env", "INFINITE_NATIVE_TOKEN", ...nativeCodexObserverArgs(session.nativeArgs ?? [], config.prompt, Boolean(session.workspace), native.info().sessionId)] };
     }
     if (session.runtime?.nativeUi === "opencode") {
       const settings = validateNativeOpenCodeArgs(session.nativeArgs ?? [], config.prompt);
@@ -1613,6 +1570,7 @@ server.listen(workerSocket, async () => {
     sizeIndex.append(runningEvent.seq, { cols: terminal.cols, rows: terminal.rows });
     persist();
     const output = (data: string) => {
+      const arrivedAt = Date.now();
       pending += data;
       try {
         if (usageLines) for (const event of usageLines.push(data)) {
@@ -1625,11 +1583,12 @@ server.listen(workerSocket, async () => {
           }
         }
         snapshots.observe(data);
-        terminal.write(data);
+        terminal.write(data, () => {
+          if (state.status === "running") screenActivity.noteRenderedOutput(screen().split("\n"), provider, arrivedAt);
+        });
       } catch {
         recordingFailure();
       }
-      screenActivity.noteRawOutput(Date.now());
       const flushed = pending.length >= 256 * 1024;
       if (flushed) try { flush(); } catch {}
       if (!flushTimer)
@@ -1639,7 +1598,7 @@ server.listen(workerSocket, async () => {
           } catch {
             return;
           }
-          checkScreen();
+          terminal.write("", () => checkScreen());
         }, 40);
       return flushed;
     };
@@ -1692,8 +1651,28 @@ server.listen(workerSocket, async () => {
         setTimeout(finish, 1500);
       })();
     };
-    const onExit = ({ exitCode }: { exitCode: number }) => terminalBarrier.dispatch(() => exited(exitCode));
-    child.onExit(onExit);
+    const bindExit = (pty: typeof child) => ({ exitCode }: { exitCode: number }) => {
+      if (pty !== child || nativeRestartHold) return;
+      terminalBarrier.dispatch(() => exited(exitCode));
+    };
+    const initialPty = child;
+    child.onExit(bindExit(initialPty));
+    restartNativeObserver = restoredThreadId => {
+      if (!native) return;
+      const previous = child;
+      const args = [...profile.args, "--remote", native.url, "--remote-auth-token-env", "INFINITE_NATIVE_TOKEN",
+        ...nativeCodexObserverArgs(session.nativeArgs ?? [], config.prompt, Boolean(session.workspace), restoredThreadId)];
+      const pty = spawn(profile.command, args, { cwd: session.cwd, env, cols: terminal.cols, rows: terminal.rows, name: "xterm-256color" });
+      child = pty;
+      previous?.kill("SIGTERM");
+      state = { ...state, status: "running", pid: pty.pid };
+      const restartedEvent = append("lifecycle", { status: "running", pid: pty.pid, cols: terminal.cols, rows: terminal.rows, providerRestarted: true });
+      sizeIndex.append(restartedEvent.seq, { cols: terminal.cols, rows: terminal.rows });
+      persist();
+      pty.onData(onData);
+      tails.track(pty);
+      pty.onExit(bindExit(pty));
+    };
     resumeProvider = nativeSessionId => {
       const next = buildLaunch(
         provider, headlessResumeProfile(profile, nativeSessionId), "",
@@ -1710,9 +1689,9 @@ server.listen(workerSocket, async () => {
       persist();
       pty.onData(onData);
       tails.track(pty);
-      pty.onExit(onExit);
+      pty.onExit(bindExit(pty));
     };
-    endSession = () => terminalBarrier.dispatch(() => exited(0, true));
+    endSession = () => { nativeRestartHold = false; terminalBarrier.dispatch(() => exited(0, true)); };
   } catch (error) {
     state = { ...state, status: "exited", exitCode: 1 };
     publish(applyLifecycle(attention, "exited", new Date().toISOString()));

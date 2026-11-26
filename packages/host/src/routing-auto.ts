@@ -1,12 +1,16 @@
 import { promptVersion, type ObjectivePrompt } from "./config-identity.js";
+import type { UsageConfig } from "./config.js";
 import { CONFIGURATIONS_MODULE, epochAt } from "./configuration-store.js";
 import type { EvidenceStore } from "./evidence/store.js";
 import type { EvidenceDb } from "./evidence/types.js";
 import { OUTCOMES_MODULE, selectRoutingEvidence } from "./outcome-store.js";
+import type { ProviderLimitEvent } from "./provider-limits.js";
 import { profileIdentity } from "./run-events.js";
-import { choose, RESCUE_USD, screen, TIER_COSTS, tierCost, type Choice, type Screened, type Scored } from "./routing-choice.js";
+import { choose, expectedCost, RESCUE_USD, screen, TIER_COSTS, tierCost, type Choice, type Screened, type Scored } from "./routing-choice.js";
 import { guardExploration } from "./routing-guards.js";
-import { CHOSEN_WEIGHT, MAX_AGE_DAYS, posterior, type CurrentConfig, type RoutingTarget } from "./routing-posterior.js";
+import { overlayLimitedHeadrooms, readProviderHeadrooms, type ProviderHeadroomCache } from "./routing-headroom.js";
+import { COST_HEADROOM_ALGORITHM_VERSION } from "./routing-policy.js";
+import { CHOSEN_WEIGHT, MAX_AGE_DAYS, observedCost, posterior, type CurrentConfig, type RoutingTarget } from "./routing-posterior.js";
 import { decisionSeed } from "./routing-sample.js";
 import { fallbackProfile, spareAttempts } from "./routing-rules.js";
 import {
@@ -14,7 +18,7 @@ import {
   readProjectState, releaseStalePending, ROUTING_MODULE, shareWindow,
 } from "./routing-store.js";
 import { taskFeatures, type FeatureMap, type TaskFeatures } from "./task-features.js";
-import type { DecisionRow, ExploreGuards, RoutingKnobs, RoutingPayload } from "./routing-types.js";
+import type { CostsBasis, DecisionRow, ExploreGuards, ProviderHeadroom, RoutingKnobs, RoutingPayload } from "./routing-types.js";
 import type { TeamModelProfile, TeamRun, TeamTask } from "./team-types.js";
 import type { Provider } from "./types.js";
 
@@ -31,6 +35,10 @@ export type RouterStart = {
   codeMode: boolean;
   featureMap: FeatureMap | undefined;
   limited: ReadonlySet<Provider>;
+  limitHistory?: readonly ProviderLimitEvent[];
+  prices?: UsageConfig["prices"];
+  headrooms?: ReadonlyMap<Provider, ProviderHeadroom>;
+  headroomCache?: ProviderHeadroomCache;
 };
 
 export type AutoFailure = "unavailable" | "budget" | "tooLarge" | "write" | "failed";
@@ -100,19 +108,41 @@ export function evaluateImplementer(db: EvidenceDb, input: RouterStart, frame: S
     point: at.point,
   };
   const since = new Date(Date.parse(now) - MAX_AGE_DAYS * DAY_MS).toISOString();
+  const useCostHeadroom = routing.algorithmVersion >= COST_HEADROOM_ALGORITHM_VERSION;
+  const providers = [...new Set(frame.screened.map(item => item.profile.provider))];
+  const headrooms = !useCostHeadroom ? undefined
+    : input.headrooms ? overlayLimitedHeadrooms(providers, input.headrooms, input.limited)
+    : input.headroomCache ? input.headroomCache.read(db, providers, input.limited, input.limitHistory ?? [], input.prices, now)
+    : readProviderHeadrooms(db, providers, input.limited, input.limitHistory ?? [], input.prices, now);
   const scored = new Map<string, Scored>();
   const current: { identity: string; epoch: number; promptVersion: string }[] = [];
+  let observedCount = 0;
+  let defaultCount = 0;
   for (const [identity, { profile, version }] of frame.versions) {
     const found: CurrentConfig = { epoch: epochAt(db, identity, now), promptVersion: version };
     const rows = selectRoutingEvidence(db, identityOf(profile), at.point, since);
     const applied = appliedOutcomeIds(db, identity, since, at.point);
-    scored.set(identity, { profile, identity, posterior: posterior(rows, target, found, now, CHOSEN_WEIGHT, applied), costUsd: tierCost(profile) });
+    const cost = useCostHeadroom
+      ? expectedCost(profile, observedCost(rows, target, found.epoch, now).listUsd)
+      : { costUsd: tierCost(profile), basis: "tier-default" as const };
+    if (cost.basis === "observed") observedCount++;
+    else defaultCount++;
+    scored.set(identity, {
+      profile, identity, posterior: posterior(rows, target, found, now, CHOSEN_WEIGHT, applied),
+      costUsd: cost.costUsd,
+      ...(useCostHeadroom ? { costBasis: cost.basis, headroom: headrooms?.get(profile.provider) } : {}),
+    });
     current.push({ identity, ...found });
   }
+  const costsBasis: CostsBasis = !useCostHeadroom || observedCount === 0 ? "tier-default" : defaultCount === 0 ? "observed" : "mixed";
   const seed = decisionSeed(routing.digest, run.id, run.revision, keys.taskKey, at.point, 1);
   const raw = choose(frame.screened, scored, knobs, features.risk, seed, at.point);
   if (raw === undefined) return undefined;
-  const guards = auto && at.point === "start" ? guardsAt(db, run, knobs, now) : undefined;
+  const chosenProvider = frame.screened.find(item => item.profile.id === raw.chosen)?.profile.provider;
+  const nearLimit = useCostHeadroom && raw.explore && chosenProvider !== undefined && Boolean(headrooms?.get(chosenProvider)?.near);
+  const guards = auto && at.point === "start"
+    ? { ...guardsAt(db, run, knobs, now), ...(nearLimit ? { nearLimit: true } : {}) }
+    : undefined;
   const choice: Choice = guards === undefined ? raw : guardExploration(raw, guards, knobs);
   const chosen = choice.candidates.find(candidate => candidate.profileId === choice.chosen)!;
   const row: DecisionRow = {
@@ -151,8 +181,8 @@ export function evaluateImplementer(db: EvidenceDb, input: RouterStart, frame: S
     featureMap: features.featureMap,
     coordinatorProfileId: row.coordinatorProfileId,
     knobs,
-    costs: { lightUsd: TIER_COSTS.light, strongUsd: TIER_COSTS.strong, rescueUsd: RESCUE_USD, basis: "tier-default" },
-    headroom: "not-modelled",
+    costs: { lightUsd: TIER_COSTS.light, strongUsd: TIER_COSTS.strong, rescueUsd: RESCUE_USD, basis: costsBasis },
+    headroom: useCostHeadroom ? "modelled" : "not-modelled",
     chosenWeight: CHOSEN_WEIGHT,
     current,
     candidates: choice.candidates,

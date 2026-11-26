@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { canonicalJson } from "../packages/host/src/evidence/crypto.js";
-import { AUTONOMOUS_DEFAULTS, ROUTING_DEFAULTS, effectiveRouting, pinRouting, policyDigest, teamRoutingSchema } from "../packages/host/src/routing-policy.js";
+import { AUTONOMOUS_DEFAULTS, COST_HEADROOM_ALGORITHM_VERSION, ROUTING_DEFAULTS, effectiveRouting, pinRouting, policyDigest, teamRoutingSchema } from "../packages/host/src/routing-policy.js";
 import type { RoutingKnobs, RoutingPoint } from "../packages/host/src/routing-types.js";
 import { mixedLineup } from "./team-fixture.js";
 
@@ -61,7 +61,7 @@ test("a pin needs shadow, the start point, and a lineup", () => {
   assert.equal(autoPin.mode, "shadow");
   assert.equal(autoPin.requested, "auto");
   assert.equal(autoPin.source, "saved");
-  assert.equal(pin.algorithmVersion, 1);
+  assert.equal(pin.algorithmVersion, COST_HEADROOM_ALGORITHM_VERSION);
   assert.equal(pin.rewardVersion, 1);
   assert.equal(Object.keys(pin.knobs).length, 9);
   const effective = effectiveRouting({ mode: "shadow" }, "supervised");
@@ -69,10 +69,12 @@ test("a pin needs shadow, the start point, and a lineup", () => {
   assert.equal(pin.digest, policyDigest(effective));
 });
 
-const AUTONOMOUS_DEFAULT_DIGEST = "ff4bbf1b489460809a862aa215af23d77e9afad6704072231c6e4ad06d012a34";
+const V1_AUTONOMOUS_DEFAULT_DIGEST = "ff4bbf1b489460809a862aa215af23d77e9afad6704072231c6e4ad06d012a34";
+const AUTONOMOUS_DEFAULT_DIGEST = digestAt(COST_HEADROOM_ALGORITHM_VERSION, "shadow", AUTONOMOUS_DEFAULTS);
 const PERIOD_END = "2026-11-01T00:00:00.000Z";
 
-test("off and shadow pins are byte-equal to step 1", () => {
+test("off and shadow pins keep deterministic version 3 digests distinct from version 1", () => {
+  assert.notEqual(AUTONOMOUS_DEFAULT_DIGEST, V1_AUTONOMOUS_DEFAULT_DIGEST);
   const cases: [Parameters<typeof pinRouting>[0], Parameters<typeof pinRouting>[1]][] = [
     [{ mode: "off" }, "autonomous"], [{ mode: "off" }, "supervised"], [{ mode: "shadow" }, "supervised"],
     [{ mode: "shadow" }, "autonomous"], [undefined, "autonomous"], [undefined, "supervised"],
@@ -149,12 +151,13 @@ function digestAt(version: number, mode: "shadow" | "auto", knobs: RoutingKnobs)
   return createHash("sha256").update(canonicalJson({ algorithmVersion: version, rewardVersion: 1, mode, knobs })).digest("hex");
 }
 
-test("a pin names version 2 only when its points list escalation or scout", () => {
+test("new pins name algorithm version 3 with normalized points and distinct digests from versions 1 and 2", () => {
   for (const saved of [{ mode: "auto" }, { mode: "shadow" }] as const) {
     const plain = pinRouting(saved, "supervised", lineup, PERIOD_END);
     assert.ok(plain);
-    assert.equal(plain.algorithmVersion, 1, JSON.stringify(saved));
-    assert.equal(plain.digest, digestAt(1, plain.mode, plain.knobs), JSON.stringify(saved));
+    assert.equal(plain.algorithmVersion, 3, JSON.stringify(saved));
+    assert.equal(plain.digest, digestAt(3, plain.mode, plain.knobs), JSON.stringify(saved));
+    assert.notEqual(plain.digest, digestAt(1, plain.mode, plain.knobs));
   }
   const listed: [RoutingPoint[], RoutingPoint[]][] = [
     [["start", "escalation"], ["start", "escalation"]],
@@ -165,9 +168,10 @@ test("a pin names version 2 only when its points list escalation or scout", () =
     for (const [points, ordered] of listed) {
       const pin = pinRouting({ ...saved, points }, "supervised", lineup, PERIOD_END);
       assert.ok(pin, JSON.stringify({ saved, points }));
-      assert.equal(pin.algorithmVersion, 2, JSON.stringify({ saved, points }));
+      assert.equal(pin.algorithmVersion, 3, JSON.stringify({ saved, points }));
       assert.deepEqual(pin.knobs.points, ordered);
-      assert.equal(pin.digest, digestAt(2, pin.mode, { ...pin.knobs, points: ordered }), JSON.stringify({ saved, points }));
+      assert.equal(pin.digest, digestAt(3, pin.mode, { ...pin.knobs, points: ordered }), JSON.stringify({ saved, points }));
+      assert.notEqual(pin.digest, digestAt(2, pin.mode, { ...pin.knobs, points: ordered }));
     }
   }
   assert.equal(pinRouting({ mode: "auto", points: ["escalation"] }, "supervised", lineup, PERIOD_END), undefined);
@@ -198,5 +202,5 @@ test("the digest changes with every knob and with nothing else", () => {
   const fromDefault = effectiveRouting(undefined, "autonomous");
   assert.ok(fromSaved.mode === "shadow" && fromDefault.mode === "shadow");
   assert.equal(policyDigest(fromSaved), policyDigest(fromDefault));
-  assert.equal(policyDigest(fromDefault), createHash("sha256").update(canonicalJson({ algorithmVersion: 1, rewardVersion: 1, mode: "shadow", knobs: AUTONOMOUS_DEFAULTS })).digest("hex"));
+  assert.equal(policyDigest(fromDefault), createHash("sha256").update(canonicalJson({ algorithmVersion: COST_HEADROOM_ALGORITHM_VERSION, rewardVersion: 1, mode: "shadow", knobs: AUTONOMOUS_DEFAULTS })).digest("hex"));
 });

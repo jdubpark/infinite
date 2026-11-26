@@ -1,7 +1,10 @@
 import type { AutonomyMode } from "./autonomy.js";
+import type { UsageConfig } from "./config.js";
 import type { EvidenceDb } from "./evidence/types.js";
+import type { ProviderLimitEvent } from "./provider-limits.js";
 import { appendRunEvent } from "./run-events.js";
 import { screen, screenEscalations } from "./routing-choice.js";
+import { ProviderHeadroomCache } from "./routing-headroom.js";
 import {
   AUTO_LOG, DECISION_BUDGET_MS, decideAutoStart, evaluateImplementer, evaluateStart, frameOf, periodEnd, REQUIRED_MODULES,
   startFrame, type AutoFailure, type Evaluated, type RouterStart,
@@ -39,6 +42,7 @@ function fallbackScout(run: TeamRun, scout: TeamScout): TeamModelProfile | undef
 }
 
 export class RoutingRecorder {
+  readonly headroomCache = new ProviderHeadroomCache();
   private readonly store: EvidenceStore;
   private readonly now: () => string;
   private readonly clock: () => number;
@@ -51,6 +55,23 @@ export class RoutingRecorder {
     this.now = options.now ?? (() => new Date().toISOString());
     this.clock = options.clock ?? (() => performance.now());
     this.log = options.log ?? (line => console.warn(line));
+  }
+
+  refreshHeadrooms(
+    lineup: TeamLineup | undefined,
+    limitHistory: readonly ProviderLimitEvent[],
+    prices: UsageConfig["prices"] | undefined,
+  ): void {
+    if (lineup === undefined) return;
+    const providers = [...lineup.implementers, ...(lineup.escalations ?? [])].map(profile => profile.provider);
+    if (providers.length === 0) return;
+    try {
+      this.store.read(db => this.headroomCache.refresh(db, providers, limitHistory, prices, this.now()));
+    } catch {}
+  }
+
+  private withCache<T extends RouterStart>(input: T): T {
+    return input.headrooms || input.headroomCache ? input : { ...input, headroomCache: this.headroomCache };
   }
 
   pin(saved: TeamRouting | undefined, autonomy: AutonomyMode, lineup: TeamLineup | undefined, projectId: string): TeamRunRouting | undefined {
@@ -98,7 +119,7 @@ export class RoutingRecorder {
     const kept = task.routing === undefined ? undefined : lineup.implementers.find(profile => profile.id === task.routing?.profileId);
     if (kept !== undefined && fixedRuleFailure(lineup, routing.knobs, kept) === undefined) return kept;
 
-    const decision = decideAutoStart(this.store, input, this.now, this.clock);
+    const decision = decideAutoStart(this.store, this.withCache(input), this.now, this.clock);
     task.routing = { profileId: decision.profile.id, by: decision.by };
     if (decision.by === "fallback") {
       appendRunEvent(run, `Host routing could not choose a profile for task ${task.id}; it is assigned ${decision.profile.label}.`);
@@ -108,13 +129,14 @@ export class RoutingRecorder {
   }
 
   routeEscalation(input: RouterEscalation): TeamModelProfile | undefined {
-    const { run, task, ownProfileId, namedProfileId } = input;
+    const cached = this.withCache(input);
+    const { run, task, ownProfileId, namedProfileId } = cached;
     const { routing, lineup } = run;
     if (routing !== undefined && lineup !== undefined && shadowsAt(routing, "escalation")) {
       this.recordShadow(() => {
-        const frame = frameOf(input, screenEscalations(lineup, routing.knobs, input.limited, ownProfileId));
+        const frame = frameOf(cached, screenEscalations(lineup, routing.knobs, cached.limited, ownProfileId));
         this.shadowAt(run, task.id, "escalation", (db, keys) =>
-          evaluateImplementer(db, input, frame, keys, this.now(), false, { point: "escalation", named: namedProfileId ?? null }));
+          evaluateImplementer(db, cached, frame, keys, this.now(), false, { point: "escalation", named: namedProfileId ?? null }));
       });
       return undefined;
     }
@@ -123,7 +145,7 @@ export class RoutingRecorder {
       if (run.routingRevokedAt !== undefined) {
         return namedProfileId === undefined ? escalationFallback(run, ownProfileId, undefined) : undefined;
       }
-      const decision = decideAutoEscalation(this.store, input, this.now, this.clock);
+      const decision = decideAutoEscalation(this.store, cached, this.now, this.clock);
       if (decision === undefined) return undefined;
       if (decision.by === "fallback") {
         appendRunEvent(run, `Host routing could not choose an escalation profile for task ${task.id}; it is assigned ${decision.profile.label}.`);
@@ -184,11 +206,12 @@ export class RoutingRecorder {
   }
 
   private record(input: RouterStart): void {
-    const { run, task } = input;
+    const cached = this.withCache(input);
+    const { run, task } = cached;
     const routing = run.routing;
     if (routing === undefined || routing.mode === "auto" || run.lineup === undefined || !routing.knobs.points.includes("start")) return;
-    const frame = startFrame(input);
-    this.shadowAt(run, task.id, "start", (db, keys) => evaluateStart(db, input, frame, keys, this.now(), false));
+    const frame = startFrame(cached);
+    this.shadowAt(run, task.id, "start", (db, keys) => evaluateStart(db, cached, frame, keys, this.now(), false));
   }
 
   private shadowAt(run: TeamRun, id: string, point: RoutingPoint, evaluate: (db: EvidenceDb, keys: { taskKey: string; key: string }) => Evaluated | undefined): void {

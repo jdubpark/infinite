@@ -10,10 +10,12 @@ import { EventOutbox, type EventProjector, type OutboxEvent } from "../packages/
 import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
 import type { EvidenceDb, RunEvent } from "../packages/host/src/evidence/types.js";
 import { outcomeProjector } from "../packages/host/src/outcome-projector.js";
+import { computeOutcomeCost, refreshOutcomeCostsForSessions, syncOutcomeCosts } from "../packages/host/src/outcome-cost.js";
 import { levels, rowExclusion, roundCounts, type RowState, scanGap } from "../packages/host/src/outcome-rules.js";
 import { linksOf, rowSignals } from "../packages/host/src/outcome-signals.js";
-import { OUTCOME_KINDS, outcomeModule, readSummary, runOutcomes } from "../packages/host/src/outcome-store.js";
+import { OUTCOME_KINDS, outcomeModule, readOutcome, readSummary, runOutcomes } from "../packages/host/src/outcome-store.js";
 import { runEventKey } from "../packages/host/src/run-events.js";
+import { usageModule, writeRecord, writeRecordWithOwner, writeSession } from "../packages/host/src/usage-store.js";
 import { bump, type Counts, type Rand, rand, RunScript } from "./outcome-sim-script.js";
 
 const DEFAULT_SEEDS = 30;
@@ -27,6 +29,10 @@ const DEFAULT_CORPUS = ONLY === undefined && COUNT === DEFAULT_SEEDS && BASE_SEE
 const T0 = Date.parse("2026-11-13T10:00:00.000Z");
 const DELETED_AT = "2026-11-14T00:00:00.000Z";
 const OUTCOME_KIND_SET: ReadonlySet<string> = new Set(OUTCOME_KINDS);
+const SIM_PRICES = {
+  "anthropic/m-1": { input: 2, output: 10, cacheRead: 0.2, cacheWrite: 2 },
+  "anthropic/m-2": { input: 1, output: 4, cacheRead: 0.1, cacheWrite: 1 },
+};
 
 function batches(r: Rand, events: readonly OutboxEvent[]): OutboxEvent[][] {
   const out: OutboxEvent[][] = [];
@@ -53,9 +59,10 @@ class Live {
     this.store = new EvidenceStore({ databasePath: this.path, vaultKey: Buffer.from(this.key) });
     this.store.register(configurationModule());
     this.store.register(outcomeModule({ now: () => DELETED_AT }));
+    this.store.register(usageModule);
     this.outbox = new EventOutbox(this.store);
     this.outbox.registerProjector(configurationProjector());
-    const inner = outcomeProjector(this.store, { log: () => undefined });
+    const inner = outcomeProjector(this.store, { log: () => undefined, prices: SIM_PRICES });
     this.outbox.registerProjector({
       name: inner.name, module: inner.module, kinds: inner.kinds,
       project: (tx, event) => {
@@ -192,6 +199,59 @@ function roundTotals(db: EvidenceDb, runId: string) {
   return totals;
 }
 
+function stripCostEnrichment(tables: Tables): Tables {
+  return {
+    ...tables,
+    outcomes: (tables.outcomes ?? []).map(row => {
+      const payload = { ...(row.payload as Record<string, unknown>) };
+      delete payload.costCoverage;
+      delete payload.tokens;
+      delete payload.listUsd;
+      delete payload.spentUsd;
+      return { ...row, list_usd: null, payload };
+    }),
+    outcome_state: (tables.outcome_state ?? []).filter(row => row.key !== "cost_sync_cursor"),
+  };
+}
+
+function checkCostRowConsistency(store: EvidenceStore, where: string): void {
+  store.read(db => {
+    const raw = db.all<{ outcome_id: string; list_usd: number | null }>("SELECT outcome_id, list_usd FROM outcomes ORDER BY outcome_id");
+    for (const entry of raw) {
+      const row = readOutcome(db, entry.outcome_id);
+      if (!row) continue;
+      if (row.payload.costCoverage === "complete") {
+        if (typeof row.payload.listUsd !== "number" || entry.list_usd !== row.payload.listUsd) {
+          fail(where, `P9: complete row ${row.outcomeId} has list_usd=${String(entry.list_usd)} vs payload.listUsd=${String(row.payload.listUsd)}`);
+        }
+      } else if (entry.list_usd !== null || row.payload.listUsd !== undefined) {
+        fail(where, `P9: non-complete row ${row.outcomeId} (${row.payload.costCoverage}) leaked list_usd=${String(entry.list_usd)} / payload.listUsd=${String(row.payload.listUsd)}`);
+      }
+    }
+  });
+}
+
+function checkCostConvergence(store: EvidenceStore, prices: typeof SIM_PRICES, where: string): void {
+  checkCostRowConsistency(store, where);
+  store.read(db => {
+    const raw = db.all<{ outcome_id: string; list_usd: number | null; disposition: string }>("SELECT outcome_id, list_usd, disposition FROM outcomes ORDER BY outcome_id");
+    for (const entry of raw) {
+      if (entry.disposition === "open") continue;
+      const row = readOutcome(db, entry.outcome_id)!;
+      const expected = computeOutcomeCost(db, row, prices);
+      const actual = {
+        costCoverage: row.payload.costCoverage,
+        ...(row.payload.tokens === undefined ? {} : { tokens: row.payload.tokens }),
+        ...(row.payload.listUsd === undefined ? {} : { listUsd: row.payload.listUsd }),
+        ...(row.payload.spentUsd === undefined ? {} : { spentUsd: row.payload.spentUsd }),
+      };
+      same(where, `P9: outcome ${row.outcomeId} cost diverged from usage ledger`, actual, expected);
+      const expectedSql = expected.costCoverage === "complete" && expected.listUsd !== undefined ? expected.listUsd : null;
+      same(where, `P9: outcome ${row.outcomeId} SQL list_usd diverged`, entry.list_usd, expectedSql);
+    }
+  });
+}
+
 function check(live: Live, reference: Reference, prev: Snapshot | undefined, where: string): Snapshot {
   const cursor = live.cursor("outcomes");
   reference.catchUp(live.store, live.cursor("configurations"), cursor, where);
@@ -205,7 +265,8 @@ function check(live: Live, reference: Reference, prev: Snapshot | undefined, whe
     fail(where, `P8: last_seq ${now.lastSeq}, outcomes cursor ${now.cursor}, highest seq ${now.maxSeq}`);
   }
   if (prev && now.cursor < prev.cursor) fail(where, `P8: the outcomes cursor moved back from ${prev.cursor} to ${now.cursor}`);
-  same(where, "P1: the live tables differ from the reference projection", now.tables, reference.store.read(db => tablesOf(db)));
+  same(where, "P1: the live tables differ from the reference projection", stripCostEnrichment(now.tables), stripCostEnrichment(reference.store.read(db => tablesOf(db))));
+  checkCostRowConsistency(live.store, where);
 
   const rows = new Map(now.tables.outcomes!.map(row => [String(row.outcome_id), row]));
   for (const old of prev?.tables.outcomes ?? []) {
@@ -322,14 +383,128 @@ function deliver(r: Rand, live: Live, batch: OutboxEvent[], rest: OutboxEvent[][
   return "flush";
 }
 
+type SimUsageMember = {
+  runId: string;
+  memberId: string;
+  taskId?: string;
+  role: string;
+  revision: number;
+  model: string;
+  at: string;
+  sessionId: string;
+  coverage: "complete" | "partial" | "none";
+  exited: boolean;
+  inputTokens: number;
+  enlarged: boolean;
+};
+
+function stepUsage(
+  rCost: Rand,
+  live: Live,
+  candidates: readonly { runId: string; memberId: string; taskId?: string; role: string; revision: number; model: string; at: string }[],
+  tracked: Map<string, SimUsageMember>,
+  counts: Counts,
+): void {
+  if (candidates.length > 0 && rCost.chance(0.55)) {
+    const pick = rCost.pick(candidates);
+    const key = `${pick.runId}:${pick.memberId}`;
+    const existing = tracked.get(key);
+    if (!existing) {
+      const coverage = rCost.pick(["complete", "complete", "complete", "partial", "none"] as const);
+      const exited = rCost.chance(0.5);
+      const sessionId = `sim-u-${pick.runId}-${pick.memberId}`;
+      const inputTokens = rCost.int(1, 5) * 100_000;
+      const entry: SimUsageMember = { ...pick, sessionId, coverage, exited, inputTokens, enlarged: false };
+      tracked.set(key, entry);
+      live.store.write(tx => {
+        writeSession(tx, {
+          sessionId,
+          provider: "claude",
+          projectId: "example",
+          createdAt: pick.at,
+          team: { runId: pick.runId, memberId: pick.memberId, ...(pick.taskId ? { taskId: pick.taskId } : {}), role: pick.role, revision: pick.revision },
+        }, { coverage, cursor: 1, seen: coverage === "none" ? 0 : 1, refused: 0, exited });
+        if (coverage !== "none") {
+          writeRecordWithOwner(tx, sessionId, {
+            provider: "claude",
+            providerId: "anthropic",
+            modelId: pick.model,
+            messageId: `msg-${sessionId}`,
+            partId: "p1",
+            modelSource: "reported",
+            completedAt: pick.at,
+            tokens: { input: inputTokens, output: 50_000, reasoning: 0, cacheRead: 0, cacheWrite: 0 },
+            reportedCost: 0,
+          });
+        }
+        if (rCost.chance(0.6)) {
+          refreshOutcomeCostsForSessions(tx, [{ sessionId, runId: pick.runId, memberId: pick.memberId, exited }], SIM_PRICES);
+        }
+      });
+      bump(counts, "cost:written");
+    } else if (!existing.exited && rCost.chance(0.7)) {
+      existing.exited = true;
+      live.store.write(tx => {
+        writeSession(tx, {
+          sessionId: existing.sessionId,
+          provider: "claude",
+          projectId: "example",
+          createdAt: existing.at,
+          team: { runId: existing.runId, memberId: existing.memberId, ...(existing.taskId ? { taskId: existing.taskId } : {}), role: existing.role, revision: existing.revision },
+        }, { coverage: existing.coverage, cursor: 2, seen: existing.coverage === "none" ? 0 : 1, refused: 0, exited: true });
+        if (rCost.chance(0.5)) {
+          refreshOutcomeCostsForSessions(tx, [{ sessionId: existing.sessionId, runId: existing.runId, memberId: existing.memberId, exited: true }], SIM_PRICES);
+        }
+      });
+      bump(counts, "cost:drained");
+    } else if (existing.coverage !== "none" && !existing.enlarged && rCost.chance(0.5)) {
+      existing.enlarged = true;
+      existing.inputTokens += 250_000;
+      live.store.write(tx => {
+        const result = writeRecordWithOwner(tx, existing.sessionId, {
+          provider: "claude",
+          providerId: "anthropic",
+          modelId: existing.model,
+          messageId: `msg-${existing.sessionId}`,
+          partId: "p1",
+          modelSource: "reported",
+          completedAt: existing.at,
+          tokens: { input: existing.inputTokens, output: 50_000, reasoning: 0, cacheRead: 0, cacheWrite: 0 },
+          reportedCost: 0,
+        });
+        refreshOutcomeCostsForSessions(tx, [{ sessionId: result.ownerSessionId, runId: existing.runId, memberId: existing.memberId, exited: existing.exited }], SIM_PRICES);
+      });
+      bump(counts, "cost:enlarged");
+    }
+  }
+  if (rCost.chance(0.25)) {
+    const page = syncOutcomeCosts(live.store, SIM_PRICES, { limit: rCost.int(1, 3) });
+    if (page.scanned > 0) bump(counts, "cost:synced-pages");
+  }
+}
+
 function simulate(seed: number, counts: Counts): void {
   const r = rand(seed);
+  const rCost = rand(seed ^ 0x9e3779b9);
   let tick = 0;
   const clock = () => new Date(T0 + 1000 * tick++).toISOString();
   const runIds = ["run-a", "run-b", "run-c"];
-  const queues = runIds.map(runId => batches(r, new RunScript(r, runId, clock, counts).script()));
+  const scripts = runIds.map(runId => new RunScript(r, runId, clock, counts).script());
+  const candidates = scripts.flat()
+    .filter(event => event.kind === "member.started" && event.memberId !== undefined && (event.data.role === "implementer" || event.data.role === "scout"))
+    .map(event => ({
+      runId: event.runId,
+      memberId: event.memberId!,
+      ...(event.taskId ? { taskId: event.taskId } : {}),
+      role: String(event.data.role),
+      revision: event.revision,
+      model: String(event.data.model ?? "m-1"),
+      at: event.at,
+    }));
+  const queues = scripts.map(events => batches(r, events));
   const key = createHash("sha256").update(`outcome-sim:${seed}`).digest();
   const delivered: OutboxEvent[] = [];
+  const trackedUsage = new Map<string, SimUsageMember>();
   const reproduce = `reproduce with OUTCOME_SIM_SEED=${seed}`;
   let root: string | undefined, live: Live | undefined, reference: Reference | undefined;
   let prev: Snapshot | undefined;
@@ -338,18 +513,36 @@ function simulate(seed: number, counts: Counts): void {
     live = new Live(evidenceDatabasePath(join(root, "live")), key);
     reference = new Reference(evidenceDatabasePath(join(root, "reference")), key);
     for (let step = 1; queues.some(queue => queue.length > 0); step += 1) {
+      stepUsage(rCost, live, candidates, trackedUsage, counts);
       const queue = r.pick(queues.filter(item => item.length > 0));
       const fault = deliver(r, live, queue.shift()!, queue, delivered, counts);
       prev = check(live, reference, prev, `seed ${seed} step ${step} (${fault}); ${reproduce}`);
     }
     for (let guard = 0; guard < 100 && live.outbox.advance().pending; guard += 1);
+    for (let page = syncOutcomeCosts(live.store, SIM_PRICES, { limit: rCost.int(1, 3), reset: true }), guard = 0; guard < 200; guard += 1) {
+      if (page.scanned > 0) bump(counts, "cost:synced-pages");
+      if (page.done) break;
+      if (rCost.chance(0.25)) live.restart();
+      page = syncOutcomeCosts(live.store, SIM_PRICES, { limit: rCost.int(1, 3) });
+    }
     const where = `seed ${seed} final drain; ${reproduce}`;
     const last = check(live, reference, prev, where);
     if (last.cursor !== last.maxSeq) fail(where, `P8: the outcomes cursor ${last.cursor} stopped short of the highest seq ${last.maxSeq}`);
+    checkCostConvergence(live.store, SIM_PRICES, where);
+    live.restart();
+    let followUpUpdated = 0;
+    for (let page = syncOutcomeCosts(live.store, SIM_PRICES, { limit: 2, reset: true }), guard = 0; guard < 200; guard += 1) {
+      followUpUpdated += page.updated;
+      if (page.done) break;
+      page = syncOutcomeCosts(live.store, SIM_PRICES, { limit: 2 });
+    }
+    same(where, "P9: follow-up cost sync after convergence should update zero rows", followUpUpdated, 0);
     for (const { kind, n } of live.store.read(db => db.all<{ kind: string; n: number }>("SELECT kind, count(*) AS n FROM run_events GROUP BY kind"))) {
       bump(counts, `kind:${kind}`, n);
     }
     bump(counts, "rows:frozen", last.tables.outcomes!.filter(row => row.frozen_at !== null).length);
+    bump(counts, "cost:complete-rows", last.tables.outcomes!.filter(row => (row.payload as { costCoverage?: string }).costCoverage === "complete").length);
+    bump(counts, "cost:partial-rows", last.tables.outcomes!.filter(row => (row.payload as { costCoverage?: string }).costCoverage === "partial").length);
     for (const summary of last.tables.run_summaries!) if (summary.settled_at !== null) bump(counts, "runs:settled");
     bump(counts, "rows:member-results", last.tables.member_results!.length);
   } finally {
@@ -371,6 +564,7 @@ const FLOORS: Readonly<Record<string, number>> = {
   "reorder:enrichment-after-settle": 52, "reorder:stop-without-start": 10, "reorder:stop-after-consumed": 20,
   "after-settle:member.stopped": 17, "after-settle:run.prepared": 5, "block:member-stalled": 3,
   "runs:settled": 35, "rows:frozen": 42, "rows:member-results": 144,
+  "cost:written": 100, "cost:drained": 30, "cost:enlarged": 15, "cost:synced-pages": 25, "cost:complete-rows": 25, "cost:partial-rows": 15,
 };
 
 test("the outcome projector keeps its invariants under seeded faults", t => {
@@ -409,6 +603,139 @@ test("a repair answer with no commit after a cancel settle recounts the summary'
       event(5, "repair.integrated", [1, 1], { memberId: "g1" }, { round: 1, headCommit: head, baseCommit: base }),
     ]);
     live.store.read(db => assert.deepEqual(readSummary(db, "run-d")!.payload.rounds, roundTotals(db, "run-d")));
+  } finally {
+    live?.store.close();
+    if (root !== undefined) rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("unreadable usage rows do not stall outcome projection across later runs and restarts", () => {
+  const base = "b".repeat(40), head = "c".repeat(40);
+  const prices = { "deepseek/deepseek-flash": { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 } };
+  const event = (runId: string, second: number, kind: string, parts: (string | number)[], ids: { memberId?: string; taskId?: string }, data: Row): OutboxEvent => ({
+    key: runEventKey(kind, runId, parts), runId, revision: 1, at: new Date(T0 + second * 1000).toISOString(), kind, ...ids, data: { v: 1, ...data },
+  });
+  let root: string | undefined, store: EvidenceStore | undefined;
+  const key = createHash("sha256").update("outcome-sim:corrupt-usage").digest();
+  const openStore = (path: string) => {
+    const opened = new EvidenceStore({ databasePath: path, vaultKey: Buffer.from(key) });
+    opened.register(configurationModule());
+    opened.register(outcomeModule({ now: () => DELETED_AT }));
+    opened.register(usageModule);
+    const outbox = new EventOutbox(opened);
+    outbox.registerProjector(configurationProjector());
+    outbox.registerProjector(outcomeProjector(opened, { log: () => undefined, prices }));
+    return { store: opened, outbox };
+  };
+  try {
+    root = mkdtempSync(join(tmpdir(), "infinite-outcome-corrupt-usage-"));
+    const dbPath = evidenceDatabasePath(root);
+    let active = openStore(dbPath);
+    store = active.store;
+    store.write(tx => {
+      writeSession(tx, {
+        sessionId: "sess-corrupt", provider: "opencode", projectId: "example", createdAt: new Date(T0).toISOString(),
+        team: { runId: "run-bad", memberId: "m1", taskId: "a", role: "implementer", revision: 1 },
+      }, { coverage: "complete", cursor: 1, seen: 1, refused: 0, exited: true });
+      writeRecord(tx, "sess-corrupt", {
+        provider: "opencode", providerId: "corrupt-provider", modelId: "corrupt-model", messageId: "m-bad", partId: "p-bad",
+        modelSource: "reported", completedAt: new Date(T0 + 500).toISOString(),
+        tokens: { input: 100_000, output: 50_000, reasoning: 0, cacheRead: 0, cacheWrite: 0 }, reportedCost: 0,
+      });
+      tx.run("UPDATE usage_models SET encrypted_model='corrupt-ciphertext' WHERE model_ref=(SELECT model_ref FROM usage_records WHERE session_id='sess-corrupt')");
+
+      writeSession(tx, {
+        sessionId: "sess-good", provider: "opencode", projectId: "example", createdAt: new Date(T0 + 1000).toISOString(),
+        team: { runId: "run-good", memberId: "m1", taskId: "b", role: "implementer", revision: 1 },
+      }, { coverage: "complete", cursor: 1, seen: 1, refused: 0, exited: true });
+      writeRecord(tx, "sess-good", {
+        provider: "opencode", providerId: "deepseek", modelId: "deepseek-flash", messageId: "m-good", partId: "p-good",
+        modelSource: "reported", completedAt: new Date(T0 + 1500).toISOString(),
+        tokens: { input: 1_000_000, output: 100_000, reasoning: 0, cacheRead: 0, cacheWrite: 0 }, reportedCost: 0,
+      });
+    });
+
+    const flush1 = active.outbox.flush([
+      event("run-bad", 0, "run.created", [], {}, { projectId: "example", purpose: "work" }),
+      event("run-bad", 1, "member.started", ["m1"], { memberId: "m1", taskId: "a" }, { role: "implementer", sessionId: "sess-corrupt", startedAt: new Date(T0 + 1000).toISOString(), baseCommit: base, provider: "opencode", model: "corrupt-provider/corrupt-model" }),
+      event("run-bad", 2, "task.integrated", [1, "a"], { memberId: "m1", taskId: "a" }, { commit: head, headCommit: head, baseCommit: base }),
+      event("run-good", 3, "run.created", [], {}, { projectId: "example", purpose: "work" }),
+      event("run-good", 4, "member.started", ["m1"], { memberId: "m1", taskId: "b" }, { role: "implementer", sessionId: "sess-good", startedAt: new Date(T0 + 4000).toISOString(), baseCommit: base, provider: "opencode", model: "deepseek/deepseek-flash" }),
+      event("run-good", 5, "task.integrated", [1, "b"], { memberId: "m1", taskId: "b" }, { commit: head, headCommit: head, baseCommit: base }),
+    ]);
+    assert.equal(flush1.stored, true);
+    assert.equal(flush1.refused, 0);
+
+    const beforeRestart = store.read(db => ({
+      cursor: Number(db.get<{ value: string }>("SELECT value FROM outcome_state WHERE key='last_seq'")?.value ?? "0"),
+      maxSeq: db.get<{ seq: number }>("SELECT COALESCE(MAX(seq), 0) AS seq FROM run_events")?.seq ?? 0,
+      bad: readOutcome(db, "run-bad:m1"),
+      good: readOutcome(db, "run-good:m1"),
+    }));
+    assert.equal(beforeRestart.cursor, beforeRestart.maxSeq);
+    assert.equal(beforeRestart.bad?.disposition, "integrated");
+    assert.equal(beforeRestart.bad?.payload.costCoverage, "none");
+    assert.equal(beforeRestart.bad?.payload.listUsd, undefined);
+    assert.equal(beforeRestart.good?.payload.costCoverage, "complete");
+    assert.equal(beforeRestart.good?.payload.listUsd, 1.2);
+
+    store.close();
+    active = openStore(dbPath);
+    store = active.store;
+    const afterRestart = active.outbox.flush([
+      event("run-after", 6, "run.created", [], {}, { projectId: "example", purpose: "work" }),
+      event("run-after", 7, "member.started", ["m1"], { memberId: "m1", taskId: "c" }, { role: "implementer", startedAt: new Date(T0 + 7000).toISOString(), baseCommit: base, provider: "opencode", model: "deepseek/deepseek-flash" }),
+      event("run-after", 8, "task.integrated", [1, "c"], { memberId: "m1", taskId: "c" }, { commit: head, headCommit: head, baseCommit: base }),
+    ]);
+    assert.equal(afterRestart.stored, true);
+    const afterState = store.read(db => ({
+      cursor: Number(db.get<{ value: string }>("SELECT value FROM outcome_state WHERE key='last_seq'")?.value ?? "0"),
+      maxSeq: db.get<{ seq: number }>("SELECT COALESCE(MAX(seq), 0) AS seq FROM run_events")?.seq ?? 0,
+      later: readOutcome(db, "run-after:m1"),
+    }));
+    assert.equal(afterState.cursor, afterState.maxSeq);
+    assert.equal(afterState.later?.disposition, "integrated");
+    assert.equal(syncOutcomeCosts(store, prices, { reset: true }).done, true);
+  } finally {
+    store?.close();
+    if (root !== undefined) rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("outcome simulator P9 catches a stale list_usd left behind after a usage record enlargement", () => {
+  const base = "b".repeat(40), head = "c".repeat(40);
+  const event = (second: number, kind: string, parts: (string | number)[], ids: { memberId?: string; taskId?: string }, data: Row): OutboxEvent => ({
+    key: runEventKey(kind, "run-stale", parts), runId: "run-stale", revision: 1, at: new Date(T0 + second * 1000).toISOString(), kind, ...ids, data: { v: 1, ...data },
+  });
+  let root: string | undefined, live: Live | undefined;
+  try {
+    root = mkdtempSync(join(tmpdir(), "infinite-outcome-stale-cost-"));
+    live = new Live(evidenceDatabasePath(root), createHash("sha256").update("outcome-sim:stale-cost").digest());
+    live.store.write(tx => {
+      writeSession(tx, {
+        sessionId: "sess-stale", provider: "claude", projectId: "example", createdAt: new Date(T0).toISOString(),
+        team: { runId: "run-stale", memberId: "m1", taskId: "a", role: "implementer", revision: 1 },
+      }, { coverage: "complete", cursor: 1, seen: 1, refused: 0, exited: true });
+      writeRecord(tx, "sess-stale", {
+        provider: "claude", providerId: "anthropic", modelId: "m-1", messageId: "m-stale", partId: "p1",
+        modelSource: "reported", completedAt: new Date(T0 + 500).toISOString(),
+        tokens: { input: 100_000, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 }, reportedCost: 0,
+      });
+    });
+    live.flush([
+      event(0, "run.created", [], {}, { projectId: "example", purpose: "work" }),
+      event(1, "member.started", ["m1"], { memberId: "m1", taskId: "a" }, { role: "implementer", sessionId: "sess-stale", startedAt: new Date(T0 + 1000).toISOString(), baseCommit: base, provider: "claude", model: "m-1" }),
+      event(2, "task.integrated", [1, "a"], { memberId: "m1", taskId: "a" }, { commit: head, headCommit: head, baseCommit: base }),
+    ]);
+    checkCostConvergence(live.store, SIM_PRICES, "before-enlarge");
+    live.store.write(tx => {
+      writeRecord(tx, "sess-stale", {
+        provider: "claude", providerId: "anthropic", modelId: "m-1", messageId: "m-stale", partId: "p1",
+        modelSource: "reported", completedAt: new Date(T0 + 500).toISOString(),
+        tokens: { input: 500_000, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 }, reportedCost: 0,
+      });
+    });
+    assert.throws(() => checkCostConvergence(live.store, SIM_PRICES, "stale-mutant"), /P9: outcome run-stale:m1 cost diverged/);
   } finally {
     live?.store.close();
     if (root !== undefined) rmSync(root, { recursive: true, force: true });

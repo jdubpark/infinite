@@ -14,6 +14,9 @@ infinite --local-ui codex [supported native flags] "Initial prompt"
 infinite --local-ui opencode [--model PROVIDER/MODEL] [--prompt "Task"]
 infinite list [--json]
 infinite resources [--watch] [--json]
+infinite usage [projects|project ID|goal ID|models [--role ROLE]] [--json]
+infinite usage repairs [--project ID] [--days N] [--json]
+infinite usage interrupted [--project ID] [--days N] [--json]
 infinite close SESSION_ID [--yes] [--takeover] [--json]
 infinite projects [group NAME REPO_ID... | rename ID NAME | hide ID | show ID | primary ID CHECKOUT_ID]
 infinite resume [session ID or unique prefix]
@@ -41,6 +44,10 @@ infinite permissions log [--rejected] [--raised] [--workspace W] [--since T] [--
 infinite permissions mark DECISION_ID --wrong --note TEXT [--request-id UUID]
 infinite permissions replay --set FILE [--json] [--request-id UUID]
                                           Measure the permission agent on a labelled set
+infinite start [--project ID] "task"
+infinite mission status ID [--json] | mission progress ID [--after CURSOR] [--json] | mission watch ID [--json]
+infinite mission answer ID DECISION_ID TEXT | steer ID TEXT | pause|resume|cancel ID
+infinite board [--project ID]
 infinite team start [OBJECTIVE] [--prd FILE] [--provider PROVIDER]
 infinite routine create --file FILE [--request-id UUID] [--json]
 infinite routine list [--json] | status ID [--json]

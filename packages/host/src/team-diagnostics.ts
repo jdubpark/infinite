@@ -5,7 +5,7 @@ import { HOST_LOAD_REASON_PREFIX } from "./host-load.js";
 import { familyOf } from "./permission-families.js";
 import type { ProviderLimit } from "./provider-limits.js";
 import { fallbackRule } from "./routing-rules.js";
-import { escalationInstructions, escalationRetarget, retargetPrompt, TEAM_PROMPT_LIMIT_BYTES } from "./team-prompts.js";
+import { escalationInstructions, escalationRetarget, getMemberPromptSections, retargetBuiltPrompt, setMemberPromptSections, TEAM_PROMPT_LIMIT_BYTES, type BuiltPrompt, type MemberPromptSectionStore, type PromptEscalationUpdate, type TeamPromptSection } from "./team-prompts.js";
 import { hostProfilesFor, resolveLimitFallback, type TeamMember, type TeamModelProfile, type TeamRun } from "./team-types.js";
 import { TeamError } from "./team-workspace.js";
 import { TeamStopRefused } from "./manager.js";
@@ -427,14 +427,34 @@ export function escalationRetargetFor(
   fromProfileId: string | undefined,
   toProfileId: string | undefined,
   currentHostProfiles?: boolean,
-): { candidates: string[]; next: string | undefined } | undefined {
+  hasSections = false,
+): PromptEscalationUpdate | undefined {
   if (role !== "implementer") return undefined;
+  if (hasSections) return escalationRetarget(run, fromProfileId, toProfileId);
   const fromHost = currentHostProfiles ?? hostProfilesFor(run, role, fromProfileId);
   const toHost = hostProfilesFor(run, role, toProfileId);
   const fromText = escalationInstructions(run, fromProfileId);
   const toText = escalationInstructions(run, toProfileId);
   if (fromHost === toHost && fromText === toText) return undefined;
   return escalationRetarget(run, fromProfileId, toProfileId);
+}
+
+export function retargetForFallback(
+  run: TeamRun,
+  role: TeamMember["role"],
+  built: BuiltPrompt,
+  fromProfileId: string | undefined,
+  fallback: TeamModelProfile,
+  currentHostProfiles?: boolean,
+): BuiltPrompt | undefined {
+  const escalation = escalationRetargetFor(run, role, fromProfileId, fallback.id, currentHostProfiles, Boolean(built.promptSections));
+  return retargetBuiltPrompt(built, {
+    provider: fallback.provider,
+    profile: fallback,
+    role,
+    entryTools: entryToolsFor(run, role),
+    ...(escalation ? { escalation } : {}),
+  });
 }
 
 export function providerLimitHoldReason(
@@ -459,7 +479,7 @@ export function providerLimitHoldReason(
 
 export type ProviderLimitLaunchAction =
   | { kind: "proceed" }
-  | { kind: "switch"; fallback: TeamModelProfile; prompt: string; limit: ProviderLimit; eventText: string }
+  | { kind: "switch"; fallback: TeamModelProfile; prompt: string; promptSections?: TeamPromptSection[]; limit: ProviderLimit; eventText: string }
   | { kind: "defer"; limit: ProviderLimit; reason: string; eventText: string };
 
 export function resolveProviderLimitLaunch(
@@ -468,6 +488,7 @@ export function resolveProviderLimitLaunch(
   activeLimits: readonly ProviderLimit[],
   limitedProviders: Set<Provider>,
   planMemberId?: string,
+  promptSections?: readonly TeamPromptSection[],
 ): ProviderLimitLaunchAction {
   const provider = member.provider ?? run.provider;
   const limit = activeLimits.find(item => item.provider === provider);
@@ -477,22 +498,17 @@ export function resolveProviderLimitLaunch(
   const fallback = selected && run.lineup
     ? resolveLimitFallback(run.lineup, selected.id, limitedProviders, eligible)
     : undefined;
-  const escalation = fallback ? escalationRetargetFor(run, member.role, selected?.id, fallback.id, member.hostProfiles === true) : undefined;
+  const source: BuiltPrompt = promptSections ? { prompt: member.prompt, promptSections: [...promptSections] } : member;
   const retargeted = fallback
-    ? retargetPrompt(member.prompt, {
-      provider: fallback.provider,
-      profile: fallback,
-      role: member.role,
-      entryTools: entryToolsFor(run, member.role),
-      ...(escalation ? { escalation } : {}),
-    })
+    ? retargetForFallback(run, member.role, source, selected?.id, fallback, member.hostProfiles === true)
     : undefined;
-  const fitsLimit = retargeted !== undefined && Buffer.byteLength(retargeted, "utf8") <= TEAM_PROMPT_LIMIT_BYTES;
+  const fitsLimit = retargeted !== undefined && Buffer.byteLength(retargeted.prompt, "utf8") <= TEAM_PROMPT_LIMIT_BYTES;
   if (selected && fallback && fitsLimit) {
     return {
       kind: "switch",
       fallback,
-      prompt: retargeted,
+      prompt: retargeted.prompt,
+      ...(retargeted.promptSections ? { promptSections: retargeted.promptSections } : {}),
       limit,
       eventText: `${selected.label} launched on ${fallback.label}: ${PROVIDER_NAMES[limit.provider]} is limited until ${clockUtc(limit.expiresAt)}`,
     };
@@ -567,9 +583,9 @@ export function evaluateLaunchAdmission(
   limitedProviders: Set<Provider>,
   sessionSlotReason: string,
   appendEvent: (text: string) => void,
-  options: { planMemberId?: string; workerCapacityFull?: boolean; hostLoadReason?: string; sessionSlotFull?: boolean } = {},
+  options: { planMemberId?: string; workerCapacityFull?: boolean; hostLoadReason?: string; sessionSlotFull?: boolean; promptSections?: readonly TeamPromptSection[] } = {},
 ): LaunchAdmissionResult {
-  const decision = resolveProviderLimitLaunch(run, member, activeLimits, limitedProviders, options.planMemberId);
+  const decision = resolveProviderLimitLaunch(run, member, activeLimits, limitedProviders, options.planMemberId, options.promptSections);
   if (decision.kind === "defer") {
     let changed = false;
     if (!member.pendingLimit) { member.pendingLimit = true; changed = true; }
@@ -605,10 +621,12 @@ export function commitProviderLimitSwitch(
   member: TeamMember,
   pendingSwitch: Extract<ProviderLimitLaunchAction, { kind: "switch" }>,
   appendEvent: (text: string) => void,
+  promptStore?: MemberPromptSectionStore,
 ): () => boolean {
   const prevProfile = member.modelProfile;
   const prevProvider = member.provider;
   const prevPrompt = member.prompt;
+  const prevPromptSections = getMemberPromptSections(promptStore, member);
   const prevHostProfiles = member.hostProfiles;
   const prevScratch = member.scratchDirectory;
   const prevEventsLen = run.events.length;
@@ -616,6 +634,7 @@ export function commitProviderLimitSwitch(
   member.modelProfile = structuredClone(pendingSwitch.fallback);
   member.provider = pendingSwitch.fallback.provider;
   member.prompt = pendingSwitch.prompt;
+  setMemberPromptSections(promptStore, member.memberId, pendingSwitch.promptSections, member.prompt);
   if (hostProfilesFor(run, member.role, pendingSwitch.fallback.id)) member.hostProfiles = true;
   else delete member.hostProfiles;
   appendEvent(pendingSwitch.eventText);
@@ -625,6 +644,7 @@ export function commitProviderLimitSwitch(
     member.modelProfile = prevProfile;
     member.provider = prevProvider;
     member.prompt = prevPrompt;
+    setMemberPromptSections(promptStore, member.memberId, prevPromptSections, prevPrompt);
     if (prevHostProfiles) member.hostProfiles = prevHostProfiles;
     else delete member.hostProfiles;
     if (prevScratch) member.scratchDirectory = prevScratch;
@@ -641,12 +661,13 @@ export function applyProviderLimitGate(
   limitedProviders: Set<Provider>,
   sessionSlotReason: string,
   appendEvent: (text: string) => void,
-  options: { planMemberId?: string; workerCapacityFull?: boolean; hostLoadReason?: string; sessionSlotFull?: boolean } = {},
+  options: { planMemberId?: string; workerCapacityFull?: boolean; hostLoadReason?: string; sessionSlotFull?: boolean; promptSections?: readonly TeamPromptSection[]; promptStore?: MemberPromptSectionStore } = {},
 ): { proceed: boolean; changed: boolean } {
-  const result = evaluateLaunchAdmission(run, member, activeLimits, limitedProviders, sessionSlotReason, appendEvent, options);
+  const promptSections = options.promptSections ?? getMemberPromptSections(options.promptStore, member);
+  const result = evaluateLaunchAdmission(run, member, activeLimits, limitedProviders, sessionSlotReason, appendEvent, { ...options, ...(promptSections ? { promptSections } : {}) });
   if (!result.proceed) return result;
   if (result.pendingSwitch) {
-    commitProviderLimitSwitch(run, member, result.pendingSwitch, appendEvent);
+    commitProviderLimitSwitch(run, member, result.pendingSwitch, appendEvent, options.promptStore);
     return { proceed: true, changed: true };
   }
   return { proceed: true, changed: result.changed };

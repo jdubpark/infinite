@@ -491,8 +491,13 @@ process record, so its run keeps the earlier behavior: elapsed time alone never
 closes it, and the owner cancels or reconciles it. Started and completed removals are
 recorded as host events, and a failed removal is retried on later scheduler
 ticks. A blocked run whose workspace is being removed cannot resume, continue,
-or be steered. An owner can cancel a blocked run directly after its goal or
-mission is no longer active. `DELETE /api/teams/:id` and `infinite team delete ID` remove a settled
+or be steered. An owner can cancel a stopped goal's leftover blocked or paused
+run directly via `POST /api/teams/:id/cancel` once the goal has stopped, has no
+queued control or pending time extension for that run, and cannot be extended
+from it after a deadline stop; cancelling updates the cycle to `cancelled` so
+goal cleanup removes the run record after workspace removal. An owner can also
+cancel a blocked mission subteam directly after its mission is no longer active.
+`DELETE /api/teams/:id` and `infinite team delete ID` remove a settled
 cancelled, merged, or no-change run (clones and record) immediately. A run that
 still holds an unresolved operation with a process record is removed only when a
 look taken at that moment finds no process of that operation and none using the
@@ -1090,13 +1095,13 @@ The Git commands that validation runs inside the grader's root are grader comman
 
 A baseline job runs replay trials. A trial gives one implementer one task of the project's `valid` set, under one configuration, in a workspace that holds only the task's base. The grader then grades the result against the hidden tests. A trial spends model tokens on one member launch, which runs as the eval account. Read [the eval member account install](../deploy/ubuntu/eval.md) and [the eval member account](security.md#eval-member-account) before you turn trials on.
 
-Trials are off in every project until the owner sets `trialsPerDay`. A project with no `trialsPerDay` runs no trial, and its baseline job is refused `409` `eval-config-incomplete`.
+Trials are off in every project until the owner configures a provider budget (`providerBudgets` in the project's `eval` block, or host `usage.budgets` for the job's providers) or sets the optional `trialsPerDay` safety cap. A project without a budget covering the requested providers and without `trialsPerDay` runs no trial, and its job is refused `409` `eval-config-incomplete`. Before removing eval firewall isolation, cancel active eval jobs and judge calibrations, remove `trialsPerDay` and `providerBudgets` from every project and any eval-enabling provider entries from host `usage.budgets` (or remove `eval.member`), and confirm no active or schedulable eval launches remain.
 
 #### Turn it on
 
 1. Set up validation: steps 1 to 4 and 6 of [the grader install](../deploy/ubuntu/grader.md), and launcher version 2 of its section 2.2.
 2. Set up the eval member account: steps 1 to 10 of [the eval member account install](../deploy/ubuntu/eval.md).
-3. In the project's `eval` block, set `focusedTest`, `reportFormat`, and `trialsPerDay`.
+3. In the project's `eval` block, set `focusedTest`, `reportFormat`, and `providerBudgets` (or host `usage.budgets`, with optional `trialsPerDay` as a secondary safety cap).
 4. Create a baseline job with `infinite eval run PROJECT --file job.json --request-id UUID`, with `"kind": "baseline"` in the file.
 
 No trial starts before step 4. The code installs nothing: the launchers, the sudo rules, the network rules, the template, and the configuration are the owner's steps.
@@ -1107,7 +1112,8 @@ The project's `eval` block takes these fields. They are read only for a `github`
 
 | Field | Limit | Default | Meaning |
 |---|---|---|---|
-| `trialsPerDay` | 1 to 50 | off | Trials a day, counted by UTC day, for a baseline job. It is the stand-in for a learning budget, see below. |
+| `providerBudgets` | `claude`, `codex`, `opencode`: `{ usd: 0..100000, period: "day" \| "week" \| "month" }` | off (`period` defaults to `"day"`) | Per-provider USD spend caps enforced fail-closed from `UsageService` alongside host `usage.budgets`. |
+| `trialsPerDay` | 1 to 50 | off | Optional secondary safety cap on trials per UTC day, kept for backwards compatibility and providers without USD metering. |
 | `trialMinutes` | 10 to 240 | 45 | Minutes a trial's member may run before it ends `timeout`. |
 | `candidateProfiles` | up to 8 model profiles | none | Profiles that the lineup does not have. A baseline job may use them, and no prompt shows them. |
 
@@ -1188,9 +1194,12 @@ One trial runs host-wide at a time. Validation and trials share the grader, one 
 | `halt` | The project is halted. |
 | `storage` | The grader has less than 10 GiB or 200,000 inodes free. |
 | `another-job` | A trial or a validation task of another job runs. |
+| `spend-fuse` | The host or project spend fuse is open or its baseline cannot be read. |
 | `provider-limit` | The configuration's provider has an active limit. |
+| `provider-budget` | A configured project or host USD budget for the configuration's provider is exhausted for the current period. |
+| `budget-unmeasurable` | A configured provider USD budget cannot be verified because spend is unavailable, unmeasured, partial, or unpriced. |
 | `session-slots` | Fewer than four host session slots are free. |
-| `daily-cap` | `trialsPerDay` trials have started today. |
+| `daily-cap` | The optional secondary `trialsPerDay` cap has been reached today. |
 | `mirror` | The project has no mirror head or no base branch. |
 | `grader-failed` | A step of the trial's source in the grader failed. |
 | `eval-failed` | A step of the trial's source in the eval account failed. |
@@ -1200,7 +1209,7 @@ A trial whose source cannot be built keeps its attempt and is tried again, and t
 
 The reasons that stop a job are `trial-voids` (three voids in a row), `eval-processes-alive` (a process of the eval account survived `stop`, and the job is blocked until the owner resumes it), and `configuration-changed`, with the validate job's reasons.
 
-`trialsPerDay` is the stand-in for the learning budget. It bounds the count of trials and nothing else. It has no USD limits, no reservation, no estimate, and no learning floor, and no duel gate exists yet. The delegated adoption design's standing budget (delivery step 4, "The standing budget") replaces it, and removes the field.
+Provider USD budgets (`providerBudgets` and host `usage.budgets`) enforce measured provider spend fail-closed across UTC day, week, and month periods, together with the spend fuse (`FuseService`) and provider quota limits (`ProviderLimits`). Creating a new trial job while the spend fuse is open, a provider USD budget is exhausted, or a configured USD budget is unmeasurable refuses with `409` (`spend-fuse-open`, `provider-budget-exceeded`, or `provider-budget-unmeasurable`). `trialsPerDay` remains optional as a secondary daily trial-count safety cap. The delegated adoption design's standing learning budget (delivery step 4) adds reservations, estimates, and weekly purpose shares on top of this enforcement.
 
 #### Missing while a launcher refuses
 
@@ -2462,10 +2471,10 @@ What a late receipt does:
 **Reads.**
 
 - `GET /api/goals/:id/verdicts` returns each cycle's verdict: the label, the composed and the evaluator's result, the counts, `progress`, the owner's outcome with that `verdictId` and whether it agrees (`met` with `achieved`, or `not-met` with `not-achieved`), and each criterion's producer, label, state, reason, receipt, handles, and note. A cycle's `detail` is `available` while the run's record lasts. After that it is `expired`, and the cycle shows its summary with no criteria. The roles are owner, controller, and viewer. The relay refuses the path.
-- A criterion's label follows one rule. A `pending-owner` criterion is `waiting for you`, whoever produces it. Otherwise a host criterion is `host receipt`, an owner criterion is `your rating`, and an evaluator criterion is `agent assessment`. The goal page and the phone show them as "Host receipt", "Waiting for you", "Your rating", and "Agent assessment, provisional".
+- A criterion's label follows one rule. A `pending-owner` criterion is `waiting for you`, whoever produces it. Otherwise a host criterion is `host receipt`, an owner criterion is `your rating`, and an evaluator criterion is `agent assessment`. The goal page shows them as "Host receipt", "Waiting for you", "Your rating", and "Agent assessment, provisional".
 - `infinite goal verdicts ID [--json]` prints one block per cycle. A block has the line `Cycle N · Agent assessment, provisional · RESULT`, with `(evaluator said RESULT)` when the results differ. It then has an optional `Reason:` line, a line of counts and progress (`Met 1 · not met 0 · inconclusive 1 · waiting for you 0 · progress 1`), and an optional `You answered RESULT` line, marked `(agrees)` when it agrees. A cycle whose detail expired has the line `Details expired: this run's record is gone.` Each criterion has one line: its id, state, label, and reason. The text form prints no note and no handle. `--json` prints the response, notes and handles included. A goal with no assessment prints `No cycle of this goal has an assessment.`
 - Through team and goal views, every device, relay devices included, sees `run.verdicts`, `run.assessment`, `GoalCycle.assessment`, `GoalCycle.supersededVerdictIds`, and an outcome's `verdictId`. All hold ids, enumerations, and counts. `supersededVerdictIds` holds verdict ids only, and it reaches relay devices.
-- The goal page and the phone's goal screen show each cycle's "Agent assessment, provisional", its counts, and, when they differ, the evaluator's own result. The owner opens a cycle to read its criteria. The owner's outcome shows as "Your assessment". A goal stopped by `provisional-met` offers "Achieved" and "Not achieved, continue", keeps the ordinary outcome form below them, and says in one line that the other answers are recorded there. The owner can therefore always record not achieved without continue, or inconclusive, also when the host refuses continue. An answer from that form carries the assessment's `verdictId`. The Mac app does not show verdicts.
+- The goal page and the phone's goal screen show each cycle's "Agent assessment, provisional", its counts, and, when they differ, the evaluator's own result. The owner opens a cycle on the web goal page to read its per-criterion details; the phone shows the provisional result and counts and points to the web client or `infinite goal verdicts` for per-criterion details, because remote machine access refuses the verdicts path. The owner's outcome shows as "Your assessment". A goal stopped by `provisional-met` offers "Achieved" and "Not achieved, continue", keeps the ordinary outcome form below them, and says in one line that the other answers are recorded there. The owner can therefore always record not achieved without continue, or inconclusive, also when the host refuses continue. An answer from that form carries the assessment's `verdictId`. The Mac app does not show verdicts.
 
 **What a restart does.** The host fences an operation that a restart interrupted. It never replays it, so nothing is written twice.
 
@@ -2869,7 +2878,7 @@ Observations are grouped into an episode held in the worker. An episode starts a
 - A limit seen in any session, team member or not, updates the host-level entry. Nothing else happens to a non-team session.
 - Clients show the entry on the Teams list and the observation on session rows. Reset times are the provider's own statement, and a missing time means the provider gave none.
 
-The Codex working rule in a member prompt is recognised by exact text, so a retarget after a limit can find it. `packages/host/src/team-rule-texts.ts` lists every rule text main has generated; the list is append-only. When a member tool schema changes, the generated rule changes with it, and `tests/team-prompt-retarget.test.ts` fails until the new text is appended to the list and its hash to the pin.
+The sealed team wrapper persists structured prompt sections outside `run.members` under `Stored.memberPromptSections` (keyed by `memberId` as `{ promptSha256, sections }` and pruned to active matching run members on load and save), alongside each member's rendered `prompt` string. Keeping sections off `TeamMember` preserves rollback privacy so a rolled-back older host spreading `...member` through `TeamService.view()` cannot expose prompt sections or permission-coordinator evidence, and binding each entry to `sha256(member.prompt)` ensures that if a rolled-back host overwrites `member.prompt` on an existing member (for example, queuing a new permission-review turn on the same `memberId`), an upgraded host discards the stale sections rather than re-rendering an earlier request over the newer prompt. On launch and on provider-limit retargeting, the host renders provider-specific profile, escalation, Codex sandbox and tool-signature, context, entry, and reporting blocks deterministically from those sections in `packages/host/src/team-prompt-sections.ts` and validates the fully assembled launch prompt (including same-provider refreshes, unchanged retries, and appended scratch-directory instructions) against the 80 KiB prompt byte limit before saving or launching. Persisted pre-upgrade member records that only carry `prompt` continue to load, recognize the four previously shipped Codex working-rule texts via frozen hashes, upgrade to persisted structured sections on an unambiguous legacy retarget, and fail closed on unrecognized or ambiguous legacy retargets.
 
 ### What the host never does
 
@@ -4455,7 +4464,7 @@ cycle's PM selects capacity for its work. The refusal uses `409` with
 | `POST /api/teams/:id/steer` | `requestId`, `revision`, `text` | Owner/controller; standalone teams |
 | `POST /api/teams/:id/continue` | `requestId` (UUID), `revision`, optional trimmed `text` (1–8,000 characters) | Owner; continuable standalone blocked runs |
 | `POST /api/teams/:id/decisions/:decisionId/answer` | `requestId`, `revision`, `text` | Owner/controller |
-| `POST /api/teams/:id/pause`, `/resume`, `/cancel` | `requestId`, `revision` | Owner; standalone teams |
+| `POST /api/teams/:id/pause`, `/resume`, `/cancel` | `requestId`, `revision` | Owner; standalone teams (`/cancel` also accepts a stopped goal's leftover blocked or paused run once the goal has stopped, has no queued control or pending time extension for the run, and cannot be extended from it after a deadline stop, updating the cycle to `cancelled` so goal cleanup removes the run record after workspace removal; and a blocked mission subteam after its mission is no longer active) |
 | `DELETE /api/teams/:id` | None; removes a settled cancelled, merged, or no-change run and its workspace | Owner |
 | `POST /api/teams/:id/tasks/:taskId/rating` | `requestId`, `score` (1–5), optional `note` (≤1,000 characters) | Owner |
 | `GET /api/teams/:id/entries`, `GET /api/teams/:id/entries/:entryId`, `POST /api/teams/:id/entries/:entryId/withdraw` | List/read blackboard entries (`?kind=`, `?task=`, `?since=`); withdraw hides an entry from members | Reads: any paired device; `withdraw`: Owner |
@@ -4889,6 +4898,11 @@ for a caller that is not the owner, `409` with
 Goal-owned team lifecycle and steering routes return `409` with
 `code: "goal-owned-team"`. Use the owning goal's endpoints. The decision route
 remains available for its active cycle while the goal is running.
+`POST /api/teams/:id/cancel` is also accepted for a stopped goal's leftover
+blocked or paused run once the goal has stopped, has no queued control or
+pending time extension for the run, and cannot be extended from it after a
+deadline stop; it updates the goal cycle to `cancelled` so goal cleanup removes
+the run record after workspace removal.
 
 The legacy team parallelism endpoint refuses owner capacity changes with `409`
 and `code: "agent-managed-capacity"`. Legacy team creation requests may include

@@ -280,7 +280,7 @@ test("late provider switch declines retargeted prompts that exceed TEAM_PROMPT_L
   const stored = internal.records.get(f.run.id)!;
 
   const basePrompt = teamPrompt(stored.run, "implementer", stored.run.tasks[0], undefined, "claude", claudeToCodex);
-  const padBytes = TEAM_PROMPT_LIMIT_BYTES - Buffer.byteLength(basePrompt, "utf8") - 120;
+  const padBytes = TEAM_PROMPT_LIMIT_BYTES - Buffer.byteLength(basePrompt, "utf8") - 600;
   assert.ok(padBytes > 0);
   const nearCapPrompt = `${basePrompt}\n\nNotes: ${"x".repeat(padBytes)}`;
   assert.ok(Buffer.byteLength(nearCapPrompt, "utf8") <= TEAM_PROMPT_LIMIT_BYTES);

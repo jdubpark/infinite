@@ -588,3 +588,49 @@ test("explain prints the guards of an auto decision", () => {
   })]));
   assert.equal(unpaused[3], "Guards: pause none · spare attempts 3 · share 1 of 4");
 });
+
+test("usage interrupted options parse", () => {
+  const parsed = parseClientArgs(["usage", "interrupted", "--project", "proj-a", "--days", "14", "--json"]);
+  assert.equal(parsed.command, "usage");
+  assert.deepEqual(parsed.args, ["interrupted"]);
+  assert.equal(parsed.options["--project"], "proj-a");
+  assert.equal(parsed.options["--days"], "14");
+  assert.equal(parsed.options["--json"], true);
+});
+
+test("routing status and explain lines reflect observed costs, modelled headroom, and candidate pressure", () => {
+  const observed = routingStatusLines(routingStatusFixture({
+    costs: { lightUsd: 0.4, strongUsd: 2.2, rescueUsd: 1.5, basis: "observed" },
+    headroom: "modelled",
+    cells: [],
+  } as Partial<RoutingStatus>));
+  assert.equal(observed.at(-1), "Costs are observed list USD (rescue default $1.50). Limit headroom is modelled. Intervals are 90% normal approximations. Coordinator-chosen history counts at half weight.");
+
+  const mixed = routingStatusLines(routingStatusFixture({
+    costs: { lightUsd: 0.4, strongUsd: 2.2, rescueUsd: 1.5, basis: "mixed" },
+    headroom: "modelled",
+    cells: [],
+  } as Partial<RoutingStatus>));
+  assert.equal(mixed.at(-1), "Costs use observed list USD where available; tier defaults: light $0.40, strong $2.20, rescue $1.50. Limit headroom is modelled. Intervals are 90% normal approximations. Coordinator-chosen history counts at half weight.");
+
+  const withProviders = routingStatusLines(routingStatusFixture({
+    costs: { lightUsd: 0.4, strongUsd: 2.2, rescueUsd: 1.5, basis: "observed" },
+    headroom: "modelled",
+    providers: {
+      codex: { headroom: null, basis: "unestimated", pressure: 0, near: false },
+      claude: { headroom: 0.143, basis: "estimated", pressure: 0.714, near: true, unit: "usd" },
+      "open\x07code": { headroom: 0, basis: "limited", pressure: 1, near: true },
+    },
+    cells: [],
+  } as Partial<RoutingStatus>));
+  assert.equal(withProviders.at(-1), "Provider headroom: claude 14% headroom (usd, pressure 0.714, near limit) · codex unestimated · open code limited (pressure 1)");
+
+  const withPressure = routingExplainLines(explainAnswer([explainDecision({
+    payload: explainPayload([
+      { profileId: "ops-light", identity: "codex/gpt/high", tier: "light", thetaMean: 0.5, thetaSd: 0.1, phiMean: 0.5, costUsd: 0.4, pressure: 0.625, greedyUtility: 0.2, sample: 0.7, sampledUtility: 0.3 },
+      { profileId: "ops-calm", identity: "claude/sonnet/high", tier: "light", thetaMean: 0.5, thetaSd: 0.1, phiMean: 0.5, costUsd: 0.4, pressure: 0, greedyUtility: 0.9, sample: 0.7, sampledUtility: 0.8 },
+    ]),
+  })]));
+  assert.equal(withPressure[3], "  ops-light  mean 0.5 · deviation 0.1 · rescue 0.5 · cost $0.40 · pressure 0.625 · greedy utility 0.2 · sample 0.7 · sampled utility 0.3");
+  assert.equal(withPressure[4], "  ops-calm  mean 0.5 · deviation 0.1 · rescue 0.5 · cost $0.40 · greedy utility 0.9 · sample 0.7 · sampled utility 0.8");
+});

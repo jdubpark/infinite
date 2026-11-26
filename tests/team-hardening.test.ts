@@ -852,6 +852,7 @@ test("implementer fallback updates escalation instructions to match member.hostP
   twoEscMember.status = "stopped"; stored.run.lineup!.escalations = [strongEsc]; stored.run.routingRevokedAt = undefined;
 
   const hostLine = `If this task exceeds your reasoning capacity or the approach is failing, you may request one explicit escalation. The host selects the stronger profile. Report {"kind":"escalate","reason":"What failed or requires deeper reasoning; identify partial edits and remaining work"}. The host checks your partial edits, stops you, and continues in the same working copy. If this task already records an escalation, ask a material user question or report blocked; do not switch models yourself.`;
+  delete stored.memberPromptSections?.[ambiguous.memberId];
   ambiguous.prompt = `${ambiguous.prompt}\n\n${hostLine}`;
   stored.run.members.push(ambiguous);
   await internal.step(stored);

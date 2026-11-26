@@ -3,6 +3,7 @@ import { ArrowDown, ArrowLeft, ArrowUp, ArrowUpRight, ChevronRight, Minus, Penci
 import { ago, isMissionManaged, names, useApi, type AccountView, type Me, type Money, type ModelRow, type OwnerRating, type Scorecard, type TaskUsage, type UsageDaily, type UsageProject, type UsageProjectRow, type UsageSummary } from "./api";
 import { useMachines } from "./machines";
 import { useLiveRefresh } from "./live-refresh";
+import { RepairMetricsPanel } from "./repair-metrics-panel";
 import type { CostView } from "./session-navigation";
 
 export const viewerZone = (() => { try { return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC"; } catch { return "UTC"; } })();
@@ -279,6 +280,7 @@ function Overview({ me }: { me: Me }) {
         </li>;
       })}</ul> : <p className="quiet">No accounts are configured on this host.</p>}
     </section>
+    <RepairMetricsPanel />
   </>;
 }
 
@@ -340,6 +342,7 @@ function ProjectDetail({ id, back }: { id: string; back: () => void }) {
       <div className="cost-section-heading"><h2>Briefings</h2><span className="quiet">{project.briefings.runs} {project.briefings.runs === 1 ? "run" : "runs"}</span></div>
       <p className="cost-briefings"><Amount money={project.briefings.total} /><Unmeasured count={project.briefings.unmeasured} word="run" /></p>
     </section>
+    <RepairMetricsPanel projectId={id} />
   </>;
 }
 

@@ -23,7 +23,7 @@ import { CmuxSessions } from "./cmux/index.js";
 import { CmuxError } from "./cmux/client.js";
 import { ContentError, recordedMessages, sessionFile } from "./session-content.js";
 import { connectRemoteAccess } from "./remote-access.js";
-import { ProjectSync, ProjectSyncError, syncFailure } from "./project-sync.js";
+import { parseSyncGeneration, parseSyncPublisherId, ProjectSync, ProjectSyncError, syncFailure } from "./project-sync.js";
 import { ProjectSourceError, ProjectSourceService } from "./project-source.js";
 import { MirroredProjects } from "./mirrored-projects.js";
 import { RepoEnrollmentService, autonomyChangeSchema, repoEnrollmentRequestSchema } from "./repo-enrollment.js";
@@ -56,7 +56,7 @@ import { lineupProfiles } from "./team-types.js";
 import { Blackboard } from "./evidence/blackboard.js";
 import { ENTRY_KINDS } from "./evidence/entry-types.js";
 import { usagePlanSchema } from "./usage-api.js";
-import { registerRepairMetricsRoute } from "./repair-metrics-routes.js";
+import { registerInterruptedTaskMetricsRoute, registerRepairMetricsRoute } from "./repair-metrics-routes.js";
 import { TeamService, TeamError } from "./teams.js";
 import { readDecisionQueue } from "./decision-queue-read.js";
 import { objectiveRoutes } from "./objective-routes.js";
@@ -73,7 +73,7 @@ import { CellQueryRefused, type CellQuery, type CostLookup } from "./outcome-cel
 import { currentEpochs, productionRows, queryCells, queryRollup } from "./outcome-reads.js";
 import { latestAssessment, rollupMissing, type RollupTarget } from "./outcome-rollup.js";
 import { importLegacy, LegacyImportRefused } from "./outcome-import.js";
-import { sessionCostOf } from "./outcome-cost.js";
+import { outcomeCostSync, sessionCostOf } from "./outcome-cost.js";
 import { legacyBatchSchema } from "./outcome-legacy.js";
 import { GoalService } from "./goals.js";
 import { RoutineService } from "./routines.js";
@@ -218,7 +218,8 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
     projectSync.applying(projectId) || projectSource.refreshing(projectId) || await projectRunning(projectId, true) });
   validateLinearConfig(config);
   validateMcpConfig(config);
-  const manager = new Manager(config, key);
+  let intakeAudience: ReturnType<typeof createIntakeAudienceGuard> | undefined;
+  const manager = new Manager(config, key, undefined, { projectContexts: new ProjectContexts(config, key, () => intakeAudience?.workspaceBindings()) });
   const projectSync = new ProjectSync(config, key);
   const desktopFiles = new DesktopFiles(config);
   const startsInFlight = new Map<string, number>();
@@ -271,8 +272,8 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
       lateReceipts();
     },
   });
-  outbox.registerProjector(outcomeProjector(evidence));
-  const evalHost: EvalHost = new EvalHost({ config, store: evidence, source: projectSource, hostLoad: manager.hostLoad, halt: () => halt, runs: () => teams.understandingRecords(), teams: () => teams, sessions: manager, cost: sessionId => sessionCostOf(usage.session(sessionId)) });
+  outbox.registerProjector(outcomeProjector(evidence, { prices: config.usage?.prices }));
+  const evalHost: EvalHost = new EvalHost({ config, store: evidence, source: projectSource, hostLoad: manager.hostLoad, halt: () => halt, runs: () => teams.understandingRecords(), teams: () => teams, sessions: manager, cost: sessionId => sessionCostOf(usage.session(sessionId)), usage: () => usage, fuse: () => gate });
   const fuse = new FuseService({ config, key, store: evidence, sessionExists: id => {
     try { manager.meta(id); return true; } catch (error) { return (error as NodeJS.ErrnoException).code !== "ENOENT"; }
   } });
@@ -281,7 +282,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
     source: projectSource,
     graphs: repositoryGraphs,
     events: outbox,
-    capture: evalHost.capture,
+    capture: evalHost.capture, replayLaunchGate: input => evalHost.replayLaunchWait(input),
     entries: blackboard, ...(options.processCensus ? { processes: options.processCensus } : {}),
     delivery: deliveryPort(evidence),
     onMerged: id => {
@@ -298,16 +299,16 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
   });
   teams.useEvidence(evidence);
   lateReceipts = () => { void teams.settleReceipts().catch(() => {}); };
-  teams.useRouter(new RoutingRecorder({ store: evidence }));
+  const router = new RoutingRecorder({ store: evidence }); teams.useRouter(router);
   const backfillOutcomes = outcomeBackfill(evidence, () => teams.understandingRecords(), {
     mapOf: projectId => config.projects.find(project => project.id === projectId)?.team?.features,
-    now: () => new Date().toISOString(),
+    now: () => new Date().toISOString(), prices: config.usage?.prices,
   });
   backfillOutcomes();
-  const usage = new UsageService(config, key, manager, evidence);
+  const usage = new UsageService(config, key, manager, evidence); const syncCosts = outcomeCostSync(evidence, config.usage?.prices); syncCosts();
   const balances = new BalanceService(config.usage?.accounts ?? {});
   usage.useBalances(balances);
-  teams.useUsage(usage);
+  teams.useUsage(usage); const refreshHeadrooms = () => router.refreshHeadrooms(config.teams?.lineup, teams.providerLimitHistory(), config.usage?.prices); refreshHeadrooms(); usage.onUpdated(refreshHeadrooms); teams.onLimitsChanged(refreshHeadrooms);
   const goals = new GoalService(config, key, teams, linear);
   lateReceipts = () => { void teams.settleReceipts().then(() => goals.syncReceipts()).catch(() => {}); };
   ownerServices.goals = goals;
@@ -395,7 +396,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
       const result = outbox.advance();
       if (!result.pending || result.blocked.length > 0) break;
     }
-    backfillOutcomes();
+    backfillOutcomes(); syncCosts();
   };
   let outboxTimer: NodeJS.Timeout | undefined;
   const closeEvidence = () => { baseScanner?.close(); clearInterval(evidenceSweep); clearInterval(outboxTimer); fuse.stop(); evalHost.close(); evidence.close(); };
@@ -407,7 +408,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
     sessionTitle: sessionId => { try { return manager.meta(sessionId).session.title; } catch { return undefined; } },
   });
   const projectSchema = z.string().regex(/^[a-z0-9-]{1,80}$/);
-  const cmux = config.cmux?.enabled ? new CmuxSessions(config, key) : undefined;
+  const cmux = config.cmux?.enabled ? new CmuxSessions(config, key, manager.projectContexts) : undefined;
   const handoffs: HandoffService = new HandoffService(config, key, manager, teams, startInProject, async (sessionId, projectId) => {
     const sourcePath = realpathSync(manager.meta(sessionId).session.cwd);
     for (const project of config.projects) {
@@ -426,7 +427,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
   const assertNoHandoff = (projectId: string) => {
     if (handoffs.activeForProject(projectId)) throw new TeamError(409, "handoff-in-progress", "This project is transferring a task to a team. Wait for its checkpoint to finish.");
   };
-  const intakeAudience = createIntakeAudienceGuard({ config, groups: projectGroups, sourceAppliedHead: projectId => projectSource.status(projectId).appliedHead });
+  intakeAudience = createIntakeAudienceGuard({ config, groups: projectGroups, sourceAppliedHead: projectId => projectSource.status(projectId).appliedHead });
   const createMission = createIntakeMissionCreator({ config, missions, groups: projectGroups, audience: intakeAudience, assertNoHandoff });
   const intakeStore = config.intake ? new IntakeStore(config, key) : undefined;
   const intakeSlackClient = config.intake?.slack ? new SlackClient({ botTokenFile: config.intake.slack.botTokenFile, appTokenFile: config.intake.slack.appTokenFile, endpoint: config.intake.slack.endpoint, teamId: config.intake.slack.teamId, organizationScope: config.intake.slack.organizationScope, workspaceAllowed: intakeAudience.workspacesAllowed }) : undefined;
@@ -797,6 +798,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
   const usageUnavailable = { error: "The usage ledger is unavailable" };
   const ledgerUnavailable = (error: unknown) => error instanceof EvidenceError && error.code === "unavailable";
   const requireLedger = () => { if (!usage.readable()) throw new EvidenceError("unavailable", "The usage ledger is unavailable."); };
+  registerInterruptedTaskMetricsRoute(app, { runs: filter => teams.interruptedTaskRuns(filter), evidence });
   app.use("/api/usage", (_req, res, next) => usage.available() ? next() : void res.status(503).json(usageUnavailable));
   app.get("/api/usage", (_req, res) => res.json(usage.summary()));
   app.get("/api/evidence/status", (_req, res) => res.json(evidence.describe()));
@@ -1010,7 +1012,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
   app.get("/api/goals", (_req, res) => res.json({ goals: goals.list() }));
   app.get("/api/goals/:id", (req, res) => res.json(goals.get(id.parse(req.params.id))));
   objectiveRoutes(app, { goals, teams }, requireRole(["owner", "controller", "viewer"]), requireRole(["owner"]));
-  routingRoutes(app, { evidence, config: () => config, teams }, requireRole(["owner", "controller", "viewer"]), requireRole(["owner"]));
+  routingRoutes(app, { evidence, config: () => config, teams, headroomCache: router.headroomCache }, requireRole(["owner", "controller", "viewer"]), requireRole(["owner"]));
   evalHost.routes(app, requireRole(["owner", "controller", "viewer"]), requireRole(["owner"]));
   app.get("/api/routines", (_req, res) => res.json({ routines: routines.list() }));
   app.get("/api/routines/:id", (req, res) => res.json(routines.get(id.parse(req.params.id))));
@@ -1320,10 +1322,8 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
     return res.json(await startInProject(body.projectId, () => teams.create(body)));
   });
   const standaloneTeam = (value: unknown, allowOrphanedBlockedCancel = false) => {
-    const teamId = id.parse(value);
-    const team = teams.get(teamId);
-    if (allowOrphanedBlockedCancel && team.status === "blocked") {
-      if (goals.ownsActiveTeam(teamId)) throw new TeamError(409, "goal-owned-team", "Control this feature from its goal. Team decisions can still be answered here.");
+    const teamId = id.parse(value), team = teams.get(teamId);
+    if (allowOrphanedBlockedCancel && !team.goal && team.status === "blocked") {
       if (missions.ownsActiveSubteam(teamId)) throw new TeamError(409, "mission-owned-team", "Control this subteam from its mission.");
       return teamId;
     }
@@ -1352,8 +1352,10 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
     res.json(await (teams.get(teamId).goal ? goals.answer(teamId, decisionId, body) : teams.answer(teamId, decisionId, body)));
   });
   for (const action of ["pause", "resume", "cancel"] as const) {
-    app.post(`/api/teams/:id/${action}`, requireRole(["owner"]), async (req, res) =>
-      res.json(await teams[action](standaloneTeam(req.params.id, action === "cancel"), teamActionSchema.parse(req.body))));
+    app.post(`/api/teams/:id/${action}`, requireRole(["owner"]), async (req, res) => {
+      const teamId = id.parse(req.params.id);
+      res.json(await (action === "cancel" && teams.get(teamId).goal && !missions.ownsActiveSubteam(teamId) ? goals.cancelReleasedRun(teamId, teamActionSchema.parse(req.body)) : teams[action](standaloneTeam(teamId, action === "cancel"), teamActionSchema.parse(req.body))));
+    });
   }
   app.get("/api/machine/resources", async (_req, res) => res.json(await desktopResources.sample()));
   app.post("/api/projects/resolve", requireRole(["owner"]), requireOwnerCli, (req, res) => {
@@ -1957,36 +1959,36 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
     res.status(409).json({ error: "This project follows GitHub; laptop sync is off. Re-enroll with --source laptop to upload from this computer.", code: "source-github" });
     return true;
   };
-  const syncWriter = (req: express.Request, res: express.Response) => ({
-    deviceId: String(res.locals.deviceId),
-    publisherId: z.uuid().optional().parse(req.get("X-Infinite-Sync-Publisher")),
-  });
-  const syncGeneration = (req: express.Request) => z.uuid().optional().parse(req.get("X-Infinite-Sync-Generation"));
+  const syncWriter = (req: express.Request, res: express.Response) => ({ deviceId: String(res.locals.deviceId), publisherId: parseSyncPublisherId(req.get("X-Infinite-Sync-Publisher")) });
+  const syncLease = (req: express.Request, res: express.Response) => ({ writer: syncWriter(req, res), generation: parseSyncGeneration(req.get("X-Infinite-Sync-Generation")) });
   app.post("/api/projects/:id/sync/begin", requireRole(["owner"]), requireOwnerCli, async (req, res) => {
     const projectId = projectSchema.parse(req.params.id);
     if (refuseGithubSync(projectId, res)) return;
-    res.json(await projectSync.begin(projectId, syncWriter(req, res)));
+    res.json(await projectSync.begin(projectId, syncWriter(req, res), z.object({ expectEmpty: z.boolean().optional() }).strict().parse(req.body ?? {})));
   });
   app.post("/api/projects/:id/sync/has", requireRole(["owner"]), requireOwnerCli, async (req, res) => {
+    const { writer, generation } = syncLease(req, res);
     const body = z.object({ hashes: z.array(z.string().regex(/^[a-f0-9]{64}$/)).max(512) }).strict().parse(req.body);
-    res.json({ missing: await projectSync.missing(projectSchema.parse(req.params.id), body.hashes, syncWriter(req, res), syncGeneration(req)) });
+    res.json({ missing: await projectSync.missing(projectSchema.parse(req.params.id), body.hashes, writer, generation) });
   });
   app.put("/api/projects/:id/sync/blob/:hash", requireRole(["owner"]), requireOwnerCli, express.raw({ type: "application/octet-stream", limit: WORKSPACE_LIMITS.chunkBytes }), async (req, res) => {
+    const { writer, generation } = syncLease(req, res);
     if (!Buffer.isBuffer(req.body) || !req.body.length) return void res.status(400).json({ error: "Send the chunk as application/octet-stream" });
-    await projectSync.putBlob(projectSchema.parse(req.params.id), String(req.params.hash), req.body, syncWriter(req, res), syncGeneration(req));
+    await projectSync.putBlob(projectSchema.parse(req.params.id), String(req.params.hash), req.body, writer, generation);
     res.json({ stored: true });
   });
   app.put("/api/projects/:id/sync/blobs", requireRole(["owner"]), requireOwnerCli, express.raw({ type: "application/octet-stream", limit: WORKSPACE_LIMITS.batchBytes }), async (req, res) => {
+    const { writer, generation } = syncLease(req, res);
     if (!Buffer.isBuffer(req.body) || !req.body.length) return void res.status(400).json({ error: "Send the chunk batch as application/octet-stream" });
-    res.json({ stored: await projectSync.putBlobs(projectSchema.parse(req.params.id), req.body, syncWriter(req, res), syncGeneration(req)) });
+    res.json({ stored: await projectSync.putBlobs(projectSchema.parse(req.params.id), req.body, writer, generation) });
   });
   app.post("/api/projects/:id/sync/commit", requireRole(["owner"]), requireOwnerCli, express.json({ limit: WORKSPACE_LIMITS.manifestBytes + 64 * 1024 }), async (req, res) => {
     const projectId = projectSchema.parse(req.params.id);
     if (refuseGithubSync(projectId, res)) return;
+    const { writer, generation } = syncLease(req, res);
     const body = z.object({ generation: z.uuid(), manifest: z.unknown() }).strict().parse(req.body);
-    const headerGeneration = syncGeneration(req);
-    if (headerGeneration && headerGeneration !== body.generation) throw new ProjectSyncError("The sync generation does not match this request", "stale-generation");
-    res.json(await projectSync.commit(projectId, body.generation, body.manifest, () => projectRunning(projectId), syncWriter(req, res)));
+    if (generation !== body.generation) throw new ProjectSyncError("The sync generation does not match this request", "stale-generation");
+    res.json(await projectSync.commit(projectId, body.generation, body.manifest, () => projectRunning(projectId), writer));
   });
   app.post("/api/projects/:id/sync/apply", requireRole(["owner"]), async (req, res) => {
     const projectId = projectSchema.parse(req.params.id);
@@ -2000,17 +2002,15 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
   app.get("/api/projects/:id/sync/blob/:hash", requireRole(["owner"]), requireOwnerCli, async (req, res) => {
     res.json({ base64: await projectSync.readBlob(projectSchema.parse(req.params.id), String(req.params.hash)) });
   });
-  const projectContexts = new ProjectContexts(config, key);
   app.get("/api/projects/:id/context-links", (req, res) => {
-    return res.json(projectContexts.listLinks(String(req.params.id)));
+    return res.json(manager.projectContexts.listLinks(String(req.params.id)));
   });
   app.put("/api/projects/:id/context-links", requireRole(["owner"]), (req, res) => {
-    return res.json(projectContexts.setLinks(String(req.params.id), contextLinksRequest.parse(req.body)));
+    return res.json(manager.projectContexts.setLinks(String(req.params.id), contextLinksRequest.parse(req.body)));
   });
   app.get("/api/projects/:id/context", (req, res) => {
-    if (!config.projects.some((p) => p.id === req.params.id))
-      return res.status(404).json({ error: "Unknown project" });
-    return res.json(manager.context(req.params.id));
+    if (!config.projects.some((p) => p.id === req.params.id)) return res.status(404).json({ error: "Unknown project" });
+    return res.json(manager.projectContexts.context(req.params.id));
   });
   app.put("/api/projects/:id/context", requireRole(["owner"]), (req, res) => {
     if (!config.projects.some((p) => p.id === req.params.id))
@@ -2023,7 +2023,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
       .strict()
       .parse(req.body);
     return res.json(
-      manager.setContext(
+      manager.projectContexts.setContext(
         String(req.params.id),
         body.text,
         body.expectedVersion,
@@ -2080,6 +2080,8 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
       }
       if ((error as NodeJS.ErrnoException).code === "ENOENT")
         return res.status(404).json({ error: "Session not found" });
+      if ((error as WorkerError).code === "resize-refused")
+        return res.status(503).json({ code: "resize-refused", error: (error as Error).message });
       if (["control-busy", "control-lost"].includes((error as WorkerError).code ?? ""))
         return res.status(409).json({
           code: (error as WorkerError).code,

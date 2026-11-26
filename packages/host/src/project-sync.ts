@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync 
 import { chmod, lstat, open, readdir, realpath, rename, rm, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
+import { z } from "zod";
 import { unseal, writeSealed } from "./vault.js";
 import {
   captureWorkspace, decodeChunkBatch, describeMaterializedTree, hasWorkspaceBlobs, materializeWorkspace, putWorkspaceBlob, putWorkspaceBlobs, readWorkspaceBlob,
@@ -26,17 +27,29 @@ export interface ProjectSyncStatus {
   skipped?: number;
 }
 type Received = { manifest: WorkspaceManifest; receivedAt: string; generation: string };
-export interface SyncWriter { deviceId: string; publisherId?: string }
+export interface SyncWriter { deviceId: string; publisherId: string }
 type UploadLease = { generation: string; writer: SyncWriter; updatedAt: string; committing: boolean };
 type ActiveUploadLease = { value: UploadLease; expiresAt: number; lastActivityAt: number; lastPersistedAt: number };
 export type RunningCheck = () => Promise<boolean>;
 type Applied = { manifest: WorkspaceManifest; appliedAt: string; baseline?: WorkspaceManifest };
 
 export class ProjectSyncError extends Error {
-  constructor(message: string, readonly code: "cloud-changed" | "session-running" | "apply-failed" | "sync-failed" | "sync-applying" | "sync-in-progress" | "stale-generation" | "missing-content" | "invalid-manifest" | "unknown-project",
+  constructor(message: string, readonly code: "cloud-changed" | "session-running" | "apply-failed" | "sync-failed" | "sync-applying" | "sync-in-progress" | "stale-generation" | "missing-content" | "invalid-manifest" | "invalid-sync-headers" | "unknown-project",
     readonly status = 409, readonly category?: SyncFailureCategory, readonly retryAfterSeconds?: number) {
     super(message);
   }
+}
+
+const syncIdSchema = z.uuid();
+export function parseSyncPublisherId(value: unknown): string {
+  const parsed = syncIdSchema.safeParse(value);
+  if (!parsed.success) throw new ProjectSyncError("Missing or invalid X-Infinite-Sync-Publisher header", "invalid-sync-headers", 400);
+  return parsed.data;
+}
+export function parseSyncGeneration(value: unknown): string {
+  const parsed = syncIdSchema.safeParse(value);
+  if (!parsed.success) throw new ProjectSyncError("Missing or invalid X-Infinite-Sync-Generation header", "invalid-sync-headers", 400);
+  return parsed.data;
 }
 
 const FAILURES: Record<SyncFailureCategory, string> = {
@@ -62,7 +75,6 @@ const MAX_MANIFEST_BYTES = 32 * 1024 * 1024;
 const UPLOAD_LEASE_MS = 5 * 60 * 1000;
 const UPLOAD_LEASE_PERSIST_MS = 30 * 1000;
 const UPLOAD_LEASE_RECOVERY_GRACE_MS = 30 * 1000;
-const INTERNAL_WRITER: SyncWriter = { deviceId: "internal", publisherId: "internal" };
 const OWNED_PREFIX = ".infinite";
 const ownedPath = (path: string) => path === OWNED_PREFIX || path.startsWith(`${OWNED_PREFIX}/`);
 const entrySignature = (entry: WorkspaceEntry) => JSON.stringify([entry.path, entry.kind, entry.mode, entry.size ?? null, entry.chunks ?? null, entry.target ?? null]);
@@ -98,7 +110,9 @@ export class ProjectSync {
         });
         else if (saved) {
           const updatedAt = Date.parse(saved.updatedAt), now = Date.now();
-          if (!Number.isFinite(updatedAt) || now > updatedAt + UPLOAD_LEASE_MS + UPLOAD_LEASE_RECOVERY_GRACE_MS) this.clearLease(project.id);
+          const validSaved = typeof saved.writer?.deviceId === "string" && saved.writer.deviceId.length > 0 &&
+            syncIdSchema.safeParse(saved.writer.publisherId).success && syncIdSchema.safeParse(saved.generation).success;
+          if (!validSaved || !Number.isFinite(updatedAt) || now > updatedAt + UPLOAD_LEASE_MS + UPLOAD_LEASE_RECOVERY_GRACE_MS) this.clearLease(project.id);
           else this.uploads.set(project.id, {
             value: saved,
             expiresAt: updatedAt + UPLOAD_LEASE_MS + UPLOAD_LEASE_RECOVERY_GRACE_MS,
@@ -175,16 +189,17 @@ export class ProjectSync {
       active.lastPersistedAt = now;
     }
   }
-  private ownedLease(projectId: string, writer: SyncWriter, generation: string | undefined, options: { touch?: boolean; allowLegacyContent?: boolean; allowCommitting?: boolean } = {}) {
+  private requireWriter(writer: SyncWriter): SyncWriter {
+    if (!writer || typeof writer.deviceId !== "string" || !writer.deviceId)
+      throw new ProjectSyncError("Missing sync device identity", "invalid-sync-headers", 400);
+    return { deviceId: writer.deviceId, publisherId: parseSyncPublisherId(writer.publisherId) };
+  }
+  private ownedLease(projectId: string, writer: SyncWriter, generation: string, options: { touch?: boolean; allowCommitting?: boolean } = {}): ActiveUploadLease {
+    const verifiedWriter = this.requireWriter(writer);
+    const verifiedGeneration = parseSyncGeneration(generation);
     this.project(projectId);
-    if (writer.publisherId && !generation) throw new ProjectSyncError("This sync request is missing its generation; begin again", "stale-generation");
     const active = this.expireLease(projectId);
-    if (!generation && !writer.publisherId && options.allowLegacyContent) {
-      if (active && !active.value.committing && !active.value.writer.publisherId && active.value.writer.deviceId === writer.deviceId && options.touch)
-        this.touchLease(projectId, active);
-      return undefined;
-    }
-    if (!active || (active.value.committing && !options.allowCommitting) || active.value.generation !== generation || !this.sameWriter(active.value.writer, writer))
+    if (!active || (active.value.committing && !options.allowCommitting) || active.value.generation !== verifiedGeneration || !this.sameWriter(active.value.writer, verifiedWriter))
       throw new ProjectSyncError("This sync generation is stale or belongs to another publisher; begin again", "stale-generation");
     if (options.touch) this.touchLease(projectId, active);
     return active;
@@ -252,36 +267,44 @@ export class ProjectSync {
     writeJson(file, value);
   }
 
-  async begin(projectId: string, writer: SyncWriter = INTERNAL_WRITER) {
+  async begin(projectId: string, writer: SyncWriter, options: { expectEmpty?: boolean } = {}) {
+    const verifiedWriter = this.requireWriter(writer);
     await this.ready(projectId);
     this.project(projectId);
     const now = Date.now(), active = this.expireLease(projectId, now);
-    if (active) {
-      if (writer.publisherId !== undefined && this.sameWriter(active.value.writer, writer)) {
-        if (active.value.committing) this.conflict(active, now);
-        this.touchLease(projectId, active, now);
-        return { generation: active.value.generation };
-      }
-      this.conflict(active, now);
+    if (active && (active.value.committing || !this.sameWriter(active.value.writer, verifiedWriter))) this.conflict(active, now);
+    if (options.expectEmpty) {
+      if (this.changing.has(projectId))
+        throw new ProjectSyncError("A workspace sync is being applied to this project. Retry after it finishes.", "sync-applying");
+      if (this.read<Received>(projectId, "received") || this.read<Applied>(projectId, "applied") || this.readPending(projectId))
+        throw new ProjectSyncError("This project already received a workspace sync generation; inspect its status before uploading again.", "cloud-changed");
     }
-    const value: UploadLease = { generation: randomUUID(), writer, updatedAt: new Date(now).toISOString(), committing: false };
+    const emptyConfirmed = options.expectEmpty ? { emptyConfirmed: true as const } : {};
+    if (active) {
+      this.touchLease(projectId, active, now);
+      return { generation: active.value.generation, ...emptyConfirmed };
+    }
+    const value: UploadLease = { generation: randomUUID(), writer: verifiedWriter, updatedAt: new Date(now).toISOString(), committing: false };
     this.writeLease(projectId, value);
     this.uploads.set(projectId, { value, expiresAt: now + UPLOAD_LEASE_MS, lastActivityAt: now, lastPersistedAt: now });
-    return { generation: value.generation };
+    return { generation: value.generation, ...emptyConfirmed };
   }
-  async missing(projectId: string, hashes: string[], writer: SyncWriter = INTERNAL_WRITER, generation?: string) {
-    this.ownedLease(projectId, writer, generation, { touch: true, allowLegacyContent: true });
+  async missing(projectId: string, hashes: string[], writer: SyncWriter, generation: string) {
+    await this.ready(projectId);
+    this.ownedLease(projectId, writer, generation, { touch: true });
     if (!Array.isArray(hashes) || hashes.length > 512 || hashes.some(h => !/^[a-f0-9]{64}$/.test(h))) throw new ProjectSyncError("Invalid blob presence request", "invalid-manifest", 400);
     return hasWorkspaceBlobs(this.store(projectId), hashes);
   }
-  async putBlob(projectId: string, hash: string, bytes: Buffer, writer: SyncWriter = INTERNAL_WRITER, generation?: string) {
-    this.ownedLease(projectId, writer, generation, { touch: true, allowLegacyContent: true });
+  async putBlob(projectId: string, hash: string, bytes: Buffer, writer: SyncWriter, generation: string) {
+    await this.ready(projectId);
+    this.ownedLease(projectId, writer, generation, { touch: true });
     if (!/^[a-f0-9]{64}$/.test(hash)) throw new ProjectSyncError("Invalid blob hash", "invalid-manifest", 400);
     if (createHash("sha256").update(bytes).digest("hex") !== hash) throw new ProjectSyncError("The uploaded content does not match its hash", "invalid-manifest", 400);
     await putWorkspaceBlob(this.store(projectId), hash, bytes.toString("base64"));
   }
-  async putBlobs(projectId: string, body: Buffer, writer: SyncWriter = INTERNAL_WRITER, generation?: string) {
-    this.ownedLease(projectId, writer, generation, { touch: true, allowLegacyContent: true });
+  async putBlobs(projectId: string, body: Buffer, writer: SyncWriter, generation: string) {
+    await this.ready(projectId);
+    this.ownedLease(projectId, writer, generation, { touch: true });
     let chunks: { hash: string; bytes: Buffer }[];
     try { chunks = decodeChunkBatch(body); } catch { throw new ProjectSyncError("Invalid chunk batch", "invalid-manifest", 400); }
     if (chunks.some(({ hash, bytes }) => createHash("sha256").update(bytes).digest("hex") !== hash))
@@ -297,10 +320,9 @@ export class ProjectSync {
     }
   }
 
-  commit(projectId: string, generation: string, value: unknown, running: RunningCheck, writer: SyncWriter = INTERNAL_WRITER) {
+  commit(projectId: string, generation: string, value: unknown, running: RunningCheck, writer: SyncWriter) {
     const admit = () => {
       const active = this.ownedLease(projectId, writer, generation);
-      if (!active) throw new ProjectSyncError("This sync generation is stale; begin again", "stale-generation");
       const admitted = { ...active.value, updatedAt: new Date().toISOString(), committing: true };
       this.writeLease(projectId, admitted);
       active.value = admitted;

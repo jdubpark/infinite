@@ -8,7 +8,15 @@ test("swarm context endpoints answer every role and refuse unknown projects, ses
   const host = await startHost();
   try {
     const me = await host.fetchApi("/me", "viewer");
-    assert.equal((me.body as { capabilities: { swarmContext?: number } }).capabilities.swarmContext, 1);
+    const meBody = me.body as { capabilities: { swarmContext?: number }; providerCapabilities?: Record<string, { observesToolInputs?: boolean }> };
+    assert.equal(meBody.capabilities.swarmContext, 1);
+    assert.deepEqual(meBody.providerCapabilities, {
+      claude: { observesToolInputs: true },
+      codex: { observesToolInputs: true },
+      grok: { observesToolInputs: false },
+      opencode: { observesToolInputs: false },
+      demo: { observesToolInputs: false },
+    });
 
     for (const role of ["owner", "controller", "viewer"] as const) {
       const map = await host.fetchApi("/projects/rehearsal/graph/map", role);

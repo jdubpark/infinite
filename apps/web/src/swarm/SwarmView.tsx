@@ -59,10 +59,10 @@ export function SwarmView(props: SwarmViewProps) {
 
   const { model, now } = useMemo(() => {
     const now = Date.now();
-    const model = buildSwarm({ sessions, teams, missions, now });
+    const model = buildSwarm({ sessions, teams, missions, providerCapabilities: me.providerCapabilities, now });
     activity.record(model.live.flatMap(swarm => allAgents(swarm)), now);
     return { model, now };
-  }, [sessions, teams, missions, activity]);
+  }, [sessions, teams, missions, me.providerCapabilities, activity]);
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {

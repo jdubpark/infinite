@@ -1,25 +1,39 @@
 import { z } from "zod";
+import {
+  ASSESSED_STATES,
+  COMPOSED_STATES,
+  CRITERIA_LABEL_BYTES,
+  CRITERIA_ROWS_MAX,
+  ID_RE,
+  criteriaRowSchema,
+  criteriaRowsSchema,
+  criteriaRowsText,
+  type AssessedState,
+  type ComposedState,
+  type CriteriaRow,
+} from "./schema-primitives.js";
 
-const ID_RE = /^[a-z][a-z0-9-]{0,39}$/;
+export {
+  criteriaRowSchema,
+  criteriaRowsSchema,
+  criteriaRowsText,
+  type AssessedState,
+  type ComposedState,
+  type CriteriaRow,
+};
 
-export const VERDICT_LIMITS = { criteria: 8, handles: 8, handleChars: 400, noteBytes: 500, labelBytes: 120 } as const;
+export const VERDICT_LIMITS = { criteria: CRITERIA_ROWS_MAX, handles: 8, handleChars: 400, noteBytes: 500, labelBytes: CRITERIA_LABEL_BYTES } as const;
 const L = VERDICT_LIMITS;
 const byteLength = (value: string): number => Buffer.byteLength(value, "utf8");
 
 export type DeliveryFact = "none" | "landed" | "reverted";
 
-export type AssessedState = "met" | "not-met" | "inconclusive";
-export type ComposedState = AssessedState | "pending-owner";
-
-const assessedStates = ["met", "not-met", "inconclusive"] as const;
-const composedStates = ["met", "not-met", "inconclusive", "pending-owner"] as const;
-
 export const verdictReportSchema = z.object({
   kind: z.literal("verdict"),
-  result: z.enum(assessedStates),
+  result: z.enum(ASSESSED_STATES),
   criteria: z.array(z.object({
     id: z.string().regex(ID_RE),
-    state: z.enum(assessedStates),
+    state: z.enum(ASSESSED_STATES),
     evidence: z.array(z.string().min(1).max(L.handleChars)).max(L.handles),
     note: z.string().optional(),
   }).strict()).min(1).max(L.criteria),
@@ -50,22 +64,10 @@ export const runAssessmentSchema: z.ZodType<RunAssessment> = z.object({
   revision: z.number().int().min(1),
   head: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i),
   kind: z.enum(["reviewed", "no-change"]),
-  result: z.enum(assessedStates),
-  evaluatorResult: z.enum(assessedStates).optional(),
+  result: z.enum(ASSESSED_STATES),
+  evaluatorResult: z.enum(ASSESSED_STATES).optional(),
   reason: z.enum(["no-independent-evaluator", "evaluator-unavailable", "record-unavailable", "context-too-large"]).optional(),
   counts: z.object({ met: countSchema, notMet: countSchema, inconclusive: countSchema, pendingOwner: countSchema }).strict(),
-  criteria: z.array(z.object({ id: z.string().regex(ID_RE), state: z.enum(composedStates) }).strict()).max(L.criteria),
+  criteria: z.array(z.object({ id: z.string().regex(ID_RE), state: z.enum(COMPOSED_STATES) }).strict()).max(L.criteria),
   at: z.iso.datetime(),
 }).strict();
-
-export const criteriaRowSchema = z.object({
-  criterion: z.string().regex(ID_RE),
-  status: z.enum(composedStates),
-  check: z.string().refine(value => byteLength(value) >= 1 && byteLength(value) <= L.labelBytes, { message: `A label is 1 to ${L.labelBytes} bytes` }),
-}).strict();
-export type CriteriaRow = z.infer<typeof criteriaRowSchema>;
-export const criteriaRowsSchema = z.array(criteriaRowSchema).min(1).max(L.criteria);
-
-export function criteriaRowsText(rows: readonly CriteriaRow[]): string {
-  return ["Agent assessment, provisional, of the latest assessed cycle:", ...rows.map(row => `- ${row.criterion}: ${row.status} (${row.check})`)].join("\n");
-}

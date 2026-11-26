@@ -2,7 +2,7 @@ import { stopHandoffProcesses } from "./handoff-processes.js";
 import { handoffEnvelopeSchema, handoffObjective } from "./handoff-types.js";
 import { cleanTeamCheckpoint } from "./team-workspace.js";
 import { createServer } from "node:net";
-import { chmodSync, mkdirSync, realpathSync, unlinkSync } from "node:fs";
+import { chmodSync, realpathSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
@@ -36,7 +36,7 @@ import {
   detectLimit,
 } from "@infinite/attention";
 import { Journal, writeSealed } from "./vault.js";
-import { socketPath } from "./ipc.js";
+import { ensureSocketDir, socketPath } from "./ipc.js";
 import { startHookServer, HookPayloadError, type HookAnswer, type HookReply, type HookRoute } from "./hooks.js";
 import { EvidenceReader } from "./evidence/reader.js";
 import { evidenceDatabasePath } from "./evidence/store.js";
@@ -57,6 +57,8 @@ import { addClaudeCodeModeToLaunchEnv, addProjectIdToLaunchEnv } from "./worker-
 import { clearEgressEnvironment, workerEgressEnvironment } from "./egress.js";
 import { claudeConfigPath, recordClaudeTrustAsync } from "./workspace-trust.js";
 import { TerminalSnapshots } from "./terminal-snapshot.js";
+import { DEFAULT_TERMINAL_SIZE, isPtyTerminalSize, TERMINAL_SIZE_INDEX_FILE, TerminalBarrier, TerminalSizeIndex } from "./terminal-size.js";
+import { SignalIndex } from "./signal-index.js";
 import { startNativeCodex, validateNativeCodexArgs } from "./native-codex.js";
 import { startNativeOpenCode, validateNativeOpenCodeArgs } from "./native-opencode.js";
 import { createExecutorTunnel, type ExecutorTunnel } from "./executor-tunnel.js";
@@ -82,20 +84,19 @@ for await (const chunk of process.stdin) {
 }
 const config = JSON.parse(bootstrap) as Bootstrap;
 bootstrap = "";
-const { session, profile, stateDir, runDir } = config;
+const { session, profile, stateDir, runDir, socketDir } = config;
+const workerSocket = socketPath({ runDir, socketDir: ensureSocketDir(socketDir ?? runDir, socketDir !== undefined ? "socketDir" : "runDir") }, session.id);
 const provider = session.provider;
 const key = Buffer.from(config.key, "base64");
 config.key = "";
 const dir = join(stateDir, "sessions", session.id);
-const journal = new Journal(join(dir, "events"), key, session.id);
+let signalIndex: SignalIndex | undefined;
+const journal = new Journal(join(dir, "events"), key, session.id, { onAppend: (event, meta) => { signalIndex?.observe(event, meta); } });
 if (journal.seq !== 0)
   throw new Error("Refusing to start a second process for an existing session");
-const terminal = new headless.Terminal({
-  cols: 120,
-  rows: 32,
-  scrollback: 5000,
-  allowProposedApi: true,
-});
+const sizeIndex = new TerminalSizeIndex(join(dir, TERMINAL_SIZE_INDEX_FILE), key, session.id);
+signalIndex = new SignalIndex(dir, key, session.id, journal.seq);
+const terminal = new headless.Terminal({ ...DEFAULT_TERMINAL_SIZE, scrollback: 5000, allowProposedApi: true });
 const snapshots = new TerminalSnapshots(terminal);
 type AnswerRequest = Extract<WorkerRequest, { op: "answer" }>;
 type TeamAnswerRequest = Extract<WorkerRequest, { op: "team-answer" }>;
@@ -117,6 +118,7 @@ let state: WorkerState = {
   status: "starting", seq: 0, screen: "", attention,
   capabilities: { terminalSnapshot: 1, inputControl: 1 },
   control: null,
+  terminalSize: { cols: terminal.cols, rows: terminal.rows },
   runtime: session.runtime ?? { id: randomUUID(), location: "local", transport: "pty" },
   ...(session.resumeNativeSession ? { nativeSession: session.resumeNativeSession } : {}),
   ...(session.workspace ? { execution: { location: "laptop", state: "connecting", cloudReady: false } as const } : {}),
@@ -142,16 +144,19 @@ terminal.parser.registerOscHandler(9, (data) => {
 let pending = "";
 const usageLines = provider === "opencode" && session.team ? new JsonLineAssembler() : undefined;
 let flushTimer: ReturnType<typeof setTimeout> | undefined;
-let snapshotQueue: (() => void)[] | undefined;
-let snapshotBytes = 0;
-let abortSnapshot: ((error: Error) => void) | undefined;
-const persist = () =>
+const terminalBarrier = new TerminalBarrier();
+let lastPersistedCoverage = 0;
+const persist = () => {
+  const covered = sizeIndex.coveredSeq(journal.seq);
+  if (covered !== undefined) lastPersistedCoverage = covered;
   writeSealed(join(dir, "status.sealed"), key, `${session.id}:status`, {
     ...state,
+    ...(covered !== undefined ? { sizeIndexCoveredSeq: covered } : {}),
     screen: "",
     seq: journal.seq,
-    workerPid: process.pid,
+    workerPid: process.pid, socketPath: workerSocket, ...(config.permissionChannel?.socket ? { permissionSocketPath: config.permissionChannel.socket } : {}),
   });
+};
 function append(type: Event["type"], data: Event["data"]): Event {
   try {
     return journal.append(type, data);
@@ -163,42 +168,34 @@ function append(type: Event["type"], data: Event["data"]): Event {
 function flush() {
   clearTimeout(flushTimer);
   flushTimer = undefined;
+  const startSeq = journal.seq;
+  let flushedBytes = 0;
   while (pending.length) {
     const data = pending.slice(0, 8192);
     pending = pending.slice(8192);
+    flushedBytes += data.length;
     append("output", { text: data });
   }
+  if (journal.seq - startSeq >= 32 || flushedBytes >= 64 * 1024) signalIndex?.checkpoint(journal.seq);
+  const covered = sizeIndex.coveredSeq(journal.seq);
+  if (covered !== undefined && covered - lastPersistedCoverage >= 256) persist();
+}
+
+function withTerminalBarrier<T>(fn: () => T, beforeDrain?: () => void): Promise<T> {
+  if (state.status === "recording-error") return Promise.reject(new Error("Recording failed"));
+  return terminalBarrier.run(flush, done => terminal.write("", done), () => {
+    if ((state as WorkerState).status === "recording-error") throw new Error("Recording failed during snapshot");
+    return fn();
+  }, beforeDrain);
 }
 
 async function snapshot(): Promise<TerminalSnapshot> {
   if (state.status === "recording-error") throw new Refusal("snapshot-unavailable");
-  snapshotQueue = [];
-  snapshotBytes = 0;
-  let deadline: ReturnType<typeof setTimeout> | undefined;
   try {
-    flush();
-    await new Promise<void>((resolve, reject) => {
-      abortSnapshot = reject;
-      deadline = setTimeout(() => reject(new Error("Terminal renderer is busy")), 1000);
-      terminal.write("", resolve);
-    });
-    if ((state as WorkerState).status === "recording-error") throw new Error("Recording failed during snapshot");
-    return {
-      ansi: snapshots.capture(),
-      seq: journal.seq,
-      cols: terminal.cols,
-      rows: terminal.rows,
-      capturedAt: new Date().toISOString(),
-    };
-  } catch {
-    throw new Refusal("snapshot-unavailable");
-  } finally {
-    clearTimeout(deadline);
-    abortSnapshot = undefined;
-    const queued = snapshotQueue;
-    snapshotQueue = undefined;
-    for (const task of queued) task();
-  }
+    return await withTerminalBarrier(() => ({
+      ansi: snapshots.capture(), seq: journal.seq, cols: terminal.cols, rows: terminal.rows, capturedAt: new Date().toISOString(),
+    }));
+  } catch { throw new Refusal("snapshot-unavailable"); }
 }
 function publish(next: Attention) {
   attention = { ...next, now: describeNow(next, provider) };
@@ -333,10 +330,10 @@ function onTranscript(body: unknown): HookReply | void {
 let handoffReceipt: string | undefined;
 let handoffStopping = false;
 let handoffInFlight = false;
-async function onHook(route: HookRoute, body: unknown): Promise<HookReply | HookAnswer | void> {
+async function onHook(route: HookRoute, body: unknown, run?: string): Promise<HookReply | HookAnswer | void> {
   if (route === "permission-check" || route === "permission-request") {
     if (!permissionChannel) throw new HookPayloadError(404);
-    return route === "permission-check" ? permissionChannel.check(body) : permissionChannel.request(body);
+    return route === "permission-check" ? permissionChannel.check(body, run) : permissionChannel.request(body, run);
   }
   if (route === "team-entry") {
     if (!entryRoute) throw new HookPayloadError(403, ENTRY_REFUSALS["entry-tools-off"]);
@@ -1250,8 +1247,10 @@ const server = createServer((socket) => {
       let result: unknown;
       if (request.op === "state") {
         currentControl();
+        const sizeIndexCoveredSeq = sizeIndex.coveredSeq(journal.seq);
         result = {
           ...state,
+          ...(sizeIndexCoveredSeq !== undefined ? { sizeIndexCoveredSeq } : {}),
           attention,
           seq: journal.seq,
           screen: request.screen ? screen() : "",
@@ -1315,20 +1314,22 @@ const server = createServer((socket) => {
         }
         result = { invalidated: true };
       } else if (request.op === "resize") {
-        if (
-          !Number.isInteger(request.cols) ||
-          !Number.isInteger(request.rows) ||
-          request.cols < 20 ||
-          request.cols > 240 ||
-          request.rows < 5 ||
-          request.rows > 100
-        )
-          throw new Error("Invalid terminal size");
-        result = await serialize(() => {
+        if (!isPtyTerminalSize(request.cols, request.rows)) throw new Error("Invalid terminal size");
+        result = await serialize(async () => {
           checkControl(request);
-          child?.resize(request.cols, request.rows);
-          terminal.resize(request.cols, request.rows);
-          refreshControl(request);
+          await withTerminalBarrier(() => {
+            terminal.resize(request.cols, request.rows);
+            const terminalSize = { cols: terminal.cols, rows: terminal.rows };
+            if (state.terminalSize?.cols !== terminalSize.cols || state.terminalSize?.rows !== terminalSize.rows) {
+              state = { ...state, terminalSize };
+              const resized = append("lifecycle", { event: "resize", cols: terminalSize.cols, rows: terminalSize.rows });
+              sizeIndex.append(resized.seq, terminalSize);
+              persist();
+            }
+            refreshControl(request);
+          }, () => {
+            child?.resize(request.cols, request.rows);
+          });
           return { ok: true };
         });
       } else if (request.op === "answer") {
@@ -1439,16 +1440,15 @@ async function exitWorker(code: number) {
   evidenceReader?.close();
   await workspaceClosing?.catch(() => {});
   try {
-    unlinkSync(socketPath(runDir, session.id));
+    unlinkSync(workerSocket);
   } catch {
   }
   process.exit(code);
 }
 
-mkdirSync(runDir, { recursive: true, mode: 0o700 });
 server.on("error", () => process.exit(1));
-server.listen(socketPath(runDir, session.id), async () => {
-  chmodSync(socketPath(runDir, session.id), 0o600);
+server.listen(workerSocket, async () => {
+  chmodSync(workerSocket, 0o600);
   try {
     journal.append("lifecycle", {
       status: "starting",
@@ -1519,7 +1519,7 @@ server.listen(socketPath(runDir, session.id), async () => {
       session.teamModelProfile,
       session.handoff?.policy ? session.id : undefined,
       session.workspaceTrusted ? session.cwd : undefined,
-      Boolean(session.team?.entryTools), Boolean(permissionChannel),
+      Boolean(session.team?.entryTools), permissionChannel?.run ?? false,
       egress.status !== "off",
       config.codeMode,
       session.runtime?.nativeUi ? 0 : session.nativeArgs?.length,
@@ -1606,13 +1606,14 @@ server.listen(socketPath(runDir, session.id), async () => {
     child = spawn(launch.command, launch.args, {
       cwd: session.cwd,
       env,
-      cols: 120,
-      rows: 32,
+      cols: terminal.cols,
+      rows: terminal.rows,
       name: "xterm-256color",
     });
-    state = { ...state, status: "running", pid: child.pid };
+    state = { ...state, status: "running", pid: child.pid, terminalSize: { cols: terminal.cols, rows: terminal.rows } };
     publish(attention);
-    journal.append("lifecycle", { status: "running", pid: child.pid });
+    const runningEvent = journal.append("lifecycle", { status: "running", pid: child.pid, cols: terminal.cols, rows: terminal.rows });
+    sizeIndex.append(runningEvent.seq, { cols: terminal.cols, rows: terminal.rows });
     persist();
     const output = (data: string) => {
       pending += data;
@@ -1643,13 +1644,7 @@ server.listen(socketPath(runDir, session.id), async () => {
           checkScreen();
         }, 40);
     };
-    const onData = (data: string) => {
-      if (snapshotQueue) {
-        snapshotQueue.push(() => output(data));
-        snapshotBytes += Buffer.byteLength(data, "utf8");
-        if (snapshotBytes > 2 * 1024 * 1024) abortSnapshot?.(new Error("Snapshot output queue is full"));
-      } else output(data);
-    };
+    const onData = (data: string) => terminalBarrier.dispatch(() => output(data), Buffer.byteLength(data, "utf8"));
     child.onData(onData);
     const finalDrain = async () => {
       try {
@@ -1677,6 +1672,7 @@ server.listen(socketPath(runDir, session.id), async () => {
         state = { ...state, status: "exited", exitCode, control: null };
         publish(applyLifecycle(attention, "exited", new Date().toISOString()));
         append("lifecycle", { status: "exited", exitCode });
+        signalIndex?.checkpoint(journal.seq);
         persist();
       } catch {
         recordingFailure();
@@ -1685,29 +1681,28 @@ server.listen(socketPath(runDir, session.id), async () => {
         await finalDrain();
         try {
           if (provider !== "opencode") append("usage-coverage", { ...transcriptWatch.finish(hooksReady, true) });
+          signalIndex?.checkpoint(journal.seq);
           persist();
         } catch {}
         const finish = () => { if (handoffStopping) setTimeout(finish, 100); else void exitWorker(0); };
         setTimeout(finish, 1500);
       })();
     };
-    const onExit = ({ exitCode }: { exitCode: number }) => {
-      if (snapshotQueue) snapshotQueue.push(() => exited(exitCode));
-      else exited(exitCode);
-    };
+    const onExit = ({ exitCode }: { exitCode: number }) => terminalBarrier.dispatch(() => exited(exitCode));
     child.onExit(onExit);
     resumeProvider = nativeSessionId => {
       const next = buildLaunch(
         provider, headlessResumeProfile(profile, nativeSessionId), "",
         hookServer ? { url: hookServer.url, token: hookToken } : null, relayPath, config.attention.hooks,
         Boolean(session.team), session.teamModelProfile, session.handoff?.policy ? session.id : undefined,
-        session.workspaceTrusted ? session.cwd : undefined, Boolean(session.team?.entryTools), true, egress.status !== "off",
+        session.workspaceTrusted ? session.cwd : undefined, Boolean(session.team?.entryTools), permissionChannel!.run, egress.status !== "off",
         config.codeMode,
       );
       const pty = spawn(next.command, next.args, { cwd: session.cwd, env, cols: terminal.cols, rows: terminal.rows, name: "xterm-256color" });
       child = pty;
       state = { ...state, status: "running", pid: pty.pid };
-      append("lifecycle", { status: "running", pid: pty.pid, permissionChannel: { event: "resumed" } });
+      const resumedEvent = append("lifecycle", { status: "running", pid: pty.pid, cols: terminal.cols, rows: terminal.rows, permissionChannel: { event: "resumed" } });
+      sizeIndex.append(resumedEvent.seq, { cols: terminal.cols, rows: terminal.rows });
       persist();
       pty.onData(onData);
       pty.onExit(onExit);
@@ -1720,6 +1715,7 @@ server.listen(socketPath(runDir, session.id), async () => {
       status: "exited",
       error: (error as Error).message,
     });
+    signalIndex?.checkpoint(journal.seq);
     persist();
     void exitWorker(1);
   }

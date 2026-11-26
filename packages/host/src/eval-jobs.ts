@@ -6,9 +6,10 @@ import type { EvidenceStore } from "./evidence/store.js";
 import type { EvidenceDb, EvidenceTx } from "./evidence/types.js";
 import { validationSettings, type EvalGraderConfig, type ValidationSettings } from "./eval-config.js";
 import type { GraderProbe } from "./eval-grader.js";
-import type { EvalJobReason, EvalJobView, EvalJobWait, EvalRefusal, ValidateJobRequest } from "./eval-types.js";
+import { evalTaskIdSchema, evalWindowSchema, type EvalJobReason, type EvalJobView, type EvalJobWait, type EvalRefusal, type ValidateJobRequest } from "./eval-types.js";
 import type { TaskValidation } from "./eval-validate.js";
 import type { RoutineStatus } from "./routine-types.js";
+import { ID_RE } from "./schema-primitives.js";
 import type { Config } from "./types.js";
 
 export const JOB_EXPIRY_DAYS_MAX = 30, JOB_TASKS_MAX = 1_000, JOB_TASKS_DEFAULT = 100, JOB_LIST_MAX = 100, STUCK_AFTER = 3,
@@ -16,24 +17,17 @@ export const JOB_EXPIRY_DAYS_MAX = 30, JOB_TASKS_MAX = 1_000, JOB_TASKS_DEFAULT 
 const NEXT_PAGE = 200, ACTIVE_LIMIT = 100, SWEEP_LIMIT = 100, DAY_MS = 86_400_000;
 const VALID_PHASE = "valid:";
 
-const TASK_ID_PATTERN = /^(captured|mined):[A-Za-z0-9:._-]{1,200}$/;
-const AREA_PATTERN = /^[a-z][a-z0-9-]{0,39}$/;
-const windowSchema = z.object({
-  startHourUtc: z.number().int().min(0).max(23),
-  endHourUtc: z.number().int().min(1).max(24),
-}).strict().refine(window => window.endHourUtc !== window.startHourUtc, "a window must not be empty");
-
 export const validateJobSchema: z.ZodType<ValidateJobRequest> = z.object({
   kind: z.literal("validate"),
   taskFilter: z.object({
-    taskIds: z.array(z.string().regex(TASK_ID_PATTERN)).max(JOB_TASKS_MAX).optional(),
+    taskIds: z.array(evalTaskIdSchema).max(JOB_TASKS_MAX).optional(),
     origins: z.array(z.enum(["captured", "mined"])).max(2).optional(),
-    areas: z.array(z.string().regex(AREA_PATTERN)).max(32).optional(),
+    areas: z.array(z.string().regex(ID_RE)).max(32).optional(),
     revalidate: z.boolean().optional(),
     maxTasks: z.number().int().min(1).max(JOB_TASKS_MAX).optional(),
   }).strict().optional(),
   limits: z.object({ maxWallMinutes: z.number().int().min(10).max(43_200) }).strict(),
-  windows: z.array(windowSchema).min(1).max(4).optional(),
+  windows: z.array(evalWindowSchema).min(1).max(4).optional(),
   expiresAt: z.iso.datetime().optional(),
 }).strict();
 

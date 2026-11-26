@@ -4,18 +4,32 @@ import { mirrorRemoteUrl } from "./project-source.js";
 import { hostGithubGrantEnvironment } from "./github-grants.js";
 import { publishTeamHead } from "./team-workspace.js";
 import { filesystemEntryExists, type TeamKernel } from "./team-kernel.js";
+import { TrackedTaskSet } from "./team-diagnostics.js";
 import type { Stored, TeamServiceOptions } from "./teams.js";
 
 export type PublisherHost = Pick<TeamKernel, "records" | "config" | "save" | "event" | "enqueue"> & {
   readonly options: TeamServiceOptions | undefined;
   retentionNow(): string;
+  onBackgroundTask?: () => void;
 };
 
 export class TeamPublisher {
   private readonly publishingRuns = new Set<string>();
-  readonly publicationTasks = new Set<Promise<void>>();
+  readonly publicationTasks: Set<Promise<void>>;
   readonly publicationControllers = new Map<string, AbortController>();
-  constructor(private readonly host: PublisherHost) {}
+  constructor(private readonly host: PublisherHost) {
+    this.publicationTasks = new TrackedTaskSet<Promise<void>>(() => this.host.onBackgroundTask?.());
+  }
+  isPublishing(runId: string): boolean {
+    return this.publishingRuns.has(runId);
+  }
+  isPublicationPending(stored: Stored): boolean {
+    if (this.publishingRuns.has(stored.run.id)) return true;
+    const { run } = stored, target = this.publicationTarget(stored);
+    if (!target || !run.headCommit || run.headCommit === run.baseCommit || ["merged", "no-change"].includes(run.status) || run.workspaceRemovedAt) return false;
+    if (run.publication?.commit === run.headCommit && run.publication.repository === target.repository) return false;
+    return !(run.publication?.repository === target.repository && run.publication.failure?.commit === run.headCommit);
+  }
   publishHeadsEnabled() {
     const teams = this.host.config.teams as (NonNullable<Config["teams"]> & { publishHeads?: boolean }) | undefined;
     return teams?.publishHeads !== false;

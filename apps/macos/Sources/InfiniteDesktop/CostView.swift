@@ -2,9 +2,6 @@ import SwiftUI
 import Charts
 import InfiniteCore
 
-/// Money the agents spent on this host: the month at a glance, thirty days stacked by account, each
-/// account's balance or plan, projects ranked by accrued cost, and a scorecard of model profiles.
-/// Every figure is the host's own ledger; a floor shows "≥", an absent balance shows "—", never $0.
 @MainActor final class CostModel: ObservableObject {
     enum Tab: String, CaseIterable, Identifiable { case overview, projects, models; var id: String { rawValue }; var title: String { rawValue.capitalizedFirst } }
     @Published var tab: Tab = .overview
@@ -24,7 +21,6 @@ import InfiniteCore
     private var displayVisible = false
     private var displayGeneration = UUID()
     private var reloadWhenIdle = false
-    /// Days are bucketed in this Mac's timezone, so the bars match the owner's calendar.
     let tz = TimeZone.current.identifier
     init(client: RemoteClient, owner: Bool) { self.client = client; self.owner = owner }
 
@@ -35,7 +31,6 @@ import InfiniteCore
         if !visible { reloadWhenIdle = false }
     }
 
-    /// One pass over every route; a single failing route leaves the others' data in place.
     func load() async {
         guard displayVisible else { return }
         guard !loading else { reloadWhenIdle = true; return }
@@ -94,15 +89,11 @@ import InfiniteCore
         do { let value = try await detail; if isCurrent(generation), projectID == id { project = value } } catch { if isCurrent(generation) { self.error = error.localizedDescription } }
         do { let value = try await days; if isCurrent(generation), projectID == id { projectDaily = value } } catch { if isCurrent(generation) { self.error = error.localizedDescription } }
     }
-    /// Owner only: asks the provider for a fresh balance, then reloads everything.
     func refresh() async {
         guard displayVisible else { return }
         if owner { do { _ = try await client.refreshBalances() } catch { self.error = error.localizedDescription } }
         await load()
     }
-    /// Owner only: sets a subscription's monthly fee (`nil` returns to the config default). The host's
-    /// reply replaces the account tiles at once; the month headline follows on the next load. A refusal
-    /// is thrown for the editor to show beside the field and never touches the view's figures.
     func setPlan(account id: String, usd: Double?) async throws {
         let accounts = try await client.setPlan(account: id, planUsd: usd)
         if var overview { overview.accounts = accounts; self.overview = overview }
@@ -116,8 +107,6 @@ import InfiniteCore
     }
 }
 
-/// One color per account, fixed by name so a filter never repaints a survivor. The order was checked
-/// for colour-vision separation on the dark ground; unknown accounts take the free slots in turn.
 enum AccountPalette {
     private static func hex(_ value: UInt32) -> Color {
         Color(red: Double((value >> 16) & 0xff) / 255, green: Double((value >> 8) & 0xff) / 255, blue: Double(value & 0xff) / 255)
@@ -186,8 +175,6 @@ struct CostView: View {
     }
 }
 
-/// A dollar figure with its source marker: "≥" and a dotted line when some steps carried no price.
-/// Unmeasured work counts the same way: a figure with gaps is a floor, and nothing measured is "—", never $0.
 struct MoneyText: View {
     let money: Money
     let unmeasured: Int
@@ -206,7 +193,6 @@ struct MoneyText: View {
             case .floor(let usd):
                 Text("≥").foregroundStyle(.secondary)
                 Text(UsageFormat.usd(usd)).overlay(alignment: .bottom) {
-                    // A hairline of dots under a floor, the same weight at every size.
                     Line().stroke(Palette.muted, style: StrokeStyle(lineWidth: 1, dash: [1, 2])).frame(height: 1).offset(y: 2)
                 }
             case .exact(let usd): Text(UsageFormat.usd(usd))
@@ -220,7 +206,6 @@ struct MoneyText: View {
     }
 }
 
-/// The month's metered spend, the thirty-day bars, and each account in one row that is also the legend.
 private struct OverviewSection: View {
     @ObservedObject var model: CostModel
     private var colors: [String: Color] { AccountPalette.colors(for: Set((model.daily?.accounts ?? []) + (model.overview?.accounts.map(\.id) ?? [])).sorted()) }
@@ -242,7 +227,6 @@ private struct OverviewSection: View {
         }
     }
     private func headline(_ overview: UsageOverview) -> some View {
-        // The host's month starts at 00:00 UTC; the name is read in UTC so it never slips a month west of it.
         let month = UsageFormat.monthName(overview.month.start)
         let previous = UsageFormat.previousMonthName(overview.month.start)
         let delta = UsageFormat.delta(overview.month.spent.usd, previous: overview.month.previous.usd)
@@ -276,7 +260,6 @@ private struct OverviewSection: View {
     private var dot: some View { Text("·").foregroundStyle(.tertiary) }
 }
 
-/// Thirty days of metered spend stacked by account. Hovering a day shows its split; the account row below is the legend.
 struct DailyChart: View {
     let daily: DailyUsage
     let colors: [String: Color]
@@ -339,11 +322,9 @@ struct DailyChart: View {
     }
 }
 
-/// Each account beside its series colour: what it spent this month or costs per month, and its balance.
 private struct AccountRow: View {
     let accounts: [AccountView]
     let colors: [String: Color]
-    /// Only the owner may change a subscription's fee; everyone else sees the figure alone.
     let owner: Bool
     let setPlan: (String, Double?) async throws -> Void
     var body: some View {
@@ -363,10 +344,20 @@ private struct AccountRow: View {
             }
             VStack(alignment: .leading, spacing: 1) {
                 HStack(alignment: .firstTextBaseline, spacing: 6) {
-                    if let month = account.month { MoneyText(month).font(.system(size: 22, weight: .semibold, design: .rounded)) }
-                    else if let plan = account.planUsd { Text(UsageFormat.usd(plan)).font(.system(size: 22, weight: .semibold, design: .rounded)) }
-                    else { Text("—").font(.system(size: 22, weight: .semibold, design: .rounded)).foregroundStyle(.tertiary) }
-                    if owner, !account.metered { PlanFeeEditor(account: account, setPlan: setPlan) }
+                    switch account.billing {
+                    case .metered(let month):
+                        if let month { MoneyText(month).font(.system(size: 22, weight: .semibold, design: .rounded)) }
+                        else { Text("—").font(.system(size: 22, weight: .semibold, design: .rounded)).foregroundStyle(.tertiary) }
+                    case .subscription(let plan, _):
+                        if let plan { Text(UsageFormat.usd(plan)).font(.system(size: 22, weight: .semibold, design: .rounded)) }
+                        else { Text("—").font(.system(size: 22, weight: .semibold, design: .rounded)).foregroundStyle(.tertiary) }
+                        if owner { PlanFeeEditor(account: account, setPlan: setPlan) }
+                    case .other(_, let month, let plan, _):
+                        if let month { MoneyText(month).font(.system(size: 22, weight: .semibold, design: .rounded)) }
+                        else if let plan { Text(UsageFormat.usd(plan)).font(.system(size: 22, weight: .semibold, design: .rounded)) }
+                        else { Text("—").font(.system(size: 22, weight: .semibold, design: .rounded)).foregroundStyle(.tertiary) }
+                        if owner { PlanFeeEditor(account: account, setPlan: setPlan) }
+                    }
                 }
                 HStack(spacing: 4) {
                     Text(account.metered ? "this month" : "per month")
@@ -393,9 +384,6 @@ private struct AccountRow: View {
     }
 }
 
-/// The owner's pencil beside a subscription fee: a popover with the dollar field, Save, Cancel, and
-/// "Reset to default" once the owner has overridden the config. The figure is checked here the way the
-/// host checks it (0–100000, two decimals); a refusal from the host shows beneath the field verbatim.
 private struct PlanFeeEditor: View {
     let account: AccountView
     let setPlan: (String, Double?) async throws -> Void
@@ -448,7 +436,6 @@ private struct PlanFeeEditor: View {
     }
 }
 
-/// The one legend for every marker the cost views use.
 private struct CostLegend: View {
     var body: some View {
         HStack(spacing: 22) {
@@ -463,7 +450,6 @@ private struct CostLegend: View {
     }
 }
 
-/// Projects ranked by accrued cost, each with its last thirty days.
 private struct ProjectsSection: View {
     @ObservedObject var model: CostModel
     var body: some View {
@@ -507,7 +493,6 @@ private struct ProjectRowView: View {
     }
 }
 
-/// Thirty daily values as one quiet line; the last day carries a marker.
 struct Sparkline: View {
     let values: [Double]
     private var top: Double { max(values.max() ?? 0, 0.01) }
@@ -530,7 +515,6 @@ struct Sparkline: View {
     }
 }
 
-/// One project's goals, team runs, sessions, and briefings, each with its cost, under its own daily bars.
 private struct ProjectDetailSection: View {
     @ObservedObject var model: CostModel
     private var colors: [String: Color] { AccountPalette.colors(for: Set((model.projectDaily?.accounts ?? []) + (model.daily?.accounts ?? [])).sorted()) }
@@ -580,7 +564,6 @@ private struct ProjectDetailSection: View {
             }
         }
     }
-    /// How many of a kind, and the dollars they add up to.
     private func kind(_ n: Int, _ noun: String, usd: Double) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             HStack(alignment: .firstTextBaseline, spacing: 4) {
@@ -608,11 +591,8 @@ private struct ProjectDetailSection: View {
     }
 }
 
-/// Model profiles in one role: outcomes, cost, time, and quality, with n beside every figure and no
-/// ranking below the host's minimum sample. Subscription profiles show "—" for money.
 private struct ModelsSection: View {
     @ObservedObject var model: CostModel
-    /// Ranked rows first, by integrated rate; the rest follow by sample size.
     private var rows: [ModelRow] {
         (model.scorecard?.rows ?? []).sorted {
             if $0.enough != $1.enough { return $0.enough }
@@ -709,7 +689,6 @@ private struct ModelGridRow: View {
     }
 }
 
-/// The integrated rate as a point, with its 95% interval as the band behind it.
 struct RateBar: View {
     let rate: Double
     let interval: (low: Double, high: Double)?
@@ -730,7 +709,6 @@ struct RateBar: View {
     }
 }
 
-/// The owner's 1–5 rating of a task: five marks, the chosen one and those below it filled.
 struct RatingControl: View {
     let score: Int?
     let at: String?

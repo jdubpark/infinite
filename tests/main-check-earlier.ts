@@ -1,7 +1,7 @@
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { setTimeout as delay } from "node:timers/promises";
-import { bootId, hostProcesses, type CensusFinding, type HostProcesses } from "../packages/host/src/process-census.js";
+import { MAX_ANCHORED, type MainCheckAnchors } from "../packages/host/src/main-check-anchors.js";
+import { bootId, hostProcesses } from "../packages/host/src/process-census.js";
 
 export async function earlierProcesses(): Promise<Map<number, string>> {
   const earlier = new Map<number, string>();
@@ -15,26 +15,8 @@ export async function earlierProcesses(): Promise<Map<number, string>> {
   return earlier;
 }
 
-export function censusPast(earlier: Map<number, string>): HostProcesses {
-  if (earlier.size === 0) return hostProcesses;
-  const later = async (findings: CensusFinding[]) => {
-    const kept: CensusFinding[] = [];
-    for (const finding of findings) {
-      const same = finding.reason === "unreadable" && earlier.has(finding.pid) && await hostProcesses.start(finding.pid).catch(() => undefined) === earlier.get(finding.pid);
-      if (!same) kept.push(finding);
-    }
-    return kept;
-  };
-  return {
-    ...hostProcesses,
-    async census(witness, directory, prefix) {
-      const first = await hostProcesses.census(witness, directory, prefix);
-      if (!first.ok) return first;
-      const kept = await later(first.findings);
-      if (kept.length > 0 || kept.length === first.findings.length) return { ok: true, findings: kept };
-      await delay(100);
-      const second = await hostProcesses.census(witness, directory, prefix);
-      return second.ok ? { ok: true, findings: await later(second.findings) } : second;
-    },
-  };
+export async function anchorSeeded(anchors: MainCheckAnchors, projectId: string, directory: string): Promise<number> {
+  const processes = [...await earlierProcesses()].map(([pid, start]) => ({ pid, start })).slice(0, MAX_ANCHORED);
+  if (processes.length > 0) anchors.write(projectId, directory, { version: 1, boot: bootId(), processes });
+  return processes.length;
 }

@@ -29,8 +29,6 @@ public struct SyncPlan: Sendable {
     public let scope: String
 }
 
-/// Content baselines are local, private and scoped to one machine/project/folder pair.
-/// Preview never writes them. Only confirmed convergence advances a baseline.
 public actor SyncBaselines {
     private struct Record: Codable { var version = 1; var files: [String: String] }
     private let directory: URL
@@ -120,7 +118,6 @@ public struct SyncPlanner: Sendable {
             } while cursor != nil
         }
         let paths = Set(local.keys).union(remote.keys).union(baseline.keys).union(issues.keys)
-        // Avoid mapping two case-distinct server files onto a case-insensitive Mac volume.
         let grouped = Dictionary(grouping: paths, by: { $0.precomposedStringWithCanonicalMapping.lowercased() })
         for group in grouped.values where group.count > 1 { for path in group { issues[path] = "Case or Unicode filename collision · choose another folder" } }
         let items = paths.sorted().map { path in
@@ -137,8 +134,6 @@ public struct SyncPlanner: Sendable {
             if item.blocked { continue }
             switch item.action {
             case .none:
-                // Equal, revalidated copies establish an initial baseline only
-                // when the user applies this preview. Conflicts remain untouched.
                 if let local = item.local, local.sha256 == item.remote?.sha256,
                    try LocalFiles.version(root: plan.localRoot, path: item.path) == local,
                    try await transfer.metadata(path: remotePath) == item.remote {

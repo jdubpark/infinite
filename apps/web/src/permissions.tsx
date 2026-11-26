@@ -66,6 +66,11 @@ function logPath(filters: Filters, before?: string) {
   return `/permissions/log${query ? `?${query}` : ""}`;
 }
 
+function olderErrorMessage(failure: unknown) {
+  const detail = failure instanceof Error ? failure.message.trim() : "";
+  return detail ? `Could not load older decisions: ${detail}` : "Could not load older decisions.";
+}
+
 export function PermissionPicker({ selected, onSelect, onOverview }: { selected: string | null; onSelect: (id: string) => void; onOverview: () => void }) {
   const api = useApi();
   const [filters, setFilters] = useState<Filters>({ rejected: false, raised: false, workspace: "", since: "" });
@@ -74,11 +79,25 @@ export function PermissionPicker({ selected, onSelect, onOverview }: { selected:
   const [next, setNext] = useState<string | undefined>();
   const [workspaces, setWorkspaces] = useState<Status["workspaces"]>([]);
   const [loadingOlder, setLoadingOlder] = useState(false);
+  const [olderError, setOlderError] = useState("");
+  const olderEpoch = useRef(0);
   const identity = JSON.stringify(filters);
-  useEffect(() => { setEntries(null); setOlder([]); setNext(undefined); }, [identity]);
+  useEffect(() => {
+    olderEpoch.current += 1;
+    setEntries(null);
+    setOlder([]);
+    setNext(undefined);
+    setLoadingOlder(false);
+    setOlderError("");
+    return () => { olderEpoch.current += 1; };
+  }, [identity]);
   const view = useLiveRefresh(async current => {
     const page = await api<{ entries: DecisionEntry[]; next?: string }>(logPath(filters));
-    if (current()) { setEntries(page.entries); setNext(previous => older.length ? previous : page.next); }
+    if (current()) {
+      setEntries(page.entries);
+      setNext(previous => older.length ? previous : page.next);
+      if (!page.next && !older.length) setOlderError("");
+    }
     return 15000;
   }, 15000, identity);
   useLiveRefresh(async current => {
@@ -88,13 +107,20 @@ export function PermissionPicker({ selected, onSelect, onOverview }: { selected:
   }, 60000, "permission-workspaces");
   async function showOlder() {
     if (!next || loadingOlder) return;
+    const epoch = olderEpoch.current;
     setLoadingOlder(true);
+    setOlderError("");
     try {
       const page = await api<{ entries: DecisionEntry[]; next?: string }>(logPath(filters, next));
+      if (olderEpoch.current !== epoch) return;
       setOlder(previous => [...previous, ...page.entries]);
       setNext(page.next);
-    } catch {}
-    finally { setLoadingOlder(false); }
+    } catch (failure) {
+      if (olderEpoch.current !== epoch) return;
+      setOlderError(olderErrorMessage(failure));
+    } finally {
+      if (olderEpoch.current === epoch) setLoadingOlder(false);
+    }
   }
   const seen = new Set<string>();
   const rows = [...(entries ?? []), ...older].filter(entry => !seen.has(entry.id) && Boolean(seen.add(entry.id)));
@@ -125,6 +151,7 @@ export function PermissionPicker({ selected, onSelect, onOverview }: { selected:
         <div className="row-meta session-id">{entry.id.slice(0, 8)}</div>
       </button>)}
       {next && entries && <button className="text-button permission-older" disabled={loadingOlder} aria-busy={loadingOlder} onClick={() => void showOlder()}>{loadingOlder && <RefreshCw className="is-refreshing" size={14} />}Show older decisions</button>}
+      {next && entries && olderError && <p className="error permission-older-error" role="alert">{olderError}</p>}
       {!rows.length && <p className="rail-empty" role="status">{entries ? (filters.rejected || filters.raised || filters.workspace || filters.since ? "No decision matches these filters." : "The permission agent has recorded no decision yet.") : view.failed ? "The decision log is unavailable." : "Loading decisions…"}</p>}
     </nav>
   </>;

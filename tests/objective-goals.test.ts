@@ -72,7 +72,6 @@ const commandCriterion = (statement: string) => ({ statement, check: { kind: "co
 const artifactCriterion = { statement: "The shortlist file exists", check: { kind: "artifact" as const, path: "research/shortlist.md" }, threshold: { kind: "pass" as const } };
 const add = (criterion: ReturnType<typeof judgement>) => ({ op: "criterion.add" as const, criterion });
 const correction = (version: number, ops: unknown[], requestId = randomUUID()) => ({ requestId, version, ops });
-const barrier = (goals: GoalService, id: string) => goals.steer(id, { requestId: randomUUID(), revision: 999, text: "Barrier" }).catch(() => undefined);
 const refused = (code: string) => (error: unknown) => error instanceof TeamError && error.code === code;
 
 function meter() {
@@ -263,7 +262,7 @@ test("a failed migration write never stops the host", { skip: process.getuid?.()
 
     const fileBefore = readFileSync(goalFile(f, id), "utf8"), eventsBefore = goals!.get(id).events.length;
     goals!.start();
-    await goals!.steer(id, { requestId: randomUUID(), revision: 999, text: "Barrier" }).catch(() => undefined);
+    await goals!.idle();
     goals!.close();
     assert.equal(goals!.get(id).status, "running");
     assert.equal(goals!.get(id).events.length, eventsBefore);
@@ -351,7 +350,7 @@ test("corrections and creation criteria need the switch", async () => {
       assert.equal(goals.objectiveRecord(created.id).version, 1);
       assert.deepEqual(goals.objectiveRecord(created.id).record.criteria.map(item => item.id), ["c0"]);
       goals.start();
-      await barrier(goals, created.id);
+      await goals.idle();
       goals.close();
       const active = goals.get(created.id).activeTeamId;
       assert.ok(active, `the goal launched a run with the switch ${String(value)}`);
@@ -410,7 +409,7 @@ test("a cycle pins the digest it launched with", async () => {
     const created = await goals.create(createInput());
     await goals.correctObjective(created.id, correction(1, [add(commandCriterion("The checks pass"))]));
     goals.start();
-    await barrier(goals, created.id);
+    await goals.idle();
     const teamId = goals.get(created.id).activeTeamId;
     assert.ok(teamId, "the tick launched the first cycle");
     assert.equal(teams.get(teamId).goal?.record?.version, 2);
@@ -436,7 +435,7 @@ test("a cycle pins the digest it launched with", async () => {
     } });
     const legacyGoals = new GoalService(f.config, f.key, reopenedTeams);
     legacyGoals.start();
-    await barrier(legacyGoals, legacyId);
+    await legacyGoals.idle();
     legacyGoals.close();
     const legacyTeam = reopenedTeams.get(legacyGoals.get(legacyId).activeTeamId!);
     assert.equal(legacyTeam.id, launchRequest);
@@ -473,7 +472,7 @@ test("a launch with the register on carries the register digest", async () => {
 
     goals = new GoalService(f.config, f.key, teams);
     goals.start();
-    await barrier(goals, created.id);
+    await goals.idle();
     const teamId = goals.get(created.id).activeTeamId;
     assert.ok(teamId, "the tick launched the cycle");
     const register = teams.get(teamId).goal?.record?.register;
@@ -496,7 +495,7 @@ test("a goal run's pass reads and writes the goal's record", async () => {
     f.writeRecord("goal", created.id, { ...stored, objectiveRecord: recordWithAssumptions(stored.goal, [checked]) });
     goals = new GoalService(f.config, f.key, teams);
     goals.start();
-    await barrier(goals, created.id);
+    await goals.idle();
     const teamId = goals.get(created.id).activeTeamId!;
     assert.ok(teamId, "the tick launched the cycle");
     goals.close();
@@ -555,7 +554,7 @@ test("an unreadable record launches without a digest", async () => {
 
     const reopened = new GoalService(f.config, f.key, teams);
     reopened.start();
-    await barrier(reopened, created.id);
+    await reopened.idle();
     reopened.close();
     const goal = reopened.get(created.id);
     assert.equal(goal.status, "running");
@@ -628,14 +627,14 @@ test("a skipped digest is logged once while its reason holds", async () => {
 
     const first = new GoalService(f.config, f.key, teams);
     first.start();
-    await barrier(first, created.id);
+    await first.idle();
     first.close();
     const ended = f.readRecord<StoredShape>("goal", created.id);
     f.writeRecord("goal", created.id, { ...ended, goal: { ...ended.goal, activeTeamId: undefined } });
 
     const second = new GoalService(f.config, f.key, teams);
     second.start();
-    await barrier(second, created.id);
+    await second.idle();
     second.close();
     assert.equal(second.get(created.id).cycles.length, 2, "the second cycle launched");
     assert.equal(eventTexts(second.get(created.id)).filter(text => text === GOAL_DIGEST_EVENTS["record-unavailable"]).length, 1);
@@ -659,7 +658,7 @@ test("a pending control reaches its team after a failed migration write", { skip
     chmodSync(goalsDirectory, 0o700);
     console.warn = warn;
     goals.start();
-    await barrier(goals, id);
+    await goals.idle();
     goals.close();
     const stored = f.readRecord<StoredShape>("goal", id);
     assert.equal(stored.control, undefined);
@@ -679,7 +678,7 @@ test("lists, single reads, and an idle tick parse no record and read no sealed f
     const first = await launching.create(createInput());
     const second = await launching.create(createInput({ title: "Second goal" }));
     launching.start();
-    await Promise.all([barrier(launching, first.id), barrier(launching, second.id)]);
+    await launching.idle();
     launching.close();
     assert.ok(launching.get(first.id).activeTeamId && launching.get(second.id).activeTeamId);
 
@@ -690,7 +689,7 @@ test("lists, single reads, and an idle tick parse no record and read no sealed f
       goals.get(first.id);
       goals.get(second.id);
       goals.start();
-      await Promise.all([barrier(goals, first.id), barrier(goals, second.id)]);
+      await goals.idle();
       goals.close();
       assert.deepEqual(counted.counts, { parses: 0, sealed: 0 });
     } finally { counted.stop(); }
@@ -706,7 +705,7 @@ test("lists, single reads, and an idle tick parse no record and read no sealed f
     const prepared = meter();
     try {
       ticking.start();
-      await barrier(ticking, third.id);
+      await ticking.idle();
       ticking.close();
       assert.deepEqual(prepared.counts, { parses: 1, sealed: 0 });
     } finally { prepared.stop(); }
@@ -717,7 +716,7 @@ test("lists, single reads, and an idle tick parse no record and read no sealed f
       const asking = checked.openTeam(), askingGoals = new GoalService(checked.config, checked.key, asking);
       const asked = await askingGoals.create(createInput({ title: "Asked goal" }));
       askingGoals.start();
-      await barrier(askingGoals, asked.id);
+      await askingGoals.idle();
       const askingTeam = askingGoals.get(asked.id).activeTeamId!;
       asking.start();
       const pm = await launchedMember(checked, asking, askingTeam, "project-manager");
@@ -731,7 +730,7 @@ test("lists, single reads, and an idle tick parse no record and read no sealed f
       const idle = meter();
       try {
         waitingGoals.start();
-        await barrier(waitingGoals, asked.id);
+        await waitingGoals.idle();
         waitingGoals.close();
         assert.deepEqual(idle.counts, { parses: 0, sealed: 0 });
       } finally { idle.stop(); waiting.close(); }
@@ -782,7 +781,7 @@ test("a goal cycle's check writes the goal's record", { timeout: 600000 }, async
     goals = new GoalService(f.config, f.key, teams);
     const created = await goals.create(createInput());
     goals.start();
-    await barrier(goals, created.id);
+    await goals.idle();
     const teamId = goals.get(created.id).activeTeamId;
     assert.ok(teamId, "the tick launched the first cycle");
     teams.start();
@@ -817,7 +816,7 @@ test("a failed goal record write changes nothing", { timeout: 600000 }, async ()
     goals = new GoalService(f.config, f.key, teams);
     const created = await goals.create(createInput());
     goals.start();
-    await barrier(goals, created.id);
+    await goals.idle();
     const teamId = goals.get(created.id).activeTeamId;
     assert.ok(teamId, "the tick launched the first cycle");
     const restore = f.blockRecordWrites("goal", created.id);

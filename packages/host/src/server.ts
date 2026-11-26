@@ -1,4 +1,5 @@
 import express from "express";
+import { browserSessionCookie } from "./browser-session.js";
 import { ProjectContexts, contextLinksRequest } from "./project-context.js";
 import { createServer } from "node:http";
 import { connectTerminals, terminalPages } from "./terminal-stream.js";
@@ -10,7 +11,7 @@ import { z } from "zod";
 import { existsSync, realpathSync } from "node:fs";
 import { join, resolve, sep } from "node:path";
 import { Manager, publicAttention } from "./manager.js";
-import { MainCheckService } from "./main-check.js";
+import { MainCheckService, type HostProcesses } from "./main-check.js";
 import { mainCheckRoute } from "./main-check-route.js";
 import { hashToken, validateLinearConfig, validateMcpConfig } from "./config.js";
 import { runtimeSecurity } from "./deployment.js";
@@ -63,6 +64,7 @@ import { withoutCodeMode } from "./session-listing.js";
 import { parseGoalCreateBody } from "./objective-input.js";
 import { routingRoutes } from "./routing-routes.js";
 import { spawnTeamBundle } from "./team-workspace.js";
+import { signalGroup, watchLeader } from "./process-group.js";
 import { createTeamSchema, teamContinueSchema, teamMutationSchema, teamDeliveryReconcileSchema, teamVerificationReconcileSchema, teamMemberRetireSchema, teamActionSchema, teamTaskRatingSchema, teamParallelismSchema } from "./team-types.js";
 import { scorecardFromRows, type ProfileIdentityOf } from "./scorecard.js";
 import { profileIdentity } from "./run-events.js";
@@ -84,7 +86,8 @@ import { createMcpServer } from "./mcp-server.js";
 import { McpRequestService } from "./mcp-requests.js";
 import { IntakeSlackSurface } from "./intake-slack.js";
 import { SlackClient } from "./slack-client.js";
-import { createMissionSchema, missionActionSchema, missionExtendSchema, missionTextSchema, type CreateMission, type Mission, type MissionOrigin } from "./mission-types.js";
+import { createIntakeAudienceGuard, createIntakeMissionCreator } from "./intake-audience.js";
+import { createMissionSchema, missionActionSchema, missionExtendSchema, missionTextSchema } from "./mission-types.js";
 import { ProjectGroupService } from "./project-groups.js";
 import { PermissionDelegationService } from "./permission-delegation.js";
 import type { PermissionAgentServices } from "./permission-agent-types.js";
@@ -113,7 +116,7 @@ import { Summarizer, SummaryError } from "./summary.js";
 import { DictationCleaner, DictationError } from "./dictation.js";
 import { RepositoryBriefings } from "./repository-briefings.js";
 import { RepositoryGraphs } from "./repository-graphs.js";
-import { ContextTouches, type SessionTouches } from "./context-touches.js";
+import { ContextTouches, hostProviderCapabilities, type SessionTouches } from "./context-touches.js";
 import { UnderstandingService } from "./understanding.js";
 import { UnderstandingCatalog, CatalogError } from "./understanding-catalog.js";
 import { UnderstandingRuntime } from "./understanding-runtime.js";
@@ -203,7 +206,7 @@ const inputSchema = z
     force: z.boolean().optional(),
   })
   .strict();
-export function createApp(config: Config, key: Buffer, options: { configFile?: string } = {}) {
+export function createApp(config: Config, key: Buffer, options: { configFile?: string; processCensus?: HostProcesses } = {}) {
   config.machine = machineIdentity(config, key);
   if ((config.cmux?.enabled || config.remote?.enabled) && runtimeSecurity(config.deployment).tenancy !== "single-tenant")
     throw new Error("Machine access and cmux require a single-tenant host");
@@ -278,7 +281,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
     graphs: repositoryGraphs,
     events: outbox,
     capture: evalHost.capture,
-    entries: blackboard,
+    entries: blackboard, ...(options.processCensus ? { processes: options.processCensus } : {}),
     delivery: deliveryPort(evidence),
     onMerged: id => {
       lateReceipts();
@@ -371,7 +374,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
     try { return permissionAgent.pipeline && permissionDelivery.active() && permissionCore.readiness().ready ? "active" as const : "inactive" as const; }
     catch { return "inactive" as const; }
   };
-  const headlessChannel = new HeadlessPermissionChannel({ key, runDir: config.runDir, sessions: manager, services: permissionAgent,
+  const headlessChannel = new HeadlessPermissionChannel({ key, target: manager.socketTarget, legacySockets: () => manager.activePermissionSockets(), sessions: manager, services: permissionAgent,
     teamLive: session => teams.permissionAgentLive(session), teamTask: session => teams.permissionAgentTask(session) });
   permissionAgent.headless = headlessChannel;
   manager.useHeadlessChannel(headlessChannel);
@@ -422,17 +425,10 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
   const assertNoHandoff = (projectId: string) => {
     if (handoffs.activeForProject(projectId)) throw new TeamError(409, "handoff-in-progress", "This project is transferring a task to a team. Wait for its checkpoint to finish.");
   };
-  const createMission = async (body: CreateMission, origin?: MissionOrigin, authorize?: () => void): Promise<Mission> => {
-    authorize?.();
-    const recorded = missions.replayCreate(body);
-    if (recorded) return recorded;
-    const group = projectGroups.get(body.groupId);
-    for (const repo of group.repos)
-      for (const checkout of repo.checkouts) assertNoHandoff(checkout.projectId);
-    return missions.create({ ...body, groupId: group.id }, body, origin, authorize);
-  };
+  const intakeAudience = createIntakeAudienceGuard({ config, groups: projectGroups, sourceAppliedHead: projectId => projectSource.status(projectId).appliedHead });
+  const createMission = createIntakeMissionCreator({ config, missions, groups: projectGroups, audience: intakeAudience, assertNoHandoff });
   const intakeStore = config.intake ? new IntakeStore(config, key) : undefined;
-  const intakeSlackClient = config.intake?.slack ? new SlackClient({ botTokenFile: config.intake.slack.botTokenFile, appTokenFile: config.intake.slack.appTokenFile, endpoint: config.intake.slack.endpoint }) : undefined;
+  const intakeSlackClient = config.intake?.slack ? new SlackClient({ botTokenFile: config.intake.slack.botTokenFile, appTokenFile: config.intake.slack.appTokenFile, endpoint: config.intake.slack.endpoint, teamId: config.intake.slack.teamId, organizationScope: config.intake.slack.organizationScope, workspaceAllowed: intakeAudience.workspacesAllowed }) : undefined;
   const intake = config.intake && intakeStore ? new IntakeService(config, intakeStore, missions, new IntakeLinear(linear), { create: createMission, threads: intakeSlackClient, ...(config.intake.slack?.classify ? { router: text => readings.requestRoute(text) } : {}) }) : undefined;
   const mcp = config.mcp && intakeStore && intake ? createMcpServer(config, new McpRequestService(config, intakeStore, intake, missions, projectGroups)) : undefined;
   const intakeSlack = intakeStore && intakeSlackClient ? new IntakeSlackSurface(config, intakeStore, missions, teams, intakeSlackClient, intake ? { direct: input => intake.requestFromSlack(input) } : {}) : undefined;
@@ -466,12 +462,12 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
     return { ...publicSession, ...(managed ? { managedBy: managed } : {}), handoff, executionLocation: executionLocation(session), backend: "infinite", machineId: config.machine!.id,
       resumable: resumable(session) && ["unavailable", "available"].includes(handoff.status) };
   };
-  const sessionEvents = async (sessionId: string, after: number, limit = 200) => {
+  const sessionEvents = async (sessionId: string, after: number, limit = 200, types?: Set<string>) => {
     if (cmux && !existsSync(join(config.stateDir, "sessions", sessionId, "meta.sealed"))) {
       await cmux.get(sessionId);
-      return cmux.events(sessionId, after, limit);
+      return cmux.events(sessionId, after, limit, types);
     }
-    return manager.events(sessionId, after, limit);
+    return manager.events(sessionId, after, limit, types);
   };
   const live = new LiveFeed({
     sessions: async () => ({ sessions: await listSessions() }),
@@ -529,7 +525,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
   permissionTurnGate.hold = () => { const view = halt.view(); return view.readable && !view.host; };
   halt.useServices({ routines, goals, missions, teams }, teamId => goals.ownsActiveTeam(teamId) || missions.ownsActiveSubteam(teamId));
   const gate = halt.gate(fuse);
-  mainCheck = new MainCheckService({ config, key, mirrorPath: id => projectSource.mirrorPath(id), halt, hostLoad: manager.hostLoad });
+  mainCheck = new MainCheckService({ config, key, mirrorPath: id => projectSource.mirrorPath(id), halt, hostLoad: manager.hostLoad, ...(options.processCensus ? { ports: { processes: options.processCensus } } : {}) });
   manager.useFuse(gate);
   teams.useFuse(gate);
   goals.useFuse(gate);
@@ -608,6 +604,11 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
       return res.status(403).json({ error: "Host is not allowed" });
     next();
   });
+  app.post("/api/login", (_req, res, next) => {
+    if (config.browserSessions === false)
+      return res.status(403).json({ code: "browser-sessions-disabled", error: "Browser sign-in is disabled on this instance" });
+    next();
+  });
   app.use((req, res, next) => /^\/api\/projects\/[^/]+\/sync\/commit$/.test(req.path) || PERMISSION_REPLAY_PATH.test(req.path) ? next()
     : express.json({ limit: /^\/api\/sessions\/[^/]+\/opencode(?:\/|$)/.test(req.path) ? "8mb" : "96kb" })(req, res, next));
   function authenticate(token: string) {
@@ -622,11 +623,8 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
       const device = authenticate(bearer);
       return device ? { device, credentialHash: device.hash, instance: "legacy", bearer: true } : undefined;
     }
-    const value = req.headers.cookie
-      ?.split(";")
-      .map((v) => v.trim())
-      .find((v) => v.startsWith("infinite="))
-      ?.slice(9);
+    if (config.browserSessions === false) return undefined;
+    const value = browserSessionCookie(req);
     const session = value ? cookies.get(hashToken(value)) : undefined;
     if (!session || session.expires <= Date.now()) return undefined;
     const device = config.tokens.find(token => token.hash === session.device.hash);
@@ -773,6 +771,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
       providers: Object.keys(config.agents).filter(
         (p) => p !== "demo" || config.enableDemo,
       ),
+      providerCapabilities: hostProviderCapabilities(config.enableDemo),
       teams: { enabled: Boolean(config.teams), repoEnrollment: 1, permissionDelegation: 1, establishChecks: 1, sessionHandoff: 1, projectSource: 1, autonomyMode: 1, routing: 1, routingAuto: 1, routingPoints: 1, maxParallelism: 4, ...(config.teams?.lineup ? { lineup: config.teams.lineup } : {}) },
       permissions: { workspaceDelegation: 1, decisionLog: 1, onboardingCoverage: 1 },
       goals: { enabled: goals.enabled() },
@@ -1195,6 +1194,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
   app.post("/api/goals/:id/extend", requireRole(["owner"]), async (req, res) => res.json(await goals.extend(id.parse(req.params.id), goalExtendSchema.parse(req.body))));
   registerMissionReadRoutes(app, { missions, teams, manager });
   app.get("/api/intake", (_req, res) => res.json({ records: intake?.list() ?? [], ...intake?.status(), ...(intakeSlack ? { slack: intakeSlack.status() } : {}) }));
+  app.get("/api/intake/workspace-scope", requireRole(["owner"]), (_req, res) => res.json({ state: !config.intake?.slack?.organizationScope ? "unconfigured" : intakeAudience.workspacesAllowed() ? "verified" : "blocked" }));
   app.post("/api/missions", requireRole(["owner"]), async (req, res) => res.json(await createMission(createMissionSchema.parse(req.body))));
   app.post("/api/missions/:id/steer", requireRole(["owner"]), async (req, res) => res.json(await missions.steer(id.parse(req.params.id), missionTextSchema.parse(req.body))));
   app.post("/api/missions/:id/answer/:decisionId", requireRole(["owner"]), async (req, res) =>
@@ -1283,7 +1283,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
     let finished = false, child: ReturnType<typeof spawnTeamBundle> | undefined;
     const stop = () => {
       if (!child || finished) return;
-      try { if (child.pid && process.platform !== "win32") process.kill(-child.pid, "SIGKILL"); else child.kill("SIGKILL"); } catch {}
+      signalGroup(child, "SIGKILL");
       child.stdout.destroy();
     };
     const disconnect = () => { if (!res.writableEnded) { stop(); finished = true; clearTimeout(timer); } };
@@ -1296,6 +1296,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
     if (req.aborted || res.destroyed || res.writableEnded) return;
     const limit = 512 * 1024 * 1024;
     child = spawnTeamBundle(bundle.workspace, bundle.branch, config.teams?.commandPrefix);
+    const leader = watchLeader(child);
     res.status(200).set({ "Content-Type": "application/octet-stream", "X-Infinite-Branch": bundle.branch, "X-Infinite-Head": bundle.head });
     let size = 0;
     child.stdout.on("data", (chunk: Buffer) => {
@@ -1310,7 +1311,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
       if (finished) return;
       finished = true;
       clearTimeout(timer);
-      if (code !== 0) res.destroy(); else res.end();
+      if (code !== 0 || leader.leftover) res.destroy(); else res.end();
     });
   });
   app.post("/api/teams", requireRole(["owner"]), async (req, res) => {
@@ -1461,13 +1462,11 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
     res.json({ ok: true });
   });
   app.post("/api/logout", (req, res) => {
-    const value = req.headers.cookie
-      ?.split(";")
-      .map((v) => v.trim())
-      .find((v) => v.startsWith("infinite="))
-      ?.slice(9);
-    if (value) cookies.delete(hashToken(value));
-    res.clearCookie("infinite", { path: "/api" });
+    if (config.browserSessions !== false) {
+      const value = browserSessionCookie(req);
+      if (value) cookies.delete(hashToken(value));
+      res.clearCookie("infinite", { path: "/api" });
+    }
     res.json({ ok: true });
   });
   app.get("/api/sessions", (req, res) => sendSessionList(req, res, listSessions));
@@ -1569,8 +1568,8 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
         await cmux.get(sessionId);
         const after = z.coerce.number().int().min(0).max(Number.MAX_SAFE_INTEGER).default(0).parse(req.query.after);
         const limit = z.coerce.number().int().min(1).max(200).default(200).parse(req.query.limit);
-        const page = cmux.events(sessionId, after, limit);
         const types = typeof req.query.types === "string" ? new Set(req.query.types.split(",")) : undefined;
+        const page = cmux.events(sessionId, after, limit, types?.size === 1 && types.has("signal") ? types : undefined);
         return void res.json({ ...page, events: types ? page.events.filter(e => types.has(e.type)) : page.events });
       }
       if (action === "/messages") return void res.json(await cmux.messages(sessionId,
@@ -1697,7 +1696,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
     if (!res.locals.bearer) return res.status(403).json({ error: "Pair an owner CLI to use the native frontend" });
     const sessionId = id.parse(req.params.id);
     if (!manager.meta(sessionId).session.runtime?.nativeUi) return res.status(409).json({ error: "This session uses its original terminal transport" });
-    res.json(await workerCall(config.runDir, sessionId, { op: "native-info" }));
+    res.json(await workerCall(manager.socketTarget, sessionId, { op: "native-info" }));
   });
   app.post("/api/sessions/:id/workspace-export", requireRole(["owner"]), async (req, res) => {
     if (!res.locals.bearer || req.headers.origin) return void res.status(403).json({ error: "Workspace recovery requires a paired owner CLI" });
@@ -1706,13 +1705,13 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
     const request = z.object({ method: z.enum(["sync/export", "sync/blob"]), hash: z.string().regex(/^[a-f0-9]{64}$/).optional() }).strict().parse(req.body);
     if (request.method === "sync/blob" && !request.hash) return void res.status(400).json({ error: "A content hash is required" });
     if (request.method === "sync/export" && request.hash) return void res.status(400).json({ error: "sync/export does not accept a content hash" });
-    res.json(await workerCall(config.runDir, sessionId, request.method === "sync/blob" ? { op: "workspace-export", method: "sync/blob", hash: request.hash! } : { op: "workspace-export", method: "sync/export" }, 300000));
+    res.json(await workerCall(manager.socketTarget, sessionId, request.method === "sync/blob" ? { op: "workspace-export", method: "sync/blob", hash: request.hash! } : { op: "workspace-export", method: "sync/export" }, 300000));
   });
   app.all(/^\/api\/sessions\/([a-f\d-]{36})\/opencode(\/.*)?$/, refuseMissionManaged, requireRole(["owner"]), async (req, res) => {
     if (!res.locals.bearer || req.headers.origin || !res.locals.leaseId) return void res.status(403).json({ error: "Native access requires an owner CLI and current control" });
     const sessionId = id.parse(req.params[0]);
     if (manager.meta(sessionId).session.runtime?.nativeUi !== "opencode") return void res.status(409).json({ error: "This session does not use an OpenCode server" });
-    const backend = await workerCall<{ url: string; token: string }>(config.runDir, sessionId, { op: "native-connect", actor: res.locals.actor, leaseId: res.locals.leaseId });
+    const backend = await workerCall<{ url: string; token: string }>(manager.socketTarget, sessionId, { op: "native-connect", actor: res.locals.actor, leaseId: res.locals.leaseId });
     if (!/^http:\/\/127\.0\.0\.1:\d+$/.test(backend.url)) throw new Error("Invalid native endpoint");
     const path = new URL(req.originalUrl, origin).pathname.slice(`/api/sessions/${sessionId}/opencode`.length) || "/";
     const query = new URL(req.originalUrl, origin).search;
@@ -1754,7 +1753,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
           )
         : undefined;
     const sessionId = id.parse(req.params.id);
-    const page = await sessionEvents(sessionId, after, limit);
+    const page = await sessionEvents(sessionId, after, limit, types?.size === 1 && types.has("signal") ? types : undefined);
     res.json({ ...page, events: types ? page.events.filter(event => types.has(event.type)) : page.events });
   });
   app.post("/api/sessions/:id/control", refuseManagedClaim, requireRole(["owner", "controller"]), async (req, res) => {
@@ -1770,7 +1769,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
     const sessionId = id.parse(req.params.id);
     manager.meta(sessionId);
     const body = z.object({ requestId: id, text: z.string().min(1).max(8192) }).strict().parse(req.body);
-    res.json(await workerCall<Receipt>(config.runDir, sessionId, { op: "raw", ...body, ...await inputAuthority(sessionId, res) }));
+    res.json(await workerCall<Receipt>(manager.socketTarget, sessionId, { op: "raw", ...body, ...await inputAuthority(sessionId, res) }));
   });
   app.get("/api/sessions/:id/stream", async (req, res) => {
     const sessionId = id.parse(req.params.id);
@@ -1805,7 +1804,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
       const body = inputSchema.parse(req.body);
       try {
         res.json(
-          await workerCall<Receipt>(config.runDir, sessionId, {
+          await workerCall<Receipt>(manager.socketTarget, sessionId, {
             op: "input",
             ...body,
             ...await inputAuthority(sessionId, res),
@@ -1832,7 +1831,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
       try {
         res.json(
           await workerCall(
-            config.runDir,
+            manager.socketTarget,
             sessionId,
             { op: "answer", ...body, ...authority },
             12000,
@@ -1864,7 +1863,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
         .strict()
         .parse(req.body);
       res.json(
-        await workerCall(config.runDir, sessionId, { op: "key", ...body, ...await inputAuthority(sessionId, res) }),
+        await workerCall(manager.socketTarget, sessionId, { op: "key", ...body, ...await inputAuthority(sessionId, res) }),
       );
     },
   );
@@ -1877,7 +1876,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
       manager.meta(sessionId);
       const body = z.object({ requestId: id }).strict().parse(req.body);
       res.json(
-        await workerCall(config.runDir, sessionId, { op: "stop", ...body, ...await inputAuthority(sessionId, res) }),
+        await workerCall(manager.socketTarget, sessionId, { op: "stop", ...body, ...await inputAuthority(sessionId, res) }),
       );
     },
   );
@@ -1895,7 +1894,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
         .strict()
         .parse(req.body);
       res.json(
-        await workerCall(config.runDir, sessionId, { op: "resize", ...body, ...await inputAuthority(sessionId, res) }),
+        await workerCall(manager.socketTarget, sessionId, { op: "resize", ...body, ...await inputAuthority(sessionId, res) }),
       );
     },
   );
@@ -2031,13 +2030,15 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
     );
   });
   app.use("/api", (_req, res) =>
-    res.status(404).json({ error: "Endpoint not found" }),
+    res.status(404).json({ code: "route-not-found", error: "Endpoint not found" }),
   );
-  app.use(
-    express.static(
-      fileURLToPath(new URL("../../../apps/web/dist/", import.meta.url)),
-    ),
-  );
+  const serveWeb = express.static(fileURLToPath(new URL("../../../apps/web/dist/", import.meta.url)));
+  app.use((req, res, next) => {
+    if (config.browserSessions === false) return res.status(503).type("html").send(
+      "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Browser sign-in disabled</title><main><h1>Browser sign-in is disabled</h1><p>Do not enter a device key here. Connect with a paired CLI or native app.</p></main></html>",
+    );
+    serveWeb(req, res, next);
+  });
   app.use(
     (
       error: unknown,

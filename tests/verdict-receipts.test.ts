@@ -111,7 +111,7 @@ test("a restart at either save of a late verdict writes nothing twice", () => {
 
   const a = delivered();
   a.host.deliveryFact = "landed";
-  a.host.failSaveIn = 1;
+  a.host.failSaveAt = 1;
   assert.throws(() => a.verdicts.settleReceipt(a.holder));
   const a2 = reopen(a);
   assert.equal(a2.holder.verdict?.delivery, undefined);
@@ -122,7 +122,7 @@ test("a restart at either save of a late verdict writes nothing twice", () => {
 
   const b = delivered();
   b.host.deliveryFact = "landed";
-  b.host.failSaveIn = 2;
+  b.host.failSaveAt = 2;
   assert.throws(() => b.verdicts.settleReceipt(b.holder));
   const b2 = reopen(b);
   assert.notEqual(b2.holder.verdict?.verdictId, b2.holder.run.assessment?.verdictId, "the new id is saved and not yet the assessment");
@@ -132,7 +132,7 @@ test("a restart at either save of a late verdict writes nothing twice", () => {
 
   const c = delivered({ goal: true });
   c.host.deliveryFact = "landed";
-  c.host.failSaveIn = 2;
+  c.host.failSaveAt = 2;
   assert.throws(() => c.verdicts.settleReceipt(c.holder));
   assert.equal(recorded(c).length, 2, "the goal's record holds the entry already");
   const c2 = reopen(c);
@@ -163,7 +163,7 @@ test("a restart at either save of a late verdict writes nothing twice", () => {
 
   const f = delivered();
   f.host.deliveryFact = "landed";
-  f.host.failSaveIn = 1;
+  f.host.failSaveAt = 1;
   assert.throws(() => f.verdicts.settleReceipt(f.holder));
   const reads = f.host.deliveryReads;
   assert.equal(f.verdicts.settleReceipt(f.holder), true);
@@ -172,7 +172,7 @@ test("a restart at either save of a late verdict writes nothing twice", () => {
 
   const g = delivered();
   g.host.deliveryFact = "landed";
-  g.host.failSaveIn = 2;
+  g.host.failSaveAt = 2;
   assert.throws(() => g.verdicts.settleReceipt(g.holder));
   const kept = snapshot(g);
   assert.equal(g.verdicts.settleReceipt(g.holder), false);
@@ -228,7 +228,7 @@ test("a late verdict judges only what its earlier verdict held, and replaces wha
 
   const lost = delivered();
   lost.host.deliveryFact = "landed";
-  lost.host.failSaveIn = 2;
+  lost.host.failSaveAt = 2;
   assert.throws(() => lost.verdicts.settleReceipt(lost.holder));
   const again = reopen(lost);
   delete again.holder.objectiveRecord;

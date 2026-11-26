@@ -215,14 +215,14 @@ const CODEX_EVENTS = [
 export const PERMISSION_CHECK_TIMEOUT_S = 30;
 export const PERMISSION_REQUEST_TIMEOUT_S = 360;
 
-export function headlessChannelArgs(relayPath: string, signalHooks: boolean, codeMode = false): string[] {
+export function headlessChannelArgs(relayPath: string, providerRun: number, signalHooks: boolean, codeMode = false): string[] {
   const development = relayPath.endsWith(".ts");
-  const run = (script: string, route: string) =>
-    [process.execPath, ...(development ? ["--import", import.meta.resolve("tsx")] : []), script, route].join(" ");
+  const run = (script: string, ...words: string[]) =>
+    [process.execPath, ...(development ? ["--import", import.meta.resolve("tsx")] : []), script, ...words].join(" ");
   const channel = join(dirname(relayPath), development ? "permission-hook.ts" : "permission-hook.js");
   const signal = { type: "command", command: run(relayPath, "claude"), timeout: 10 };
-  const check = { type: "command", command: run(channel, "check"), timeout: PERMISSION_CHECK_TIMEOUT_S };
-  const decide = { type: "command", command: run(channel, "request"), timeout: PERMISSION_REQUEST_TIMEOUT_S };
+  const check = { type: "command", command: run(channel, "check", String(providerRun)), timeout: PERMISSION_CHECK_TIMEOUT_S };
+  const decide = { type: "command", command: run(channel, "request", String(providerRun)), timeout: PERMISSION_REQUEST_TIMEOUT_S };
   const hooks: Record<string, { hooks: object[] }[]> = {};
   for (const event of CLAUDE_EVENTS) {
     const relayed = signalHooks && event !== "PermissionRequest";
@@ -310,7 +310,7 @@ export function buildLaunch(
   handoffSessionId?: string,
   trustedCwd?: string,
   entryTools?: boolean,
-  channel = false,
+  channel: number | false = false,
   egressConfigured = false,
   codeMode = false,
   nativeArgCount = 0,
@@ -369,8 +369,8 @@ export function buildLaunch(
   const relay = relayPath.endsWith(".ts")
     ? ["node", "--import", import.meta.resolve("tsx"), relayPath]
     : ["node", relayPath];
-  const codeModeRequest = codeMode && provider === "claude" && !channel ? { env: { [CLAUDE_CODE_MODE_ENV]: "1" } } : undefined;
-  if (hooks && provider === "claude" && enabled.claude && !channel) {
+  const codeModeRequest = codeMode && provider === "claude" && channel === false ? { env: { [CLAUDE_CODE_MODE_ENV]: "1" } } : undefined;
+  if (hooks && provider === "claude" && enabled.claude && channel === false) {
     const handler = { type: "command", command: [...relay, "claude"].join(" "), timeout: 10 };
     const settings = {
       disableAllHooks: false,
@@ -383,8 +383,8 @@ export function buildLaunch(
   } else if (codeModeRequest && nativeArgCount <= profile.args.length && !profile.args.some(arg => arg === "--settings" || arg.startsWith("--settings="))) {
     args.splice(profile.args.length - nativeArgCount, 0, "--settings", JSON.stringify(codeModeRequest));
   }
-  if (hooks && provider === "claude" && channel) args.push(...headlessChannelArgs(relayPath, enabled.claude, codeMode));
-  if (team && provider === "claude" && !channel) {
+  if (hooks && provider === "claude" && channel !== false) args.push(...headlessChannelArgs(relayPath, channel, enabled.claude, codeMode));
+  if (team && provider === "claude" && channel === false) {
     if (profile.args.some(arg => arg === "--setting-sources" || arg.startsWith("--setting-sources=")))
       throw new Error("A Claude team launch chooses its own setting sources; remove --setting-sources from the profile.");
     args.push("--setting-sources", "user");

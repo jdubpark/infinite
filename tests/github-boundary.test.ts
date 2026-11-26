@@ -1,12 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
-import { chmodSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { chmodSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { hostGithubGrantEnvironment, projectGithubRepository, sessionGithubGrant, sessionGithubScope, sessionGithubScopeFor } from "../packages/host/src/github-grants.js";
 import { teamCommandEnvironment } from "../packages/host/src/team-workspace.js";
 import { verifyGrant } from "../scripts/github-proxy.mjs";
+import { mkdtempSecure } from "./helpers.js";
 
 const repository = "example/product";
 
@@ -53,10 +53,9 @@ test("only a session whose creation path says the owner started it gets the owne
 });
 
 test("with the boundary configured, session and host grants verify in the proxy with their scope", () => {
-  const root = realpathSync(mkdtempSync(join(homedir(), ".github-boundary-test-")));
+  const root = mkdtempSecure("github-boundary-test-");
   const trustedUid = process.getuid!();
   try {
-    chmodSync(root, 0o700);
     const key = randomBytes(32);
     const keyPath = join(root, "grant.key");
     writeFileSync(keyPath, `${key.toString("hex")}\n`);

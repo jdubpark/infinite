@@ -76,13 +76,17 @@ export function reportOf(states: Record<string, AssessedState>, note?: string, e
 
 export type FakeHolder = VerdictHolder & { outbox: VerdictEventData[] };
 export type PassEntry = { head: string; pending: boolean; receipts?: ObjectiveReceipt[] };
-export type World = { passes: Map<string, PassEntry>; uuids: number; store?: { record: ObjectiveRecord; failing: boolean }; marks: number };
+export type World = { passes: Map<string, PassEntry>; uuids: number; store?: { record: ObjectiveRecord; failing: boolean; failNextWrite?: boolean }; marks: number };
 export const newWorld = (): World => ({ passes: new Map(), uuids: 0, marks: 0 });
 
 export function goalPort(world: World): GoalRecordPort {
   return {
     read: () => ({ kind: "ready" as const, record: world.store!.record }),
     write: (_goalId, expectedVersion, next) => {
+      if (world.store!.failNextWrite) {
+        world.store!.failNextWrite = false;
+        throw new Error("simulated crash before goal record write");
+      }
       if (world.store!.failing) throw new Error("the goal record could not be saved");
       if (world.store!.record.version !== expectedVersion) throw objectiveError("objective-version-stale");
       world.store = { record: next, failing: world.store!.failing };
@@ -133,7 +137,7 @@ export class FakeHost implements VerdictHost {
   clock = AT;
   saves = 0;
   failNextSave = false;
-  failSaveIn = 0;
+  failSaveAt = 0;
   deliveryFact: DeliveryFact | undefined = "none";
   deliveryReads = 0;
   verdicts?: TeamVerdicts;
@@ -160,7 +164,10 @@ export class FakeHost implements VerdictHost {
       this.failNextSave = false;
       throw new Error("the host stopped before it saved");
     }
-    if (this.failSaveIn > 0 && --this.failSaveIn === 0) throw new Error("the host stopped before it saved");
+    if (this.failSaveAt > 0) {
+      this.failSaveAt -= 1;
+      if (this.failSaveAt === 0) throw new Error("the host stopped before it saved");
+    }
     this.saves += 1;
     this.persisted.set(holder.run.id, JSON.stringify(holder));
   }

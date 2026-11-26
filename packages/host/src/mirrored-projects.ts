@@ -60,7 +60,7 @@ export class MirroredProjects {
       try { if (!lstatSync(current).isDirectory()) throw invalid(); }
       catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
     }
-    const protectedPaths = [this.config.stateDir, this.config.runDir, this.config.keyFile, this.config.teams?.workspaceDir,
+    const protectedPaths = [this.config.stateDir, this.config.runDir, this.config.socketDir, this.config.keyFile, this.config.teams?.workspaceDir,
       this.config.linear?.apiKeyFile, this.config.push?.accessTokenFile, this.config.remote?.relay?.tokenFile, this.config.summaries?.apiKeyFile, this.config.jev?.apiKeyFile]
       .filter((value): value is string => Boolean(value));
     if (protectedPaths.some(value => inside(destination, this.canonical(resolve(value))) || inside(this.canonical(resolve(value)), destination))) throw invalid();

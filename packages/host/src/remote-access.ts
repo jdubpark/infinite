@@ -23,65 +23,99 @@ const MAX_REQUEST_FRAME = MAX_REQUEST_BYTES * 2 + 4096;
 const REQUEST_TIMEOUT_MS = 30000;
 const TEAM_LIST_RETRY_MS = 5 * 60_000;
 
-function allowedPath(method: RemoteMethod, path: string): boolean {
-  if (path.length > 8192 || !path.startsWith("/api/") || path.includes("\\") || path.includes("#") || /[\x00-\x20]/.test(path)) return false;
-  const url = new URL(path, "http://infinite.invalid");
-  if (url.pathname !== path.split("?")[0] || /%/i.test(url.pathname)) return false;
-  if (method === "GET" && url.pathname === "/api/me") return true;
-  if (method === "GET" && url.pathname === "/api/machine/resources") return true;
-  if (method === "GET" && ["/api/permissions/log", "/api/permissions/candidates"].includes(url.pathname)) return true;
-  if (method === "GET" && /^\/api\/permissions\/decisions\/[A-Za-z0-9_.:-]{1,200}$/.test(url.pathname)) return true;
-  if (method === "POST" && url.pathname === "/api/permissions/marks") return true;
-  if (method === "GET" && url.pathname === "/api/halt") return true;
-  if (method === "GET" && ["/api/usage", "/api/usage/daily", "/api/usage/models", "/api/usage/projects"].includes(url.pathname)) return true;
-  if (method === "GET" && /^\/api\/usage\/projects\/[a-z0-9-]{1,80}$/.test(url.pathname)) return true;
-  if (method === "POST" && url.pathname === "/api/usage/balances/refresh") return true;
-  if (method === "PUT" && /^\/api\/usage\/accounts\/[A-Za-z0-9_.-]+\/plan$/.test(url.pathname)) return true;
-  if (["GET", "POST"].includes(method) && url.pathname === "/api/sessions") return true;
-  if (["GET", "POST"].includes(method) && url.pathname === "/api/teams") return true;
-  if (["GET", "POST"].includes(method) && url.pathname === "/api/goals") return true;
-  const goal = /^\/api\/goals\/([^/]+)(?:\/(steer|pause|resume|cancel|outcome))?$/.exec(url.pathname);
-  if (goal && UUID.test(goal[1])) return method === "GET" ? !goal[2] : method === "POST" && Boolean(goal[2]);
-  if (method === "GET" && url.pathname === "/api/board") return true;
-  if (method === "GET" && url.pathname === "/api/decision-queue") return true;
-  if (["GET", "POST"].includes(method) && url.pathname === "/api/project-groups") return true;
-  if (method === "GET" && /^\/api\/project-groups\/[a-z0-9-]{1,80}\/understanding$/.test(url.pathname)) return true;
-  if (method === "GET" && /^\/api\/project-groups\/[a-z0-9-]{1,80}\/understanding\/(?:catalog|components(?:\/[A-Za-z0-9_-]{1,160})?)$/.test(url.pathname)) return true;
-  if (method === "GET" && /^\/api\/project-groups\/[a-z0-9-]{1,80}\/understanding\/(?:briefs|planned|work|generated|brief|diagrams\/[A-Za-z0-9_:.-]{1,200})$/.test(url.pathname)) return true;
-  const behavior = /^\/api\/project-groups\/[a-z0-9-]{1,80}\/understanding\/behaviors(?:\/([A-Za-z][A-Za-z0-9_.:-]{0,79})(?:\/(suite|run))?)?$/.exec(url.pathname);
-  if (behavior) {
-    if (method === "GET") return behavior[1] === undefined || (behavior[2] === undefined || behavior[2] === "suite");
-    if (method === "POST") return behavior[1] === undefined || behavior[2] === "run";
+const PROJECT_ID = /^[a-z0-9-]{1,80}$/;
+const DECISION_ID = /^[A-Za-z0-9_.:-]{1,200}$/;
+const COMPONENT_ID = /^[A-Za-z0-9_-]{1,160}$/;
+const DIAGRAM_ID = /^[A-Za-z0-9_:.-]{1,200}$/;
+const BEHAVIOR_ID = /^[A-Za-z][A-Za-z0-9_.:-]{0,79}$/;
+
+function parsePathSegments(path: string): { rawPathname: string; raw: string[]; decoded: string[] } | undefined {
+  if (path.length > 8192 || !path.startsWith("/api/") || path.includes("\\") || path.includes("#") || /[\x00-\x20\x7f]/.test(path)) return undefined;
+  const queryIndex = path.indexOf("?");
+  const rawPathname = queryIndex === -1 ? path : path.slice(0, queryIndex);
+  let url: URL;
+  try { url = new URL(path, "http://infinite.invalid"); } catch { return undefined; }
+  if (url.origin !== "http://infinite.invalid" || url.pathname !== rawPathname) return undefined;
+  const raw = rawPathname.slice(1).split("/");
+  const decoded: string[] = [];
+  for (const segment of raw) {
+    if (!segment.length || /%(?![0-9A-Fa-f]{2})/.test(segment)) return undefined;
+    let value: string;
+    try { value = decodeURIComponent(segment); } catch { return undefined; }
+    if (!value.length || value === "." || value === ".." || value.includes("/") || value.includes("\\") || /[\x00-\x1f\x7f]/.test(value) || /%[0-9A-Fa-f]{2}/.test(value)) return undefined;
+    decoded.push(value);
   }
-  if (method === "POST" && /^\/api\/project-groups\/[a-z0-9-]{1,80}\/understanding\/(?:refresh|catalog\/(?:projects|features|plans|components|policy)(?:\/[A-Za-z0-9_-]{1,160})?)$/.test(url.pathname)) return true;
-  if (method === "GET" && /^\/api\/project-groups\/[a-z0-9-]{1,80}$/.test(url.pathname)) return true;
-  if (["PUT", "DELETE"].includes(method) && /^\/api\/project-groups\/[a-z0-9-]{1,80}$/.test(url.pathname)) return true;
-  if (["GET", "POST"].includes(method) && url.pathname === "/api/missions") return true;
-  const mission = /^\/api\/missions\/([^/]+)(?:\/(steer|pause|resume|cancel|extend|answer\/([^/]+)))?$/.exec(url.pathname);
-  if (mission && UUID.test(mission[1])) return method === "GET" ? !mission[2]
-    : method === "POST" && Boolean(mission[2]) && (!mission[3] || UUID.test(mission[3]));
-  const teamContext = /^\/api\/teams\/([^/]+)\/context$/.exec(url.pathname);
-  if (teamContext) return method === "GET" && UUID.test(teamContext[1]);
-  if (method === "GET" && /^\/api\/projects\/[a-z0-9-]{1,80}\/graph\/map$/.test(url.pathname)) return true;
-  const team = /^\/api\/teams\/([^/]+)(?:\/(steer|pause|resume|continue|cancel|decisions\/([^/]+)\/answer))?$/.exec(url.pathname);
-  if (team && UUID.test(team[1])) return method === "GET" ? !team[2]
-    : method === "POST" && Boolean(team[2]) && (!team[3] || UUID.test(team[3]));
-  if (["POST", "DELETE"].includes(method) && url.pathname === "/api/devices/push") return true;
-  if (method === "POST" && url.pathname === "/api/dictation/cleanup") return true;
-  if (["GET", "PUT"].includes(method) && /^\/api\/projects\/[a-z0-9-]{1,80}\/context$/.test(url.pathname)) return true;
-  if (method === "GET" && /^\/api\/projects\/[a-z0-9-]{1,80}$/.test(url.pathname)) return true;
-  if (method === "POST" && /^\/api\/projects\/[a-z0-9-]{1,80}\/sync\/apply$/.test(url.pathname)) return true;
-  if (method === "GET" && /^\/api\/projects\/[a-z0-9-]{1,80}\/files$/.test(url.pathname)) return true;
-  if (["GET", "DELETE"].includes(method) && /^\/api\/projects\/[a-z0-9-]{1,80}\/file$/.test(url.pathname)) return true;
-  if (method === "POST" && /^\/api\/projects\/[a-z0-9-]{1,80}\/uploads$/.test(url.pathname)) return true;
-  if (method === "POST" && /^\/api\/projects\/[a-z0-9-]{1,80}\/directories$/.test(url.pathname)) return true;
-  const upload = /^\/api\/projects\/[a-z0-9-]{1,80}\/uploads\/([^/]+)(\/commit)?$/.exec(url.pathname);
-  if (upload && UUID.test(upload[1]) && (upload[2] ? method === "POST" : ["PUT", "DELETE"].includes(method))) return true;
-  const match = /^\/api\/sessions\/([^/]+)(?:\/([^/]+))?$/.exec(url.pathname);
-  if (!match || !UUID.test(match[1])) return false;
-  return method === "GET" ? [undefined, "events", "messages", "summary", "file", "handoff", "context"].includes(match[2])
-    : method === "DELETE" ? match[2] === undefined
-      : method === "POST" && ["control", "input", "answer", "key", "stop", "resize", "resume", "archive"].includes(match[2]);
+  return { rawPathname, raw, decoded };
+}
+
+function allowedPath(method: RemoteMethod, path: string): boolean {
+  const parsed = parsePathSegments(path);
+  if (!parsed) return false;
+  const { rawPathname, raw, decoded } = parsed;
+  if (method === "GET" && rawPathname === "/api/me") return true;
+  if (method === "GET" && rawPathname === "/api/machine/resources") return true;
+  if (method === "GET" && ["/api/permissions/log", "/api/permissions/candidates"].includes(rawPathname)) return true;
+  if (method === "GET" && raw.length === 4 && raw[1] === "permissions" && raw[2] === "decisions" && DECISION_ID.test(decoded[3])) return true;
+  if (method === "POST" && rawPathname === "/api/permissions/marks") return true;
+  if (method === "GET" && rawPathname === "/api/halt") return true;
+  if (method === "GET" && ["/api/usage", "/api/usage/daily", "/api/usage/models", "/api/usage/projects"].includes(rawPathname)) return true;
+  if (method === "GET" && raw.length === 4 && raw[1] === "usage" && raw[2] === "projects" && PROJECT_ID.test(decoded[3])) return true;
+  if (method === "POST" && rawPathname === "/api/usage/balances/refresh") return true;
+  if (method === "PUT" && raw.length === 5 && raw[1] === "usage" && raw[2] === "accounts" && raw[4] === "plan") return true;
+  if (["GET", "POST"].includes(method) && ["/api/sessions", "/api/teams", "/api/goals", "/api/project-groups", "/api/missions"].includes(rawPathname)) return true;
+  if (raw[1] === "goals" && raw.length >= 3 && raw.length <= 4 && UUID.test(decoded[2])) {
+    return raw.length === 3 ? method === "GET" : method === "POST" && ["steer", "pause", "resume", "cancel", "outcome"].includes(raw[3]);
+  }
+  if (method === "GET" && ["/api/board", "/api/decision-queue"].includes(rawPathname)) return true;
+  if (raw[1] === "project-groups" && raw.length >= 3 && PROJECT_ID.test(decoded[2])) {
+    if (raw.length === 3) return ["GET", "PUT", "DELETE"].includes(method);
+    if (raw[3] === "understanding") {
+      if (raw.length === 4) return method === "GET";
+      if (raw.length === 5 && method === "GET" && ["catalog", "components", "briefs", "planned", "work", "generated", "brief"].includes(raw[4])) return true;
+      if (raw.length === 6 && method === "GET" && raw[4] === "components" && COMPONENT_ID.test(decoded[5])) return true;
+      if (raw.length === 6 && method === "GET" && raw[4] === "diagrams" && DIAGRAM_ID.test(decoded[5])) return true;
+      if (raw[4] === "behaviors") {
+        if (raw.length === 5) return method === "GET" || method === "POST";
+        if (raw.length === 6 && BEHAVIOR_ID.test(decoded[5])) return method === "GET";
+        if (raw.length === 7 && BEHAVIOR_ID.test(decoded[5])) return (method === "GET" && raw[6] === "suite") || (method === "POST" && raw[6] === "run");
+      }
+      if (method === "POST" && raw.length === 5 && raw[4] === "refresh") return true;
+      if (method === "POST" && raw[4] === "catalog" && ["projects", "features", "plans", "components", "policy"].includes(raw[5] ?? "")) {
+        return raw.length === 6 || (raw.length === 7 && COMPONENT_ID.test(decoded[6]));
+      }
+    }
+    return false;
+  }
+  if (raw[1] === "missions" && raw.length >= 3 && UUID.test(decoded[2])) {
+    if (raw.length === 3) return method === "GET";
+    if (raw.length === 4) return method === "POST" && ["steer", "pause", "resume", "cancel", "extend"].includes(raw[3]);
+    return raw.length === 5 && method === "POST" && raw[3] === "answer" && UUID.test(decoded[4]);
+  }
+  if (raw[1] === "teams" && raw.length >= 3 && UUID.test(decoded[2])) {
+    if (raw.length === 3) return method === "GET";
+    if (raw.length === 4 && raw[3] === "context") return method === "GET";
+    if (raw.length === 4) return method === "POST" && ["steer", "pause", "resume", "continue", "cancel"].includes(raw[3]);
+    return raw.length === 6 && method === "POST" && raw[3] === "decisions" && UUID.test(decoded[4]) && raw[5] === "answer";
+  }
+  if (["POST", "DELETE"].includes(method) && rawPathname === "/api/devices/push") return true;
+  if (method === "POST" && rawPathname === "/api/dictation/cleanup") return true;
+  if (raw[1] === "projects" && raw.length >= 3 && PROJECT_ID.test(decoded[2])) {
+    if (raw.length === 3) return method === "GET";
+    if (raw.length === 4 && raw[3] === "context") return ["GET", "PUT"].includes(method);
+    if (raw.length === 4 && raw[3] === "files") return method === "GET";
+    if (raw.length === 4 && raw[3] === "file") return ["GET", "DELETE"].includes(method);
+    if (raw.length === 4 && (raw[3] === "uploads" || raw[3] === "directories")) return method === "POST";
+    if (raw.length === 5 && raw[3] === "graph" && raw[4] === "map") return method === "GET";
+    if (raw.length === 5 && raw[3] === "sync" && raw[4] === "apply") return method === "POST";
+    if (raw.length === 5 && raw[3] === "uploads" && UUID.test(decoded[4])) return ["PUT", "DELETE"].includes(method);
+    return raw.length === 6 && method === "POST" && raw[3] === "uploads" && UUID.test(decoded[4]) && raw[5] === "commit";
+  }
+  if (raw[1] === "sessions" && raw.length >= 3 && raw.length <= 4 && UUID.test(decoded[2])) {
+    if (raw.length === 3) return method === "GET" || method === "DELETE";
+    return method === "GET" ? ["events", "messages", "summary", "file", "handoff", "context"].includes(raw[3])
+      : method === "POST" && ["control", "input", "answer", "key", "stop", "resize", "resume", "archive"].includes(raw[3]);
+  }
+  return false;
 }
 
 function parseRequest(value: unknown): RemoteRequest {

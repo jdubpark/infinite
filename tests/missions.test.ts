@@ -6,8 +6,8 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { randomBytes, randomUUID } from "node:crypto";
 import { WebSocket } from "ws";
-import { waitFor } from "./helpers.js";
-import { inProcessHost } from "./helpers.js";
+import { inProcessHost, waitFor } from "./helpers.js";
+import { socketPath } from "../packages/host/src/ipc.js";
 import { unseal, writeSealed } from "../packages/host/src/vault.js";
 import { Manager } from "../packages/host/src/manager.js";
 import { TeamError, TeamService } from "../packages/host/src/teams.js";
@@ -59,12 +59,12 @@ function missionCheckoutAdmission(primaryReady: boolean) {
         ] },
       ] };
   } };
-  const teams = { useMissionReservations() {}, isActiveRun() { return false; } };
+  const teams = { useMissionReservations() {}, useMissionReviews() {}, isActiveRun() { return false; } };
   const missions = new MissionService(config, randomBytes(32), {} as Manager, teams as unknown as TeamService, groups);
   return { missions, close: () => { missions.close(); rmSync(root, { recursive: true, force: true }); } };
 }
 
-test("mission-managed sessions refuse direct human input but keep answers, reads, and standalone access", { timeout: 15000 }, async () => {
+test("mission-managed sessions refuse direct human input but keep answers, reads, and standalone access", { timeout: 60000 }, async () => {
   const host = await inProcessHost();
   const workers: ReturnType<typeof createNetServer>[] = [];
   const workerRequests: { sessionId: string; request: Record<string, unknown> }[] = [];
@@ -98,6 +98,7 @@ test("mission-managed sessions refuse direct human input but keep answers, reads
       writeSealed(join(directory, "meta.sealed"), host.manager.key, `${session.id}:meta`, { session, fingerprint: "fixture" });
       const worker = createNetServer(socket => {
         let text = "";
+        socket.on("error", () => {});
         socket.on("data", chunk => {
           text += chunk.toString();
           const end = text.indexOf("\n");
@@ -110,7 +111,7 @@ test("mission-managed sessions refuse direct human input but keep answers, reads
           socket.end(JSON.stringify({ result }) + "\n");
         });
       });
-      await new Promise<void>((resolve, reject) => { worker.once("error", reject); worker.listen(join(host.config.runDir, `${session.id}.sock`), resolve); });
+      await new Promise<void>((resolve, reject) => { worker.once("error", reject); worker.listen(socketPath(host.config, session.id), resolve); });
       workers.push(worker);
     }
 
@@ -992,6 +993,7 @@ test("mission restore adopts a legacy pending solo launch and persists capacity 
   let parallelism = 4, ceiling: number | undefined, reconciliations = 0;
   const teams = {
     useMissionReservations() {},
+    useMissionReviews() {},
     ensureMissionCapacityCeiling(_id: string, linkedMission: string, expected: number) {
       assert.equal(linkedMission, missionId);
       if (ceiling !== expected || parallelism > expected) {

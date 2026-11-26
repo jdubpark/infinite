@@ -83,7 +83,7 @@ export function assertTeamworkPath(config: Config, path: string) {
     }
   }
   const comparable = (value: string) => { try { return canonicalMissing(resolve(value)); } catch { return resolve(value); } };
-  const conflicts = [...config.projects.map(project => project.path), config.stateDir, config.runDir, config.keyFile,
+  const conflicts = [...config.projects.map(project => project.path), config.stateDir, config.runDir, config.socketDir, config.keyFile,
     config.teams?.workspaceDir, config.linear?.apiKeyFile, config.push?.accessTokenFile,
     config.remote?.relay?.tokenFile, config.summaries?.apiKeyFile, config.jev?.apiKeyFile].filter((value): value is string => Boolean(value));
   const overlaps = (left: string, right: string) => {
@@ -297,7 +297,7 @@ export class RepoEnrollmentService {
 
   private assertProjectPathAllowed(path: string) {
     const protectedPaths = [
-      this.config.stateDir, this.config.runDir, this.config.keyFile, this.config.teams?.workspaceDir,
+      this.config.stateDir, this.config.runDir, this.config.socketDir, this.config.keyFile, this.config.teams?.workspaceDir,
       this.config.linear?.apiKeyFile, this.config.push?.accessTokenFile, this.config.remote?.relay?.tokenFile,
       this.config.summaries?.apiKeyFile,
       this.config.jev?.apiKeyFile,

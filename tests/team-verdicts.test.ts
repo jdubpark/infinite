@@ -660,8 +660,8 @@ test("a new revision or head drops the state in testing, queued, and releasing",
   }
 });
 
-const SEEDS = 100;
-const crashes = { afterWrite: 0 };
+const SEEDS = 200;
+const crashes = { beforeIntent: 0, beforeRecordWrite: 0, afterWrite: 0 };
 const seen = { c0Met: 0, c0NotMet: 0, contradicted: 0 };
 
 function mulberry32(seed: number): () => number {
@@ -688,7 +688,7 @@ function opsOf(seed: number): Op[] {
   return Array.from({ length: count }, () => ({ name: BAG[Math.floor(random() * BAG.length)]!, a: random(), clean: random() < 0.85 }));
 }
 
-type Sim = { world: World; host: FakeHost; verdicts: TeamVerdicts; kind: SimKind; parent?: FakeHolder };
+type Sim = { seed: number; crashCount: number; world: World; host: FakeHost; verdicts: TeamVerdicts; kind: SimKind; parent?: FakeHolder };
 const holderOfSim = (sim: Sim): FakeHolder => sim.host.holders.get(RUN)!;
 const recordOfSim = (sim: Sim): ObjectiveRecord => sim.world.store ? sim.world.store.record : holderOfSim(sim).objectiveRecord as ObjectiveRecord;
 const headFor = (revision: number): string => String(revision % 10 === 0 ? 9 : revision % 10).repeat(40);
@@ -699,7 +699,7 @@ function addPm(run: TeamRun): TeamMember {
   return pm;
 }
 
-function build(kind: SimKind): Sim {
+function build(kind: SimKind, seed: number): Sim {
   const world = newWorld();
   const goal = kind !== "standalone";
   const run = runOf(goal ? { goal: { id: GOAL, revision: 1, cycle: 2, parentRunId: PARENT } as never } : {});
@@ -717,7 +717,7 @@ function build(kind: SimKind): Sim {
   const verdicts = new TeamVerdicts(host);
   host.verdicts = verdicts;
   if (goal) verdicts.goals = goalPort(world);
-  const sim: Sim = { world, host, verdicts, kind };
+  const sim: Sim = { seed, crashCount: 0, world, host, verdicts, kind };
   if (kind === "nochange") {
     sim.parent = holderOf(runOf({ id: PARENT }));
     holders.set(PARENT, sim.parent);
@@ -742,6 +742,7 @@ function restart(sim: Sim): void {
   sim.host = host;
   sim.verdicts = verdicts;
   const holder = holderOfSim(sim);
+  verdicts.recover(holder);
   for (const member of holder.run.members) {
     const state = holder.verdict;
     if (member.role === "evaluator" && member.status === "reported" && state?.status === "evaluating" && state.evaluatorMemberId === member.memberId) {
@@ -840,16 +841,27 @@ function applyOp(sim: Sim, op: Op, withRestarts: boolean): void {
         return;
       }
       const before = recordOfSim(sim).version;
-      sim.host.failNextSave = true;
+      const pick = Math.floor(op.a * 3) + sim.crashCount;
+      const mode = sim.world.store ? (["before-intent", "before-record", "after-write"] as const)[pick % 3]! : (pick % 2 === 0 ? "before-intent" : "after-write");
+      if (mode === "before-intent") sim.host.failSaveAt = 1;
+      else if (mode === "before-record") {
+        sim.host.failSaveAt = 2;
+        if (sim.world.store) sim.world.store.failNextWrite = true;
+      } else sim.host.failSaveAt = 2;
       let crashed = false;
       try {
         settle(sim.host, op.clean);
       } catch {
         crashed = true;
       }
-      sim.host.failNextSave = false;
+      sim.host.failSaveAt = 0;
+      if (sim.world.store) sim.world.store.failNextWrite = false;
       if (!crashed) return;
-      if (recordOfSim(sim).version > before) crashes.afterWrite += 1;
+      sim.crashCount += 1;
+      const persisted = JSON.parse(sim.host.persisted.get(RUN)!) as FakeHolder;
+      if (sim.world.store ? sim.world.store.record.version > before : recordOfSim(sim).version > before) crashes.afterWrite += 1;
+      else if (persisted.verdict?.status === "recording") crashes.beforeRecordWrite += 1;
+      else crashes.beforeIntent += 1;
       restart(sim);
       settle(sim.host, op.clean);
       return;
@@ -911,7 +923,7 @@ function summary(sim: Sim): Record<string, string> {
 
 function simulate(seed: number, withRestarts: boolean): Sim {
   const kind: SimKind = (["standalone", "goal", "nochange"] as const)[seed % 3]!;
-  const sim = build(kind);
+  const sim = build(kind, seed);
   const ops = opsOf(seed);
   ops.forEach((op, index) => {
     try {
@@ -945,5 +957,7 @@ test("seeded verdicts with restarts compose each verdict once", () => {
   assert.equal(seen.c0Met > 0, true, "no verdict recorded c0 met, so the evaluator's answers never reached the record");
   assert.equal(seen.c0NotMet > 0, true, "no verdict recorded c0 not-met");
   assert.equal(seen.contradicted > 0, true, "the contradiction path never ran");
+  assert.equal(crashes.beforeIntent > 0, true, "no seed crashed before persisting the verdict commit intent");
+  assert.equal(crashes.beforeRecordWrite > 0, true, "no seed crashed after persisting the commit intent and before writing the record");
   assert.equal(crashes.afterWrite > 0, true, "no seed crashed inside a finish after the record write, so the replay guard was never exercised");
 });

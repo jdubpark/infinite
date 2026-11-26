@@ -12,7 +12,7 @@ import { theme } from "../../theme";
 import { visibleGroups } from "../projects/model";
 import { HaltBanner } from "../halt/HaltBanner";
 import { Composer } from "./Composer";
-import { attemptLabel, boardKind, boardStatusLabel, groupBoard } from "./model";
+import { attemptLabel, boardKind, boardStatusLabel, groupBoard, subtaskProgressLabel } from "./model";
 
 export function Board({ connection, machines, pushNote, onSelectMachine, onAddMachine, onDisconnect }: {
   connection: Connection; machines: Connection[]; pushNote?: string;
@@ -83,9 +83,9 @@ export function Board({ connection, machines, pushNote, onSelectMachine, onAddMa
                 <Chip label={item.projectName} accessibilityLabel={`Project: ${item.projectName}`} />
                 <Text style={[s.status, (item.column === "needs-input" || item.status === "paused") && s.attention]} numberOfLines={1}>{boardStatusLabel(item)}</Text>
                 {attemptLabel(item) ? <Text style={s.progress}>{attemptLabel(item)}</Text> : null}
-                {item.subtasks?.total ? <Text style={s.progress}>{item.subtasks.done}/{item.subtasks.total}</Text> : null}
+                {subtaskProgressLabel(item) ? <Text style={s.progress}>{subtaskProgressLabel(item)}</Text> : null}
               </View>
-              <Text style={s.detail} numberOfLines={1}>{item.detail}</Text>
+              {item.detail ? <Text style={s.detail} numberOfLines={1}>{item.detail}</Text> : null}
             </View>
             <Glyph name="forward" size={12} color={theme.colors.mutedInk} />
           </Pressable>)}

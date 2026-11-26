@@ -20,9 +20,20 @@ import type { Provider } from "./types.js";
 
 export { verdictPin } from "./evaluator-profiles.js";
 
+export type VerdictPendingCommit = {
+  composed: ComposedVerdict;
+  at: string;
+  rubricVersion: number;
+  sourceRecordVersion?: number;
+  criteriaDigests?: Record<string, string>;
+  composedCriteriaDigests?: Record<string, string>;
+  report?: VerdictReport;
+  reason?: VerdictReason;
+};
+
 export type VerdictState = {
   revision: number; head: string; kind: "reviewed" | "no-change"; verdictId: string;
-  status: "testing" | "queued" | "evaluating" | "releasing" | "done";
+  status: "testing" | "queued" | "evaluating" | "recording" | "releasing" | "done";
   failures: 0 | 1; excluded?: string[];
   since?: string;
   judged?: Record<string, string>;
@@ -34,9 +45,10 @@ export type VerdictState = {
   delivery?: "landed" | "reverted";
   earlier?: string[];
   written?: "wrote" | "log-full" | "record-unavailable" | "write-failed";
+  commit?: VerdictPendingCommit;
 };
 
-export type VerdictHolder = { run: TeamRun; verdict?: VerdictState; objectiveRecord?: unknown; checkHead?: string };
+export type VerdictHolder = { run: TeamRun; verdict?: VerdictState; objectiveRecord?: unknown; checkHead?: string; outbox?: unknown[]; ledgerGap?: unknown };
 
 export type VerdictHost = {
   holder(runId: string): VerdictHolder | undefined;
@@ -108,13 +120,61 @@ function digestsOf(record: ObjectiveRecord): Record<string, string> {
   for (const item of record.criteria) {
     if (item.state !== "active") continue;
     const statement = item.statementOf === "objective" ? record.statement.objective : item.statement;
-    digests[item.id] = createHash("sha256").update(canonicalJson({ statement, check: item.check })).digest("hex");
+    digests[item.id] = createHash("sha256").update(canonicalJson({
+      statement,
+      check: item.check,
+      producer: item.producer,
+      threshold: item.threshold,
+      ...(item.pinned === undefined ? {} : { pinned: item.pinned }),
+    })).digest("hex");
   }
   return digests;
 }
 
 function emptyVerdict(reason: VerdictReason): ComposedVerdict {
   return { result: "inconclusive", reason, criteria: [], counts: { met: 0, notMet: 0, inconclusive: 0, pendingOwner: 0 }, dropped: { unknownIds: 0, handles: 0 } };
+}
+
+function fenceChangedHostCriteria(
+  composed: ComposedVerdict,
+  previousDigests: Record<string, string> | undefined,
+  currentDigests: Record<string, string>,
+): ComposedVerdict {
+  if (!previousDigests) return composed;
+  let changed = false;
+  const criteria = composed.criteria.map(item => {
+    if (item.producer !== "host" || previousDigests[item.id] === currentDigests[item.id] || item.state === "inconclusive") return item;
+    changed = true;
+    const { receipt: _receipt, contradicted: _contradicted, ...rest } = item;
+    return { ...rest, state: "inconclusive" as const, reason: "no-receipt" as const };
+  });
+  if (!changed) return composed;
+  const counts: VerdictCounts = { met: 0, notMet: 0, inconclusive: 0, pendingOwner: 0 };
+  for (const item of criteria) {
+    if (item.state === "met") counts.met += 1;
+    else if (item.state === "not-met") counts.notMet += 1;
+    else if (item.state === "inconclusive") counts.inconclusive += 1;
+    else counts.pendingOwner += 1;
+  }
+  const result: AssessedState = counts.notMet > 0 ? "not-met" : counts.inconclusive > 0 || criteria.length === 0 ? "inconclusive" : "met";
+  return { ...composed, result, criteria, counts };
+}
+
+function restoreHolderSideEffects(
+  holder: VerdictHolder,
+  events: TeamRun["events"],
+  outbox: unknown[] | undefined,
+  ledgerGap: unknown,
+): void {
+  holder.run.events.splice(0, holder.run.events.length, ...events);
+  if (outbox !== undefined) {
+    if (holder.outbox) holder.outbox.splice(0, holder.outbox.length, ...outbox);
+    else holder.outbox = outbox;
+  } else {
+    delete holder.outbox;
+  }
+  if (ledgerGap !== undefined) holder.ledgerGap = ledgerGap;
+  else delete holder.ledgerGap;
 }
 
 type Cycle = { authors: TeamModelProfile[]; reviewers: TeamModelProfile[]; managers: TeamModelProfile[] };
@@ -159,6 +219,24 @@ export class TeamVerdicts {
     return true;
   }
 
+  restore(holders: Iterable<VerdictHolder>): void {
+    for (const holder of holders) {
+      try { this.recover(holder); } catch {}
+    }
+  }
+
+  recover(holder: VerdictHolder): boolean {
+    if (holder.run.verdicts !== "on") return false;
+    const state = holder.verdict;
+    if (!state || state.status !== "recording") return false;
+    if (holder.run.goal && !this.goals) return false;
+    this.dropStale(holder);
+    const current = holder.verdict;
+    if (!current || current.status !== "recording") return true;
+    this.commitVerdict(holder, current);
+    return true;
+  }
+
   holdNoChange(holder: VerdictHolder, member: TeamMember): boolean {
     const run = holder.run;
     if (run.verdicts !== "on" || run.goal?.parentRunId === undefined) return false;
@@ -168,6 +246,10 @@ export class TeamVerdicts {
     if (!state) return this.startNoChange(holder, member, run.goal.parentRunId);
     if (state.kind !== "no-change") return false;
     if (state.status === "done") return false;
+    if (state.status === "recording") {
+      this.commitVerdict(holder, state);
+      return true;
+    }
     if (state.status === "releasing") {
       state.status = "done";
       this.host.save(holder);
@@ -185,6 +267,10 @@ export class TeamVerdicts {
     this.dropStale(holder);
     const state = holder.verdict;
     if (!state || state.status === "done") return false;
+    if (state.status === "recording") {
+      this.commitVerdict(holder, state);
+      return true;
+    }
     if (STOPPED.includes(holder.run.status)) return false;
     this.advance(holder, state);
     return true;
@@ -291,6 +377,9 @@ export class TeamVerdicts {
         return;
       case "evaluating":
         this.evaluating(holder, state);
+        return;
+      case "recording":
+        this.commitVerdict(holder, state);
         return;
       case "releasing":
         this.release(holder, state);
@@ -418,38 +507,131 @@ export class TeamVerdicts {
     this.finish(holder, state, undefined, reason);
   }
 
+  private composeFor(holder: VerdictHolder, state: VerdictState, record: ObjectiveRecord, report?: VerdictReport, reason?: VerdictReason): ComposedVerdict {
+    const held = state.earlier === undefined ? undefined : heldIds(state);
+    return composeVerdict({
+      record: held === undefined ? record : { ...record, criteria: record.criteria.filter(item => held.has(item.id)) }, head: state.head, kind: state.kind, configured: this.host.configured(holder.run), receipts: this.receiptsOf(state),
+      facts: this.factsOf(holder, state), changedPaths: this.changeListOf(holder, state),
+      ...(report === undefined ? {} : { report: this.judgedOnly(state, record, report) }), ...(reason === undefined ? {} : { reason }),
+    });
+  }
+
   private finish(holder: VerdictHolder, state: VerdictState, report?: VerdictReport, reason?: VerdictReason): void {
-    const run = holder.run;
-    const record = this.readyRecord(holder);
-    const supersedes = state.earlier;
-    const held = supersedes === undefined ? undefined : heldIds(state);
-    let composed: ComposedVerdict;
-    let written: VerdictState["written"];
-    let version = 0;
-    if (!record) {
-      composed = emptyVerdict("record-unavailable");
-      written = "record-unavailable";
-    } else {
-      composed = composeVerdict({
-        record: held === undefined ? record : { ...record, criteria: record.criteria.filter(item => held.has(item.id)) }, head: state.head, kind: state.kind, configured: this.host.configured(run), receipts: this.receiptsOf(state),
-        facts: this.factsOf(holder, state), changedPaths: this.changeListOf(holder, state),
-        ...(report === undefined ? {} : { report: this.judgedOnly(state, record, report) }), ...(reason === undefined ? {} : { reason }),
-      });
-      const outcome = this.writeRecord(holder, state, record, composed, supersedes);
-      written = outcome.written;
-      version = outcome.version;
+    if (state.status === "recording" && state.commit) {
+      this.commitVerdict(holder, state);
+      return;
     }
+    const record = this.readyRecord(holder);
+    const at = this.host.now();
+    if (!record) {
+      this.finalize(holder, state, emptyVerdict("record-unavailable"), "record-unavailable", at);
+      return;
+    }
+    const criteriaDigests = digestsOf(record);
+    const composed = this.composeFor(holder, state, record, report, reason);
+    const previousStatus = state.status;
+    state.status = "recording";
+    state.commit = {
+      composed, at, rubricVersion: record.rubricVersion, sourceRecordVersion: record.version, criteriaDigests,
+      ...(report === undefined ? {} : { report }), ...(reason === undefined ? {} : { reason }),
+    };
+    try { this.host.save(holder); }
+    catch (error) {
+      state.status = previousStatus;
+      delete state.commit;
+      throw error;
+    }
+    this.commitVerdict(holder, state);
+  }
+
+  private commitVerdict(holder: VerdictHolder, state: VerdictState): void {
+    if (holder.run.goal && !this.goals) return;
+    let commit = state.commit;
+    if (!commit) {
+      this.finalize(holder, state, emptyVerdict("record-unavailable"), "record-unavailable", this.host.now());
+      return;
+    }
+    const record = this.readyRecord(holder);
+    if (!record) {
+      this.finalize(holder, state, emptyVerdict("record-unavailable"), "record-unavailable", commit.at);
+      return;
+    }
+    const handle = `verdict:${state.verdictId}`;
+    const existing = record.log.find(entry => entry.op === VERDICT_OPS.recorded && entry.handle === handle);
+    if (!existing) {
+      const currentDigests = digestsOf(record);
+      const comparedDigests = commit.composedCriteriaDigests ?? commit.criteriaDigests;
+      const recordChanged = commit.sourceRecordVersion !== undefined && record.version !== commit.sourceRecordVersion
+        || comparedDigests !== undefined && canonicalJson(currentDigests) !== canonicalJson(comparedDigests);
+      if (recordChanged) {
+        const nextComposed = fenceChangedHostCriteria(
+          this.composeFor(holder, state, record, commit.report, commit.reason),
+          commit.criteriaDigests,
+          currentDigests,
+        );
+        const previousCommit = commit;
+        const updatedCommit: VerdictPendingCommit = {
+          ...commit, composed: nextComposed, rubricVersion: record.rubricVersion,
+          sourceRecordVersion: record.version, composedCriteriaDigests: currentDigests,
+        };
+        state.commit = updatedCommit;
+        try { this.host.save(holder); }
+        catch (error) {
+          state.commit = previousCommit;
+          throw error;
+        }
+        commit = updatedCommit;
+      }
+    }
+    const outcome = this.writeRecord(holder, state, record, commit.composed, commit.at);
+    this.finalize(holder, state, commit.composed, outcome.written, commit.at, { version: outcome.version, rubricVersion: commit.rubricVersion });
+  }
+
+  private finalize(
+    holder: VerdictHolder,
+    state: VerdictState,
+    composed: ComposedVerdict,
+    written: VerdictState["written"],
+    at: string,
+    emitted?: { version: number; rubricVersion: number },
+  ): void {
+    const previous = {
+      status: state.status,
+      commit: state.commit,
+      composed: state.composed,
+      written: state.written,
+      reason: state.reason,
+      assessment: holder.run.assessment,
+      events: [...holder.run.events],
+      outbox: holder.outbox === undefined ? undefined : [...holder.outbox],
+      ledgerGap: holder.ledgerGap === undefined ? undefined : structuredClone(holder.ledgerGap),
+    };
     state.composed = composed;
     state.written = written;
     if (composed.reason !== undefined) state.reason = composed.reason;
     else delete state.reason;
-    const at = this.host.now();
-    run.assessment = this.assessmentOf(state, composed, at);
-    if (record) this.host.emit(holder, this.rowOf(holder, state, composed, record, version, this.applied(composed)));
+    delete state.commit;
+    holder.run.assessment = this.assessmentOf(state, composed, at);
+    if (emitted) this.host.emit(holder, this.rowOf(holder, state, composed, emitted.rubricVersion, emitted.version, this.applied(composed)));
     this.events(holder, composed, written);
-    if (supersedes !== undefined) this.host.event(holder, VERDICT_EVENTS.delivery);
+    if (state.earlier !== undefined) this.host.event(holder, VERDICT_EVENTS.delivery);
     state.status = state.kind === "no-change" ? "releasing" : "done";
-    this.host.save(holder);
+    try { this.host.save(holder); }
+    catch (error) {
+      state.status = previous.status;
+      if (previous.commit !== undefined) state.commit = previous.commit;
+      else delete state.commit;
+      if (previous.composed !== undefined) state.composed = previous.composed;
+      else delete state.composed;
+      if (previous.written !== undefined) state.written = previous.written;
+      else delete state.written;
+      if (previous.reason !== undefined) state.reason = previous.reason;
+      else delete state.reason;
+      if (previous.assessment !== undefined) holder.run.assessment = previous.assessment;
+      else delete holder.run.assessment;
+      restoreHolderSideEffects(holder, previous.events, previous.outbox, previous.ledgerGap);
+      throw error;
+    }
   }
 
   private events(holder: VerdictHolder, composed: ComposedVerdict, written: VerdictState["written"]): void {
@@ -466,12 +648,12 @@ export class TeamVerdicts {
     return { ...report, criteria: report.criteria.filter(item => digests[item.id] === undefined || state.judged?.[item.id] === digests[item.id]) };
   }
 
-  private writeRecord(holder: VerdictHolder, state: VerdictState, record: ObjectiveRecord, composed: ComposedVerdict, supersedes?: readonly string[]): { written: "wrote" | "log-full" | "write-failed"; version: number } {
+  private writeRecord(holder: VerdictHolder, state: VerdictState, record: ObjectiveRecord, composed: ComposedVerdict, at: string): { written: "wrote" | "log-full" | "write-failed"; version: number } {
     const handle = `verdict:${state.verdictId}`;
     const existing = record.log.find(entry => entry.op === VERDICT_OPS.recorded && entry.handle === handle);
     if (existing) return { written: "wrote", version: existing.version };
     try {
-      const next = verdictRecord(record, composed, { verdictId: state.verdictId, kind: state.kind, revision: state.revision, head: state.head, at: this.host.now(), ...(supersedes === undefined ? {} : { supersedes }) });
+      const next = verdictRecord(record, composed, { verdictId: state.verdictId, kind: state.kind, revision: state.revision, head: state.head, at, ...(state.earlier === undefined ? {} : { supersedes: state.earlier }) });
       if (next === "log-full") return { written: "log-full", version: record.version };
       writeHeldRecord(holder, this.goals, record, next);
       return { written: "wrote", version: next.version };
@@ -493,7 +675,7 @@ export class TeamVerdicts {
     return composed.criteria.some(item => item.evaluatorState !== undefined);
   }
 
-  private rowOf(holder: VerdictHolder, state: VerdictState, composed: ComposedVerdict, record: ObjectiveRecord, version: number, answered: boolean): VerdictEventData {
+  private rowOf(holder: VerdictHolder, state: VerdictState, composed: ComposedVerdict, rubricVersion: number, version: number, answered: boolean): VerdictEventData {
     const run = holder.run;
     const choice = answered ? state.choice : undefined;
     return {
@@ -502,7 +684,7 @@ export class TeamVerdicts {
       ...(run.goal === undefined ? {} : { goalId: run.goal.id, cycle: run.goal.cycle }),
       kind: state.kind,
       recordVersion: version,
-      rubricVersion: record.rubricVersion,
+      rubricVersion,
       ...(choice === undefined ? {} : { profileId: choice.profileId, family: choice.family }),
       ...(choice === undefined || !EVENT_PROVIDERS.includes(choice.provider) ? {} : { provider: choice.provider as "claude" | "codex" | "opencode" }),
       ...(choice?.model === undefined ? {} : { model: choice.model }),
@@ -571,17 +753,39 @@ export class TeamVerdicts {
 
   private dropStale(holder: VerdictHolder): void {
     const run = holder.run;
-    let changed = false;
-    if (holder.verdict && !this.current(run, holder.verdict)) {
+    const dropVerdict = holder.verdict !== undefined && !this.current(run, holder.verdict);
+    const dropAssessment = run.assessment !== undefined && (run.assessment.revision !== run.revision || run.assessment.head !== headOf(run));
+    if (!dropVerdict && !dropAssessment) return;
+    const stale = holder.verdict;
+    if (dropVerdict && stale?.status === "recording" && stale.commit && run.goal && !this.goals) return;
+    const previous = {
+      verdict: holder.verdict,
+      assessment: run.assessment,
+      events: [...run.events],
+      outbox: holder.outbox === undefined ? undefined : [...holder.outbox],
+      ledgerGap: holder.ledgerGap === undefined ? undefined : structuredClone(holder.ledgerGap),
+    };
+    if (dropVerdict) {
+      if (stale?.status === "recording" && stale.commit) {
+        const record = this.readyRecord(holder);
+        const existing = record?.log.find(entry => entry.op === VERDICT_OPS.recorded && entry.handle === `verdict:${stale.verdictId}`);
+        if (existing) {
+          this.host.emit(holder, this.rowOf(holder, stale, stale.commit.composed, stale.commit.rubricVersion, existing.version, this.applied(stale.commit.composed)));
+          this.events(holder, stale.commit.composed, "wrote");
+        }
+      }
       delete holder.verdict;
-      changed = true;
     }
-    const assessment = run.assessment;
-    if (assessment && (assessment.revision !== run.revision || assessment.head !== headOf(run))) {
-      delete run.assessment;
-      changed = true;
+    if (dropAssessment) delete run.assessment;
+    try { this.host.save(holder); }
+    catch (error) {
+      if (previous.verdict !== undefined) holder.verdict = previous.verdict;
+      else delete holder.verdict;
+      if (previous.assessment !== undefined) run.assessment = previous.assessment;
+      else delete run.assessment;
+      restoreHolderSideEffects(holder, previous.events, previous.outbox, previous.ledgerGap);
+      throw error;
     }
-    if (changed) this.host.save(holder);
   }
 
   private readyRecord(holder: VerdictHolder): ObjectiveRecord | undefined {

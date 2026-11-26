@@ -108,6 +108,28 @@ test("request channels are optional, bounded unique Slack channel IDs and requir
   const tooManyChannels = Array.from({ length: 21 }, (_, index) => `C${String(index).padStart(3, "0")}`);
   assert.throws(() => parsed({ slack: { ...slack, requestChannelIds: tooManyChannels } }));
 });
+test("organization source scope is opt-in with an optional unique channel grant", () => {
+  assert.equal(parsed({}).intake!.slack!.organizationScope, undefined);
+  assert.deepEqual(parsed({ slack: { ...slack, organizationScope: {} } }).intake!.slack!.organizationScope, {});
+  assert.deepEqual(parsed({ slack: { ...slack, organizationScope: { channelIds: [] } } }).intake!.slack!.organizationScope?.channelIds, []);
+  assert.deepEqual(parsed({ slack: { ...slack, organizationScope: { channelIds: ["C123", "G456"] } } }).intake!.slack!.organizationScope?.channelIds, ["C123", "G456"]);
+  assert.throws(() => parsed({ slack: { ...slack, organizationScope: { channelIds: ["C123", "C123"] } } }), /unique/);
+  assert.throws(() => parsed({ slack: { ...slack, organizationScope: { channelIds: ["U123"] } } }));
+  assert.throws(() => parsed({ slack: { ...slack, organizationScope: { channelIds: ["C123"], unexpected: true } } }));
+});
+test("organization workspace pins require canonical paths and unique validated repository bindings", () => {
+  const workspace = { projectId: "work-repo", path: "/srv/work/work-repo", repository: "Example/work-repo" };
+  assert.equal(parsed({}).intake!.slack!.organizationScope?.workspaces, undefined);
+  assert.deepEqual(parsed({ slack: { ...slack, organizationScope: { workspaces: [workspace] } } }).intake!.slack!.organizationScope?.workspaces, [workspace]);
+  const localWorkspace = { ...workspace, repository: null, rootCommit: "a".repeat(40) };
+  assert.doesNotThrow(() => parsed({ slack: { ...slack, organizationScope: { workspaces: [localWorkspace] } } }));
+  assert.throws(() => parsed({ slack: { ...slack, organizationScope: { workspaces: [{ ...workspace, repository: null }] } } }), /root commit/);
+  assert.throws(() => parsed({ slack: { ...slack, organizationScope: { workspaces: [{ ...workspace, rootCommit: "a".repeat(40) }] } } }), /must not set rootCommit/);
+  assert.throws(() => parsed({ slack: { ...slack, organizationScope: { workspaces: [workspace, workspace] } } }), /unique/);
+  assert.throws(() => parsed({ slack: { ...slack, organizationScope: { workspaces: [{ ...workspace, path: "/srv/work/../work-repo" }] } } }), /canonical/);
+  assert.throws(() => parsed({ slack: { ...slack, organizationScope: { workspaces: [{ ...workspace, repository: "not-a-repository" }] } } }));
+  assert.throws(() => parsed({ slack: { ...slack, organizationScope: { workspaces: [workspace], unexpected: true } } }));
+});
 test("linear.reportName defaults to Infinite, accepts a plain name, and rejects Markdown, link text, newlines, and long values", () => {
   assert.equal(reportName(parsed({})), "Infinite");
   assert.equal(Object.hasOwn(parsed({}).linear!, "reportName"), false, "display defaults leave persisted configuration digests unchanged");

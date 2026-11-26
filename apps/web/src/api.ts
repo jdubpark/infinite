@@ -24,6 +24,7 @@ export type Session = {
   capabilities?: { terminalSnapshot?: 1; inputControl?: 1 };
   control?: ControlLease | null;
   runtime?: { id: string; location: string; transport: "pty" | "cmux" };
+  terminalSize?: { cols: number; rows: number };
   execution?: { location: "laptop" | "cloud"; state: "connecting" | "online" | "offline" | "preparing" | "paused"; cloudReady: boolean; checkpoint?: { id: string; capturedAt: string }; reason?: string; reconciliation?: "available" };
   attention?: Attention;
   usage?: UsageTotals;
@@ -98,6 +99,7 @@ export type Scorecard = { rubricVersion: 1; minAttempts: number; rows: ModelRow[
 export type ProviderLimit = { provider: string; detectedAt: string; resetsAt?: string; expiresAt: string; sessionId: string; runId?: string; confidence: "corroborated" };
 export type LimitSwitch = { fromProfileId?: string; toProfileId: string; reason: string; resetsAt?: string; memberId: string; at: string };
 export const clock = (iso: string) => new Intl.DateTimeFormat([], { hour: "2-digit", minute: "2-digit", hour12: false, timeZoneName: "short" }).format(new Date(iso));
+export type ProviderCapabilities = { observesToolInputs?: boolean };
 export type Me = {
   role: "owner" | "controller" | "viewer";
   environment: "cloud" | "local";
@@ -106,6 +108,7 @@ export type Me = {
   backendProviders?: { infinite: string[]; cmux?: string[] };
   capabilities?: { signals: boolean; answer: boolean; push: boolean; dictation?: { model: string }; swarmContext?: 1 };
   providers: string[];
+  providerCapabilities?: Record<string, ProviderCapabilities>;
   projects: { id: string; name: string; linear?: { enabled: boolean }; team?: { establishChecks?: true; checks: { command: string; args: string[] }[]; setup?: { command: string; args: string[] } } }[];
   teams?: { enabled: boolean; lineup?: TeamLineup };
   goals?: { enabled: boolean };

@@ -433,10 +433,15 @@ uses the normal `cancelledMinutes` retention. The outcome ledger keeps the run
 as blocked: the close writes no second settled event. A blocked run that
 still holds an unresolved operation keeps its workspaces unless the host looks
 and finds no process of that operation. The host records each command an
-operation starts, as the leader of its own session and process group, and while
-the operation runs it samples the process table for descendants that moved to
-other sessions or groups. The saved intent says that this record may be
-incomplete from before a command starts until a save holds it. While such a run
+operation starts, as the leader of its own session and process group, in the
+step that starts it, and while the operation runs it samples the process table
+for descendants that moved to other sessions or groups. The saved intent says
+that this record may be incomplete from before a command starts until a save
+holds it. When an operation fails, the host ends the operation's commands that
+are still running, as a halt does, and starts no further command for it. The
+saved failure holds every command that has started, so it marks the record
+incomplete only while a command is still starting, not while the host still
+reads a command's start time. While such a run
 is blocked or paused with no command of its own running, the host looks at most
 every ten minutes for processes that match the record, and for any process of
 the host account or of the account that runs team commands that uses the run
@@ -450,7 +455,10 @@ run keeps its workspaces and stays blocked: when a look finds a process; when it
 cannot finish; when a process of those accounts refuses inspection; when the
 record overflowed; or when an earlier API process stopped while the record was
 marked incomplete and the host has not rebooted since. In the last four cases
-the host says it cannot tell. The host never signals or stops a process it
+the host says it cannot tell. Earlier versions also marked a failure's record
+incomplete while the host still read a command's start time; a run held that
+way at the upgrade waits until the host boots again.
+The host never signals or stops a process it
 finds. The look has stated limits: it does not inspect other accounts or a
 process that left its recorded session and group and no longer uses the run
 directory, and it is evidence about left-over processes, not a defense against

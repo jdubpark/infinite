@@ -472,7 +472,10 @@ Before a rollback to such a host, in this order:
    the older host until that run is finished or cancelled.
 3. Wait until no mission holds a queued forward: an event "The coordinator
    forwarded the owner's review" with no later "received the owner's review"
-   or "was not forwarded" event. The older host cannot apply a
+   or "was not forwarded" event. A forward does not end by itself while its
+   mission is paused or blocked at its time limit, or while a paused or blocked
+   run holds its repository: resume, extend, or cancel that mission, or resume
+   or cancel the holding run. The older host cannot apply a
    `review-forward` operation. The mission blocks with "The mission could not
    advance" and logs it again on every scheduler pass.
 4. Finish or cancel every mission that is live, paused, or blocked at its time

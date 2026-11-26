@@ -1730,6 +1730,7 @@ small,
 .permission-filter-fields { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 8px; margin: 0 8px 10px; }
 .permission-filter-fields select { min-height: 40px; padding: 8px 10px; font-size: 12px; }
 .permission-older { margin: 0 6px 12px; }
+.permission-older-error { margin: 0 12px 12px; font-size: 12px; line-height: 1.5; }
 .permission-code { overflow-wrap: anywhere; white-space: pre-wrap; }
 .permission-control { display: contents; }
 .permission-rule { display: inline-block; margin: 0 8px 4px 0; background: #edf0e7; padding: 2px 6px; border-radius: 4px; }

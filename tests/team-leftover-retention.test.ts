@@ -11,7 +11,7 @@ import { newWitness, type CensusResult, type HostProcesses, type ProcessWitness 
 import { schedulerFixture } from "./fixtures/team-scheduler.js";
 
 type Fixture = ReturnType<typeof schedulerFixture>;
-type Internals = { records: Map<string, { pending?: unknown; leftover?: unknown }> };
+type Internals = { records: Map<string, { pending?: unknown; leftover?: unknown }>; step(stored: unknown): Promise<void> };
 
 const RUNNING = "The host still sees 1 process(es) left behind by an earlier command of this run. It keeps this run's directories until a census finds none.";
 const ENDED = "The host sees no process left behind by an earlier command of this run, and none using this run's directory. Its directories can be removed.";
@@ -19,6 +19,23 @@ const ENDED = "The host sees no process left behind by an earlier command of thi
 function processes(census: () => CensusResult, seen: ProcessWitness[] = []): HostProcesses {
   return { table: async () => ({ boot: "test-boot", rows: [] }), start: async () => "test-start",
     census: async witness => { seen.push(structuredClone(witness)); return census(); } };
+}
+
+function byWitness(alive: Set<number>, seen: ProcessWitness[]): HostProcesses {
+  return { table: async () => ({ boot: "test-boot", rows: [] }), start: async () => "test-start",
+    census: async recorded => {
+      seen.push(structuredClone(recorded));
+      return { ok: true, findings: recorded.processes.filter(item => alive.has(item.pid)).map(item => ({ pid: item.pid, reason: "recorded-process" as const })) };
+    } };
+}
+
+function countSteps(teams: TeamService) {
+  const internal = teams as unknown as Internals, step = internal.step.bind(teams), passes = { count: 0 };
+  internal.step = async stored => {
+    await step(stored);
+    passes.count++;
+  };
+  return passes;
 }
 
 function openTeam(f: Fixture, now: () => number, hostProcesses: HostProcesses) {
@@ -77,10 +94,13 @@ for (const [status, text, limit] of [
     let result: CensusResult = { ok: true, findings: [{ pid: 4242, reason: "recorded-group" }] };
     let now = Date.parse(at) + 3_600_001, looks = 0;
     const teams = openTeam(f, () => now, processes(() => { looks++; return result; }));
+    const passes = countSteps(teams);
     try {
       leftover(teams, f.run, at);
       teams.start();
-      await delay(1200);
+      await waitFor(() => looks >= 1 && count(teams, f.run, RUNNING) === 1, "the host should look for the process", 30_000);
+      const looked = passes.count;
+      await waitFor(() => passes.count >= looked + 2, "the scheduler should step the run again", 30_000);
       await teams.idle();
       assert.equal(existsSync(runDirectory(f.run)), true, "the directories stay while the process runs");
       assert.equal(count(teams, f.run, RUNNING), 1, "the host says it still sees the process");
@@ -89,7 +109,7 @@ for (const [status, text, limit] of [
       assert.equal(looks, 1, "a census that found the process stands until the next scheduled look");
       result = { ok: true, findings: [] };
       now += 10 * 60_000;
-      await waitFor(() => !existsSync(runDirectory(f.run)), "the directories should be removed once the census finds no process");
+      await waitFor(() => !existsSync(runDirectory(f.run)), "the directories should be removed once the census finds no process", 30_000);
       await teams.idle();
       assert.equal(count(teams, f.run, ENDED), 1);
       assert.equal(teams.get(f.run.id).leftoverProcesses, undefined);
@@ -146,10 +166,11 @@ test("an active run keeps an integrated member clone while it records a process 
   f.config.teams!.stallMinutes = 600;
   f.writeTeam();
   const teams = openTeam(f, () => Date.parse(at) + 1000, processes(() => ({ ok: true, findings: [{ pid: 4242, reason: "recorded-group" }] })));
+  const passes = countSteps(teams);
   try {
     leftover(teams, f.run, at);
     teams.start();
-    await delay(1500);
+    await waitFor(() => passes.count >= 2, "the scheduler should step the run", 30_000);
     await teams.idle();
     assert.equal(existsSync(cwd), true, "the clone stays while the run records the process");
     assert.equal(teams.get(f.run.id).members.find(item => item.memberId === member.memberId)?.workspaceRemovedAt, undefined);
@@ -160,31 +181,31 @@ test("an active run keeps an integrated member clone while it records a process 
   } finally { await close(f, teams); }
 });
 
-test("a cancelled run with both an unfinished operation and a process an earlier command left waits on both through one census of both records per removal decision", async () => {
+test("a cancelled run with both an unfinished operation and a process an earlier command left waits on both, with one census of each record per removal decision", async () => {
   const f = schedulerFixture();
   const at = settled(f, "cancelled", "Team cancelled.");
   retention(f, { cancelledMinutes: 1 });
   f.writeTeam();
-  const seen: ProcessWitness[] = [];
-  let result: CensusResult = { ok: true, findings: [{ pid: 4242, reason: "recorded-session" }] };
+  const seen: ProcessWitness[] = [], alive = new Set([101, 202]);
   let now = Date.parse(at) + 60_001;
-  const teams = openTeam(f, () => now, processes(() => result, seen));
+  const teams = openTeam(f, () => now, byWitness(alive, seen));
+  const passes = countSteps(teams);
   try {
     (teams as unknown as Internals).records.get(f.run.id)!.pending = { id: randomUUID(), kind: "check", revision: 1, witness: witness(101) };
     leftover(teams, f.run, at, witness(202));
     teams.start();
-    await waitFor(() => teams.get(f.run.id).pendingOperation?.processes === "running", "the host should look for the operation's processes");
+    await waitFor(() => teams.get(f.run.id).pendingOperation?.processes === "running", "the host should look for the operation's processes", 30_000);
+    await teams.idle();
     const before = seen.length;
     await assert.rejects(teams.removeRun(f.run.id), (error: unknown) => error instanceof TeamError && error.code === "team-leftover-running");
-    assert.equal(seen.length, before + 1, "one removal decision takes one census");
-    assert.deepEqual(seen.at(-1)?.processes.map(recorded => recorded.pid).sort(), [101, 202], "the census covers both records");
-    assert.equal(teams.get(f.run.id).leftoverProcesses?.state, "running");
+    assert.deepEqual(seen.slice(before).map(recorded => recorded.processes.map(item => item.pid).join(",")).sort(), ["101", "202"], "one removal decision takes one census of each record");
     now += 10 * 60_000;
-    await delay(1200);
+    const looked = seen.length, stepped = passes.count;
+    await waitFor(() => seen.length > looked && passes.count >= stepped + 2, "the host should look again after ten minutes", 30_000);
     await teams.idle();
     assert.equal(existsSync(runDirectory(f.run)), true);
-    result = { ok: true, findings: [] };
+    alive.clear();
     now += 10 * 60_000;
-    await waitFor(() => !existsSync(runDirectory(f.run)), "the directories should be removed once the census finds neither record's processes");
+    await waitFor(() => !existsSync(runDirectory(f.run)), "the directories should be removed once the census finds neither record's processes", 30_000);
   } finally { await close(f, teams); }
 });

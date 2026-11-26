@@ -489,9 +489,13 @@ directory later. When a removal falls due, the host looks
 for processes that match the record and for processes that use the run
 directory, as described above, at most every ten minutes; the owner's removal
 takes a look of its own. When the run also holds an unresolved operation with a
-process record, one look covers both records, and each record's counts include
-the processes of both. A look that finds neither kind clears the record, and
-the removal proceeds. The run's events record each change in what the host saw.
+process record, the host looks for each record's processes separately, and each
+record's state and events describe only its own processes and the processes
+using the run directory. Requests that arrive during a look share it only when
+it covers the same process record. A look that finds neither kind clears the
+record, and the removal proceeds. The run's events record each change in what
+the host saw for a record, and a look that sees the same as the last one records
+nothing.
 The team view carries `leftoverProcesses` while the record stands:
 `{ since, state: "unchecked" }` before the first look, then
 `{ since, state, checkedAt }` with `state` set to `running`, `in-use` or
@@ -504,7 +508,9 @@ statement that the processes ended, the same action that lifts a stopped
 command's hold: `POST /api/teams/:id/processes-ended` with
 `{ "requestId": "<uuid>" }`, or `infinite team processes-ended ID`. The host
 takes a look of its own for the statement. While it finds a process, the host
-answers `team-command-running` (409) and records nothing. When it finds none,
+answers `team-command-running` (409) and does not record the statement; the
+look's result is recorded as for any other look, with an event when it changed.
+When it finds none,
 the record clears as after any look. When it cannot tell, the host records the
 statement as a run event that names what the look reported and clears the
 record; the next removal proceeds as for a run without one. The statement lifts
@@ -514,6 +520,12 @@ the statement are not on the relay allowlist.
 The record covers only the case above. A process that a command leaves behind
 without holding the command's output is never noted, so the host takes no look
 for it, and the run's directory may be removed while that process runs.
+
+**Rollback.** A host without this change keeps the record in the sealed run
+file but ignores it. It removes a held run's directories under its retention
+policy and on the owner's removal while the process may still run. Before a
+rollback, check each run whose view carries `leftoverProcesses`, and end its
+processes or accept that its directories go.
 
 Retention marks a workspace removal as started in the run record, then removes
 the tree outside the serialized team mutation queue. At most two background

@@ -1,4 +1,4 @@
-import { bootId, hostProcesses, mergeWitness, type CensusResult } from "./process-census.js";
+import { bootId, hostProcesses, type CensusResult, type ProcessWitness } from "./process-census.js";
 import { teamRunDirectory, type TeamKernel } from "./team-kernel.js";
 import { COMMAND_STOP_UNCONFIRMED_REASON, TeamError } from "./team-workspace.js";
 import { CENSUS_TTL_MS, censusCounts, countsKey, leftoverCensusEvent, leftoverStatementEvent, type StoredLeftover } from "./team-leftover.js";
@@ -9,7 +9,7 @@ export const commandStopReasons = new Set([COMMAND_STOP_UNCONFIRMED_REASON, COMM
 export const HALT_CENSUS_MS = 30_000;
 
 export type OwnerStatement = { requestId: string; at: string; detail: string };
-export type TakenCensus = { pendingId?: string; leftover?: StoredLeftover; at: string; result: CensusResult };
+export type TakenCensus = { at: string; operation?: { pendingId: string; result: CensusResult }; leftover?: { record: StoredLeftover; result: CensusResult } };
 export type FenceHost = Pick<TeamKernel, "records" | "commands" | "config" | "save" | "event" | "enqueue"> & { readonly options: TeamServiceOptions | undefined };
 type OperationCensus = NonNullable<Stored["census"]>;
 type CensusState = OperationCensus["state"];
@@ -65,12 +65,19 @@ export class CommandFence {
   async take(id: string, anyOperation = false, withLeftover = false): Promise<TakenCensus | undefined> {
     const stored = this.host.records.get(id);
     if (!stored || this.host.commands.has(id)) return undefined;
-    const pending = stored.pending?.witness && (anyOperation || stopFenced(stored)) ? stored.pending : undefined, leftover = withLeftover ? stored.leftover : undefined;
-    const witness = pending?.witness && leftover ? mergeWitness(pending.witness, leftover.witness) : pending?.witness ?? leftover?.witness;
-    if (!witness) return undefined;
-    const at = new Date(this.now()).toISOString(), processes = this.host.options?.processes ?? hostProcesses;
-    const result = await this.flight(`${id}:${pending?.id ?? ""}:${leftover ? "leftover" : ""}`, () => processes.census(witness, teamRunDirectory(stored.run.workspace), this.host.config.teams?.commandPrefix));
-    return { ...(pending ? { pendingId: pending.id } : {}), ...(leftover ? { leftover } : {}), at, result };
+    const pending = stored.pending?.witness && (anyOperation || stopFenced(stored)) ? stored.pending : undefined, record = withLeftover ? stored.leftover : undefined;
+    const witness = pending?.witness;
+    if (!witness && !record) return undefined;
+    const at = new Date(this.now()).toISOString();
+    const [operation, leftover] = await Promise.all([
+      pending && witness ? this.census(stored, `operation:${pending.id}`, witness) : undefined,
+      record ? this.census(stored, "leftover", record.witness) : undefined,
+    ]);
+    return { at, ...(pending && operation ? { operation: { pendingId: pending.id, result: operation } } : {}), ...(record && leftover ? { leftover: { record, result: leftover } } : {}) };
+  }
+  private census(stored: Stored, kind: string, witness: ProcessWitness): Promise<CensusResult> {
+    const recorded = structuredClone(witness), processes = this.host.options?.processes ?? hostProcesses;
+    return this.flight(`${stored.run.id}:${kind}:${JSON.stringify(recorded)}`, () => processes.census(recorded, teamRunDirectory(stored.run.workspace), this.host.config.teams?.commandPrefix));
   }
   async refresh(stored: Stored, force = false, withLeftover = false): Promise<CensusState | undefined> {
     const { run } = stored, pending = stored.pending?.witness ? stored.pending : undefined, leftover = withLeftover ? stored.leftover : undefined;
@@ -81,31 +88,34 @@ export class CommandFence {
     return taken && this.apply(stored, taken);
   }
   apply(stored: Stored, taken: TakenCensus): CensusState | undefined {
-    const { run } = stored, pending = stored.pending;
+    const { run } = stored, pending = stored.pending, operation = taken.operation, leftover = taken.leftover;
     if (this.host.records.get(run.id) !== stored || this.host.commands.has(run.id)) return undefined;
-    if (taken.pendingId !== undefined && (!pending?.witness || pending.id !== taken.pendingId)) return undefined;
-    if (taken.leftover && stored.leftover !== taken.leftover) return undefined;
-    const counts = censusCounts(taken.result);
-    const state = taken.pendingId === undefined ? "ended" : this.applyOperation(stored, taken, counts);
-    if (!taken.leftover) return state;
-    stored.leftover = counts.state === "ended" ? undefined : { ...taken.leftover, census: { ...counts, at: taken.at } };
-    if (!taken.leftover.census || countsKey(taken.leftover.census) !== countsKey(counts)) {
+    if (operation && (!pending?.witness || pending.id !== operation.pendingId)) return undefined;
+    if (leftover && stored.leftover?.witness !== leftover.record.witness) return undefined;
+    const state = operation ? this.applyOperation(stored, taken.at, censusCounts(operation.result)) : "ended";
+    const left = leftover ? this.applyLeftover(stored, taken.at, censusCounts(leftover.result)) : "ended";
+    return state === "ended" ? left : state;
+  }
+  private applyLeftover(stored: Stored, at: string, counts: ReturnType<typeof censusCounts>): CensusState {
+    const current = stored.leftover!;
+    stored.leftover = counts.state === "ended" ? undefined : { ...current, census: { ...counts, at } };
+    if (!current.census || countsKey(current.census) !== countsKey(counts)) {
       this.host.event(stored, leftoverCensusEvent(counts));
       this.host.save(stored);
     }
-    return state === "ended" ? counts.state : state;
+    return counts.state;
   }
-  private applyOperation(stored: Stored, taken: TakenCensus, counts: ReturnType<typeof censusCounts>): CensusState {
+  private applyOperation(stored: Stored, at: string, counts: ReturnType<typeof censusCounts>): CensusState {
     const { run } = stored, pending = stored.pending!;
     const previous = stored.census?.pendingId === pending.id ? stored.census : undefined;
-    if (previous && Date.parse(previous.at) > Date.parse(taken.at)) return previous.state;
+    if (previous && Date.parse(previous.at) > Date.parse(at)) return previous.state;
     const recorder = this.recorderOf(stored, pending);
     const incomplete = pending.recording && !recorder && pending.witness?.boot === bootId();
     const census: Omit<OperationCensus, "at" | "pendingId"> = counts.state !== "ended" ? counts
       : incomplete ? { state: "unknown", detail: "the host stopped while the operation was starting a command, so its record of the operation's processes may be incomplete" }
         : recorder && recorder.inFlight > 0 ? { state: "unknown", detail: "a command of the operation is still starting" }
           : counts;
-    stored.census = { pendingId: pending.id, at: taken.at, ...census };
+    stored.census = { pendingId: pending.id, at, ...census };
     const changed = previous?.state !== census.state || previous.recorded !== census.recorded || previous.using !== census.using || previous.detail !== census.detail;
     const reason = stopFenced(stored) && commandStopReasons.has(run.reason ?? "") ? (census.state === "unknown" ? COMMAND_STOP_STATEMENT_REASON : COMMAND_STOP_UNCONFIRMED_REASON) : run.reason;
     if (changed) this.host.event(stored, operationCensusEvent(pending.kind, census));

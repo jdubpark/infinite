@@ -817,7 +817,7 @@ export class MissionService {
           if (live.has(mission.status))
             this.message(stored, teamId + ":cancelled", { type: "subtask-finished", subtaskId: subtask.id, teamId, status: "cancelled", teamStatus: "cancelled",
               ...(subtask.finalEvidence?.reason ? { reason: subtask.finalEvidence.reason } : {}),
-              retentionNote: "Cancelled run data and its workspace are deleted after its members settle. If work is still needed, dispatch a replacement subtask with a new ID in the same repository." });
+              retentionNote: "Cancelled run data and its workspace are deleted once its members settle and the host sees no process left running by its commands; such a process delays the deletion for as long as it runs. If work is still needed, dispatch a replacement subtask with a new ID in the same repository." });
           this.save(stored);
         }
         continue;
@@ -834,7 +834,7 @@ export class MissionService {
           ...(team.reason ? { reason: team.reason } : {}),
           ...(report ? { report } : {}),
           ...(blocker ? { blocker } : {}),
-          ...(status === "cancelled" ? { retentionNote: "Cancelled run data and its workspace are deleted after its members settle. If work is still needed, dispatch a replacement subtask with a new ID in the same repository." } : {}) });
+          ...(status === "cancelled" ? { retentionNote: "Cancelled run data and its workspace are deleted once its members settle and the host sees no process left running by its commands; such a process delays the deletion for as long as it runs. If work is still needed, dispatch a replacement subtask with a new ID in the same repository." } : {}) });
       }
       if (status === "cancelled" && team.workspaceRemovedAt) {
         this.save(stored);

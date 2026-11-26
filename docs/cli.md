@@ -23,6 +23,7 @@ infinite usage goal GOAL_ID
 infinite usage models [--role implementer]
 infinite usage outcomes [--run ID | --goal ID | --mission ID]
 infinite usage repairs [--project ID] [--days N] [--json]
+infinite usage interrupted [--project ID] [--days N] [--json]
 infinite usage --json
 infinite cost [--json]
 infinite cost plan ACCOUNT USD
@@ -49,7 +50,7 @@ infinite close SESSION_ID  # confirm before ending its provider process
 
 `close` requires an explicit session ID or unique prefix and an owner key. It shows the selected process and asks for confirmation; `--yes` confirms noninteractive use. Another client's active input lease blocks closing unless `--takeover` is explicitly supplied. A delivered receipt confirms the stop request reached the worker; check `list` for the resulting process status. An uncertain response is reported and never retried automatically. Closing ends the provider process; Ctrl+] only detaches the terminal client.
 
-`usage` prints the current and previous month, plan fees, account balances, and a 30-day bar chart in the local timezone. `projects`, `project`, `goal`, and `models` show the corresponding roll-up; `repairs` reports baseline repair-loop latency, measured token/USD medians (excluding unmeasured loops rather than zeroing them), and cold-replacement/failed-resume counts (`GET /api/usage/repair-loops`, accepting `--project` and `--days 1..366`). Every form accepts `--json`; `models` accepts `--role ROLE`. Unpriced totals are marked `≥`. Balances are shown only when the provider returned one; otherwise the CLI prints `—`. Budgets are informational. See [Usage and budgets](teams.md#usage-and-budgets).
+`usage` prints the current and previous month, plan fees, account balances, and a 30-day bar chart in the local timezone. `projects`, `project`, `goal`, and `models` show the corresponding roll-up; `repairs` reports baseline repair-loop latency, measured token/USD medians (excluding unmeasured loops rather than zeroing them), and cold-replacement/failed-resume counts (`GET /api/usage/repair-loops`, accepting `--project` and `--days 1..366`). `interrupted` reports the INF-325 interrupted-task trigger gauge (`GET /api/usage/interrupted-tasks`, accepting `--project` and `--days 1..366`), counting non-integrated tasks outside the source task and its dependents across automatic `agent-question`/`agent-blocked` recoveries and blocked runs, while reporting unattributed events as `unknown` rather than `0`. Every form accepts `--json`; `models` accepts `--role ROLE`. Unpriced totals are marked `≥`. Balances are shown only when the provider returned one; otherwise the CLI prints `—`. Budgets are informational. See [Usage and budgets](teams.md#usage-and-budgets).
 
 `evidence status` prints the state of the host's evidence store, the reason when it is unavailable, each module's state, the file and WAL sizes, and the event count. `--json` prints the host's full status. Any paired device can read it. See [Evidence store](architecture.md#evidence-store).
 

@@ -39,7 +39,7 @@ import type { CellsResult } from "./outcome-reads.js";
 import type { OutcomeRollup } from "./outcome-rollup.js";
 import { LEGACY_BATCH_MAX, parseLegacyFile, type LegacyLineOutcome } from "./outcome-legacy.js";
 import type { LegacyImportResult } from "./outcome-import.js";
-import { handleUsageRepairsCommand } from "./repair-metrics-cli.js";
+import { handleUsageInterruptedCommand, handleUsageRepairsCommand } from "./repair-metrics-cli.js";
 
 type Me = { role: string; capabilities?: { workspaceMirror?: number; mirrorForget?: number }; machine?: { label?: string }; nativeUi?: string[]; execution?: { laptop: boolean; cloudHandoff: boolean }; terminal?: { stream: boolean; raw: boolean; duplex?: boolean; snapshot?: boolean; control?: boolean }; projects: { id: string; name: string }[] };
 const providers = new Set(["claude", "codex", "grok", "opencode"]);
@@ -1050,10 +1050,11 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
     if (command === "usage" || command === "cost") {
       const sub = positional[0], tz = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC", query = `?tz=${encodeURIComponent(tz)}`;
       if (sub === "repairs") return await handleUsageRepairsCommand(positional.slice(1), options, api);
+      if (sub === "interrupted") return await handleUsageInterruptedCommand(positional.slice(1), options, api);
       if (sub === "projects") { const result = await api.json("/usage/projects" + query); console.log(JSON.stringify(result, null, 2)); return true; }
       if (sub === "project" || sub === "goal") { if (!positional[1]) throw new Error(`Usage: infinite usage ${sub} ID [--json]`); console.log(JSON.stringify(await api.json(sub === "project" ? `/usage/projects/${encodeURIComponent(positional[1])}${query}` : `/goals/${encodeURIComponent(positional[1])}`), null, 2)); return true; }
       if (sub === "models") { console.log(JSON.stringify(await api.json(`/usage/models?role=${encodeURIComponent(String(options["--role"] ?? "implementer"))}`), null, 2)); return true; }
-      if (sub || positional.length) throw new Error("Usage: infinite usage [repairs|projects|project ID|goal ID|models [--role ROLE]] [--json]");
+      if (sub || positional.length) throw new Error("Usage: infinite usage [repairs|interrupted|projects|project ID|goal ID|models [--role ROLE]] [--json]");
       const [summary, daily] = await Promise.all([api.json<import("./usage-service.js").UsageSummary>("/usage"), api.json<{ days: { date: string; usd: number }[] }>(`/usage/daily?days=30&tz=${encodeURIComponent(tz)}`)]);
       if (options["--json"]) console.log(JSON.stringify({ ...summary, daily }, null, 2)); else for (const line of usageOverview(summary, daily)) console.log(line); return true;
     }

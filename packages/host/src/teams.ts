@@ -2810,8 +2810,9 @@ export class TeamService {
         this.emitWith(stored, "task.escalated", [member.revision, task.id], { memberId: member.memberId, taskId: task.id, revision: member.revision }, () => ({
           fromProfileId: task.escalation?.fromProfileId, toProfileId: task.escalation?.toProfileId,
         }));
-        const next = this.newMember(run, "implementer", member.cwd, member.baseCommit, task.id, undefined, profile);
-        next.prompt = teamPrompt(run, "implementer", task, `The previous implementer requested escalation: ${report.reason}. Its partial edits are present in this working copy and have passed the host's path-scope check. Inspect them before continuing.`, next.provider ?? run.provider, next.modelProfile);
+        const next = this.newMember(run, "implementer", member.cwd, member.baseCommit, task.id, undefined, profile), escalationNote = `The previous implementer requested escalation: ${report.reason}. Its partial edits are present in this working copy and have passed the host's path-scope check. Inspect them before continuing.`;
+        next.contextFeedback = [member.contextFeedback ?? member.prompt, escalationNote].filter(Boolean).join("\n\n");
+        next.prompt = teamPrompt(run, "implementer", task, escalationNote, next.provider ?? run.provider, next.modelProfile);
         run.members.push(next); this.linkReplacement(stored, next, member, "escalation"); task.memberId = next.memberId; task.status = "running";
         run.status = "implementing";
         this.event(stored, `${task.title} escalated to ${profile.label}; the stopped member's partial work was preserved.`);

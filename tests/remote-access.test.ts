@@ -838,3 +838,23 @@ test("the relay carries understanding work brief reads and refreshes, enforces r
     await host.stop();
   }
 });
+
+test("remote access allows GET /api/usage/interrupted-tasks and rejects mutations", async () => {
+  const runner = await httpRunner();
+  const client = createRemoteClient({ url: runner.url, token: runner.token });
+  try {
+    await client.request("/me");
+    assert.deepEqual(
+      await client.request("/usage/interrupted-tasks?project=shop&days=14"),
+      { count: 2, method: "GET", path: "/api/usage/interrupted-tasks?project=shop&days=14" },
+    );
+    await assert.rejects(
+      client.request("/usage/interrupted-tasks", { method: "POST", body: {} }),
+      (error: RemoteError) => error.status === 403 && error.code === "remote-endpoint-denied",
+    );
+    assert.equal(runner.requests.length, 2);
+  } finally {
+    client.close();
+    runner.close();
+  }
+});

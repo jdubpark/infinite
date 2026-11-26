@@ -80,6 +80,8 @@ export function writeSealed(
 const SEGMENT_SIZE = 256;
 export class Journal {
   seq = 0;
+  private failure: unknown;
+  private failed = false;
   constructor(
     readonly directory: string,
     readonly key: Buffer,
@@ -105,6 +107,16 @@ export class Journal {
     return this.appendAll(type, [data])[0];
   }
   appendAll(type: Event["type"], items: Event["data"][]): Event[] {
+    if (this.failed) throw new Error("Journal closed after a failed write", { cause: this.failure });
+    try {
+      return this.write(type, items);
+    } catch (error) {
+      this.failed = true;
+      this.failure = error;
+      throw error;
+    }
+  }
+  private write(type: Event["type"], items: Event["data"][]): Event[] {
     const at = new Date().toISOString();
     const events = items.map(
       (data, index): Event => ({ seq: this.seq + index + 1, at, type, data }),

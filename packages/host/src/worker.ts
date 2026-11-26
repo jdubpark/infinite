@@ -197,6 +197,7 @@ function publish(next: Attention) {
   state = { ...state, attention };
 }
 function recordingFailure() {
+  if (state.status === "recording-error") return;
   state = { ...state, status: "recording-error" };
   publish(
     applyLifecycle(attention, "recording-error", new Date().toISOString()),
@@ -387,7 +388,7 @@ async function onHook(route: HookRoute, body: unknown, run?: string): Promise<Ho
     return;
   }
   if (route === "drain") { const started = drainOpen ? transcriptWatch.drainFinal() : undefined; return started ? { transcript: started } : undefined; }
-  if (route === "transcript") return state.status === "running" || drainOpen ? onTranscript(body) : undefined;
+  if (route === "transcript") return state.status === "running" || (drainOpen && state.status !== "recording-error") ? onTranscript(body) : undefined;
   if (state.status !== "running") return;
   const signals = route === "claude" ? claudeTurnSignals(mapClaudeHook(body), () => permissionChannel?.takeContinue() === true) : route === "codex" ? mapCodexHook(body) : mapCodexNotify(body);
   const linkOnly = route === "codex-notify" && !config.attention.hooks.codex;
@@ -1330,6 +1331,7 @@ const server = createServer((socket) => {
       } else if (request.op === "answer") {
         if (!validAnswer(request)) throw new Error("Invalid answer request");
         result = await serialize(() => {
+          if (state.status === "recording-error") throw new Error("Recording failed");
           if (!permissionChannel?.owns(request.promptId, request.requestId)) return answer(request);
           if (!request.missionManaged) checkControl(request);
           return permissionChannel.answer(request);
@@ -1404,6 +1406,7 @@ const permissionChannel = config.permissionChannel && session.headless?.channel 
       },
       publish: view => { state = { ...state, permissionChannel: view }; persist(); },
       resume: nativeSessionId => {
+        if (state.status === "recording-error") throw new Error("Recording failed");
         if (!resumeProvider) throw new Error("The provider cannot be resumed");
         resumeProvider(nativeSessionId);
       },
@@ -1661,7 +1664,9 @@ server.listen(workerSocket, async () => {
       } catch {}
     };
     const exited = (exitCode: number) => {
-      if (permissionChannel?.exited(exitCode)) return;
+      let resumable = false;
+      try { resumable = permissionChannel?.exited(exitCode) === true; } catch { recordingFailure(); }
+      if (resumable) return;
       native?.stop();
       void hybrid?.close().catch(() => {}); executor?.close();
       try {
@@ -1673,6 +1678,9 @@ server.listen(workerSocket, async () => {
         persist();
       } catch {
         recordingFailure();
+        controller = null;
+        state = { ...state, exitCode, control: null };
+        try { persist(); } catch {}
       }
       void (async () => {
         await finalDrain();
@@ -1707,11 +1715,13 @@ server.listen(workerSocket, async () => {
   } catch (error) {
     state = { ...state, status: "exited", exitCode: 1 };
     publish(applyLifecycle(attention, "exited", new Date().toISOString()));
-    journal.append("lifecycle", {
-      status: "exited",
-      error: (error as Error).message,
-    });
-    persist();
+    try {
+      journal.append("lifecycle", {
+        status: "exited",
+        error: (error as Error).message,
+      });
+      persist();
+    } catch {}
     void exitWorker(1);
   }
 });

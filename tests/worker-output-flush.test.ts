@@ -6,7 +6,7 @@ import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { randomBytes, randomUUID } from "node:crypto";
 import { workerCall, type WorkerError } from "../packages/host/src/ipc.js";
-import { readEvents } from "../packages/host/src/vault.js";
+import { readEvents, unseal } from "../packages/host/src/vault.js";
 import { waitFor } from "./helpers.js";
 import type { Bootstrap, ControlLease, Event, Receipt, WorkerRequest, WorkerState } from "../packages/host/src/types.js";
 
@@ -86,6 +86,17 @@ async function start(env: Record<string, string>) {
   return {
     call, output, stop,
     burst: (size: number) => call<Receipt>({ op: "raw", requestId: randomUUID(), text: `${size}\n` }),
+    journal: () => {
+      const events: Event[] = [];
+      for (let cursor = 0, more = true; more;) {
+        const page = readEvents(join(stateDir, "sessions", id, "events"), key, id, cursor, 200);
+        events.push(...page.events);
+        cursor = page.cursor;
+        more = page.more;
+      }
+      return events;
+    },
+    saved: () => unseal<WorkerState>(key, `${id}:status`, readFileSync(join(stateDir, "sessions", id, "status.sealed"), "utf8")),
     synced: () => JSON.parse(readFileSync(report, "utf8")) as { synced: number; largest: number },
   };
 }
@@ -159,6 +170,27 @@ test("a failed journal sync during an output flush enters recording-error and re
     await worker.burst(256 * 1024);
     const state = await waitFor(() => worker.call({ op: "state" }), state => state.status === "recording-error");
     assert.equal(state.seq, worker.synced().synced, "the worker reports only events whose sync succeeded");
+  } finally {
+    await worker.stop(agent);
+  }
+});
+
+test("after a failed sync the journal takes no more events, so it reads end to end once the disk recovers, and the child's exit is still saved", { timeout: 40_000 }, async () => {
+  const worker = await start({ INFINITE_TEST_JOURNAL_SYNC_FAIL: "once" });
+  let agent: number | undefined;
+  try {
+    agent = (await worker.call({ op: "state" })).pid;
+    await worker.burst(1024 * 1024);
+    const failed = await waitFor(() => worker.call({ op: "state" }), state => state.status === "recording-error");
+    await new Promise(resolve => setTimeout(resolve, 600));
+    const later = await worker.call({ op: "state" });
+    assert.deepEqual([later.status, later.seq], ["recording-error", failed.seq]);
+    const events = worker.journal();
+    assert.deepEqual(events.map(event => event.seq), events.map((_, index) => index + 1));
+    process.kill(agent!, "SIGKILL");
+    const saved = await waitFor(async () => worker.saved(), state => state.exitCode !== undefined);
+    assert.equal(saved.status, "recording-error");
+    assert.equal(worker.journal().length, events.length);
   } finally {
     await worker.stop(agent);
   }

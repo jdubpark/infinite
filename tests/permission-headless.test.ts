@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { randomBytes, randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { Manager } from "../packages/host/src/manager.js";
 import { workerCall } from "../packages/host/src/ipc.js";
@@ -203,6 +203,24 @@ test("an owner's refusal reaches the call with the host's notice and the owner's
     await waitFor(() => live(r, id), s => s.status === "exited", 30_000);
     assert.equal(r.log("ran.log"), "");
     assert.equal(r.log("denied.log"), `deploy production: ${OWNER_DENIED} Owner direction: Use the staging checklist\n`);
+  } finally { await r.stop(); }
+});
+
+test("after a recording error an owner's answer neither resumes the session nor appends", { timeout: 90_000 }, async () => {
+  const r = await rig();
+  try {
+    const id = randomUUID();
+    await r.manager.create({ requestId: id, provider: "claude", projectId: "rehearsal", title: "Headless", prompt: "mixed" });
+    const waiting = await waitFor(() => live(r, id), s => s.attention.state === "needs-you" && Boolean(s.permissionChannel?.waiting), 40_000);
+    const files = readdirSync(join(r.config.stateDir, "sessions", id, "events")).map(name => join(r.config.stateDir, "sessions", id, "events", name));
+    for (const file of files) chmodSync(file, 0o400);
+    await assert.rejects(workerCall(r.config.runDir, id, { op: "stop", requestId: randomUUID() }), /EACCES/);
+    for (const file of files) chmodSync(file, 0o600);
+    const failed = await waitFor(() => r.manager.state(id), s => s.status === "recording-error", 10_000);
+    await assert.rejects(workerCall(r.config.runDir, id, { op: "answer", requestId: randomUUID(), promptId: waiting.attention.prompt!.id, option: 0 }));
+    const after = await r.manager.state(id);
+    assert.deepEqual([after.status, after.seq], ["recording-error", failed.seq]);
+    assert.equal(r.log("ran.log"), "make safe-build\n");
   } finally { await r.stop(); }
 });
 

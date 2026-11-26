@@ -4,6 +4,8 @@ import { syncBuiltinESMExports } from "node:module";
 const delay = Number(process.env.INFINITE_TEST_JOURNAL_SYNC_DELAY_MS ?? 0);
 const report = process.env.INFINITE_TEST_JOURNAL_SYNC_REPORT;
 const failBatches = process.env.INFINITE_TEST_JOURNAL_SYNC_FAIL === "1";
+const failOnce = process.env.INFINITE_TEST_JOURNAL_SYNC_FAIL === "once";
+let failedOnce = false;
 const { openSync, closeSync, writeSync, fsyncSync, writeFileSync } = fs;
 const unsynced = new Map();
 const gate = new Int32Array(new SharedArrayBuffer(4));
@@ -35,6 +37,10 @@ fs.fsyncSync = fd => {
   const lines = unsynced.get(fd);
   if (delay) Atomics.wait(gate, 0, 0, delay);
   if (failBatches && (failing ||= lines > 1)) throw Object.assign(new Error("Injected journal sync failure"), { code: "EIO" });
+  if (failOnce && !failedOnce && lines > 1) {
+    failedOnce = true;
+    throw Object.assign(new Error("Injected journal sync failure"), { code: "EIO" });
+  }
   fsyncSync(fd);
   unsynced.set(fd, 0);
   synced += lines;

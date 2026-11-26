@@ -9,7 +9,7 @@ import type { Config } from "./types.js";
 import { DEFAULT_TEAM_RETENTION, hostClosedBlockedReason, inputSourceLabel, type BlockerEvidence, type CreateTeam, type NativeContinuation, type TeamAssignment, type TeamView } from "./team-types.js";
 import type { ProductGoal } from "./goal-types.js";
 import type { ProjectGroup } from "./project-group-types.js";
-import { createMissionSchema, missionActionSchema, missionExtendSchema, missionReportEnvelopeSchema, missionTextSchema, type Board, type BoardColumn, type BoardItem, type CreateMission, type Mission, type MissionFollowUp, type MissionInputSource, type MissionOrigin, type MissionReport, type MissionSubtaskPlan, type RecordedMissionFollowUp } from "./mission-types.js";
+import { createMissionSchema, missionActionSchema, missionExtendSchema, missionLineupSchema, missionReportEnvelopeSchema, missionTextSchema, type Board, type BoardColumn, type BoardItem, type CreateMission, type Mission, type MissionFollowUp, type MissionInputSource, type MissionOrigin, type MissionReport, type MissionSubtaskPlan, type RecordedMissionFollowUp } from "./mission-types.js";
 import { askedRecommendation, isDirectionMessage, missionFollowUpPromptWithMessageCount, missionPromptWithMessageCount, subteamReport, type MissionCoordinatorNote, type MissionMessage, type MissionOpenChildDecision, type MissionPromptRepo } from "./team-prompts.js";
 import { questionProblem, recommendationOutcome } from "./question-recommendation.js";
 import { addRollups, emptyRollup, teamUsage } from "./team-usage.js";
@@ -202,10 +202,7 @@ export class MissionService {
       (mission.status !== "blocked" || mission.stopReason === "deadline") && !["ready-for-review", "cancelled"].includes(mission.status) &&
       mission.subtasks.some(subtask => subtask.teamId === teamId));
   }
-  enabled() {
-    const lineup = this.config.teams?.lineup;
-    return Boolean(lineup && lineup.coordinator.tier === "strong" && lineup.reviewer.tier === "strong");
-  }
+  enabled() { return this.records.size > 0 || missionLineupSchema.safeParse(this.config.teams?.lineup).success; }
   private enqueue<T>(id: string, task: () => T | Promise<T>): Promise<T> {
     return this.queues.enqueue(id, task);
   }
@@ -260,7 +257,7 @@ export class MissionService {
     });
     mission.usage = addRollups([coordinator, ...subteams]);
     if (stored.clockStoppedAt) mission.clockStoppedAt = stored.clockStoppedAt;
-    return mission;
+    if (mission.status === "paused" && stored.ownerHalt?.revision === mission.revision) mission.canAnswerPaused = true; return mission;
   }
   list() { return [...this.records.values()].map(stored => this.view(stored)).sort((a, b) => b.createdAt.localeCompare(a.createdAt)); }
   understandingRecords() { return [...this.records.values()].map(stored => structuredClone(stored.mission)); }
@@ -311,8 +308,13 @@ export class MissionService {
       const replayed = this.replayCreate(request);
       if (replayed) return replayed;
       const fingerprint = digest(request);
-      if (!this.enabled()) throw new TeamError(409, "missions-not-configured", "Configure a team lineup with a strong coordinator and reviewer before starting a mission.");
-      const group = this.groups.get(request.groupId);
+      const configured = this.config.teams?.lineup, parsedLineup = configured ? missionLineupSchema.safeParse(structuredClone(configured)) : undefined;
+      if (!parsedLineup?.success) {
+        if (configured?.coordinator.tier === "strong" && configured.reviewer.tier === "strong" && configured.coordinator.provider !== "claude")
+          throw new TeamError(409, "mission-coordinator-unsupported", parsedLineup?.error.issues[0]?.message ?? "Mission coordinators require Claude Code.");
+        throw new TeamError(409, "missions-not-configured", "Configure a team lineup with a strong Claude Code coordinator and strong reviewer before starting a mission.");
+      }
+      const lineup = parsedLineup.data, group = this.groups.get(request.groupId);
       const checkoutIds = new Set(group.repos.flatMap(repo => repo.checkouts.map(checkout => checkout.projectId)));
       if (request.checkouts?.some(projectId => !checkoutIds.has(projectId)))
         throw new TeamError(400, "mission-checkout-invalid", "Choose checkouts that belong to this project.");
@@ -327,9 +329,8 @@ export class MissionService {
         return { projectId: project.id, name: repo.name, path: realpathSync(project.path), teamReady };
       });
       if (!repos.some(repo => repo.teamReady)) throw new TeamError(409, "mission-project-not-configured", "Configure required checks, or authorize a team to establish them, in at least one repository of this project.");
-      const lineup = structuredClone(this.config.teams!.lineup!), profile = this.config.agents[lineup.coordinator.provider];
+      const profile = this.config.agents[lineup.coordinator.provider];
       if (!profile) throw new TeamError(409, "provider-not-configured", "The coordinator provider must be configured and available on this host.");
-      if (lineup.coordinator.provider !== "claude") throw new TeamError(409, "mission-coordinator-unsupported", "Missions need a Claude Code coordinator in the team lineup; a Codex coordinator cannot yet be restricted to reading and reporting.");
       try { missionCoordinatorLaunch(lineup.coordinator.provider, profile); }
       catch (error) { throw new TeamError(409, "mission-coordinator-profile", `The coordinator profile cannot run as a read-only mission coordinator: ${(error as Error).message}`); }
       try { teamModelLaunch(profile, lineup.coordinator); }
@@ -364,7 +365,8 @@ export class MissionService {
     return folder;
   }
 
-  private replay(stored: Stored, action: string, body: Action & object) {
+  private authorizeAndCheckReplay(stored: Stored, action: string, body: Action & object, authorize?: () => void) {
+    authorize?.();
     const prior = stored.receipts[body.requestId];
     if (!prior) return false;
     if (prior !== receiptDigest({ action, ...body })) throw new TeamError(409, "request-conflict", "This request ID belongs to a different mission action.");
@@ -381,11 +383,11 @@ export class MissionService {
   }
   resume(id: string, input: Action, source?: MissionInputSource, authorize?: () => void) { return this.action(id, "resume", { ...missionActionSchema.parse(input), ...(source === undefined ? {} : { source }) }, authorize); }
   cancel(id: string, input: Action, source?: MissionInputSource, authorize?: () => void) { return this.action(id, "cancel", { ...missionActionSchema.parse(input), ...(source === undefined ? {} : { source }) }, authorize); }
-  extend(id: string, input: { requestId: string; revision: number; minutes: number }): ReturnType<MissionService["resume"]> {
+  extend(id: string, input: { requestId: string; revision: number; minutes: number }, authorize?: () => void): ReturnType<MissionService["resume"]> {
     const body = missionExtendSchema.parse(input);
     return this.enqueue(id, () => {
       const stored = this.record(id), mission = stored.mission;
-      if (this.replay(stored, "extend", body)) return this.view(stored);
+      if (this.authorizeAndCheckReplay(stored, "extend", body, authorize)) return this.view(stored);
       const deadlineBlocked = mission.status === "blocked" && mission.stopReason === "deadline";
       if (!(live.has(mission.status) || mission.status === "paused" || deadlineBlocked))
         throw new TeamError(409, "mission-not-extendable", "Only a running mission, or one stopped by its time limit, can be extended.");
@@ -414,8 +416,7 @@ export class MissionService {
     const reason = body.reason;
     return this.enqueue(id, () => {
       const stored = this.record(id), mission = stored.mission;
-      authorize?.();
-      if (this.replay(stored, action, body)) return this.view(stored);
+      if (this.authorizeAndCheckReplay(stored, action, body, authorize)) return this.view(stored);
       if (action === "pause" && !live.has(mission.status)) throw new TeamError(409, "mission-not-running", "Only a running mission can be paused.");
       if (action === "resume" && mission.status !== "paused") throw new TeamError(409, "mission-not-paused", "Only a paused mission can resume.");
       if (action === "resume" && typeof body.source === "object" && (stored.ownerHalt || this.fuse?.held?.(mission.repoProjectIds)))
@@ -516,8 +517,7 @@ export class MissionService {
     const body = { ...missionTextSchema.parse(input), ...(source === undefined ? {} : { source }) };
     return this.enqueue(id, () => {
       const stored = this.record(id), mission = stored.mission;
-      authorize?.();
-      if (this.replay(stored, "steer", body)) return this.view(stored);
+      if (this.authorizeAndCheckReplay(stored, "steer", body, authorize)) return this.view(stored);
       if (!live.has(mission.status)) throw new TeamError(409, "mission-not-running", "Resume the mission before sending direction, or start a new mission if it has stopped.");
       if (steeringFull(mission, body.text))
         throw new TeamError(409, "mission-steering-limit", "Start a new mission with consolidated directions.");
@@ -536,8 +536,7 @@ export class MissionService {
     const body = { ...missionTextSchema.parse(input), ...(source === undefined ? {} : { source }) };
     return this.enqueue(id, () => {
       const stored = this.record(id), mission = stored.mission;
-      authorize?.();
-      if (this.replay(stored, `answer:${decisionId}`, body)) return this.view(stored);
+      if (this.authorizeAndCheckReplay(stored, `answer:${decisionId}`, body, authorize)) return this.view(stored);
       const decision = mission.decisions.find(item => item.id === decisionId);
       if (!decision) throw new TeamError(404, "decision-not-found", "This decision does not exist.");
       if (decision.answer) throw new TeamError(409, "decision-answered", "This decision already has an answer.");
@@ -1102,10 +1101,9 @@ export class MissionService {
       this.event(stored, mission.reason!); this.save(stored); return;
     }
     const revision = stored.attempts.length + 1, profile = mission.lineup.coordinator;
-    let continuation: NativeContinuation | undefined, rotated: RotationRule | undefined;
-    if (profile.provider === "claude") {
-      ({ continuation, rotated } = selectCoordinatorContinuation(stored.attempts, nativeSessionId => this.rotation(stored, nativeSessionId), randomUUID));
-    }
+    const { continuation, rotated } = profile.provider === "claude"
+      ? selectCoordinatorContinuation(stored.attempts, nativeSessionId => this.rotation(stored, nativeSessionId), randomUUID)
+      : { continuation: undefined, rotated: undefined };
     reconcileDeliveredUnapplied(stored, continuation?.mode === "resume" ? continuation.nativeSessionId : undefined);
     const inbox = stored.inbox.slice(0, messageLimit), notes = stored.notes.slice(0, messageLimit - inbox.length);
     const waiting = stored.inbox.length + stored.notes.length - inbox.length - notes.length;

@@ -137,6 +137,13 @@ order. When `resync.required` is true, replace the local view with the returned
 Observations are sampled on reads. A transition between reads may appear only
 in the underlying team record.
 
+`infinite mission watch ID [--json]` keeps that live progress feed full screen
+alongside linked subteam blackboard entries (`j`/`k` or `↑`/`↓` select subtask,
+`e` toggle entries, `Enter` toggle detail, `f` toggle follow, `q` or Ctrl+C
+detach). The web client (`apps/web/src/mission-inspector/`) and phone app
+(`MissionProgressSection`) render the same `GET /api/missions/:id/progress`
+snapshot and cursor stream.
+
 `POST /api/missions` (owner) creates a mission for a group. A retry with the
 same `requestId` returns the recorded mission before any admission check, so it
 succeeds even after the group was edited or deleted or a handoff started. The host launches
@@ -145,9 +152,19 @@ folder outside every repository, with each repository's host path listed in its
 prompt for reading. The coordinator must not edit repositories directly; all
 changes go through subteams. The launch enforces this: a Claude Code coordinator
 runs in `dontAsk` mode with only Read, Glob, Grep, and its mission report tool,
-and only its report MCP server. Codex is refused as a coordinator for now,
-because Codex merges inherited MCP servers that could keep write-capable tools
-outside its read-only sandbox.
+and only its report MCP server. Mission coordinators require Claude Code; Codex
+and other non-Claude providers are excluded from mission coordinator schemas
+(`missionCoordinatorProviderSchema`, `missionLineupSchema`), intake config
+validation (`readConfig`), `POST /api/missions`, and `missionCoordinatorLaunch`.
+`MissionService.enabled()` requires a valid Claude mission lineup unless saved
+mission records already exist, so owners can still inspect and control existing
+missions after switching `teams.lineup.coordinator` while new mission creation
+is rejected. Codex deep-merges inherited `[mcp_servers.*]` tables
+across configuration layers (neither `-c mcp_servers={}` nor profiles clear
+inherited servers), and redirecting `CODEX_HOME` breaks credentials and OAuth
+refresh across the host-to-agent `sudo` boundary while leaving system config and
+shell/connector surfaces open. Standalone single-repository team runs, goals,
+routines, and handoffs may still configure a Codex coordinator in `teams.lineup`.
 
 A mission's coordinator sees one entry per repository: the chosen checkout's host
 project ID, the repository name, its path, and whether it is team-ready. The
@@ -278,9 +295,8 @@ recommendation. It is evidence for the coordinator's own choice between
 coordinator's `question` report requires its own recommendation through the
 report tool. A forwarded question without `answerMode` takes the subteam
 decision's mode, so the host checks the options and the recommendation against
-that final mode: one option unless the mode is `multiple`. A question from a
-coordinator started before this rule is still read, with no recommendation,
-and its reporter falls back the same way a team member's does.
+that final mode: one option unless the mode is `multiple`. A question recorded
+by a coordinator before this rule is still read, with no recommendation.
 When the owner, a connector, or the coordinator's `answer-child` answers a
 mission decision, the host records `matched`, `different`, or `other` on its
 recommendation, as for team decisions. A connector reads the recommendation
@@ -619,9 +635,11 @@ Read-only is enforced by the provider's tool flags for the coordinator, not by a
 
 A mission started by intake records `origin`: `kind: "intake"`, the Linear issue
 ID, its identifier and URL, and the rule that admitted it (the label, the owner
-creator, and the owner's Slack mention when a thread is required). Missions the
-owner creates through `POST /api/missions` have no origin. The origin is recorded
-at creation and does not change. See [intake](intake.md).
+creator, and the owner's Slack mention when a thread is required). When started
+through the external [MCP request connector](mcp.md), `origin.source` records
+the connector identity (`ConnectorSource`). Missions the owner creates directly
+through `POST /api/missions` have no origin. The origin is recorded at creation
+and does not change. See [intake](intake.md).
 
 ## Board
 
@@ -630,8 +648,8 @@ were not started by a mission. Subteams appear only inside their mission.
 
 | Column | Mission | Team run | Goal |
 |---|---|---|---|
-| `needs-input` | `needs-input`, `blocked` | `needs-input`, `blocked` | `needs-input`, `blocked` |
-| `working` | `planning`, `working`, `paused` | active and `paused` statuses | `running`, `paused` |
+| `needs-input` | `needs-input`, `blocked`, or running with a user-owned provider prompt on a subteam (`promptedSubtask`) | `needs-input`, `blocked`, or running with a user-owned provider prompt (`waitsOnProvider`) | `needs-input`, `blocked`, or active cycle waiting on a user-owned provider prompt |
+| `working` | `planning`, `working`, `paused` (without a user-owned prompt) | active and `paused` statuses (without a user-owned prompt) | `running`, `paused` |
 | `review` | `ready-for-review` | `ready-for-review` | `ready-for-review` |
 | `ended` | `cancelled` | `merged`, `no-change`, `cancelled` | other terminal statuses |
 
@@ -688,3 +706,19 @@ and a collapsed Ended section, with a composer that targets a project.
 
 A mission row opens a detail view: open decisions first, then subtasks with
 their repository and status. Each subtask opens the existing team detail.
+
+## API
+
+| Method and endpoint | Purpose | Role |
+| --- | --- | --- |
+| `GET /api/missions`, `GET /api/missions/:id` | List or inspect missions, coordinator attempts, decisions, and subtasks | Any paired device |
+| `GET /api/missions/:id/progress[?after=CURSOR]` | Resumable cursor-based progress feed across the mission and its subteams (bounded 8-slot fair child worker probing) | Any paired device |
+| `POST /api/missions` | Create a mission (`requestId`, `groupId`, `objective`, optional `mode`, `checkouts`, `maxSubtasks`, `maxMinutes`) | Owner |
+| `POST /api/missions/:id/answer/:decisionId` | Answer an open `MissionDecision` (`requestId`, `revision`, `text`) | Owner |
+| `POST /api/missions/:id/steer` | Add owner steering (`requestId`, `revision`, `text`) | Owner |
+| `POST /api/missions/:id/extend` | Extend the working-time limit by 5–1,440 minutes (`requestId`, `revision`, `minutes`) | Owner |
+| `POST /api/missions/:id/pause`, `/resume`, `/cancel` | Pause, resume, or cancel a mission (`requestId`, `revision`) | Owner |
+| `GET /api/board` | Unified 4-column Board view (`needs-input`, `working`, `review`, `ended`) across missions, standalone teams, and goals | Any paired device |
+| `GET/POST/PUT/DELETE /api/project-groups[/:id]` | Inspect and manage repository groups, primary checkouts, and visibility | Reads: any; mutations: Owner |
+
+See [Orchestration Hierarchy](diagrams/orchestration-hierarchy.svg) and [System Architecture](architecture.md#orchestration-stack-and-state-machines) for the complete mission-to-team ownership chain.

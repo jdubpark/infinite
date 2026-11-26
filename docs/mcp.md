@@ -1,8 +1,12 @@
 # MCP request connector
 
+> **Scope note:** This document covers the **external HTTP `/mcp` connector** (`packages/host/src/mcp-server.ts`, `mcp-requests.ts`) for external assistants. Infinite also runs an **internal stdio JSON-RPC MCP server** (`packages/host/src/team-mcp.ts`, server name `infinite-team`) inside agent sessions to expose `report`, `mission_report`, `handoff`, and opt-in Blackboard tools (`entry_post`, `entry_list`, `entry_get`); see [System Architecture](architecture.md#blackboard-internal-mcp-and-board-aggregation) and [Goals and agent teams](teams.md#blackboard-and-member-entry-tools).
+
 An external assistant can discover enrolled projects, queue a tracked request,
 read progress and questions, reply, and pause, resume, or cancel a started
-request. Infinite executes the work through its existing [intake](intake.md)
+request (when an owner halt holds a mission, `availableActions` omits `resume`
+and `control_request` refuses resume until the owner releases the halt). Infinite
+executes the work through its existing [intake](intake.md)
 and [mission](missions.md) services. The connector is disabled unless the host
 configuration contains `mcp`.
 

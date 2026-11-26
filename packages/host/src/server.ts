@@ -55,6 +55,7 @@ import { lineupProfiles } from "./team-types.js";
 import { Blackboard } from "./evidence/blackboard.js";
 import { ENTRY_KINDS } from "./evidence/entry-types.js";
 import { usagePlanSchema } from "./usage-api.js";
+import { registerRepairMetricsRoute } from "./repair-metrics-routes.js";
 import { TeamService, TeamError } from "./teams.js";
 import { readDecisionQueue } from "./decision-queue-read.js";
 import { objectiveRoutes } from "./objective-routes.js";
@@ -110,7 +111,7 @@ import { LinearService } from "./linear.js";
 import { goalActionSchema, goalExtendSchema, goalSteerSchema, goalOutcomeSchema, goalParallelismSchema } from "./goal-types.js";
 import { createProjectGroupSchema, projectGroupIdSchema, updateProjectGroupSchema } from "./project-group-types.js";
 import { DesktopError, DesktopFiles, DesktopResources, DESKTOP_LIMITS } from "./desktop.js";
-import { type Config, type Role, type Receipt, type Session, httpControlRequestSchema, learningPurpose, normalizeControlRequest } from "./types.js";
+import { type Config, type Role, type Receipt, type Session, httpControlRequestSchema, isEvalSession, normalizeControlRequest } from "./types.js";
 import { Summarizer, SummaryError } from "./summary.js";
 import { DictationCleaner, DictationError } from "./dictation.js";
 import { RepositoryBriefings } from "./repository-briefings.js";
@@ -417,16 +418,16 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
   const createMission = createIntakeMissionCreator({ config, missions, groups: projectGroups, audience: intakeAudience, assertNoHandoff });
   const intakeStore = config.intake ? new IntakeStore(config, key) : undefined;
   const intakeSlackClient = config.intake?.slack ? new SlackClient({ botTokenFile: config.intake.slack.botTokenFile, appTokenFile: config.intake.slack.appTokenFile, endpoint: config.intake.slack.endpoint, teamId: config.intake.slack.teamId, organizationScope: config.intake.slack.organizationScope, workspaceAllowed: intakeAudience.workspacesAllowed }) : undefined;
-  const intake = config.intake && intakeStore ? new IntakeService(config, intakeStore, missions, new IntakeLinear(linear), { create: createMission, threads: intakeSlackClient, ...(config.intake.slack?.classify ? { router: text => readings.requestRoute(text) } : {}) }) : undefined;
+  const intake = config.intake && intakeStore ? new IntakeService(config, intakeStore, missions, new IntakeLinear(linear), { create: createMission, threads: intakeSlackClient, audience: intakeAudience, ...(config.intake.slack?.classify ? { router: text => readings.requestRoute(text) } : {}) }) : undefined;
   const mcp = config.mcp && intakeStore && intake ? createMcpServer(config, new McpRequestService(config, intakeStore, intake, missions, projectGroups)) : undefined;
-  const intakeSlack = intakeStore && intakeSlackClient ? new IntakeSlackSurface(config, intakeStore, missions, teams, intakeSlackClient, intake ? { direct: input => intake.requestFromSlack(input) } : {}) : undefined;
+  const intakeSlack = intakeStore && intakeSlackClient && intake ? new IntakeSlackSurface(config, intakeStore, missions, teams, intakeSlackClient, { audience: intakeAudience, direct: input => intake.requestFromSlack(input) }) : undefined;
   const resumable = (session: { status: string; provider: string; workspace?: unknown; team?: unknown; nativeSession?: unknown; resumeNativeSession?: unknown }) =>
     session.status === "exited" && !session.workspace && !session.team && Boolean(session.nativeSession ?? session.resumeNativeSession) && ["claude", "codex", "opencode"].includes(session.provider);
   const executionLocation = (session: { executionLocation?: "cloud" | "laptop"; workspace?: unknown }): "cloud" | "laptop" =>
     session.executionLocation ?? (session.workspace ? "laptop" : "cloud");
   const usageRow = (id: string) => { const row = usage.session(id); return row.measured ? { usage: row } : {}; };
-  const listSessions = async () => {
-    const native = (await manager.list({ includeFullMessage: Boolean(config.jev && config.jev.sessionReadings !== false) })).filter(session => !learningPurpose(session.purpose)).map(session => {
+  const listSessions = async (options: { includeFullMessage?: boolean } = {}) => {
+    const native = (await manager.list({ includeFullMessage: options.includeFullMessage === true || Boolean(config.jev && config.jev.sessionReadings !== false) })).filter(session => !isEvalSession(session)).map(session => {
       const handoff = handoffs.listedView(session.id);
       const managed = managedBy(session);
       return { ...session, ...(managed ? { managedBy: managed } : {}), handoff, ...usageRow(session.id), executionLocation: executionLocation(session), backend: "infinite" as const, machineId: config.machine!.id,
@@ -436,7 +437,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
       .map(s => `${s.provider}:${s.nativeSession!.id}:${s.pid}`));
     const external = cmux ? (await cmux.list()).filter(s => s.status !== "running" || !s.nativeSession || !s.pid || !known.has(`${s.provider}:${s.nativeSession.id}:${s.pid}`)) : [];
     const merged = readings.merge([...native, ...external.map(s => ({ ...s, backend: "cmux" as const, machineId: config.machine!.id, resumable: resumable(s) }))]);
-    return merged.map(session => ({ ...session, attention: publicAttention(session.attention) }));
+    return options.includeFullMessage === true ? merged : merged.map(session => ({ ...session, attention: publicAttention(session.attention) }));
   };
   const sessionDetail = async (sessionId: string) => {
     if (cmux && !existsSync(join(config.stateDir, "sessions", sessionId, "meta.sealed"))) {
@@ -526,7 +527,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
   });
   goals.useSignals(signals.reader());
   fuse.start();
-  const desktopResources = new DesktopResources(config, listSessions);
+  const desktopResources = new DesktopResources(config, () => listSessions());
   const changeProjectFiles = async <T>(projectId: string, action: () => Promise<T>) => {
     if (projectFileChanges.has(projectId)) throw new DesktopError("files-changing", "Project files are being changed. Retry after the transfer finishes.");
     projectFileChanges.add(projectId);
@@ -863,11 +864,10 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
       throw error;
     }
   });
-  app.get("/api/usage/daily", (req, res, next) => {
-    try { const query = z.object({ days: z.coerce.number().int().min(1).max(366).default(30), tz: z.string().default("UTC"), project: z.string().optional() }).strict().parse(req.query); return void res.json(usage.daily({ days: query.days, tz: query.tz, projectId: query.project })); } catch (error) { if (error instanceof RangeError) return void res.status(400).json({ error: "Invalid timezone or day range" }); return next(error); }
-  });
+  app.get("/api/usage/daily", (req, res, next) => { try { const query = z.object({ days: z.coerce.number().int().min(1).max(366).default(30), tz: z.string().default("UTC"), project: z.string().optional() }).strict().parse(req.query); return void res.json(usage.daily({ days: query.days, tz: query.tz, projectId: query.project })); } catch (error) { if (error instanceof RangeError) return void res.status(400).json({ error: "Invalid timezone or day range" }); return next(error); } });
   app.get("/api/usage/projects", (req, res, next) => { try { const query = z.object({ tz: z.string().default("UTC") }).strict().parse(req.query); return void res.json(usage.projects({ tz: query.tz })); } catch (error) { if (error instanceof RangeError) return void res.status(400).json({ error: "Invalid timezone" }); return next(error); } });
   app.get("/api/usage/projects/:id", (req, res, next) => { try { const query = z.object({ tz: z.string().default("UTC") }).strict().parse(req.query), result = usage.project(String(req.params.id), { tz: query.tz }); if (!result) return void res.status(404).json({ error: "Project usage not found" }); return void res.json(result); } catch (error) { if (error instanceof RangeError) return void res.status(400).json({ error: "Invalid timezone" }); return next(error); } });
+  registerRepairMetricsRoute(app, { runs: filter => teams.repairMetricsRuns(filter), memberUsage: (runId, memberId) => usage.memberFinal(runId, memberId), evidence, readable: () => usage.readable() });
   app.put("/api/usage/accounts/:id/plan", requireRole(["owner"]), (req, res) => {
     const accounts = config.usage?.accounts, accountId = String(req.params.id);
     const account = accounts && Object.hasOwn(accounts, accountId) ? accounts[accountId] : undefined;
@@ -1182,7 +1182,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
   app.post("/api/goals/:id/extend", requireRole(["owner"]), async (req, res) => res.json(await goals.extend(id.parse(req.params.id), goalExtendSchema.parse(req.body))));
   registerMissionReadRoutes(app, { missions, teams, manager });
   app.get("/api/intake", (_req, res) => res.json({ records: intake?.list() ?? [], ...intake?.status(), ...(intakeSlack ? { slack: intakeSlack.status() } : {}) }));
-  app.get("/api/intake/workspace-scope", requireRole(["owner"]), (_req, res) => res.json({ state: !config.intake?.slack?.organizationScope ? "unconfigured" : intakeAudience.workspacesAllowed() ? "verified" : "blocked" }));
+  app.get("/api/intake/workspace-scope", requireRole(["owner"]), (_req, res) => res.json({ state: !config.intake?.slack ? "unconfigured" : intakeAudience.workspacesAllowed() ? "verified" : "blocked" }));
   app.post("/api/missions", requireRole(["owner"]), async (req, res) => res.json(await createMission(createMissionSchema.parse(req.body))));
   app.post("/api/missions/:id/steer", requireRole(["owner"]), async (req, res) => res.json(await missions.steer(id.parse(req.params.id), missionTextSchema.parse(req.body))));
   app.post("/api/missions/:id/answer/:decisionId", requireRole(["owner"]), async (req, res) =>
@@ -1457,7 +1457,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
     }
     res.json({ ok: true });
   });
-  app.get("/api/sessions", (req, res) => sendSessionList(req, res, listSessions));
+  app.get("/api/sessions", (req, res) => sendSessionList(req, res, () => listSessions()));
   app.get("/api/events", (req, res) => {
     const topicValues = z.array(z.union([z.literal("sessions"), z.literal("teams"), z.string().regex(/^session\/[0-9a-f-]{36}$/i)])).min(1).max(16)
       .parse(z.string().min(1).max(4096).parse(req.query.topics).split(","));

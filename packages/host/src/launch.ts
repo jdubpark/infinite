@@ -1,15 +1,48 @@
+import { createHash } from "node:crypto";
 import { HANDOFF_INSTRUCTIONS } from "./handoff-types.js";
-import { learningPurpose, type AgentProfile, type Config, type Provider, type SessionPurpose } from "./types.js";
+import { sessionExecutionIdentity, type AgentProfile, type Config, type ExecutionIdentity, type Provider, type SessionPurpose } from "./types.js";
 import { dirname, join } from "node:path";
 import { teamModelProfileSchema, type TeamModelProfile } from "./team-types.js";
+import { parseMissionCoordinatorProvider, type MissionCoordinatorProvider } from "./mission-types.js";
+export { parseMissionCoordinatorProvider };
 import { TeamError } from "./team-workspace.js";
 import { codexTrustArgs } from "./workspace-trust.js";
 import { sudoShape } from "./sudo-profile.js";
 import { EGRESS_ENVIRONMENT_NAMES } from "./egress.js";
 import { CLAUDE_CODE_MODE_ENV, codeModeEnabled } from "./code-mode.js";
 
-export function sessionAgentProfile(config: Pick<Config, "agents" | "eval">, provider: Provider, purpose: SessionPurpose | undefined): AgentProfile | undefined {
-  if (!learningPurpose(purpose)) return config.agents[provider];
+const HOST_LAUNCH_FIELDS = ["executionIdentity", "purpose", "configId", "team", "teamCwd", "teamModelProfile", "recordedCodeMode"] as const;
+
+export function hasHostLaunchFields(request: object): boolean {
+  return HOST_LAUNCH_FIELDS.some(field => field in request);
+}
+
+export function stripHostLaunchFields<T extends object>(request: T): T {
+  const cleaned = { ...request } as Record<string, unknown>;
+  for (const field of HOST_LAUNCH_FIELDS) delete cleaned[field];
+  return cleaned as T;
+}
+
+export function sessionRequestFingerprint(request: { requestId: string }, targetId: string): string {
+  const canonical = targetId === request.requestId ? request : { ...request, requestId: targetId };
+  return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
+}
+
+export function matchesSessionRequestFingerprint(
+  storedFingerprint: string,
+  request: { requestId: string; purpose?: SessionPurpose; executionIdentity?: ExecutionIdentity },
+  targetId: string,
+  resolvedIdentity: ExecutionIdentity,
+): boolean {
+  if (storedFingerprint === sessionRequestFingerprint(request, targetId)) return true;
+  if (request.executionIdentity === undefined) return false;
+  if (sessionExecutionIdentity({ purpose: request.purpose }) !== resolvedIdentity) return false;
+  const { executionIdentity: _executionIdentity, ...legacy } = request;
+  return storedFingerprint === sessionRequestFingerprint(legacy, targetId);
+}
+
+export function sessionAgentProfile(config: Pick<Config, "agents" | "eval">, provider: Provider, executionIdentity: ExecutionIdentity = "production"): AgentProfile | undefined {
+  if (executionIdentity !== "eval") return config.agents[provider];
   const agents = config.eval?.member?.agents;
   const profile = agents && (provider === "claude" || provider === "codex" || provider === "opencode") ? agents[provider] : undefined;
   if (!profile) throw new TeamError(409, "eval-identity-missing", "The eval identity has no launch profile for this provider.");
@@ -23,8 +56,8 @@ export function memberCodeModeExpected(config: Pick<Config, "agents" | "codeMode
   return codeModeEnabled(config.codeMode?.claude, "claude", { headless: shape.headless, served: shape.headless && shape.unservable === undefined, excluded: false });
 }
 
-export function withoutSharedContext<T extends { text: string; sources: readonly unknown[] }>(context: T, purpose: SessionPurpose | undefined): T {
-  return learningPurpose(purpose) ? { ...context, text: "", sources: [] } : context;
+export function withoutSharedContext<T extends { text: string; sources: readonly unknown[] }>(context: T, executionIdentity: ExecutionIdentity = "production"): T {
+  return executionIdentity === "eval" ? { ...context, text: "", sources: [] } : context;
 }
 
 export function teamModelLaunch(profile: AgentProfile, input: TeamModelProfile): AgentProfile {
@@ -160,31 +193,29 @@ export function permissionCoordinatorLaunch(provider: Provider, profile: AgentPr
   return { ...profile, args: merged };
 }
 
-export function missionCoordinatorLaunch(provider: Provider, profile: AgentProfile): AgentProfile {
-  if (provider === "claude") {
-    const args: string[] = [];
-    const valueFlags = new Set(["--permission-mode", "--settings", "--agents", "--plugin-dir", "--permission-prompt-tool"]);
-    const listFlags = new Set(["--allowedTools", "--allowed-tools", "--disallowedTools", "--disallowed-tools", "--tools", "--mcp-config"]);
-    for (let index = 0; index < profile.args.length; index++) {
-      const arg = profile.args[index], flag = arg.split("=")[0];
-      if (["--dangerously-skip-permissions", "--allow-dangerously-skip-permissions", "--session-id", "--resume", "-r", "--continue", "-c"].includes(flag))
-        throw new Error(`Mission coordinator profile cannot configure ${flag}.`);
-      if (arg.startsWith("-c") && arg !== "--" && !arg.startsWith("--"))
-        throw new Error("Mission coordinator profile cannot configure -c.");
-      if (arg.startsWith("-r") && !arg.startsWith("--"))
-        throw new Error("Mission coordinator profile cannot configure -r.");
-      if (valueFlags.has(flag)) { if (!arg.includes("=")) index++; continue; }
-      if (listFlags.has(flag)) {
-        if (!arg.includes("=")) while (index + 1 < profile.args.length && !profile.args[index + 1].startsWith("-")) index++;
-        continue;
-      }
-      args.push(arg);
+export function missionCoordinatorLaunch(provider: MissionCoordinatorProvider, profile: AgentProfile): AgentProfile {
+  if (provider !== "claude") throw new Error("Mission coordinators require Claude Code.");
+  const args: string[] = [];
+  const valueFlags = new Set(["--permission-mode", "--settings", "--agents", "--plugin-dir", "--permission-prompt-tool"]);
+  const listFlags = new Set(["--allowedTools", "--allowed-tools", "--disallowedTools", "--disallowed-tools", "--tools", "--mcp-config"]);
+  for (let index = 0; index < profile.args.length; index++) {
+    const arg = profile.args[index], flag = arg.split("=")[0];
+    if (["--dangerously-skip-permissions", "--allow-dangerously-skip-permissions", "--session-id", "--resume", "-r", "--continue", "-c"].includes(flag))
+      throw new Error(`Mission coordinator profile cannot configure ${flag}.`);
+    if (arg.startsWith("-c") && arg !== "--" && !arg.startsWith("--"))
+      throw new Error("Mission coordinator profile cannot configure -c.");
+    if (arg.startsWith("-r") && !arg.startsWith("--"))
+      throw new Error("Mission coordinator profile cannot configure -r.");
+    if (valueFlags.has(flag)) { if (!arg.includes("=")) index++; continue; }
+    if (listFlags.has(flag)) {
+      if (!arg.includes("=")) while (index + 1 < profile.args.length && !profile.args[index + 1].startsWith("-")) index++;
+      continue;
     }
-    args.push("--permission-mode", "dontAsk", "--tools", "Read,Glob,Grep",
-      "--allowedTools", "Read", "Glob", "Grep", "mcp__infinite_team__mission_report", "--strict-mcp-config", "--disable-slash-commands");
-    return { ...profile, args };
+    args.push(arg);
   }
-  throw new Error("Mission coordinators require Claude Code.");
+  args.push("--permission-mode", "dontAsk", "--tools", "Read,Glob,Grep",
+    "--allowedTools", "Read", "Glob", "Grep", "mcp__infinite_team__mission_report", "--strict-mcp-config", "--disable-slash-commands");
+  return { ...profile, args };
 }
 
 const CLAUDE_EVENTS = [
@@ -355,9 +386,8 @@ export function buildLaunch(
     for (const [key, value] of Object.entries({
       command: process.execPath,
       args: serverArgs,
-      env_vars: ["INFINITE_HOOK_URL", "INFINITE_HOOK_TOKEN", "INFINITE_TEAM_ASSIGNMENT", "INFINITE_MISSION_ASSIGNMENT", "INFINITE_PROJECT_ID", ...hostEgressEnvVars],
+      env_vars: ["INFINITE_HOOK_URL", "INFINITE_HOOK_TOKEN", "INFINITE_TEAM_ASSIGNMENT", "INFINITE_PROJECT_ID", ...hostEgressEnvVars],
       "tools.report.approval_mode": "approve",
-      "tools.mission_report.approval_mode": "approve",
       ...(withEntryTools ? {
         "env.INFINITE_TEAM_ENTRY_TOOLS": "1",
         "tools.entry_post.approval_mode": "approve",

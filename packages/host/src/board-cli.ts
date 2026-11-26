@@ -8,6 +8,7 @@ import { recommendationLine } from "./question-recommendation.js";
 import type { ClientApi as Api } from "./client-api.js";
 import { boundTeamProject } from "./team-cli.js";
 import { teamWatchFrame } from "./team-watch.js";
+import { runMissionWatch } from "./mission-watch.js";
 
 type ClientConfig = { origin: string; token: string };
 type Options = Record<string, string | boolean>;
@@ -304,6 +305,10 @@ async function answerSelected(
 
 async function openItem(item: BoardItem, api: Api, config: ClientConfig, configPath: string) {
   if (item.kind === "mission") {
+    if (process.stdout.isTTY && process.stdin.isTTY) {
+      await runMissionWatch(api, item.id);
+      return;
+    }
     const mission = await api.json<Mission>(`/missions/${item.id}`);
     const lines = [`${mission.title}  ${mission.id}`, `${mission.groupName}  · ${mission.status}  · revision ${mission.revision}`];
     if (mission.reason) lines.push(`Reason: ${safe(mission.reason)}`);
@@ -390,7 +395,12 @@ export async function handleBoardClientCommand(
   }
   if (command === "mission") {
     const [action, id, argument, ...rest] = positional;
-    if (!action || !id) throw new Error("Usage: infinite mission status ID | progress ID [--after CURSOR] [--json] | answer ID DECISION_ID TEXT | steer ID TEXT | pause|resume|cancel ID");
+    if (!action || !id) throw new Error("Usage: infinite mission status ID | progress ID [--after CURSOR] [--json] | watch ID [--json] | answer ID DECISION_ID TEXT | steer ID TEXT | pause|resume|cancel ID");
+    if (action === "watch") {
+      if (argument || rest.length) throw new Error("Usage: infinite mission watch ID [--json]");
+      await runMissionWatch(api, id, { json: Boolean(options["--json"]) });
+      return true;
+    }
     if (action === "progress") {
       const after = options["--after"];
       if (argument || rest.length || (after !== undefined && (typeof after !== "string" || !after)))
@@ -419,7 +429,7 @@ export async function handleBoardClientCommand(
     } else if (["pause", "resume", "cancel"].includes(action)) {
       if (argument || rest.length) throw new Error(`Usage: infinite mission ${action} ID`);
       await api.json(`/missions/${id}/${action}`, { requestId, revision: current.revision });
-    } else throw new Error("Usage: infinite mission status|progress|answer|steer|pause|resume|cancel ...");
+    } else throw new Error("Usage: infinite mission status|progress|watch|answer|steer|pause|resume|cancel ...");
     console.log(`Mission ${id} ${action} requested.`);
     return true;
   }

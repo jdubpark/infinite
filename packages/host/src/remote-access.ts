@@ -28,6 +28,7 @@ const DECISION_ID = /^[A-Za-z0-9_.:-]{1,200}$/;
 const COMPONENT_ID = /^[A-Za-z0-9_-]{1,160}$/;
 const DIAGRAM_ID = /^[A-Za-z0-9_:.-]{1,200}$/;
 const BEHAVIOR_ID = /^[A-Za-z][A-Za-z0-9_.:-]{0,79}$/;
+const WORK_ID = /^(team|mission|goal):[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 function parsePathSegments(path: string): { rawPathname: string; raw: string[]; decoded: string[] } | undefined {
   if (path.length > 8192 || !path.startsWith("/api/") || path.includes("\\") || path.includes("#") || /[\x00-\x20\x7f]/.test(path)) return undefined;
@@ -58,7 +59,7 @@ function allowedPath(method: RemoteMethod, path: string): boolean {
   if (method === "GET" && raw.length === 4 && raw[1] === "permissions" && raw[2] === "decisions" && DECISION_ID.test(decoded[3])) return true;
   if (method === "POST" && rawPathname === "/api/permissions/marks") return true;
   if (method === "GET" && rawPathname === "/api/halt") return true;
-  if (method === "GET" && ["/api/usage", "/api/usage/daily", "/api/usage/models", "/api/usage/projects"].includes(rawPathname)) return true;
+  if (method === "GET" && ["/api/usage", "/api/usage/daily", "/api/usage/models", "/api/usage/projects", "/api/usage/repair-loops"].includes(rawPathname)) return true;
   if (method === "GET" && raw.length === 4 && raw[1] === "usage" && raw[2] === "projects" && PROJECT_ID.test(decoded[3])) return true;
   if (method === "POST" && rawPathname === "/api/usage/balances/refresh") return true;
   if (method === "PUT" && raw.length === 5 && raw[1] === "usage" && raw[2] === "accounts" && raw[4] === "plan") return true;
@@ -74,6 +75,10 @@ function allowedPath(method: RemoteMethod, path: string): boolean {
       if (raw.length === 5 && method === "GET" && ["catalog", "components", "briefs", "planned", "work", "generated", "brief"].includes(raw[4])) return true;
       if (raw.length === 6 && method === "GET" && raw[4] === "components" && COMPONENT_ID.test(decoded[5])) return true;
       if (raw.length === 6 && method === "GET" && raw[4] === "diagrams" && DIAGRAM_ID.test(decoded[5])) return true;
+      if (raw[4] === "work" && raw.length >= 6 && WORK_ID.test(decoded[5])) {
+        if (raw.length === 6) return method === "GET";
+        return raw.length === 7 && raw[6] === "refresh" && method === "POST";
+      }
       if (raw[4] === "behaviors") {
         if (raw.length === 5) return method === "GET" || method === "POST";
         if (raw.length === 6 && BEHAVIOR_ID.test(decoded[5])) return method === "GET";
@@ -88,13 +93,15 @@ function allowedPath(method: RemoteMethod, path: string): boolean {
   }
   if (raw[1] === "missions" && raw.length >= 3 && UUID.test(decoded[2])) {
     if (raw.length === 3) return method === "GET";
+    if (raw.length === 4 && raw[3] === "progress") return method === "GET";
     if (raw.length === 4) return method === "POST" && ["steer", "pause", "resume", "cancel", "extend"].includes(raw[3]);
     return raw.length === 5 && method === "POST" && raw[3] === "answer" && UUID.test(decoded[4]);
   }
   if (raw[1] === "teams" && raw.length >= 3 && UUID.test(decoded[2])) {
     if (raw.length === 3) return method === "GET";
-    if (raw.length === 4 && raw[3] === "context") return method === "GET";
+    if (raw.length === 4 && ["context", "context-usage", "entries"].includes(raw[3])) return method === "GET";
     if (raw.length === 4) return method === "POST" && ["steer", "pause", "resume", "continue", "cancel"].includes(raw[3]);
+    if (raw.length === 5 && raw[3] === "entries" && UUID.test(decoded[4])) return method === "GET";
     return raw.length === 6 && method === "POST" && raw[3] === "decisions" && UUID.test(decoded[4]) && raw[5] === "answer";
   }
   if (["POST", "DELETE"].includes(method) && rawPathname === "/api/devices/push") return true;

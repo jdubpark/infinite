@@ -18,7 +18,7 @@ export async function* terminalPages(
   snapshot = false,
   initialState?: WorkerState,
 ) {
-  let cursor = after, changed = true, wake: (() => void) | undefined, lastState = 0;
+  let cursor = after, changed = true, wake: (() => void) | undefined, lastState = 0, unavailable = 0;
   let activeSize: TerminalSize | undefined;
   const sizeFields = () => (activeSize ? { cols: activeSize.cols, rows: activeSize.rows } : {});
   const observeEventSize = (event: Event) => {
@@ -97,12 +97,13 @@ export async function* terminalPages(
       cursor = page.cursor;
       if (page.more) continue;
       if (Date.now() - lastState >= 1000) {
-        const { status, pid, exitCode, control, capabilities, runtime, nativeSession, terminalSize } = await manager.state(sessionId);
+        const { status, pid, exitCode, outputTailIncomplete, control, capabilities, runtime, nativeSession, terminalSize } = await manager.state(sessionId);
         const liveSize = terminalSizeOf(terminalSize);
         if (!activeSize && liveSize) activeSize = liveSize;
-        yield { state: { status, pid, exitCode, control, capabilities, runtime, nativeSession, ...(liveSize ? { terminalSize: liveSize } : {}) } };
+        yield { state: { status, pid, exitCode, outputTailIncomplete, control, capabilities, runtime, nativeSession, ...(liveSize ? { terminalSize: liveSize } : {}) } };
         lastState = Date.now();
-        if (status === "exited" || status === "unavailable") {
+        unavailable = status === "unavailable" ? unavailable + 1 : 0;
+        if (status === "exited" || unavailable >= 3) {
           const final = manager.events(sessionId, cursor, 200, new Set(["output", "lifecycle"]));
           for (const event of final.events) {
             observeEventSize(event);

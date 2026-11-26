@@ -1,47 +1,88 @@
 # Infinite
 
-A persistent agent host for Claude Code, Codex, Grok Build, and OpenCode. Agents run on the host; cmux, the native Mac app, a browser, and the React Native phone app attach to the same sessions. Closing the laptop does not move or restart the agent.
+Infinite is a persistent agent host and autonomous orchestration runtime for Claude Code, Codex, Grok Build, and OpenCode. Agent processes run in detached workers on the host rather than inside a client tab or terminal window. The laptop CLI, browser client, native macOS app, and React Native phone app attach to those same live processes, recover full recorded output after disconnects, and coordinate multi-agent runs across repositories.
 
-**Status: single-tenant cloud pilot with a paired laptop CLI.** Claude, Codex, Grok, and OpenCode have completed authenticated tool runs on the rented server. Cloud processes survive client disconnection and API restarts. Encrypted backup and data-restore checks are complete. Independent cloud backup storage, cold-boot recovery, and operator-confidential multi-tenant execution remain unfinished. See the [commissioning record](deploy/ubuntu/commissioning.md).
+Closing a laptop, losing Wi-Fi, or restarting the API server leaves running agent workers alive.
 
-**Two deployment modes are supported by the architecture:** direct single-tenant execution with no VM isolation requirement, and a managed multi-tenant service with a complete context bucket per user. The single-tenant runner is deployed directly on the owner-controlled host. The managed target also requires confidentiality from the operator, which the current runner does not provide. One full VM and one Infinite installation per user is the development boundary; the development host lacks the required confidential VM support. See the [managed tenant architecture](docs/multi-tenant.md) and [Proxmox development plan](deploy/proxmox/README.md). Private workloads are refused by that planner.
+![Infinite System Architecture](docs/diagrams/system-topology.svg)
 
-```sh
-npm run host -- plan-fleet deploy/proxmox/fleet.example.json
+For a file-level lookup map and a thematic guide to all 22 Architecture Decision Records ([`docs/adr/README.md`](docs/adr/README.md)), open the [Documentation and Research Index](docs/README.md). For protocols, state machines, storage schemas, and isolation boundaries, open [System Architecture](docs/architecture.md).
+
+---
+
+## Current Status and Boundaries
+
+Infinite separates shipped runtime behavior from unattached foundations and unfinished design specs.
+
+### Deployment Modes
+
+| Mode | Target | Runtime status | Operator confidentiality |
+| --- | --- | --- | --- |
+| `single-tenant` (default; legacy alias `personal`) | Owner-controlled Ubuntu 24.04 server running all four native providers | Active pilot. Commissioned checks verify authenticated tool runs for all four providers, API-restart continuity, encrypted local backups/restores, and paired laptop CLI plus desktop and phone-sized browser access over Tailscale Serve HTTPS (native Android validation excluded). Optional egress/GitHub proxies, blind relay, and native macOS/mobile clients are implemented and configurable separately. | Owner trusts the host and guest root. Roles (`owner`, `controller`, `viewer`) share one tenant bucket. |
+| `tenant-development` | Multi-tenant Proxmox KVM development boundary (`npm run host -- plan-fleet`) | Synthetic rehearsal only. Accepts only the `demo` provider; refuses native providers, remote access, cmux, and workspace sync. | None (`operatorConfidential: false`, `dataPolicy: "synthetic-only"`). |
+| `confidential` | Managed multi-tenant confidential VMs (AMD SEV-SNP, Intel TDX, Confidential Space, or Nitro) | Hard-refused at init until hardware TEE attestation, measured immutable images, and user-controlled key release exist. | Target requires zero operator decryption. See [managed tenants](docs/multi-tenant.md). |
+
+See the [commissioning record](deploy/ubuntu/commissioning.md) for verified host checks and remaining gaps (off-host backup uploads, cold-boot worker recovery, live Claude hook spike, physical-phone push delivery, and iOS native runtime signing).
+
+### Subsystem Shipment Matrix
+
+| Layer | Live-wired in host and clients | Implemented, not wired into live runtime | Spec-only or partial |
+| --- | --- | --- | --- |
+| Session Runtime and Transport | Detached PTY workers (`worker.ts`), AES-256-GCM vault and 256-record journals, `@infinite/attention`, verified answers, 30s control leases, SSE `/api/events`, `?since=` versioning, `infinite-remote-v1` E2E WS, blind relay, cmux bridge, `--laptop` Codex handoff, `--local-ui` Codex/OpenCode, batched workspace sync | None | Claude/Grok native UI adapters; automatic host-reboot worker recovery |
+| Orchestration and Intake | `TeamService` (14 states, 10 roles), `GoalService` (finite and standing), `MissionService` (cross-repo DAG, read-only Claude coordinator), `RoutineService` (30d authority-pinned), `HandoffService`, `ProjectGroups`, Blackboard (`evidence/blackboard.ts`), Linear + Slack Socket intake with mandatory pinned `organizationScope`, external `/mcp` connector + internal stdio `infinite-team` MCP | `read-phases.ts` / `read-request.ts` (read-pool models), `search-engine.ts` (Search Mode pure state machine) | None |
+| Governance and Security | `HaltService` autonomous-work halt, `FuseService` hourly launch fuse, `hostLoad` gate, 5-step `HostPermissionPipeline` (class rules v8, 2-tier tool-less cross-family review, `permissionWriteFence`) plus legacy repository-level `permission-coordinator` fallback, 7-account Ubuntu isolation, 3 `nftables` tables, egress and GitHub credential proxies, provider ceilings, freeze-watchdog `age` backups | None | Metered USD admission reservations (current fuse caps launch count, not dollars) |
+| Evidence, Routing and Evaluation | Single-writer encrypted SQLite `EvidenceStore` (15 modules, 4 `EventOutbox` projectors), `ObjectiveRecord` + `TeamIntent` + `TeamRegister` + `TeamVerdicts`, `OutcomeLedger` + `BaseScanner` + `SignalService`, hierarchical Beta-Binomial Thompson `RoutingRecorder` (shadow/auto), `EvalHost` + `Grader` + `TrialPump` + Bootstrap/Holm comparisons + Phase 1 blind `JudgeCalibrations` | None | Live production duels (Phase 2), Improvement Gate candidate registry, Class A automated lesson/prompt adoption |
+| Understanding, Telemetry and Memory | `RepositoryGraphs` (Graphify code maps), `RepositoryBriefings` (`jevcode auto`), `UnderstandingRuntime` + plan/source fence + `WorkBriefService`, finite BFS/TLA+ `BehaviorChecker`, TypeSafe Jev `Readings`, `UsageService` + `BalanceService` + `ProviderLimits` + `Scorecard` | `packages/host/src/memory/` (17-table encrypted SQLite store, Ed25519 witness recovery, Lexical and fail-closed `HonchoMemoryAdapter`), `deploy/ubuntu/memory/` Honcho v3.4.0 qualification suite | Honcho production ingestion and semantic recall (gated on AGPL-3.0 review and metered egress proxy) |
+
+---
+
+## Core Architecture and Monorepo Map
+
+Infinite is a TypeScript and Swift npm-workspace monorepo built around one detached-worker host, two shared wire/protocol packages, three graphical clients, a laptop CLI, and Linux hardening templates.
+
+```text
+packages/
+  attention/   @infinite/attention (16 modules): pure attention reducer, terminal prompt parser,
+               spinner-immune screen activity, hook mappers (Claude/Codex), destructive detector, delegation gate
+  remote/      @infinite/remote (13 modules): infinite-remote-v1 E2E WS cipher (HKDF + AES-GCM),
+               ?since= list sync, data-only Markdown/Mermaid/diagram layouts, Understanding & Memory schemas
+  host/        @infinite/host: Control API, detached PTY workers, vault/journals, encrypted SQLite
+               EvidenceStore, Teams/Goals/Missions/Routines/Intake, Permissions/Halt/Fuse,
+               Adaptive Routing, Replay Eval, Judge Calibration, Understanding, Usage, Laptop CLI, Relay
+apps/
+  web/         @infinite/web (React + Vite): Swarm (Lanes/Wall/Graph), Decision Queue, xterm.js,
+               Sessions, Teams + Blackboard Inspector, Goals, Missions + Progress Inspector, Cost, Permissions, Halt, Dictation, Remote pairing
+  mobile/      @infinite/mobile (Expo / React Native, Android-first, iOS config): Board, Sessions Brief,
+               Understand & Diagrams, Teams + Evidence Sheet, Goals, Missions + Progress Inspector, Cost, Permissions, Dictation, Expo Push
+  macos/       InfiniteDesktop (SwiftUI + CryptoKit): WKWebView xterm, split panes, Files & Sync,
+               Understand (Knowledge + Behavior), Cost, Resources window, native cmux Noise client
+deploy/
+  ubuntu/      7-account Linux hardening, systemd units, sudoers, nftables (egress/eval/grader),
+               provider ceilings, freeze-watchdog age backups, secondary instances, Honcho qualifier
+  proxmox/     Synthetic-only multi-tenant KVM fleet planner (plan-fleet)
+scripts/       Zero-dependency egress & GitHub proxies, GitHub App token refresher, Graphify builder,
+               comment & file-size ratchets, macOS/CLI/Codex handoff builders, test runner
+docs/          System architecture, 6 SVG diagrams, subsystem guides, 22 ADRs (docs/adr/)
+tests/         Discovered test suites (tests/*.test.ts): unit, live PTY continuity, OS-boundary launchers,
+               Playwright smoke, compile-time type tests, and seeded crash/fault/differential simulators
+verification/  Formal finite-state safety models (Understanding refresh fence) + TLA+/TLC exports
 ```
 
-This emits a secret-free, capacity-checked development specification and makes no infrastructure changes. `tenant-development` runners accept only the rehearsal provider and report their lack of operator confidentiality through `/api/me`. `confidential` initialization refuses until a real attestation and user-key-release implementation exists.
+### Five Design Invariants
 
-For direct use, initialization defaults to `--deployment-mode single-tenant` and permits the four native providers. No tenant UUID, Proxmox, or attestation is required. Legacy `personal` configurations map to this mode. This does not disable authentication or recording encryption.
+1. **Detached execution and encrypted truth.** Every session runs in its own worker process (`packages/host/src/worker.ts`) behind a private Unix socket (`0600`). Output, input intent, receipts, and signals write to 256-record AES-256-GCM journal segments (`packages/host/src/vault.ts`) before or alongside PTY writes; a recording failure suspends the native process with `SIGSTOP` (`recording-error`) rather than continuing unrecorded.
+2. **Receipts over inference.** A delivered receipt confirms bytes reached the PTY, never that an agent accepted or completed a task. Evaluator verdicts (`TeamVerdicts`) are provisional agent assessments and never mark a product goal `achieved` without an explicit human outcome (owner or controller). Merges are recorded as agent reports and validated against Git commits before a next cycle starts. No score, reward, routing decision, or usage figure enters an agent prompt.
+3. **Fail-closed governance.** `HaltService` runs ahead of `FuseService` across autonomous and team launches (routines, goals, missions, teams, `Manager.createTeamSession` for `request.team` launches, replay eval trials, and main checks) as well as permission review and delivery, with zero exempt autonomous roles; an unreadable halt record fails closed across those gated autonomous launches and permission reviews host-wide. Separately, `FuseService` enforces rolling hourly launch limits across fuse-gated autonomous launches (`routines`, `goals`, `missions`, `teams`, and `Manager.createTeamSession`) and fails closed for non-exempt launches when its baseline is unreadable (`unmeasurable`), while exempting `permission-coordinator` and not gating `MainCheckService` (which checks halt and `hostLoad` directly). Ordinary interactive sessions started directly by the owner keep running during a halt and can still start—halt is an autonomous-work stop, not a host-wide kill switch for interactive sessions. Provider permissions stay with the owner unless explicitly delegated through one of two paths (check both when auditing): workspace-level delegation to the separate two-tier tool-less `HostPermissionPipeline` (where five interrupt classes—production/staging, credentials, money, destructive outside workspace, global/account settings—always escalate to the owner), or the legacy repository-level delegation (`project.team.permissions`, enabled by default on first `infinite repo init` unless `--permissions off`) that lets a strong `permission-coordinator` decide bounded one-shot requests for team runs not served by the permission agent.
+4. **Partitioned concurrency and compile-time state machines.** Global mutexes and lockfiles have been replaced by per-entity `KeyedQueue` chains with strict acyclic lock ordering (`Routine -> Goal -> Mission -> Team -> Session`, [ADR-0016](docs/adr/0016-wave3-per-entity-orchestration-queues.md)), atomic temp-`fsync`-rename storage, Swift actors on macOS, and discriminated-union state machines pinned by compile-time `@ts-expect-error` tests ([ADR-0019](docs/adr/0019-orchestration-wire-and-domain-type-invariants.md)).
+5. **Zero inline prose comments; invariants live in ADRs.** `npm run check:comments` enforces zero prose comments across all checked TypeScript, JavaScript, Swift, Python, C, shell, CSS, and systemd source files ([ADR-0003](docs/adr/0003-comment-policy-and-ratchet.md)). Non-obvious invariants live in [`docs/adr/0001`–`0022`](docs/adr/README.md).
 
-## Laptop CLI
+---
 
-```sh
-infinite claude
-infinite codex --model MODEL
-infinite grok
-infinite opencode --model deepseek/deepseek-flash
-infinite list
-infinite resources --watch
-infinite resume
-infinite monitor
-infinite close SESSION_ID
-infinite cmux
-```
+## Quickstart
 
-The CLI is installed and paired on the commissioning laptop. Every provider runs on the cloud host by default. `resume` attaches to the same process; `monitor` starts read-only. Press Enter to enable steering, Ctrl+G to monitor, or Ctrl+] to detach. Put wrapper options before the provider, for example `infinite --project PROJECT_ID --title "Task" codex`. See [installation, pairing, and CLI behavior](docs/cli.md).
+### Run a local development host
 
-The Mac app can stay closed. `list` includes project and working directory, `resources --watch` shows server counters, and `close` asks before ending the selected provider process (`--yes` for scripts). `infinite cmux` opens the app's separate cmux workspace catalog through the independently installed and enrolled `infinite-cmux` launcher. Infinite's catalog and cmux's catalog retain their own IDs. An independent SSH tunnel can keep both connections available at login.
-
-Run `infinite sync` inside a checkout to keep the configured cloud project current with it, one way; `infinite pull` downloads the cloud tree into a new directory. See [workspace sync](docs/workspace-sync.md).
-
-Run `infinite --laptop codex` inside your project to keep tools on the laptop. Tools use that directory immediately while a detached service prepares an incremental cloud checkpoint. With a qualified backend, laptop loss automatically moves tools to the prepared cloud workspace in the same conversation; uncertain operations pause. `infinite recover SESSION_ID` downloads cloud edits into a separate copy for reconciliation. See [laptop execution](docs/cli.md#laptop-execution-with---laptop).
-
-An experimental `infinite --local-ui codex "Initial prompt"` mode runs Codex's interface locally while its backend remains on the host. Typing stays local; `resume` rejoins the recorded conversation. This requires a supported Codex binary on both machines and an initial prompt. See [local Codex usage and limits](docs/cli.md#experimental-local-codex-interface). OpenCode also supports `infinite --local-ui opencode`, including empty sessions; see [local OpenCode usage](docs/cli.md#experimental-local-opencode-interface).
-
-## Run locally
-
-Requires Node.js 22.14+ and npm. Linux needs the usual C++/Python build tools for `node-pty`; macOS needs Xcode Command Line Tools.
+Requires Node.js 22.14+ and npm, plus native build tools for `node-pty` (C++/Python build tools on Linux; Xcode Command Line Tools on macOS).
 
 ```sh
 npm ci
@@ -49,9 +90,7 @@ npm run build
 npm run dev
 ```
 
-Open **http://127.0.0.1:4780**. The first run creates private `.local/config.json`, `.local/devices.json`, and a separate `.local/secrets/vault.key`. Copy the owner key from `devices.json` into the browser sign-in. This development key layout is convenient for rehearsal; copying the entire `.local` directory copies both ciphertext and its key.
-
-Create a **Rehearsal** session to check continuity without calling a model. Other providers launch the configured native binaries with their normal permissions. They may wait for authentication, workspace trust, or tool approval.
+Open **http://127.0.0.1:4780**. First run writes private `.local/config.json`, `.local/devices.json`, and `.local/secrets/vault.key`. Paste the generated owner key from `.local/devices.json` into the browser sign-in. Start a Rehearsal (`demo`) session to verify continuity without model calls, or inspect the host directly:
 
 ```sh
 npm run host -- doctor --config .local/config.json
@@ -59,148 +98,124 @@ npm run host -- list --config .local/config.json
 npm run host -- attach SESSION_ID --config .local/config.json
 ```
 
-`Ctrl+]` detaches the terminal client. `Ctrl+C` interrupts the underlying agent. Closing a client or the API leaves worker processes alive. To stop a session, use the authenticated owner `POST /api/sessions/:id/stop` endpoint. Stopping the entire VM stops its processes; automatic recovery after a host reboot is not implemented.
+`Ctrl+]` detaches the terminal client; `Ctrl+C` interrupts the underlying agent. Closing any client or stopping the API server leaves worker processes running. Stop a session explicitly with `POST /api/sessions/:id/stop` or `infinite close SESSION_ID`.
 
-## Browser
-
-**Teams** accepts a feature request or PRD and coordinates a project manager,
-parallel implementers, integration, configured checks and an independent agent
-review. Questions and steering stay with the run. Configure isolated working
-copies and project checks before starting; see [agent teams](docs/teams.md).
-
-**Goals** lets the team select and build improvements within approved outcomes,
-file scope, deadlines, and execution limits. Strong coordinators and reviewers
-guide lighter workers. Each cycle starts from the previous reviewed commit;
-product outcomes require a separate assessment with evidence. Projects with
-Linear configured can link an existing goal issue or create one, with a child
-issue for each feature cycle. Issue state and the last tracking check are shown
-separately from execution; Infinite does not mark issues Done automatically.
-
-Search sessions by title, provider, project ID, or session ID. **Active** shows running and starting processes, **Needs you** shows reported attention requests, and **All** includes recordings. The selected session and view stay in the URL, so reload and browser Back return to them.
-
-Type a draft while monitoring or offline, then take control explicitly to send. **Cmd/Ctrl+Enter** sends; Enter adds a line. Switching sessions preserves drafts and recent views in this tab's memory. Reconnecting refreshes the view without sending the draft or reclaiming control. Reloading or closing the tab discards unsent drafts; they are not synchronized to other devices.
-
-## Mac app
-
-The personal macOS app embeds real terminal output, a native prompt editor,
-resource monitoring, session controls, and file transfer/sync preview. Enter sends
-a locally edited prompt; Shift-Enter adds a line. Direct terminal keys are an
-explicit mode. Server processes continue after the app closes.
+To inspect the synthetic multi-tenant Proxmox planner (emits a secret-free plan without touching infrastructure):
 
 ```sh
-npm run desktop:install
+npm run host -- plan-fleet deploy/proxmox/fleet.example.json
 ```
 
-Requires macOS 14 or newer and Xcode command-line tools. Connect an Infinite host
-with `remote.enabled: true`, or enroll separately with a cmux server. The native
-connections are application-encrypted to the trusted server. See [build, pairing,
-file-safety rules, and verified limitations](docs/desktop.md).
+---
 
-## Phone
+## Client Surfaces
 
-The React Native app is in `apps/mobile`. It supports Android and has an iPhone build configuration. Pair it with an HTTPS Tailscale Serve address and a **controller** or **viewer** key, or, without a VPN on the phone, with a relay behind Cloudflare Access ([phone access guide](deploy/ubuntu/public-relay.md)). Enable `remote.enabled` on the host; direct and relay connections require the application-encrypted endpoint. Keys go into Android Keystore/iOS Keychain through Expo SecureStore. Logs are kept in memory while the app is open and remain on the host for replay.
+All four clients authenticate against the same host API, respect `owner`, `controller`, and `viewer` roles, and enforce the worker's 30-second renewable input control lease (explicit takeover, never silent). See the [Understanding and Client Surface Matrix](docs/diagrams/understanding-and-clients.svg) for the full feature comparison.
+
+### Laptop CLI (`infinite`)
+
+Install via `make cli` (bundles into a content-hashed directory and symlinks `~/.local/bin/infinite`). Every provider runs on the cloud host by default, mapping the local checkout's home-relative path into a persistent cloud project. Put wrapper options before the provider name (`infinite --project ID --title "Task" codex`).
+
+```sh
+# Interactive cloud sessions & attachment
+infinite claude
+infinite codex --model MODEL
+infinite grok
+infinite opencode --model deepseek/deepseek-flash
+infinite list
+infinite resume SESSION_ID
+infinite monitor SESSION_ID
+infinite close SESSION_ID
+infinite resources --watch
+infinite cmux
+
+# One-way workspace sync, hybrid laptop execution & experimental local TUI
+infinite sync                         # incremental 256 KiB batched chunk upload
+infinite pull PROJECT_ID --output DIR # export cloud tree into a new directory
+infinite --laptop codex               # tools run locally; cloud handoff on loss (qualified backend)
+infinite --local-ui codex "Prompt"    # local Codex TUI over cloud backend
+infinite --local-ui opencode          # local OpenCode TUI (supports empty sessions)
+
+# Orchestration, governance, evaluation & understanding
+infinite projects
+infinite board
+infinite start "Task"
+infinite mission progress MISSION_ID
+infinite mission watch MISSION_ID
+infinite team start "Task"
+infinite team status TEAM_ID
+infinite team watch TEAM_ID
+infinite team watch TEAM_ID --board
+infinite team entries TEAM_ID
+infinite team steer TEAM_ID "Note"
+infinite team answer TEAM_ID QUESTION_ID "Choice"
+infinite routine list
+infinite routing status PROJECT_ID
+infinite permissions status
+infinite halt
+infinite fuse
+infinite cost
+infinite usage
+infinite usage repairs
+infinite understand check --file def.json
+```
+
+Additional CLI command families cover goals (`infinite goal`), autonomy (`infinite autonomy`), replay eval (`infinite eval`), judge calibration (`infinite duels`), and project signals (`infinite signal`). Press `Enter` to claim steering, `Ctrl+G` to monitor read-only, `Ctrl+E` for the AES-GCM encrypted local draft editor, or `Ctrl+]` to detach. See [CLI contract](docs/cli.md), [workspace sync](docs/workspace-sync.md), and [hybrid execution](docs/hybrid-execution.md).
+
+### Browser (`apps/web`)
+
+Opens on the read-only Swarm view (`#/swarm` Lanes, `#/swarm/wall` Tiles, `#/swarm/graph` Code Context Graph using Graphify code maps). Includes the Decision Queue (`#/decisions`, oldest-first prompts and decisions with keyboard selection), Sessions (Chat, Screen, full xterm.js Terminal, Project Files, Context), Teams (with blackboard evidence inspector and outcome groups), Goals, Missions (with live progress inspector), Cost, Permissions, Halt banner, Web Speech dictation cleanup, and paired remote machines over `@infinite/remote` encrypted WebSockets. Unsent drafts stay in tab memory and are never auto-sent on reconnect. See [Swarm view](docs/swarm.md).
+
+### Native macOS App (`apps/macos`)
+
+SwiftUI + CryptoKit desktop client (`npm run desktop:install`, requires macOS 14+ and Xcode Command Line Tools). Connects over `infinite-remote-v1` encrypted WebSockets (direct or relayed) and includes an independent native cmux client over Noise transport. Features WKWebView xterm.js terminals, side-by-side split panes, local prompt composer (`DraftStore` Swift actor sealed in Keychain), Home (Board), Understand (Workspace overview, Knowledge catalog, Behavior verification), Teams, Missions, Cost, Halt banner, Resources window, and hash-pinned chunked file transfer and folder sync preview. See [Infinite Desktop](docs/desktop.md).
+
+### Phone App (`apps/mobile`)
+
+Expo / React Native client (Android-first with iOS build configuration). Always connects over `@infinite/remote` encrypted WebSockets (direct Tailscale Serve HTTPS or blind relay behind Cloudflare Access), storing keys in Android Keystore or iOS Keychain via `expo-secure-store`. Features Board, Sessions (Attention Brief, Conversation, Activity, Read-only Files, Screen plus steering), Understand (Current vs Planned vs Difference, Work Briefs, native SVG diagrams, offline metadata cache), Teams (with blackboard evidence sheet and outcome groups), Goals, Missions (with live progress inspector), Cost, Permissions, native speech dictation (`ExpoSpeechRecognition`), and optional minimal-body Expo push notifications.
 
 ```sh
 npm run android -w @infinite/mobile
 npm run ios -w @infinite/mobile
 ```
 
-Dictation uses a native speech module, so it needs a rebuilt development or release app; Expo Go and older builds hide the mic.
+Keep private EAS and Firebase identifiers out of tracked files (`apps/mobile/.local/eas.json` or `INFINITE_EAS_PROJECT_ID`, and `apps/mobile/.local/google-services.json` or `GOOGLE_SERVICES_JSON`). For an Android emulator against a local rehearsal host, forward ports with `adb reverse tcp:4780 tcp:4780 && adb reverse tcp:8081 tcp:8081` (development builds allow `http://127.0.0.1:4780`; release builds require HTTPS).
 
-**Understand** groups repositories, projects, features, and execution records by
-workspace. Open components to compare Current source evidence with Planned
-designs and the recorded Difference. Owners can maintain projects and features,
-request source refreshes, and configure bounded background maintenance.
-Provider check and deployment observations retain their source and observation
-time. Reading starts no analysis job. See
-[Workspace Understanding](docs/repository-briefings.md#workspace-understanding)
-for permissions, retention, source identity, and coverage limits.
+---
 
-On hosts whose workers enforce input control, the phone sends nothing until you tap **Take control** (or **Take over** when another device holds the session). The lease lasts 30 seconds, renews while the session is on screen, and is released when you leave the session or background the app. Viewers stay read-only.
+## Checks, Quality Ratchets and Verification
 
-The **Teams** and **Goals** tabs appear on hosts that support teams; a host without teams configured shows setup guidance there. They list each run with what it waits on, open its decisions, plan, members, checks, and review, and let an owner or controller answer and steer. Starting, pausing, resuming, and cancelling a run are owner actions. See [Goals and agent teams](docs/teams.md).
-
-Search the inbox or pull down to refresh it. The composer allows local drafting while monitoring or reconnecting, with a control action beside the draft when the host is ready. Taking control never sends the draft. Drafts remain in this app's memory across navigation; they are not shared with another device or retained after the app exits.
-
-Push notifications need an EAS project ID. Keep it in the ignored `apps/mobile/.local/eas.json` file as `{ "projectId": "YOUR_EAS_PROJECT_ID" }`, or set `INFINITE_EAS_PROJECT_ID`. The dynamic app config adds it to `extra.eas.projectId` at build time. Set the same variable in the EAS preview and production environments for cloud builds; do not commit the real identifier to `app.json` or `eas.json`. See [Expo dynamic configuration](https://docs.expo.dev/workflow/configuration/).
-
-For an Android emulator connected to the local rehearsal host:
+Run checks from the repository root (when working on Infinite checkouts from a workstation with an enrolled verification runner, dispatch through the cloud runner rather than running builds or tests locally):
 
 ```sh
-adb reverse tcp:4780 tcp:4780
-adb reverse tcp:8081 tcp:8081
-```
-
-Use `http://127.0.0.1:4780` in a **development** build. Release pairing requires HTTPS. If macOS binds Metro only to IPv6 localhost, start it with `NODE_OPTIONS=--dns-result-order=ipv4first npx expo start --localhost` from `apps/mobile`.
-
-`eas.json` includes an Android internal APK profile. Signing and distribution to a physical phone require the owner's app signing setup. The debug APK is a development artifact, not a release build.
-
-### Attention Brief and push
-
-The host side is implemented: sessions report an attention state, `GET /api/me` advertises `capabilities` for signals, answering and push, and the API can send push notifications. The phone Brief is implemented too: the inbox, the decision card, the "So far" timeline, the docked composer and the terminal route. It was exercised on an Android emulator against the rehearsal host.
-
-Two things are not verified yet. The live Claude Code spike (S1 in the design spec) has not been run, so Claude hook behavior against the real CLI is untested. Push was verified only against a fake Expo endpoint, not delivered to a phone. The Codex spike (S2) ran on 2026-11-13 against the non-interactive CLI: the injected hooks work, but the flag that lets them run also lets a repository's own Codex hooks run without review. Codex hooks therefore stay off by default. Set `attention.hooks.codex` to `true` only for repositories whose contents you trust.
-
-Push setup, in order:
-
-1. Create an EAS project with `eas init` in `apps/mobile` and set its project id.
-2. Create a Firebase project for `dev.infinite.app` and download `google-services.json`. Keep it out of the repository: store it as the EAS file variable `GOOGLE_SERVICES_JSON` for cloud builds, or at `apps/mobile/.local/google-services.json` for local builds. `app.config.ts` sets `android.googleServicesFile` from either.
-3. Upload an FCM V1 service-account key with `eas credentials`.
-4. Create an Expo access token and store it in a file with mode 0600 outside the state directory.
-5. Enable the `push` block in the host config:
-
-```json
-"push": { "enabled": true, "accessTokenFile": "/path/outside/state/expo-token", "detail": "minimal" }
-```
-
-`detail` is `minimal` by default. `events` selects notifications: priority session attention (`needs-you`, `recording-error`) and goal/team lifecycle events are on by default; `turn-finished` and `exited` are opt-in. Stuck goal and team events need attention, and full detail may include their reason. Push messages go through Expo's push service, so enabling it adds an outbound dependency. Run `infinite doctor` to confirm the relay, hooks and push status.
-
-## What is implemented
-
-- Detached PTY workers; client and API lifetimes are independent of agent lifetimes.
-- Same-process terminal attachment, screen snapshots, full raw terminal recordings, and paginated replay by sequence number.
-- An encrypted record of session metadata, initial context, output, input intent, and delivery receipts. Records use AES-256-GCM with session/sequence authenticated data and a key outside the state directory.
-- Owner, controller, and viewer access. Creating sessions, teams, and goals is owner-only on every client; controllers answer and steer; viewers read. These are credential roles, not proof of a physical laptop's identity.
-- Device input control: one renewable 30-second lease per session, enforced in the worker, with explicit takeover. A refused input journals nothing.
-- A laptop CLI that launches native provider CLIs with exact arguments, reattaches over one WebSocket, and starts from a bounded terminal snapshot.
-- Idempotent creation and input IDs. An ambiguous terminal write is not automatically repeated. A delivered receipt means bytes reached the PTY, not that the provider accepted or completed a task.
-- Versioned project context with conflict detection and an immutable starting snapshot per session.
-- Responsive web client and native React Native client. Both visibly distinguish an unreachable host from an exited agent.
-- A configurable concurrent session limit, default 24.
-- Attention signals from agent hooks, terminal sequences and screen detection, journaled by source, with a per-session state (`working`, `needs-you`, `turn-finished`, `idle`, `exited`, `unavailable`, `recording-error`).
-- A verified answer operation: the host presses keys for an on-screen dialog only when the prompt id and screen hash match, then reports `closed`, `still-open` or `changed`. Hooks never approve anything.
-- Optional Expo push notifications with minimal bodies by default.
-
-## Important boundaries
-
-This is a universal terminal wrapper. It records visible terminal output and supplied requests; it does not expose hidden model reasoning or merge the internal state of four different providers. Provider-native history remains on the host. Mobile recording is a compact rendering of terminal events; it is not yet a structured message/tool-call timeline.
-
-Project context is deliberately shared at session creation. Later changes must be sent to running sessions explicitly. Ordinary sessions use the configured project directory directly, so configure separate project entries for parallel writers. Teams and Goals create independent Git copies, validate file ownership, and serialize integration; they leave the original checkout unchanged.
-
-The system does not upload the laptop's home directory, synchronize arbitrary credentials, replicate local apps, provision MCP dependencies, or automatically pull cloud file changes into a dirty checkout. The cloud workspace is authoritative; use Git or SSH-based file access for source changes. Those boundaries matter for both fidelity and privacy.
-
-Unattended work is limited by each provider's permissions, quotas, authentication expiry, and the task supplied. Infinite does not loop “continue” forever. Ordinary sessions do not silently approve tools. An owner can delegate bounded one-shot tool requests to the strong coordinator through repository enrollment. Workspace trust and persistent permission changes still require owner handling. A machine that can execute a tool is not necessarily permitted to execute it unattended.
-
-**An attacker controlling the active worker or guest root can read active files and memory.** Journal encryption does not change that. Workspace files, native CLI histories, swap, credentials, and backups need the separate storage/isolation controls described in [security](docs/security.md).
-
-## Checks and deployment
-
-```sh
-npm run check
+npm run check                          # check:size + check:comments + typecheck + test + build
 npm run lint -w @infinite/mobile
+npm run typecheck -w @infinite/mobile
 npm run export:android -w @infinite/mobile
 npm run export:ios -w @infinite/mobile
 ```
 
-On a resource-constrained verification runner, `INFINITE_TEST_CONCURRENCY=1 npm run check` runs test files serially. The default runs up to four files at once.
+`npm run check` enforces five gates in order:
 
-The integration test starts 12 real demo PTYs, kills and restarts the API process, checks the same PIDs continue, replays recordings, and checks authorization and duplicate delivery. The vault test checks segment boundaries and authentication failures. These do not establish live Claude/Codex/Grok/OpenCode compatibility or cloud security.
+1. **`npm run check:size`** (`scripts/check-file-size.mjs`): 1,000-line cap on new source files; downward-only baseline across 24 grandfathered files.
+2. **`npm run check:comments`** (`scripts/check-comments.mjs`): zero-comment policy across `.ts/.tsx/.js/.mjs/.swift/.py/.sh/.c/.h/.kt/.css/.service/.timer/.socket` (`scripts/comments-baseline.json` is at `0`).
+3. **`npm run typecheck`**: TypeScript strict check across all workspaces plus `tsconfig.type-tests.json` (`@ts-expect-error` state-machine and wire-contract tests).
+4. **`npm test`** (`scripts/run-tests.mjs`): discovers every top-level `tests/*.test.ts` file, running parallelizable suites concurrently (default concurrency 4; override with `--concurrency=` or `INFINITE_TEST_CONCURRENCY=1` on small runners) followed by contention-sensitive suites listed in `serialFiles` sequentially, covering 12-PTY live API-restart continuity, vault/SQLite crypto, OS-boundary eval/grader launchers, Playwright browser smoke, and seeded crash/fault/differential simulators.
+5. **`npm run build`**: sequential build of `@infinite/attention -> @infinite/remote -> @infinite/host -> @infinite/web`.
 
-An actual Android debug build was installed on the Pixel 9 emulator. Pairing, steering, native back navigation, and saved pairing after app restart were exercised. Android and iOS JavaScript bundles export successfully; iPhone native builds, physical phones, and release signing remain unverified. The terminal protocol regression also checks cursor-query responses without an attached client and a compact screen that preserves full history in the recording.
+End-to-end browser verification against a disposable host uses `.agents/skills/verify-infinite/scripts/drive.mjs session --instance DIR`.
 
-The verification skill's `session` command (`node .agents/skills/verify-infinite/scripts/drive.mjs session --instance DIR`) drives sign-in, a Rehearsal session, steering, offline reconnect with the same PID, and a controller phone view in Node Playwright against a disposable host; see `.agents/skills/verify-infinite/SKILL.md`.
+---
 
-See [architecture and protocol](docs/architecture.md), [server comparison](docs/hosting.md), and [Ubuntu commissioning](deploy/ubuntu/README.md). The commissioning record separates authenticated provider results, client/API continuity, tested data restoration, and cold-boot recovery work still required.
+## Documentation and Research Map
 
-The optional [MCP request connector](docs/mcp.md) lets an external assistant such
-as Grok Bot submit and follow tracked work through a dedicated, scoped endpoint.
+Open the [Documentation and Research Index](docs/README.md) for task-based reading paths, a 29-entry "Where to look in code" lookup table, and the thematic map of all 22 ADRs.
+
+| Area | Primary docs | Graphics |
+| --- | --- | --- |
+| System Architecture | [docs/architecture.md](docs/architecture.md), [docs/README.md](docs/README.md), [PRODUCT.md](PRODUCT.md), [DESIGN.md](DESIGN.md) | [System Topology](docs/diagrams/system-topology.svg) |
+| Session Continuity, CLI and Clients | [docs/cli.md](docs/cli.md), [docs/desktop.md](docs/desktop.md), [docs/remote-machines.md](docs/remote-machines.md), [docs/workspace-sync.md](docs/workspace-sync.md), [docs/hybrid-execution.md](docs/hybrid-execution.md), [docs/native-continuity.md](docs/native-continuity.md) | [Session Protocol and Permissions](docs/diagrams/session-protocol-and-permissions.svg), [Understanding and Clients](docs/diagrams/understanding-and-clients.svg) |
+| Orchestration, Intake and MCP | [docs/teams.md](docs/teams.md), [docs/missions.md](docs/missions.md), [docs/swarm.md](docs/swarm.md), [docs/intake.md](docs/intake.md), [docs/mcp.md](docs/mcp.md) | [Orchestration Hierarchy](docs/diagrams/orchestration-hierarchy.svg) |
+| Evidence, Routing, Eval and Understanding | [docs/architecture.md#evidence-store-self-improvement-and-evaluation](docs/architecture.md#evidence-store-self-improvement-and-evaluation), [docs/repository-briefings.md](docs/repository-briefings.md), [docs/repository-graphs.md](docs/repository-graphs.md), [docs/behavior-verification.md](docs/behavior-verification.md) | [Self-Improvement Loops](docs/diagrams/self-improvement-loop.svg), [Understanding and Clients](docs/diagrams/understanding-and-clients.svg) |
+| Security, Isolation and Operations | [docs/security.md](docs/security.md), [docs/multi-tenant.md](docs/multi-tenant.md), [docs/hosting.md](docs/hosting.md), [deploy/ubuntu/README.md](deploy/ubuntu/README.md), [deploy/ubuntu/commissioning.md](deploy/ubuntu/commissioning.md), [deploy/proxmox/README.md](deploy/proxmox/README.md) | [Security Boundaries](docs/diagrams/security-boundaries.svg) |
+| Invariants and Decision Records | [docs/adr/README.md](docs/adr/README.md) (ADR-0001 through ADR-0022), [docs/research/agent-runtimes/README.md](docs/research/agent-runtimes/README.md) | None |

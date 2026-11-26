@@ -154,6 +154,8 @@ import InfiniteCore
     private var queuedRaw = Data()
     private var sendingRaw = false
     private var lastSize = (80, 24)
+    private var awaitingOpenCatchUp = false
+    private var pendingStreamReplay = false
     var observing = false
     var identity: String { "\(profileID):\(session.id)" }
     var hasControl: Bool {
@@ -280,6 +282,7 @@ import InfiniteCore
         streamState = .attaching(generation: current)
         rendererState = .awaitingSnapshot(generation: UUID())
         queuedRaw = Data(); sendingRaw = false
+        awaitingOpenCatchUp = false; pendingStreamReplay = false
         pipe.feed(Data(), reset: true)
         do {
             let id = try await deps.openTerminal(client, session.id) { [weak self] message in
@@ -293,27 +296,89 @@ import InfiniteCore
             notice = error.localizedDescription
         }
     }
+    private static func eventDimensions(_ event: JSON) -> TerminalDimensions? {
+        let type = event["type"].string
+        guard type == "lifecycle" || type == "output" else { return nil }
+        let data = event["data"]
+        return TerminalDimensions(json: data) ?? TerminalDimensions(json: data["terminalSize"])
+    }
     func receive(_ event: JSON) {
         if event["type"].string == "terminal-closed" {
             connectionLost()
             notice = session.status == "running"
                 ? "Terminal stream closed. Checking server status; your draft stays here."
-                : "This session is \(session.status). Your draft stays here."
+                : "This session is \(session.status).\(session.outputTailIncomplete ? " The recording may be missing the session’s last output." : "") Your draft stays here."
             return
         }
         let message = event["message"]
+        let topSize = TerminalDimensions(json: message)
         if message["snapshot"] != .null {
+            let snapshot = message["snapshot"]
+            let size = TerminalDimensions(json: snapshot) ?? TerminalDimensions(json: message["open"]) ?? topSize
+            awaitingOpenCatchUp = false
+            pendingStreamReplay = false
             markSnapshotReceived()
-            pipe.feed(Data(message["snapshot"]["ansi"].string.utf8), reset: true, columns: message["snapshot"]["cols"].int, rows: message["snapshot"]["rows"].int)
+            pipe.feed(Data(snapshot["ansi"].string.utf8), reset: true, columns: size?.columns, rows: size?.rows)
+        } else if message["open"] != .null {
+            let size = TerminalDimensions(json: message["open"]) ?? topSize
+            awaitingOpenCatchUp = true
+            pendingStreamReplay = false
+            pipe.feed(Data(), reset: true, columns: size?.columns, rows: size?.rows, completesReplay: false)
         }
-        for output in message["events"].array where output["type"].string == "output" {
-            let first = !rendererState.receivedScreen
-            markSnapshotReceived()
-            pipe.feed(Data(output["data"]["text"].string.utf8), reset: first)
+        if message["type"].string == "resize" || message["resize"] != .null,
+           let resizeSize = TerminalDimensions(json: message["resize"]) ?? topSize {
+            pipe.feed(Data(), reset: false, columns: resizeSize.columns, rows: resizeSize.rows)
+        }
+        if case .array(let events) = message["events"] {
+            let hasEventSizes = events.contains { Self.eventDimensions($0) != nil }
+            let hasMore = message["more"].bool
+            let explicitEndOfPage = message["more"] == .bool(false)
+            if events.isEmpty {
+                if let topSize {
+                    pipe.feed(Data(), reset: false, columns: topSize.columns, rows: topSize.rows)
+                }
+            } else {
+                var appliedTopSize = hasEventSizes
+                for item in events {
+                    let type = item["type"].string
+                    if type == "lifecycle" {
+                        let size = Self.eventDimensions(item) ?? (!appliedTopSize ? topSize : nil)
+                        if let size {
+                            appliedTopSize = true
+                            pipe.feed(Data(), reset: false, columns: size.columns, rows: size.rows)
+                        }
+                    } else if type == "output" {
+                        let first = !rendererState.receivedScreen
+                        markSnapshotReceived()
+                        let fallbackSize = !appliedTopSize ? topSize : nil
+                        let size = Self.eventDimensions(item) ?? fallbackSize ?? (first ? pipe.activeDimensions : nil)
+                        if size != nil { appliedTopSize = true }
+                        if first { pendingStreamReplay = true }
+                        pipe.feed(Data(item["data"]["text"].string.utf8), reset: first, columns: size?.columns, rows: size?.rows, completesReplay: !first)
+                    }
+                }
+            }
+            if explicitEndOfPage { awaitingOpenCatchUp = false }
+            if pendingStreamReplay && !hasMore && !awaitingOpenCatchUp {
+                pendingStreamReplay = false
+                pipe.completeReplay()
+            } else if explicitEndOfPage && !pendingStreamReplay {
+                pipe.completeReplay()
+            }
         }
         if message["state"] != .null {
+            let state = message["state"]
+            if pipe.activeDimensions == nil,
+               let stateSize = TerminalDimensions(json: state["terminalSize"]) ?? TerminalDimensions(json: state) {
+                pipe.feed(Data(), reset: false, columns: stateSize.columns, rows: stateSize.rows)
+            }
+            if awaitingOpenCatchUp || pendingStreamReplay {
+                awaitingOpenCatchUp = false
+                pendingStreamReplay = false
+                pipe.completeReplay()
+            }
             var value = session.value.object
-            for (key, item) in message["state"].object { value[key] = item }
+            for (key, item) in state.object { value[key] = item }
             observe(.object(value))
         }
         if message["refusal"] != .null {
@@ -494,6 +559,7 @@ import InfiniteCore
         let previous = streamState.streamID
         streamState = .detached
         sending = false
+        awaitingOpenCatchUp = false; pendingStreamReplay = false
         rendererState = .awaitingSnapshot(generation: rendererState.generation)
         releaseControlState(otherHolder: currentOtherHolder)
         if let previous { Task { await deps.closeTerminal(client, previous) } }
@@ -505,6 +571,7 @@ import InfiniteCore
         stopChat(); markRead()
         streamState = .detached
         sending = false
+        awaitingOpenCatchUp = false; pendingStreamReplay = false
         rendererState = .awaitingSnapshot(generation: rendererState.generation)
         releaseControlState(otherHolder: currentOtherHolder)
         saveTask?.cancel(); saveTask = nil; try? await persistDraft(flush: true)

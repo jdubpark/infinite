@@ -45,8 +45,8 @@ function setup(t: test.TestContext, options: { adapter?: UnderstandingAdapter; p
   return { runtime, root, secondRoot, stateDir, group, config, setCatalog(value: KnowledgeCatalog) { currentCatalog = value; } };
 }
 async function waitUntil(predicate: () => boolean, ms = 20000) {
-  const end = Date.now() + ms;
-  while (Date.now() < end) { if (predicate()) return; await new Promise(resolvePromise => setTimeout(resolvePromise, 10)); }
+  const end = performance.now() + ms;
+  while (performance.now() < end) { if (predicate()) return; await new Promise(resolvePromise => setTimeout(resolvePromise, 10)); }
   assert.fail("timed out waiting for Understanding maintenance");
 }
 
@@ -595,13 +595,15 @@ test("a brief that runs out of time keeps the source map and component diagram, 
 const quickBrief: NonNullable<UnderstandingAdapter["brief"]> = async input => ({ head: input.context.head, base: null, generatedAt: new Date().toISOString(),
   brief: { summary: "Fast brief.", architecture: [], changes: [], checks: [], review: [], guidance: [], unknowns: [] }, diagrams: [], evidence: [], coverage: [] });
 const untilAborted = <T>(options: { signal: AbortSignal }) => new Promise<T>((_, reject) => options.signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true }));
+const freezeClock = (t: test.TestContext) => { const now = Date.now(); t.mock.method(Date, "now", () => now); };
 
 test("a stored brief and the source map publish when synthesis runs past the deadline", { timeout: 120000 }, async t => {
   const s = setup(t, { processFixture: true, adapter: { context: async root => sampleContext(root), brief: quickBrief, synthesize: (_input, options) => untilAborted(options) } });
   s.config.repositoryBriefings!.timeoutMs = 2000;
   s.setCatalog({ ...catalog(), policy: { ...catalog().policy, enabled: true, synthesis: true } });
+  freezeClock(t);
   s.runtime.refresh("workspace");
-  await waitUntil(() => !["queued", "running"].includes(s.runtime.read("workspace").maintenance.state), 10000);
+  await waitUntil(() => !["queued", "running"].includes(s.runtime.read("workspace").maintenance.state), 60000);
   const read = s.runtime.read("workspace");
   assert.equal(read.maintenance.state, "failed");
   assert.match(read.maintenance.message ?? "", /Repository Repository: synthesis unavailable: understanding-timeout/);
@@ -615,8 +617,9 @@ test("a re-check that runs out of time publishes the source map without the unco
   const s = setup(t, { processFixture: true, adapter: { context: async (root, options) => ++captures === 2 ? untilAborted(options) : sampleContext(root), brief: quickBrief } });
   s.config.repositoryBriefings!.timeoutMs = 2000;
   s.setCatalog({ ...catalog(), policy: { ...catalog().policy, enabled: true, synthesis: true } });
+  freezeClock(t);
   s.runtime.refresh("workspace");
-  await waitUntil(() => !["queued", "running"].includes(s.runtime.read("workspace").maintenance.state), 10000);
+  await waitUntil(() => !["queued", "running"].includes(s.runtime.read("workspace").maintenance.state), 60000);
   const read = s.runtime.read("workspace");
   assert.equal(captures, 2);
   assert.equal(read.maintenance.state, "failed");

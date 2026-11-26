@@ -43,13 +43,19 @@ import {
   type GoalCycle,
   type UnclassifiedGoalCycle,
 } from "../packages/host/src/goal-types.js";
+import { missionCoordinatorLaunch } from "../packages/host/src/launch.js";
 import {
+  missionCoordinatorProfileSchema,
+  missionCoordinatorProviderSchema,
+  missionLineupSchema,
   missionSubtaskSchema,
   recordedMissionFollowUpSchema,
   type Mission,
   type MissionDecisionState,
+  type MissionLineup,
 } from "../packages/host/src/mission-types.js";
 import { MissionService } from "../packages/host/src/missions.js";
+import { TeamError } from "../packages/host/src/teams.js";
 import { writeSealed } from "../packages/host/src/vault.js";
 import { validateWorkspaceManifest } from "../packages/host/src/workspace-checkpoint.js";
 import {
@@ -597,4 +603,94 @@ test("PassedTeamCheck, sync/blob hashes, and checkpoint timestamps match host st
     cloudReady: true,
     checkpoint: { id: validatedManifest.id, capturedAt: "not-a-timestamp" },
   }).success, false);
+});
+
+test("mission coordinator schemas, MissionLineup type, and MissionService reject Codex and non-Claude coordinators before launch", async () => {
+  const claudeStrong = { id: "lead", label: "Lead", provider: "claude" as const, model: "claude-opus-5-5", effort: "xhigh" as const, tier: "strong" as const };
+  const codexStrong = { id: "codex-lead", label: "Codex lead", provider: "codex" as const, model: "gpt-6-astra", effort: "xhigh" as const, tier: "strong" as const };
+  const opencodeStrong = { id: "oc-lead", label: "OpenCode lead", provider: "opencode" as const, model: "vendor/strong", variant: "high", tier: "strong" as const };
+  const codexLight = { id: "impl", label: "Impl", provider: "codex" as const, model: "gpt-6-luna", effort: "high" as const, tier: "light" as const };
+
+  assert.equal(missionCoordinatorProviderSchema.safeParse("claude").success, true);
+  assert.equal(missionCoordinatorProviderSchema.safeParse("codex").success, false);
+  assert.equal(missionCoordinatorProviderSchema.safeParse("opencode").success, false);
+  assert.equal(missionCoordinatorProfileSchema.safeParse(claudeStrong).success, true);
+  assert.equal(missionCoordinatorProfileSchema.safeParse(codexStrong).success, false);
+  assert.equal(missionCoordinatorProfileSchema.safeParse({ ...claudeStrong, tier: "light" }).success, false);
+
+  const validMissionLineup: MissionLineup = missionLineupSchema.parse({
+    coordinator: claudeStrong,
+    integrator: codexStrong,
+    reviewer: codexStrong,
+    implementers: [codexLight],
+  });
+  assert.equal(validMissionLineup.coordinator.provider, "claude");
+
+  const codexResult = missionLineupSchema.safeParse({
+    coordinator: codexStrong,
+    integrator: codexStrong,
+    reviewer: claudeStrong,
+    implementers: [codexLight],
+  });
+  assert.equal(codexResult.success, false);
+  if (!codexResult.success) {
+    assert.deepEqual(codexResult.error.issues[0]?.path, ["coordinator", "provider"]);
+    assert.match(codexResult.error.issues[0]?.message ?? "", /Codex merges inherited MCP server tables/);
+  }
+  assert.equal(missionLineupSchema.safeParse({
+    coordinator: opencodeStrong,
+    integrator: claudeStrong,
+    reviewer: claudeStrong,
+    implementers: [codexLight],
+  }).success, false);
+  assert.equal(missionLineupSchema.safeParse({
+    coordinator: { ...claudeStrong, tier: "light" },
+    integrator: claudeStrong,
+    reviewer: claudeStrong,
+    implementers: [codexLight],
+  }).success, false);
+
+  const invalidCodexMissionLineup: MissionLineup = {
+    // @ts-expect-error MissionLineup coordinator cannot use Codex
+    coordinator: codexStrong,
+    integrator: claudeStrong,
+    reviewer: claudeStrong,
+    implementers: [codexLight],
+  };
+  assert.throws(() => {
+    // @ts-expect-error missionCoordinatorLaunch rejects Codex at compile time
+    missionCoordinatorLaunch("codex", { command: "codex", args: [] });
+  }, /require Claude Code/);
+  assert.ok(invalidCodexMissionLineup);
+
+  const dir = mkdtempSync(join(tmpdir(), "inf-mission-codex-reject-"));
+  const stateDir = join(dir, "state");
+  const key = randomBytes(32);
+  let calledGroupLookup = false;
+  const service = new MissionService(
+    {
+      stateDir,
+      projects: [],
+      agents: { claude: { command: "claude", args: [] }, codex: { command: "codex", args: [] } },
+      teams: {
+        workspaceDir: join(dir, "teams"),
+        lineup: { coordinator: codexStrong, integrator: claudeStrong, reviewer: claudeStrong, implementers: [codexLight] },
+      },
+    } as unknown as Config,
+    key,
+    {} as never,
+    { useMissionReservations() {}, useMissionReviews() {} } as never,
+    { get() { calledGroupLookup = true; throw new Error("unexpected group lookup"); } },
+  );
+  try {
+    assert.equal(service.enabled(), false, "MissionService.enabled() returns false for a Codex coordinator");
+    await assert.rejects(
+      service.create({ requestId: UUID, groupId: "shop", objective: "Coordinate repositories", maxSubtasks: 4, maxMinutes: 30 }),
+      (error: unknown) => error instanceof TeamError && error.status === 409 && error.code === "mission-coordinator-unsupported" && /Codex merges inherited MCP server tables/.test(error.message),
+    );
+    assert.equal(calledGroupLookup, false, "Codex mission coordinator is rejected at schema validation before touching groups or launch");
+  } finally {
+    await service.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

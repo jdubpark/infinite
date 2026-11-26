@@ -73,7 +73,7 @@ test("a pause ends the Git read that collects requested permission evidence, sta
 
 test("a pause ends the Git read that rechecks the target before an approved answer, and nothing is sent (INF-521)", { timeout: 180000 }, async () => {
   const control = mkdtempSync(join(tmpdir(), "team-answer-halt-"));
-  const f = await fixture("permissions-codex", limitLineup,
+  const f = await fixture("permissions-codex", lineup,
     { teams: { commandPrefix: { command: process.execPath, args: ["-e", holdEvidenceRead, control] } } } as Partial<Config>);
   try {
     writeFileSync(join(control, "receipts"), f.receipts);

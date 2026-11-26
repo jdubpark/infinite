@@ -4,6 +4,7 @@ import { spawn } from "node:child_process";
 import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { createConnection } from "node:net";
+import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { randomBytes, randomUUID } from "node:crypto";
 import headless from "@xterm/headless";
@@ -136,7 +137,7 @@ process.stdin.on("data", data => {
 `;
 
 async function fixture(provider: "demo" | "claude" | "codex" = "demo", initialPrompt = "", team?: TeamAssignment) {
-  const root = mkdtempSync("/tmp/inf-worker-");
+  const root = mkdtempSync(join(tmpdir(), "inf-worker-"));
   const id = randomUUID();
   const key = randomBytes(32);
   const runDir = join(root, "run");

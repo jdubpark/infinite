@@ -122,6 +122,7 @@ const schema = z
     browserSessions: z.boolean().default(true),
     stateDir: z.string(),
     runDir: z.string(),
+    socketDir: z.string().min(1).optional(),
     keyFile: z.string(),
     environment: z.enum(["local", "cloud"]),
     enableDemo: z.boolean().default(false),
@@ -186,7 +187,7 @@ export function assertPrivateCredentialFile(config: Config, file: string, messag
   try {
     if (!isAbsolute(file) || (statSync(file).mode & 0o777) !== 0o600 || !statSync(file).isFile()) throw new Error();
     const actual = realpathSync(file);
-    for (const directory of [config.stateDir, config.runDir, config.teams?.workspaceDir, ...config.projects.flatMap(project => [project.path, project.teamworkDir])].filter((value): value is string => Boolean(value))) {
+    for (const directory of [config.stateDir, config.runDir, config.socketDir, config.teams?.workspaceDir, ...config.projects.flatMap(project => [project.path, project.teamworkDir])].filter((value): value is string => Boolean(value))) {
       let base: string;
       try { base = realpathSync(directory); } catch { base = resolve(directory); }
       const rel = relative(base, actual);
@@ -272,6 +273,7 @@ export function readConfig(file: string): { config: Config; key: Buffer } {
   for (const path of [
     config.stateDir,
     config.runDir,
+    ...(config.socketDir !== undefined ? [config.socketDir] : []),
     config.keyFile,
     ...config.projects.map((p) => p.path),
   ]) {
@@ -304,7 +306,7 @@ export function readConfig(file: string): { config: Config; key: Buffer } {
     const info = statSync(file);
     if (!info.isFile() || (info.mode & 0o777) !== 0o600) throw new Error(message);
     const actual = realpathSync(file);
-    for (const directory of [config.stateDir, config.runDir, config.teams?.workspaceDir, ...config.projects.flatMap(project => [project.path, project.teamworkDir])].filter((value): value is string => Boolean(value))) {
+    for (const directory of [config.stateDir, config.runDir, config.socketDir, config.teams?.workspaceDir, ...config.projects.flatMap(project => [project.path, project.teamworkDir])].filter((value): value is string => Boolean(value))) {
       let base: string;
       try { base = realpathSync(directory); } catch { base = resolve(directory); }
       const rel = relative(base, actual);

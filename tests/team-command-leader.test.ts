@@ -558,3 +558,22 @@ test("under sudo the anchor passes the relayed SIGTERM to the whole group: the f
     rmSync(base, { recursive: true, force: true });
   }
 });
+
+test("under a prefix, a stop that lands before the command's turn resolves as interrupted without spawning it and without an unconfirmed-stop error", PREFIX_CASE, async () => {
+  const base = mkdtempSync(join(tmpdir(), "team-command-early-"));
+  const marker = join(base, "marker");
+  try {
+    const controller = new AbortController();
+    controller.abort();
+    const started: Array<number | undefined> = [];
+    const scope: CommandScope = { starting: () => undefined, started: pid => { started.push(pid); } };
+    const command = nodeCommand(["require('node:fs').writeFileSync(process.argv[1], 'ran');"], marker);
+    const result = await commandScope.run(scope, () => teamOperationCommand(command, base, controller.signal, 60_000, RELAY));
+    assert.equal(result.interrupted, true, "the command counts as interrupted");
+    assert.equal(result.exitCode, null);
+    assert.deepEqual(started, [undefined], "no process was started");
+    assert.equal(existsSync(marker), false, "the command never ran");
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});

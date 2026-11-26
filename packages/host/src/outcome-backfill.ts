@@ -1,14 +1,17 @@
 import { profileIdentityKey } from "./config-identity.js";
+import type { UsageConfig } from "./config.js";
 import { CONFIGURATIONS_MODULE, epochAt } from "./configuration-store.js";
 import { type EvidenceIndexClass, canonicalJson } from "./evidence/crypto.js";
 import type { EvidenceStore } from "./evidence/store.js";
 import type { EvidenceTx } from "./evidence/types.js";
+import { applyOutcomeCost } from "./outcome-cost.js";
 import { type Disposition, type Flag, type LinkState, exclusionOf, levels, replaces, reportDisposition, roundCounts } from "./outcome-rules.js";
 import { recomputeRun } from "./outcome-signals.js";
 import { OUTCOMES_MODULE, type OutcomePayload, type OutcomeRow, type RunSummaryPayload, type RunSummaryRow, readOutcome, readSummary, writeOutcome, writeSummary } from "./outcome-store.js";
 import { type FeatureMap, taskFeatures } from "./task-features.js";
 import { profileIdentity, runEventKey, runSummaryCounts } from "./run-events.js";
 import type { TeamMember, TeamRun, TeamTask } from "./team-types.js";
+import { usageModule } from "./usage-store.js";
 
 const DEFAULT_LIMIT = 20;
 const NO_ACTIVITY = "No activity for ";
@@ -162,7 +165,7 @@ export function backfillRun(run: TeamRun, context: BackfillContext): { rows: Out
   return { rows, summary, skipped, rounds };
 }
 
-export function backfillTick(store: EvidenceStore, runs: () => TeamRun[], options: { mapOf: (projectId: string) => FeatureMap | undefined; limit?: number; now: () => string }): { written: number; remaining: number } {
+export function backfillTick(store: EvidenceStore, runs: () => TeamRun[], options: { mapOf: (projectId: string) => FeatureMap | undefined; limit?: number; now: () => string; prices?: UsageConfig["prices"] }): { written: number; remaining: number } {
   try {
     if (!ready(store)) return { written: 0, remaining: 0 };
     const limit = options.limit !== undefined && Number.isFinite(options.limit) ? Math.max(1, Math.floor(options.limit)) : DEFAULT_LIMIT;
@@ -189,7 +192,7 @@ export function backfillTick(store: EvidenceStore, runs: () => TeamRun[], option
   }
 }
 
-export function outcomeBackfill(store: EvidenceStore, runs: () => TeamRun[], options: { mapOf: (projectId: string) => FeatureMap | undefined; limit?: number; now: () => string }): () => void {
+export function outcomeBackfill(store: EvidenceStore, runs: () => TeamRun[], options: { mapOf: (projectId: string) => FeatureMap | undefined; limit?: number; now: () => string; prices?: UsageConfig["prices"] }): () => void {
   let done = false;
   let first = true;
   return () => {
@@ -206,7 +209,7 @@ function ready(store: EvidenceStore): boolean {
   return status.state === "ready" && status.modules[OUTCOMES_MODULE] === "ready" && status.modules[CONFIGURATIONS_MODULE] === "ready";
 }
 
-function writeRun(store: EvidenceStore, tx: EvidenceTx, run: TeamRun, options: { mapOf: (projectId: string) => FeatureMap | undefined; now: () => string }): WriteOutcome {
+function writeRun(store: EvidenceStore, tx: EvidenceTx, run: TeamRun, options: { mapOf: (projectId: string) => FeatureMap | undefined; now: () => string; prices?: UsageConfig["prices"] }): WriteOutcome {
   const map = options.mapOf(run.projectId);
   let result: ReturnType<typeof backfillRun>;
   try {
@@ -221,9 +224,13 @@ function writeRun(store: EvidenceStore, tx: EvidenceTx, run: TeamRun, options: {
     tx.run("INSERT INTO backfill_runs (run_id, at, rows, skipped) VALUES (?, ?, 0, -1) ON CONFLICT(run_id) DO NOTHING", run.id, options.now());
     return "unreadable";
   }
+  const usageReady = store.status().modules[usageModule.name] === "ready";
   const inserted: string[] = [];
   for (const row of result.rows) {
     if (readOutcome(tx, row.outcomeId) !== undefined) continue;
+    if (usageReady) {
+      try { applyOutcomeCost(tx, row, options.prices); } catch {}
+    }
     writeOutcome(tx, row);
     inserted.push(row.outcomeId);
   }

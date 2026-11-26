@@ -105,7 +105,29 @@ export function routingStatusLines(status: RoutingStatus): string[] {
     lines.push(`Auto starts, last 30 days: ${counts.pending} pending, ${counts.applied} applied, ${counts.released} released.${counts.capped ? ` (newest ${DECISION_LIMIT})` : ""}`);
   }
   const costs = status.costs;
-  lines.push(`Costs are tier defaults: light ${money(costs.lightUsd)}, strong ${money(costs.strongUsd)}, rescue ${money(costs.rescueUsd)}. Limit headroom is not modelled. Intervals are 90% normal approximations. Coordinator-chosen history counts at half weight.`);
+  const costText = costs.basis === "observed"
+    ? `Costs are observed list USD (rescue default ${money(costs.rescueUsd)}).`
+    : costs.basis === "mixed"
+      ? `Costs use observed list USD where available; tier defaults: light ${money(costs.lightUsd)}, strong ${money(costs.strongUsd)}, rescue ${money(costs.rescueUsd)}.`
+      : `Costs are tier defaults: light ${money(costs.lightUsd)}, strong ${money(costs.strongUsd)}, rescue ${money(costs.rescueUsd)}.`;
+  const headroomText = status.headroom === "modelled" ? "Limit headroom is modelled." : "Limit headroom is not modelled.";
+  lines.push(`${costText} ${headroomText} Intervals are 90% normal approximations. Coordinator-chosen history counts at half weight.`);
+  if (status.providers && Object.keys(status.providers).length > 0) {
+    const formatted = Object.entries(status.providers)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([provider, info]) => {
+        const name = clean(provider);
+        if (info.basis === "limited") return `${name} limited (pressure ${decimal(info.pressure)})`;
+        if (info.basis === "estimated" && info.headroom !== null) {
+          const pct = Math.round(info.headroom * 100);
+          const unit = info.unit ? `${clean(info.unit)}, ` : "";
+          const near = info.near ? ", near limit" : "";
+          return `${name} ${pct}% headroom (${unit}pressure ${decimal(info.pressure)}${near})`;
+        }
+        return `${name} unestimated`;
+      });
+    lines.push(`Provider headroom: ${formatted.join(" · ")}`);
+  }
   if (auto) lines.push("The router's applied choices count at full weight.");
   for (const entry of status.cells) {
     if (entry.cell.scope === "new-task") lines.push("New task (project level)");
@@ -125,8 +147,9 @@ function candidateLine(candidate: CandidateRecord): string {
   const name = clean(candidate.profileId);
   if (candidate.removed) return `  ${name}  removed: ${clean(candidate.removed)}`;
   const cost = candidate.costUsd === undefined ? "unknown" : money(candidate.costUsd);
+  const pressure = candidate.pressure !== undefined && candidate.pressure > 0 ? ` · pressure ${decimal(candidate.pressure)}` : "";
   const fallback = candidate.samplerFallback ? " · sampler fallback" : "";
-  return `  ${name}  mean ${decimal(candidate.thetaMean)} · deviation ${decimal(candidate.thetaSd)} · rescue ${decimal(candidate.phiMean)} · cost ${cost} · greedy utility ${decimal(candidate.greedyUtility)} · sample ${decimal(candidate.sample)} · sampled utility ${decimal(candidate.sampledUtility)}${fallback}`;
+  return `  ${name}  mean ${decimal(candidate.thetaMean)} · deviation ${decimal(candidate.thetaSd)} · rescue ${decimal(candidate.phiMean)} · cost ${cost}${pressure} · greedy utility ${decimal(candidate.greedyUtility)} · sample ${decimal(candidate.sample)} · sampled utility ${decimal(candidate.sampledUtility)}${fallback}`;
 }
 
 export function routingExplainLines(explain: RoutingExplain): string[] {

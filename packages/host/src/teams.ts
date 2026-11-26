@@ -480,7 +480,7 @@ export class TeamService {
   }
   private currentDate() { return new Date(this.options?.now?.() ?? Date.now()); }
   diagnostics(): TeamDiagnosticsSnapshot { return this.diag.snapshot(); }
-  providerLimits() { return this.limits.active(this.currentDate()); }
+  providerLimits() { return this.limits.active(this.currentDate()); } providerLimitHistory() { return this.limits.history(this.currentDate()); } onLimitsChanged(listener: () => void) { this.limits.onChanged(listener); }
   private confirmed(id: string): Promise<void> {
     const run = this.records.get(id)?.run;
     if (!this.linear || !run || !(run.linearTracking || run.linear)) return Promise.resolve();
@@ -2499,7 +2499,7 @@ export class TeamService {
     if (stored.run.replay) return void this.replays.end(stored, "void-limit", limit.resetsAt);
     const run = stored.run, provider = member.provider ?? run.provider, name = PROVIDER_NAMES[provider];
     const kind = limit.limit === "credits" ? "credit limit" : "usage limit", resets = limit.resetsAt ? clock(limit.resetsAt) : undefined;
-    if (limit.confidence === "corroborated") this.limits.observe({ provider, detectedAt: limit.at, ...(limit.resetsAt ? { resetsAt: limit.resetsAt } : {}), sessionId: member.sessionId, runId: run.id, confidence: "corroborated" });
+    if (limit.confidence === "corroborated") this.limits.observe({ provider, limit: limit.limit, detectedAt: limit.at, ...(limit.resetsAt ? { resetsAt: limit.resetsAt } : {}), sessionId: member.sessionId, runId: run.id, confidence: "corroborated" });
     try { if (!await this.stopped(member)) { member.cursor = limit.seq - 1; this.save(stored); return; } }
     catch { member.cursor = limit.seq - 1; member.status = "unavailable"; run.reason = "An agent could not be stopped. Release its input control or inspect its terminal before integration."; this.save(stored); return; }
     member.stoppedReason = `${name} ${kind}${resets ? `, resets ${resets}` : ""}`;
@@ -2611,9 +2611,9 @@ export class TeamService {
       this.event(stored, `${member.title} queued in an isolated working copy.`);
     });
   }
-  private routerInput(run: TeamRun) {
+  private routerInput(run: TeamRun, now = this.currentDate()) {
     return { publishHeads: this.publishHeadsEnabled(), entryTools: entryToolsFor(run, "implementer"), objectiveDigest: objectivePromptOf(run), codeMode: memberCodeModeExpected(this.config),
-      limited: this.limits.limited(this.currentDate()), featureMap: (run.handoff?.project ?? this.config.projects.find(project => project.id === run.projectId)?.team)?.features };
+      limited: this.limits.limited(now), limitHistory: this.limits.history(now), prices: this.config.usage?.prices, featureMap: (run.handoff?.project ?? this.config.projects.find(project => project.id === run.projectId)?.team)?.features };
   }
   private rebuildDeliveryPrompts(stored: Stored, target?: TeamMember): () => void {
     const run = stored.run, members = target ? [target] : run.members.filter(m => m.role === "delivery" && m.revision === run.revision && m.status === "queued");

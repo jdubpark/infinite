@@ -21,22 +21,27 @@ export interface UsageTotals { cost: number; tokens: UsageTokens; messages: numb
 
 const MICRO_DOLLARS_PER_DOLLAR = 1_000_000;
 
-export function priceUsage(record: UsageRecord, prices: UsageConfig["prices"] | undefined, catalog: Record<string, CatalogPrice> = PRICE_CATALOG): { cost: number; pricing: Pricing } {
+export function listPriceUsage(record: UsageRecord, prices: UsageConfig["prices"] | undefined, catalog: Record<string, CatalogPrice> = PRICE_CATALOG): { cost: number; pricing: "configured" | "catalog" | "unknown" } {
   if (record.modelSource === "unknown") return { cost: 0, pricing: "unknown" };
+  if (record.provider === "codex" && record.tokens.cacheWrite > 0) return { cost: 0, pricing: "unknown" };
   const key = `${record.providerId}/${record.modelId}`;
   const configured = prices?.[key], catalogPrice = catalog[key], price = configured ?? catalogPrice;
-  if (price) {
-    const { tokens } = record;
-    const date = new Date(record.completedAt);
-    const peak = !configured && catalogPrice?.peak && catalogPrice.peak.days.includes(date.getUTCDay()) && catalogPrice.peak.hoursUtc.some(([start, end]) => date.getUTCHours() >= start && date.getUTCHours() < end);
-    const multiplier = peak && catalogPrice?.peak ? catalogPrice.peak.multiplier : 1;
-    const microDollars = (tokens.input * price.input
-      + (tokens.output + tokens.reasoning) * price.output
-      + tokens.cacheRead * (price.cacheRead ?? price.input)
-      + tokens.cacheWrite * (price.cacheWrite ?? price.input)) * multiplier;
-    return { cost: Math.round(microDollars) / MICRO_DOLLARS_PER_DOLLAR, pricing: configured ? "configured" : "catalog" };
-  }
-  if (record.reportedCost > 0) return { cost: record.reportedCost, pricing: "provider" };
+  if (!price) return { cost: 0, pricing: "unknown" };
+  const { tokens } = record;
+  const date = new Date(record.completedAt);
+  const peak = !configured && catalogPrice?.peak && catalogPrice.peak.days.includes(date.getUTCDay()) && catalogPrice.peak.hoursUtc.some(([start, end]) => date.getUTCHours() >= start && date.getUTCHours() < end);
+  const multiplier = peak && catalogPrice?.peak ? catalogPrice.peak.multiplier : 1;
+  const microDollars = (tokens.input * price.input
+    + (tokens.output + tokens.reasoning) * price.output
+    + tokens.cacheRead * (price.cacheRead ?? price.input)
+    + tokens.cacheWrite * (price.cacheWrite ?? price.input)) * multiplier;
+  return { cost: Math.round(microDollars) / MICRO_DOLLARS_PER_DOLLAR, pricing: configured ? "configured" : "catalog" };
+}
+
+export function priceUsage(record: UsageRecord, prices: UsageConfig["prices"] | undefined, catalog: Record<string, CatalogPrice> = PRICE_CATALOG): { cost: number; pricing: Pricing } {
+  const listed = listPriceUsage(record, prices, catalog);
+  if (listed.pricing !== "unknown") return listed;
+  if (record.modelSource !== "unknown" && record.reportedCost > 0) return { cost: record.reportedCost, pricing: "provider" };
   return { cost: 0, pricing: "unknown" };
 }
 

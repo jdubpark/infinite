@@ -73,7 +73,7 @@ import { CellQueryRefused, type CellQuery, type CostLookup } from "./outcome-cel
 import { currentEpochs, productionRows, queryCells, queryRollup } from "./outcome-reads.js";
 import { latestAssessment, rollupMissing, type RollupTarget } from "./outcome-rollup.js";
 import { importLegacy, LegacyImportRefused } from "./outcome-import.js";
-import { sessionCostOf } from "./outcome-cost.js";
+import { outcomeCostSync, sessionCostOf } from "./outcome-cost.js";
 import { legacyBatchSchema } from "./outcome-legacy.js";
 import { GoalService } from "./goals.js";
 import { RoutineService } from "./routines.js";
@@ -272,7 +272,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
       lateReceipts();
     },
   });
-  outbox.registerProjector(outcomeProjector(evidence));
+  outbox.registerProjector(outcomeProjector(evidence, { prices: config.usage?.prices }));
   const evalHost: EvalHost = new EvalHost({ config, store: evidence, source: projectSource, hostLoad: manager.hostLoad, halt: () => halt, runs: () => teams.understandingRecords(), teams: () => teams, sessions: manager, cost: sessionId => sessionCostOf(usage.session(sessionId)) });
   const fuse = new FuseService({ config, key, store: evidence, sessionExists: id => {
     try { manager.meta(id); return true; } catch (error) { return (error as NodeJS.ErrnoException).code !== "ENOENT"; }
@@ -299,16 +299,16 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
   });
   teams.useEvidence(evidence);
   lateReceipts = () => { void teams.settleReceipts().catch(() => {}); };
-  teams.useRouter(new RoutingRecorder({ store: evidence }));
+  const router = new RoutingRecorder({ store: evidence }); teams.useRouter(router);
   const backfillOutcomes = outcomeBackfill(evidence, () => teams.understandingRecords(), {
     mapOf: projectId => config.projects.find(project => project.id === projectId)?.team?.features,
-    now: () => new Date().toISOString(),
+    now: () => new Date().toISOString(), prices: config.usage?.prices,
   });
   backfillOutcomes();
-  const usage = new UsageService(config, key, manager, evidence);
+  const usage = new UsageService(config, key, manager, evidence); const syncCosts = outcomeCostSync(evidence, config.usage?.prices); syncCosts();
   const balances = new BalanceService(config.usage?.accounts ?? {});
   usage.useBalances(balances);
-  teams.useUsage(usage);
+  teams.useUsage(usage); const refreshHeadrooms = () => router.refreshHeadrooms(config.teams?.lineup, teams.providerLimitHistory(), config.usage?.prices); refreshHeadrooms(); usage.onUpdated(refreshHeadrooms); teams.onLimitsChanged(refreshHeadrooms);
   const goals = new GoalService(config, key, teams, linear);
   lateReceipts = () => { void teams.settleReceipts().then(() => goals.syncReceipts()).catch(() => {}); };
   ownerServices.goals = goals;
@@ -396,7 +396,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
       const result = outbox.advance();
       if (!result.pending || result.blocked.length > 0) break;
     }
-    backfillOutcomes();
+    backfillOutcomes(); syncCosts();
   };
   let outboxTimer: NodeJS.Timeout | undefined;
   const closeEvidence = () => { baseScanner?.close(); clearInterval(evidenceSweep); clearInterval(outboxTimer); fuse.stop(); evalHost.close(); evidence.close(); };
@@ -1011,7 +1011,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
   app.get("/api/goals", (_req, res) => res.json({ goals: goals.list() }));
   app.get("/api/goals/:id", (req, res) => res.json(goals.get(id.parse(req.params.id))));
   objectiveRoutes(app, { goals, teams }, requireRole(["owner", "controller", "viewer"]), requireRole(["owner"]));
-  routingRoutes(app, { evidence, config: () => config, teams }, requireRole(["owner", "controller", "viewer"]), requireRole(["owner"]));
+  routingRoutes(app, { evidence, config: () => config, teams, headroomCache: router.headroomCache }, requireRole(["owner", "controller", "viewer"]), requireRole(["owner"]));
   evalHost.routes(app, requireRole(["owner", "controller", "viewer"]), requireRole(["owner"]));
   app.get("/api/routines", (_req, res) => res.json({ routines: routines.list() }));
   app.get("/api/routines/:id", (req, res) => res.json(routines.get(id.parse(req.params.id))));

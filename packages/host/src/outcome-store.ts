@@ -64,8 +64,11 @@ export type OutcomePayload = import("./outcome-gauges.js").GaugePayload & {
   legacy?: LegacyPayload;
   diff?: TeamTask["diffStat"];
   wallMs?: number;
+  tokens?: number;
+  spentUsd?: number;
+  listUsd?: number;
   limitEvents: number;
-  costCoverage: "none";
+  costCoverage: "none" | "partial" | "complete";
 };
 
 export type RunSummaryPayload = {
@@ -239,7 +242,7 @@ const OUTCOME_COLUMNS = [
   "attempt_index", "inherited", "role", "profile_id", "provider", "model", "effort", "profile_epoch", "config_id",
   "experiment_ref", "area_ref", "kind", "risk", "feature_version", "disposition", "exclusion", "flags",
   "integrated", "accepted", "acceptance", "first_pass", "held", "started_at", "ended_at", "frozen_at", "hold_until",
-  "run_deleted_at", "payload", "goal_ref", "mission_ref", "point", "feature_map_ref", "owner_score",
+  "run_deleted_at", "payload", "goal_ref", "mission_ref", "point", "feature_map_ref", "owner_score", "list_usd",
 ] as const;
 const SUMMARY_COLUMNS = [
   "run_id", "source", "project_ref", "revision", "status", "block_code", "flags", "created_at", "settled_at",
@@ -297,6 +300,7 @@ type OutcomeSql = {
   point: RoutingPointValue | null;
   feature_map_ref: string | null;
   owner_score: number | null;
+  list_usd: number | null;
 };
 
 type SummarySql = {
@@ -344,13 +348,14 @@ export function outcomeModule(options?: { now?: () => string }): EvidenceModule 
   const now = options?.now ?? (() => new Date().toISOString());
   return {
     name: OUTCOMES_MODULE,
-    version: 4,
+    version: 5,
     readVersion: 2,
     migrate(tx, from) {
       if (from < 1) migrateVersion1(tx);
       if (from < 2) migrateVersion2(tx);
       if (from < 3) migrateVersion3(tx);
       if (from < 4) migrateVersion4(tx);
+      if (from < 5) migrateVersion5(tx);
     },
     deleteRun(tx, runId) {
       const stamp = now();
@@ -535,6 +540,23 @@ function migrateVersion4(tx: EvidenceTx): void {
   }
 }
 
+function outcomeListUsd(payload: Pick<OutcomePayload, "costCoverage" | "listUsd">): number | null {
+  return payload.costCoverage === "complete" && typeof payload.listUsd === "number" && Number.isFinite(payload.listUsd) && payload.listUsd >= 0
+    ? payload.listUsd
+    : null;
+}
+
+function migrateVersion5(tx: EvidenceTx): void {
+  tx.exec("ALTER TABLE outcomes ADD COLUMN list_usd REAL");
+  for (const row of tx.all<{ outcome_id: string; payload: string }>("SELECT outcome_id, payload FROM outcomes")) {
+    try {
+      const listUsd = outcomeListUsd(tx.open<OutcomePayload>(OUTCOMES, row.outcome_id, row.payload));
+      if (listUsd !== null) tx.run("UPDATE outcomes SET list_usd=? WHERE outcome_id=?", listUsd, row.outcome_id);
+    } catch {
+    }
+  }
+}
+
 type RoutingPointValue = "start" | "escalation";
 type PointBase = { runId: string; source: string; role: string; attemptIndex: number; replaces: Replaces };
 type Replaces = OutcomePayload["replaces"];
@@ -603,9 +625,16 @@ export function selectOutcomes(db: EvidenceDb, filter: OutcomeFilter): { rows: O
 
 export const ROUTING_EVIDENCE_SQL = "SELECT o.outcome_id, o.source, o.project_ref, o.area_ref, o.provider, o.model, o.effort, "
   + "o.profile_epoch, o.kind, o.feature_version, o.disposition, o.exclusion, o.flags, o.integrated, o.accepted, "
-  + "o.first_pass, o.held, o.ended_at, o.frozen_at, o.point, o.feature_map_ref, o.owner_score, c.prompt_version "
+  + "o.first_pass, o.held, o.ended_at, o.frozen_at, o.point, o.feature_map_ref, o.owner_score, o.list_usd, c.prompt_version "
   + "FROM outcomes o LEFT JOIN configurations c ON c.config_id = o.config_id "
   + "WHERE o.source = ? AND o.role = 'implementer' AND o.point = ? AND o.provider = ? AND o.model = ? AND o.effort IS ? "
+  + "AND o.ended_at >= ? ORDER BY o.ended_at DESC, o.outcome_id DESC LIMIT ?";
+
+export const SCOUT_EVIDENCE_SQL = "SELECT o.outcome_id, o.source, o.project_ref, o.area_ref, o.provider, o.model, o.effort, "
+  + "o.profile_epoch, o.kind, o.feature_version, o.disposition, o.exclusion, o.flags, o.integrated, o.accepted, "
+  + "o.first_pass, o.held, o.ended_at, o.frozen_at, o.point, o.feature_map_ref, o.owner_score, o.list_usd, c.prompt_version "
+  + "FROM outcomes o LEFT JOIN configurations c ON c.config_id = o.config_id "
+  + "WHERE o.source = ? AND o.role = 'scout' AND o.point IS NULL AND o.provider = ? AND o.model = ? AND o.effort IS ? "
   + "AND o.ended_at >= ? ORDER BY o.ended_at DESC, o.outcome_id DESC LIMIT ?";
 
 const ROUTING_SOURCES = ["production", "duel"] as const;
@@ -633,35 +662,27 @@ export function selectRoutingEvidence(
   return rows.sort((a, b) => compareKeys(a.outcomeId, b.outcomeId));
 }
 
+export function selectScoutEvidence(db: EvidenceDb, identity: Identity, since: string): RoutingEvidenceRow[] {
+  const rows: RoutingEvidenceRow[] = [];
+  for (const source of ROUTING_SOURCES) {
+    const found = db.all<RoutingSql>(SCOUT_EVIDENCE_SQL, source, identity.provider, identity.model, identity.effort, since, ROUTING_ROWS_PER_SOURCE);
+    for (const row of found) rows.push({ ...toRoutingEvidence(row), point: "scout" });
+  }
+  return rows.sort((a, b) => compareKeys(a.outcomeId, b.outcomeId));
+}
+
 type RoutingSql = Pick<OutcomeSql, "outcome_id" | "source" | "project_ref" | "area_ref" | "provider" | "model" | "effort"
   | "profile_epoch" | "kind" | "feature_version" | "disposition" | "exclusion" | "integrated" | "accepted" | "first_pass" | "held"
-  | "ended_at" | "frozen_at"> & { flags: string; point: RoutingPointValue; feature_map_ref: string | null; owner_score: number | null; prompt_version: string | null };
+  | "ended_at" | "frozen_at"> & { flags: string; point: RoutingPointValue; feature_map_ref: string | null; owner_score: number | null; list_usd: number | null; prompt_version: string | null };
 
 function toRoutingEvidence(row: RoutingSql): RoutingEvidenceRow {
   return {
-    outcomeId: row.outcome_id,
-    source: row.source,
-    projectRef: row.project_ref,
-    areaRef: row.area_ref,
-    provider: row.provider,
-    model: row.model,
-    effort: row.effort,
-    profileEpoch: row.profile_epoch,
-    kind: row.kind,
-    featureVersion: row.feature_version,
-    disposition: row.disposition,
-    exclusion: row.exclusion,
-    flags: splitFlags(row.flags),
-    integrated: row.integrated,
-    accepted: row.accepted,
-    firstPass: row.first_pass,
-    held: row.held,
-    endedAt: row.ended_at,
-    frozenAt: row.frozen_at,
-    point: row.point,
-    featureMapRef: row.feature_map_ref,
-    ownerScore: row.owner_score,
-    promptVersion: row.prompt_version,
+    outcomeId: row.outcome_id, source: row.source, projectRef: row.project_ref, areaRef: row.area_ref,
+    provider: row.provider, model: row.model, effort: row.effort, profileEpoch: row.profile_epoch,
+    kind: row.kind, featureVersion: row.feature_version, disposition: row.disposition, exclusion: row.exclusion,
+    flags: splitFlags(row.flags), integrated: row.integrated, accepted: row.accepted, firstPass: row.first_pass,
+    held: row.held, endedAt: row.ended_at, frozenAt: row.frozen_at, point: row.point,
+    featureMapRef: row.feature_map_ref, ownerScore: row.owner_score, listUsd: row.list_usd, promptVersion: row.prompt_version,
   };
 }
 
@@ -671,51 +692,18 @@ export function writeOutcome(tx: EvidenceTx, row: OutcomeRow): void {
   const routing = routingColumns(tx, row);
   tx.run(
     OUTCOME_UPSERT,
-    row.outcomeId,
-    row.source,
-    tx.index("project", payload.projectId),
-    tx.index("task", payload.taskId),
-    row.runId,
-    row.revision,
-    row.memberId,
-    row.sessionId,
-    row.attemptIndex,
-    row.inherited ? 1 : 0,
-    row.role,
-    row.profileId,
-    row.provider,
-    row.model,
-    row.effort,
-    row.profileEpoch,
-    row.configId,
-    row.experimentRef,
-    tx.index("area", payload.area),
-    row.kind,
-    row.risk,
-    row.featureVersion,
-    row.disposition,
-    row.exclusion,
-    joinFlags(row.flags),
-    row.integrated,
-    row.accepted,
-    row.acceptance === undefined ? row.accepted : row.acceptance,
-    row.firstPass,
-    row.held,
-    row.startedAt,
-    row.endedAt,
-    row.frozenAt,
-    row.holdUntil,
-    row.runDeletedAt,
-    tx.seal(OUTCOMES, row.outcomeId, payload),
-    refs.goalRef,
-    refs.missionRef,
-    routing.point,
-    routing.featureMapRef,
-    routing.ownerScore,
+    row.outcomeId, row.source, tx.index("project", payload.projectId), tx.index("task", payload.taskId),
+    row.runId, row.revision, row.memberId, row.sessionId, row.attemptIndex, row.inherited ? 1 : 0,
+    row.role, row.profileId, row.provider, row.model, row.effort, row.profileEpoch, row.configId, row.experimentRef,
+    tx.index("area", payload.area), row.kind, row.risk, row.featureVersion, row.disposition, row.exclusion,
+    joinFlags(row.flags), row.integrated, row.accepted, row.acceptance === undefined ? row.accepted : row.acceptance,
+    row.firstPass, row.held, row.startedAt, row.endedAt, row.frozenAt, row.holdUntil, row.runDeletedAt,
+    tx.seal(OUTCOMES, row.outcomeId, payload), refs.goalRef, refs.missionRef,
+    routing.point, routing.featureMapRef, routing.ownerScore, routing.listUsd,
   );
 }
 
-function routingColumns(tx: EvidenceTx, row: OutcomeRow): { point: RoutingPointValue | null; featureMapRef: string; ownerScore: number | null } {
+function routingColumns(tx: EvidenceTx, row: OutcomeRow): { point: RoutingPointValue | null; featureMapRef: string; ownerScore: number | null; listUsd: number | null } {
   const payload = row.payload;
   return {
     point: pointOf(
@@ -724,6 +712,7 @@ function routingColumns(tx: EvidenceTx, row: OutcomeRow): { point: RoutingPointV
     ),
     featureMapRef: tx.index("feature-map", payload.featureMap),
     ownerScore: payload.ownerRating?.score ?? null,
+    listUsd: outcomeListUsd(payload),
   };
 }
 

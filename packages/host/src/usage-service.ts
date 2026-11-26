@@ -3,19 +3,22 @@ import { join } from "node:path";
 import type { Config, Provider, SessionPurpose } from "./types.js";
 import type { Manager } from "./manager.js";
 import { writeSealed, unseal } from "./vault.js";
-import { accountOf, periodStart, priceUsage, sumUsage, type Pricing, type UsageRecord, type UsageTokens, type UsageTotals } from "./usage.js";
+import { accountOf, listPriceUsage, periodStart, priceUsage, sumUsage, type Pricing, type UsageRecord, type UsageTokens, type UsageTotals } from "./usage.js";
 import { usagePlanSchema, type AccountView, type Balance, type BriefingUsage, type Money, type TaskUsage, type UsageResolvers } from "./usage-api.js";
 import { EvidenceError } from "./evidence/types.js";
 import type { EvidenceStore } from "./evidence/store.js";
 import type { EvidenceTx } from "./evidence/types.js";
-import type { UsageCoverage } from "./transcript-usage.js";
+import { OUTCOMES_MODULE } from "./outcome-store.js";
+import { refreshOutcomeCostsForSessions } from "./outcome-cost.js";
 import {
-  SESSION_PURPOSES, importLedger, importState, ledgerRecord, readBriefings, readRecords, readSessions, usageModule, writeBriefing, writeRecord, writeSession,
+  SESSION_PURPOSES, combineCoverage, importLedger, importState, ledgerRecord, readBriefings, readRecords, readSessions, usageModule, writeBriefing, writeRecordWithOwner, writeSession,
   type LedgerCoverage, type LedgerCoverageReason, type LedgerHeader, type LedgerState, type SealedLedger, type StoredSession,
 } from "./usage-store.js";
 
+export { combineCoverage };
+
 type Period = "day" | "week" | "month";
-export interface SessionUsage extends UsageTotals { measured: true; coverage: "partial" | "complete"; coverageReason?: LedgerCoverageReason }
+export interface SessionUsage extends UsageTotals { measured: true; coverage: "partial" | "complete"; coverageReason?: LedgerCoverageReason; list?: Money }
 export type UnmeasuredUsage = { measured: false; coverage: "none"; coverageReason?: LedgerCoverageReason; unavailable?: true };
 export type UsageSummary = {
   period: { start: string; end: string };
@@ -83,15 +86,6 @@ export function ledgerCoverage(input: { provider: Provider; measuredLaunch: bool
   return valid > 0 ? { coverage: "partial", reason: "drain-incomplete" } : { coverage: "none", reason: "unsupported" };
 }
 
-export function combineCoverage(parts: readonly { coverage: UsageCoverage; coverageReason?: LedgerCoverageReason }[]): LedgerCoverage {
-  const live = parts.filter(part => part.coverage !== "none");
-  if (live.length === 0) return { coverage: "none" };
-  if (live.every(part => part.coverage === "complete")) return { coverage: "complete" };
-  const gap = live.find(part => part.coverage === "partial" && part.coverageReason !== "running");
-  if (!gap) return { coverage: "partial", reason: "running" };
-  return gap.coverageReason === undefined ? { coverage: "partial" } : { coverage: "partial", reason: gap.coverageReason };
-}
-
 export class UsageService {
   private timer?: NodeJS.Timeout;
   private running = false;
@@ -107,6 +101,7 @@ export class UsageService {
   private readonly planFile: string;
   private planOverrides: Record<string, number> = Object.create(null) as Record<string, number>;
   private balances?: { get(id: string): Balance };
+  private onWritten?: () => void;
   private resolvers: UsageResolvers = { goalOfRun: () => undefined, runTitle: () => undefined, projectName: id => id, sessionTitle: () => undefined };
   constructor(private readonly config: Config, private readonly key: Buffer, private readonly manager: Manager, private readonly store: EvidenceStore) {
     this.planFile = join(config.stateDir, "usage-plans.sealed");
@@ -130,6 +125,7 @@ export class UsageService {
   close() { this.closed = true; this.running = false; if (this.timer) clearInterval(this.timer); }
   useBalances(service: { get(id: string): Balance }) { this.balances = service; }
   useResolvers(resolvers: UsageResolvers) { this.resolvers = resolvers; }
+  onUpdated(listener: () => void) { this.onWritten = listener; }
 
   available(): boolean { return this.storeReady() && !this.tickFailed; }
   readable(): boolean {
@@ -161,6 +157,7 @@ export class UsageService {
       const stored = new Map(this.store.read(db => readSessions(db)).map(row => [row.sessionId, row]));
       const now = Date.now();
       let pages = MAX_PAGES;
+      let wroteRecords = false;
       for (const session of rows ?? await this.manager.list()) {
         if (this.closed) break;
         const previous = stored.get(session.id);
@@ -218,10 +215,36 @@ export class UsageService {
             const next: Row = { exited: closes(!page.more, journaled), lastActiveAt, cursor: page.cursor,
               seen: current.seen + seen, refused: current.refused + refused, ...(journaled ? { journaled } : {}) };
             const key = keyed(next);
-            if (key !== saved) {
+            if (key !== saved || records.length > 0) {
               const written = this.write(tx => {
                 if (!writeSession(tx, header, stateOf(next))) return false;
-                for (const record of records) writeRecord(tx, session.id, record);
+                const owners = new Set<string>([session.id]);
+                for (const record of records) {
+                  const res = writeRecordWithOwner(tx, session.id, record);
+                  if (res.status !== "kept") {
+                    owners.add(res.ownerSessionId);
+                    wroteRecords = true;
+                  }
+                }
+                if (this.store.status().modules[OUTCOMES_MODULE] === "ready") {
+                  const targets: { sessionId: string; runId?: string; memberId?: string; exited?: boolean }[] = [];
+                  for (const ownerId of owners) {
+                    if (ownerId === session.id) {
+                      targets.push({ sessionId: session.id, runId: header.team?.runId, memberId: header.team?.memberId, exited: next.exited });
+                      continue;
+                    }
+                    const meta = tx.get<{ run_id: string | null; member_id: string | null; exited: number }>(
+                      "SELECT run_id, member_id, exited FROM usage_sessions WHERE session_id=?", ownerId,
+                    );
+                    targets.push({
+                      sessionId: ownerId,
+                      ...(meta?.run_id ? { runId: meta.run_id } : {}),
+                      ...(meta?.member_id ? { memberId: meta.member_id } : {}),
+                      exited: meta?.exited === 1,
+                    });
+                  }
+                  refreshOutcomeCostsForSessions(tx, targets, this.config.usage?.prices);
+                }
                 return true;
               });
               if (!written) {
@@ -236,9 +259,16 @@ export class UsageService {
         }
         const final: Row = { ...current, exited: closes(complete, current.journaled) };
         if (final.exited) this.exitedAt.delete(session.id);
-        if (keyed(final) !== saved) this.write(tx => writeSession(tx, header, stateOf(final)));
+        if (keyed(final) !== saved) {
+          this.write(tx => {
+            if (writeSession(tx, header, stateOf(final)) && this.store.status().modules[OUTCOMES_MODULE] === "ready") {
+              refreshOutcomeCostsForSessions(tx, [{ sessionId: session.id, runId: header.team?.runId, memberId: header.team?.memberId, exited: final.exited }], this.config.usage?.prices);
+            }
+          });
+        }
       }
       this.tickFailed = false;
+      if (wroteRecords) try { this.onWritten?.(); } catch {}
     } catch (error) {
       if (!this.tickFailed) console.warn(`[Infinite] The usage ledger could not record this tick: ${error instanceof Error ? error.message : String(error)}`);
       this.tickFailed = true;
@@ -323,6 +353,9 @@ export class UsageService {
   }
   private price(record: UsageRecord): { cost: number; pricing: Pricing } {
     return record.provider === "opencode" ? priceUsage(record, this.config.usage?.prices) : { cost: 0, pricing: "unknown" };
+  }
+  private listMoney(records: UsageRecord[]): Money {
+    return this.money(records.map(record => listPriceUsage(record, this.config.usage?.prices)));
   }
   private priced(records: UsageRecord[]) {
     return records.map(record => ({ ...this.price(record), tokens: record.tokens }));
@@ -441,7 +474,8 @@ export class UsageService {
     try { data = this.ledger(); } catch { return { measured: false, coverage: "none", unavailable: true }; }
     const session = data.byId.get(sessionId);
     if (!session || !measured(session)) return { measured: false, coverage: "none", ...(session?.reason ? { coverageReason: session.reason } : {}) };
-    return { ...sumUsage(this.priced(data.bySession.get(sessionId) ?? [])), measured: true, coverage: session.coverage as "partial" | "complete", ...(session.reason ? { coverageReason: session.reason } : {}) };
+    const rows = data.bySession.get(sessionId) ?? [];
+    return { ...sumUsage(this.priced(rows)), measured: true, coverage: session.coverage as "partial" | "complete", list: this.listMoney(rows), ...(session.reason ? { coverageReason: session.reason } : {}) };
   }
   member(runId: string, memberId: string): SessionUsage | UnmeasuredUsage {
     let data: Ledger;
@@ -451,7 +485,7 @@ export class UsageService {
     const coverage = combineCoverage(ordered.map(session => ({ coverage: session.coverage, coverageReason: session.reason })));
     if (coverage.coverage === "none") return { measured: false, coverage: "none" };
     const rows = sessions.flatMap(session => data.bySession.get(session.sessionId) ?? []).sort((a, b) => data.order.get(a)! - data.order.get(b)!);
-    return { ...sumUsage(this.priced(rows)), measured: true, coverage: coverage.coverage as "partial" | "complete", ...(coverage.reason ? { coverageReason: coverage.reason } : {}) };
+    return { ...sumUsage(this.priced(rows)), measured: true, coverage: coverage.coverage as "partial" | "complete", list: this.listMoney(rows), ...(coverage.reason ? { coverageReason: coverage.reason } : {}) };
   }
   memberFinal(runId: string, memberId: string): SessionUsage | UnmeasuredUsage {
     let data: Ledger;

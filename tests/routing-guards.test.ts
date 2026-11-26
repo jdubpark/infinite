@@ -74,14 +74,18 @@ test("a choice that does not explore is returned unchanged, and the guards do no
   assert.equal(guardExploration(single, OPEN, EXPLORE_KNOBS), single);
 });
 
-test("guardExploration checks pause, then budget, then share", () => {
+test("guardExploration checks pause, then budget, then headroom, then share", () => {
   const explore: Choice = { basis: "sampled", chosen: "p2", greedy: "p1", explore: true, candidates: [] };
   const share = { exploratory: 9, of: 40 };
-  const all = guardExploration(explore, { pausedAt: "x", spareAttempts: 0, share }, EXPLORE_KNOBS);
+  const all = guardExploration(explore, { pausedAt: "x", spareAttempts: 0, nearLimit: true, share }, EXPLORE_KNOBS);
   assert.equal(all.basis, "greedy-paused");
-  assert.equal(guardExploration(explore, { pausedAt: null, spareAttempts: 0, share }, EXPLORE_KNOBS).basis, "greedy-budget");
-  assert.equal(guardExploration(explore, { pausedAt: null, spareAttempts: 4, share }, EXPLORE_KNOBS).basis, "greedy-share");
-  const allowed = guardExploration(explore, { pausedAt: null, spareAttempts: 4, share: { exploratory: 0, of: 4 } }, EXPLORE_KNOBS);
+  assert.equal(guardExploration(explore, { pausedAt: null, spareAttempts: 0, nearLimit: true, share }, EXPLORE_KNOBS).basis, "greedy-budget");
+  const near = guardExploration(explore, { pausedAt: null, spareAttempts: 4, nearLimit: true, share }, EXPLORE_KNOBS);
+  assert.equal(near.basis, "greedy-headroom");
+  assert.equal(near.chosen, "p1");
+  assert.equal(near.explore, false);
+  assert.equal(guardExploration(explore, { pausedAt: null, spareAttempts: 4, nearLimit: false, share }, EXPLORE_KNOBS).basis, "greedy-share");
+  const allowed = guardExploration(explore, { pausedAt: null, spareAttempts: 4, nearLimit: false, share: { exploratory: 0, of: 4 } }, EXPLORE_KNOBS);
   assert.equal(allowed, explore);
 });
 

@@ -80,7 +80,7 @@ async function cancel(f: Awaited<ReturnType<typeof fixture>>, run: TeamView) {
   assert.equal(cancelled.body?.status, "cancelled", JSON.stringify(cancelled.body));
 }
 
-const remove = (f: Awaited<ReturnType<typeof fixture>>, id: string, body?: unknown) => f.host.fetchApi(`/teams/${id}`, "owner", body, {}, "DELETE");
+const remove = (f: Awaited<ReturnType<typeof fixture>>, id: string) => f.host.fetchApi(`/teams/${id}`, "owner", undefined, {}, "DELETE");
 
 async function removedAfterEnd(t: Awaited<ReturnType<typeof leavingTeam>>) {
   writeFileSync(t.release, "done");
@@ -107,10 +107,9 @@ test("a cancelled run keeps its directory while a process its passing check left
     const refused = await remove(t.f, t.id);
     assert.equal(refused.status, 409);
     assert.equal(refused.body?.code, "team-leftover-running", JSON.stringify(refused.body));
-    const stated = await remove(t.f, t.id, { processesEnded: true });
-    assert.equal(stated.body?.code, "team-leftover-running", "the owner's statement is refused while the census sees the helper");
-    assert.equal((await remove(t.f, t.id, { processesEnded: true, force: true })).status, 400, "the removal body refuses unknown fields");
-    assert.equal((await remove(t.f, t.id, { processesEnded: false })).status, 400, "the statement is only true");
+    const stated = await t.f.host.fetchApi(`/teams/${t.id}/processes-ended`, "owner", { requestId: randomUUID() });
+    assert.equal(stated.body?.code, "team-command-running", "the owner's statement is refused while the census sees the helper");
+    assert.equal((await remove(t.f, t.id)).body?.code, "team-leftover-running", "a refused statement leaves the hold");
     assert.equal(existsSync(t.runDirectory), true);
     assert.ok(t.helpers.every(alive));
     await removedAfterEnd(t);

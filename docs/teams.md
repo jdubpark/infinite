@@ -500,14 +500,16 @@ The team view carries `leftoverProcesses` while the record stands:
 The owner's removal of such a run answers `team-leftover-running` (409) while a
 look finds a process, and `team-leftover-unknown` (409) while the look cannot
 tell. `unknown` keeps the directories, and the only way out is the owner's
-statement that the processes ended: `DELETE /api/teams/:id` with the body
-`{ "processesEnded": true }`, or `infinite team delete ID --processes-ended`.
-The host accepts the statement only when the look taken for that request
-reports `unknown`, and refuses it while a look finds a process. It records the
-statement as a run event that names what the look reported, then removes the
-run. The statement lifts an unresolved operation's record for removal in the
-same way. The body accepts no other field, and a removal without a body behaves
-as before. Run removal is not on the relay allowlist.
+statement that the processes ended, the same action that lifts a stopped
+command's hold: `POST /api/teams/:id/processes-ended` with
+`{ "requestId": "<uuid>" }`, or `infinite team processes-ended ID`. The host
+takes a look of its own for the statement. While it finds a process, the host
+answers `team-command-running` (409) and records nothing. When it finds none,
+the record clears as after any look. When it cannot tell, the host records the
+statement as a run event that names what the look reported and clears the
+record; the next removal proceeds as for a run without one. The statement lifts
+an unresolved operation's record for removal in the same way. Run removal and
+the statement are not on the relay allowlist.
 
 The record covers only the case above. A process that a command leaves behind
 without holding the command's output is never noted, so the host takes no look

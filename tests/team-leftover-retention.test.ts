@@ -98,7 +98,7 @@ for (const [status, text, limit] of [
   });
 }
 
-test("a cancelled run whose census cannot tell refuses removal, accepts it on the owner's statement that the processes ended, and refuses that statement while the census sees the process", async () => {
+test("a cancelled run whose census cannot tell refuses removal, is removed after the owner's statement that the processes ended, and that statement is refused while the census sees the process", async () => {
   const f = schedulerFixture();
   const at = settled(f, "cancelled", "Team cancelled.");
   retention(f, { cancelledMinutes: 60 });
@@ -111,16 +111,20 @@ test("a cancelled run whose census cannot tell refuses removal, accepts it on th
     await assert.rejects(teams.removeRun(f.run.id), (error: unknown) => error instanceof TeamError && error.status === 409 && error.code === "team-leftover-unknown");
     assert.equal(existsSync(runDirectory(f.run)), true);
     assert.equal(teams.get(f.run.id).leftoverProcesses?.state, "unknown");
-    assert.equal(count(teams, f.run, "The host cannot tell whether a process left behind by an earlier command of this run still runs: The process table is unreadable. It keeps this run's directories; after checking, the owner can remove the run with processesEnded (docs/teams.md)."), 1);
+    assert.equal(count(teams, f.run, "The host cannot tell whether a process left behind by an earlier command of this run still runs: The process table is unreadable. It keeps this run's directories; after checking the host, the owner can state that it ended with `infinite team processes-ended RUN_ID`."), 1);
     result = { ok: true, findings: [{ pid: 4242, reason: "recorded-process" }] };
-    await assert.rejects(teams.removeRun(f.run.id, { processesEnded: true }), (error: unknown) => error instanceof TeamError && error.status === 409 && error.code === "team-leftover-running");
+    await assert.rejects(teams.processesEnded(f.run.id, { requestId: randomUUID() }), (error: unknown) => error instanceof TeamError && error.status === 409 && error.code === "team-command-running");
     assert.equal(existsSync(runDirectory(f.run)), true, "the statement is refused while the census sees the process");
     assert.equal(teams.get(f.run.id).leftoverProcesses?.state, "running");
     result = { ok: false, problem: "The process table is unreadable" };
-    const removed = await teams.removeRun(f.run.id, { processesEnded: true });
+    const statement = { requestId: randomUUID() };
+    const stated = await teams.processesEnded(f.run.id, statement);
+    assert.equal(stated.leftoverProcesses, undefined, "the statement lifts the hold");
+    assert.equal(stated.events.filter(event => event.text === "The owner stated that the processes an earlier command of this run left behind have ended. The host's census could not tell (The process table is unreadable); it no longer keeps this run's directories for them.").length, 1,
+      JSON.stringify(stated.events.slice(-4)));
+    assert.equal((await teams.processesEnded(f.run.id, statement)).events.length, stated.events.length, "a repeated statement records nothing more");
+    await teams.removeRun(f.run.id);
     assert.equal(existsSync(runDirectory(f.run)), false);
-    assert.ok(removed.events.some(event => event.text === "The owner stated that the processes of this run's earlier commands have ended. The host's census could not tell (The process table is unreadable); the host removes this run on the owner's statement."),
-      JSON.stringify(removed.events.slice(-4)));
     assert.equal(teams.statuses().some(row => row.id === f.run.id), false);
   } finally { await close(f, teams); }
 });
@@ -139,6 +143,7 @@ test("an active run keeps an integrated member clone while it records a process 
   f.run.updatedAt = at;
   f.run.events.push({ at, text: `${member.title} reported a result; its validated changes were integrated.` });
   retention(f, { memberMinutes: 0 });
+  f.config.teams!.stallMinutes = 600;
   f.writeTeam();
   const teams = openTeam(f, () => Date.parse(at) + 1000, processes(() => ({ ok: true, findings: [{ pid: 4242, reason: "recorded-group" }] })));
   try {
@@ -151,6 +156,7 @@ test("an active run keeps an integrated member clone while it records a process 
     assert.equal(teams.get(f.run.id).leftoverProcesses?.state, "unchecked", "an active run takes no census for the record");
     (teams as unknown as Internals).records.get(f.run.id)!.leftover = undefined;
     await waitFor(() => !existsSync(cwd), "the clone should be removed once the record is gone");
+    assert.equal(teams.get(f.run.id).status, "implementing");
   } finally { await close(f, teams); }
 });
 

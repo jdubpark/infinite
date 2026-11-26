@@ -48,7 +48,7 @@ import type { ProjectSourceService } from "./project-source.js";
 import type { RepositoryGraphs, RepositoryGraphResult } from "./repository-graphs.js";
 import { LEGACY_READ_ONLY_ROLE_CHANGED_FILES_REASON, TeamError, assertMemberReadOnly, assertMemberScope, assertTeamPath, captureDeliveryBaseline, captureMemberResult, ensureDefaultTeamRoot, ensureHostDirectory, integrateMemberResult, prepareMemberScratch, prepareMemberWorkspace, prepareRecoveryWorkspaceFromSource, prepareTeamWorkspace, prepareTeamWorkspaceFromMirror, prepareVerificationWorkspace, commandScope, type CommandResult, type CommandScope, CommandStopUnconfirmed, teamOperationCommand, teamCommand, teamHead, teamWorkspacePath, teamGitArgs, validateTeamPlan, writeTeamContext } from "./team-workspace.js";
 import { assertTeamworkPath } from "./repo-enrollment.js";
-import { CommandFence, HALT_CENSUS_MS, commandStopReasons, ownerStatementEvent, stopFenceLifted, stopFenced, type OwnerStatement, type TakenCensus } from "./team-command-fence.js";
+import { CommandFence, HALT_CENSUS_MS, commandStopReasons, stopFenceLifted, stopFenced, type OwnerStatement, type TakenCensus } from "./team-command-fence.js";
 import { HOST_LOAD_REASON_PREFIX, LaunchHeldError } from "./host-load.js";
 import { permissionEvidenceHash } from "./team-permissions.js";
 import { storageShortfall, volumeUsage, type VolumeUsage } from "./storage.js";
@@ -890,7 +890,7 @@ export class TeamService {
   private get removalTasks() { return this.retention.removalTasks; }
   private get memberWorkSaveTasks() { return this.retention.memberWorkSaveTasks; }
   private get memberWorkSaveControllers() { return this.retention.memberWorkSaveControllers; }
-  removeRun(id: string, removal: { processesEnded?: true } = {}): Promise<TeamView> { return this.retention.removeRun(id, removal); }
+  removeRun(id: string): Promise<TeamView> { return this.retention.removeRun(id); }
   private retire(...args: Parameters<TeamRetention["retire"]>) { return this.retention.retire(...args); }
 
   private publisherHost(): PublisherHost {
@@ -1431,20 +1431,17 @@ export class TeamService {
   processesEnded(id: string, input: TeamProcessesEnded) {
     const body = teamProcessesEndedSchema.parse(input), fingerprint = receiptDigest({ operation: "processes-ended", ...body });
     const replayed = this.records.get(id)?.receipts[body.requestId] === fingerprint;
-    return (replayed ? Promise.resolve(undefined) : this.fence.take(id, true)).then(taken => this.enqueue(id, async () => {
+    return (replayed ? Promise.resolve(undefined) : this.fence.take(id, true, true)).then(taken => this.enqueue(id, async () => {
       const stored = this.record(id), pending = stored.pending, prior = stored.receipts[body.requestId];
       if (prior) {
         if (prior !== fingerprint) throw new TeamError(409, "request-conflict", "This request ID belongs to a different team action.");
         return this.view(stored);
       }
-      if (!pending?.witness) throw new TeamError(409, "team-no-process-record", "This run holds no record of an operation's processes for the owner to state as ended.");
+      if (!pending?.witness && !stored.leftover) throw new TeamError(409, "team-no-process-record", "This run holds no record of an operation's processes, or of processes an earlier command left behind, for the owner to state as ended.");
       const state = taken && this.fence.apply(stored, taken);
       if (state === undefined) throw new TeamError(409, "team-operation-running", "The run's operation is running, or changed during the host's census. Retry the statement after it settles.");
       if (state === "running" || state === "in-use") throw new TeamError(409, "team-command-running", "The host still sees processes of this run's operation, or processes using its directory, so it does not accept the statement. Retry after they have exited.");
-      if (state === "unknown") {
-        pending.processesEnded = { requestId: body.requestId, at: timestamp(), detail: stored.census?.detail ?? "" };
-        this.event(stored, ownerStatementEvent(pending.kind, pending.processesEnded.detail));
-      }
+      if (state === "unknown") this.fence.state(stored, body.requestId);
       stored.receipts[body.requestId] = fingerprint;
       this.save(stored);
       this.trackBlocked(stored);

@@ -849,10 +849,10 @@ export async function handleTeamClientCommand(command: "repo" | "team", position
     outputTeam(team, Boolean(options["--json"])); return true;
   }
   if (subcommand === "delete") {
-    if (!id || rest.length) throw new Error("Usage: infinite team delete ID [--processes-ended] [--json]");
+    if (!id || rest.length) throw new Error("Usage: infinite team delete ID [--json]");
     z.uuid().parse(id);
     try {
-      outputTeam(await api.json<any>(`/teams/${id}`, options["--processes-ended"] ? { processesEnded: true } : undefined, undefined, undefined, "DELETE"), Boolean(options["--json"]));
+      outputTeam(await api.json<any>(`/teams/${id}`, undefined, undefined, undefined, "DELETE"), Boolean(options["--json"]));
     } catch (error) {
       if ((error as { status?: number })?.status !== 404) throw error;
       if (options["--json"]) console.log(JSON.stringify({ id, status: "already-removed" }));

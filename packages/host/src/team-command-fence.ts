@@ -1,7 +1,7 @@
 import { bootId, hostProcesses, mergeWitness, type CensusResult } from "./process-census.js";
 import { teamRunDirectory, type TeamKernel } from "./team-kernel.js";
 import { COMMAND_STOP_UNCONFIRMED_REASON, TeamError } from "./team-workspace.js";
-import { CENSUS_TTL_MS, censusCounts, countsKey, leftoverCensusEvent, type StoredLeftover } from "./team-leftover.js";
+import { CENSUS_TTL_MS, censusCounts, countsKey, leftoverCensusEvent, leftoverStatementEvent, type StoredLeftover } from "./team-leftover.js";
 import type { PendingOperation, Stored, TeamServiceOptions } from "./teams.js";
 
 export const COMMAND_STOP_STATEMENT_REASON = "The host stopped a configured team command but cannot confirm that it ended, and its process census cannot tell whether that command's processes still run. While the census cannot tell, the owner's statement is the only way out: after checking the host, run `infinite team processes-ended RUN_ID` (POST /api/teams/RUN_ID/processes-ended); Resume is accepted after that.";
@@ -38,7 +38,7 @@ function stopFenceRefusal(state: CensusState | undefined, code = "team-command-r
     : new TeamError(409, code, "An earlier command of this run may still be running. The host accepts this request once a process census finds none of that operation's processes.");
 }
 
-export function ownerStatementEvent(kind: string, detail: string) {
+function ownerStatementEvent(kind: string, detail: string) {
   return `The owner stated that the processes of the run's ${kind} operation have ended. The host's process census could not tell (${detail}); the host accepts the statement in place of a census that finds none.`;
 }
 
@@ -114,6 +114,17 @@ export class CommandFence {
       this.host.save(stored);
     }
     return census.state;
+  }
+  state(stored: Stored, requestId: string) {
+    const pending = stored.pending, census = stored.census, leftover = stored.leftover;
+    if (pending?.witness && census?.pendingId === pending.id && census.state === "unknown") {
+      pending.processesEnded = { requestId, at: new Date(this.now()).toISOString(), detail: census.detail ?? "" };
+      this.host.event(stored, ownerStatementEvent(pending.kind, pending.processesEnded.detail));
+    }
+    if (leftover?.census?.state === "unknown") {
+      this.host.event(stored, leftoverStatementEvent(leftover.census.detail));
+      stored.leftover = undefined;
+    }
   }
   watch(stored: Stored) {
     if (!stopFenced(stored)) return;

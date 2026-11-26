@@ -49,14 +49,14 @@ export function leftoverCensusEvent(census: CensusCounts) {
     case "in-use":
       return `The host sees ${census.using} process(es) using this run's directory after an earlier command of this run left a process behind. It keeps this run's directories until a census finds none.`;
     case "unknown":
-      return `The host cannot tell whether a process left behind by an earlier command of this run still runs: ${census.detail}. It keeps this run's directories; after checking, the owner can remove the run with processesEnded (docs/teams.md).`;
+      return `The host cannot tell whether a process left behind by an earlier command of this run still runs: ${census.detail}. It keeps this run's directories; after checking the host, the owner can state that it ended with \`infinite team processes-ended RUN_ID\`.`;
     case "ended":
       return "The host sees no process left behind by an earlier command of this run, and none using this run's directory. Its directories can be removed.";
   }
 }
 
-export function attestedRemovalEvent(detail: string) {
-  return `The owner stated that the processes of this run's earlier commands have ended. The host's census could not tell (${detail}); the host removes this run on the owner's statement.`;
+export function leftoverStatementEvent(detail: string) {
+  return `The owner stated that the processes an earlier command of this run left behind have ended. The host's census could not tell (${detail}); it no longer keeps this run's directories for them.`;
 }
 
 export function leftoverView(leftover: StoredLeftover): TeamLeftoverProcesses {

@@ -189,7 +189,7 @@ infinite team pause TEAM_ID
 infinite team resume TEAM_ID
 infinite team cancel TEAM_ID
 infinite team processes-ended TEAM_ID
-infinite team delete TEAM_ID [--processes-ended] [--json]
+infinite team delete TEAM_ID [--json]
 infinite team entries TEAM_ID [--kind KIND] [--task TASK_ID] [--since SEQ] [--json]
 infinite team entry TEAM_ID ENTRY_ID [--json]
 infinite team entry TEAM_ID ENTRY_ID withdraw [--json]
@@ -207,14 +207,12 @@ the current view. A non-interactive watch prints again only when the visible
 text changes. `--logs` starts in the review log, and
 `infinite team status TEAM_ID --logs` prints the current revision's logs once.
 `team processes-ended` states, as the owner, that the processes of a stopped
-setup or check command have ended, for a run whose process census cannot tell;
-see [Goals and agent teams](teams.md). `team delete` removes a settled
-cancelled, merged, or no-change run and its
-workspace. Repeating the command after removal prints `already removed` and
-exits successfully. `--processes-ended` states that the processes an earlier
-command of the run left behind have ended; the host accepts it only when its own
-look cannot tell (see [Goals and agent teams](teams.md)). `--json` prints the
-final team record. See [Goals and agent teams](teams.md) for the
+setup or check command, or the processes an earlier command left behind, have
+ended, for a run whose process census cannot tell; see
+[Goals and agent teams](teams.md). `team delete` removes a settled cancelled,
+merged, or no-change run and its workspace. Repeating the command after removal
+prints `already removed` and exits successfully. `--json` prints the final team
+record. See [Goals and agent teams](teams.md) for the
 full key list.
 
 `repo init` takes these source and delivery options:

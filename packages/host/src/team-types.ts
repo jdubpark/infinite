@@ -406,7 +406,6 @@ export const teamMemberRetireSchema = z.object({ requestId: z.uuid(), revision: 
   identity: z.string().regex(/^[a-f0-9]{64}$/), text: z.string().trim().min(1).max(4000) }).strict();
 export type TeamMemberRetire = z.infer<typeof teamMemberRetireSchema>;
 export const teamActionSchema = z.object({ requestId: z.uuid(), revision: z.number().int().min(1) }).strict();
-export const teamRemovalSchema = z.object({ processesEnded: z.literal(true).optional() }).strict();
 export const teamProcessesEndedSchema = z.object({ requestId: z.uuid() }).strict();
 export type TeamProcessesEnded = z.infer<typeof teamProcessesEndedSchema>;
 export const teamContinueSchema = z.object({ requestId: z.uuid(), revision: z.number().int().min(1), text: z.string().trim().min(1).max(8000).optional() }).strict();

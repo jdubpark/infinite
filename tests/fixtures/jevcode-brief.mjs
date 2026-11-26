@@ -1,10 +1,11 @@
-import { appendFileSync } from "node:fs";
+import { appendFileSync, existsSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 
 const receiptPath = process.argv[2];
-const mode = ["fail", "skip", "empty", "disabled", "invalid", "large"].includes(process.argv[3]) ? process.argv[3] : null;
+const mode = ["fail", "skip", "empty", "disabled", "invalid", "large", "hold"].includes(process.argv[3]) ? process.argv[3] : null;
+const releaseHold = mode === "hold" ? process.argv[4] : undefined;
 const fail = mode === "fail";
-const args = process.argv.slice(mode ? 4 : 3);
+const args = process.argv.slice(mode === "hold" ? 5 : mode ? 4 : 3);
 const repo = args[args.indexOf("--repo") + 1];
 const baseIndex = args.indexOf("--base");
 const base = baseIndex >= 0 ? args[baseIndex + 1] : null;
@@ -16,6 +17,7 @@ const input = await new Promise((resolve, reject) => {
   process.stdin.on("error", reject);
 });
 appendFileSync(receiptPath, `${JSON.stringify({ args, input })}\n`);
+if (releaseHold) while (!existsSync(releaseHold)) await new Promise(resolve => setTimeout(resolve, 10));
 if (fail) process.exit(1);
 
 const activity = input.trim().split("\n").filter(Boolean).map(line => JSON.parse(line));

@@ -46,7 +46,6 @@ relay({ ...base, hook_event_name: "UserPromptSubmit", prompt: "Review the curren
 relay({ ...base, hook_event_name: "Stop", last_assistant_message: "The first turn has ended." });
 
 while (!existsSync(releaseLateTranscript)) await sleep(10);
-await sleep(90);
 appendFileSync(transcriptPath, `${userRecord("later")}\n${assistantRecord("later", "FINAL_TRANSCRIPT_MARKER: new turn result")}\n`);
 relay({ ...base, hook_event_name: "SessionEnd", reason: "completed" });
 

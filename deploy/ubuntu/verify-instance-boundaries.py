@@ -38,6 +38,7 @@ class InstanceSpec:
     name: str
     users: tuple
     paths: tuple
+    retired_paths: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -57,6 +58,7 @@ class Resource:
     device: int
     inode: int
     filesystem_roots: tuple
+    retired: bool = False
 
 
 @dataclass(frozen=True)
@@ -77,6 +79,25 @@ def _unique_object(pairs):
 
 def _reject_json_constant(_value):
     raise VerificationError("invalid_manifest")
+
+
+def _validate_path_list(paths):
+    if type(paths) is not list:
+        raise VerificationError("invalid_manifest")
+    clean = []
+    for path in paths:
+        if type(path) is not str:
+            raise VerificationError("invalid_manifest")
+        try:
+            encoded_path_length = len(path.encode("utf-8"))
+        except UnicodeEncodeError as error:
+            raise VerificationError("invalid_manifest") from error
+        if encoded_path_length > MAX_PATH_BYTES:
+            raise VerificationError("invalid_manifest")
+        if not path.startswith("/") or "\x00" in path:
+            raise VerificationError("invalid_manifest")
+        clean.append(path)
+    return tuple(clean)
 
 
 def parse_manifest(raw):
@@ -101,7 +122,7 @@ def parse_manifest(raw):
     account_names = set()
     total_paths = 0
     for row in rows:
-        if type(row) is not dict or set(row) != {"name", "users", "paths"}:
+        if type(row) is not dict or not ({"name", "users", "paths"} <= set(row) <= {"name", "users", "paths", "retiredPaths"}):
             raise VerificationError("invalid_manifest")
         name = row["name"]
         if type(name) is not str or not name or len(name) > 64 or name in names:
@@ -121,25 +142,19 @@ def parse_manifest(raw):
             clean_users.append(username)
 
         paths = row["paths"]
-        if type(paths) is not list or not 1 <= len(paths) <= MAX_PATHS_PER_INSTANCE:
+        retired_paths = row.get("retiredPaths", [])
+        if type(paths) is not list or type(retired_paths) is not list:
             raise VerificationError("invalid_manifest")
-        clean_paths = []
-        for path in paths:
-            if type(path) is not str:
-                raise VerificationError("invalid_manifest")
-            try:
-                encoded_path_length = len(path.encode("utf-8"))
-            except UnicodeEncodeError as error:
-                raise VerificationError("invalid_manifest") from error
-            if encoded_path_length > MAX_PATH_BYTES:
-                raise VerificationError("invalid_manifest")
-            if not path.startswith("/") or "\x00" in path:
-                raise VerificationError("invalid_manifest")
-            clean_paths.append(path)
-        total_paths += len(clean_paths)
+        if not 1 <= len(paths) + len(retired_paths) <= MAX_PATHS_PER_INSTANCE:
+            raise VerificationError("invalid_manifest")
+        clean_paths = _validate_path_list(paths)
+        clean_retired_paths = _validate_path_list(retired_paths)
+        if len(set(clean_retired_paths)) != len(clean_retired_paths) or not set(clean_paths).isdisjoint(clean_retired_paths):
+            raise VerificationError("invalid_manifest")
+        total_paths += len(clean_paths) + len(clean_retired_paths)
         if total_paths > MAX_TOTAL_PATHS:
             raise VerificationError("invalid_manifest")
-        instances.append(InstanceSpec(name, tuple(clean_users), tuple(clean_paths)))
+        instances.append(InstanceSpec(name, tuple(clean_users), clean_paths, clean_retired_paths))
     return tuple(instances)
 
 
@@ -243,7 +258,9 @@ def _mount_roots_for_path(path, kind, mounts):
 def _resolve_resources(instances, mounts):
     resources = []
     for instance_index, instance in enumerate(instances):
-        for raw_path in instance.paths:
+        entries = [(raw_path, False) for raw_path in instance.paths]
+        entries.extend((raw_path, True) for raw_path in instance.retired_paths)
+        for raw_path, retired in entries:
             try:
                 canonical = str(Path(raw_path).resolve(strict=True))
                 root_stat = os.stat(canonical)
@@ -251,23 +268,40 @@ def _resolve_resources(instances, mounts):
                 raise VerificationError("resource_unavailable") from error
             if canonical == "/" or not (stat.S_ISREG(root_stat.st_mode) or stat.S_ISDIR(root_stat.st_mode)):
                 raise VerificationError("resource_type_invalid")
+            if retired and (root_stat.st_uid != 0 or (stat.S_IMODE(root_stat.st_mode) & 0o077) != 0):
+                raise VerificationError("retired_path_permissions")
             kind = "directory" if stat.S_ISDIR(root_stat.st_mode) else "file"
             roots = _mount_roots_for_path(canonical, kind, mounts)
-            resources.append(Resource(canonical, kind, instance_index, root_stat.st_dev, root_stat.st_ino, roots))
+            resources.append(Resource(canonical, kind, instance_index, root_stat.st_dev, root_stat.st_ino, roots, retired))
     return tuple(resources)
+
+
+def _roots_contain(parent_roots, child_roots):
+    return any(parent_device == child_device and _path_contains(parent_root, child_root)
+               for parent_device, parent_root in parent_roots
+               for child_device, child_root in child_roots)
+
+
+def _resources_overlap(left, right):
+    return (_path_contains(left.path, right.path) or _path_contains(right.path, left.path)
+            or (left.device, left.inode) == (right.device, right.inode)
+            or _roots_contain(left.filesystem_roots, right.filesystem_roots)
+            or _roots_contain(right.filesystem_roots, left.filesystem_roots))
 
 
 def _ensure_disjoint(resources):
     for left_index, left in enumerate(resources):
         for right in resources[left_index + 1:]:
-            if left.instance_index == right.instance_index:
+            if left.instance_index != right.instance_index or (left.retired and right.retired):
+                if _resources_overlap(left, right):
+                    raise VerificationError("resource_ownership_overlap")
                 continue
-            if (_path_contains(left.path, right.path) or _path_contains(right.path, left.path)
-                    or (left.device, left.inode) == (right.device, right.inode)
-                    or any(left_device == right_device and
-                           (_path_contains(left_root, right_root) or _path_contains(right_root, left_root))
-                           for left_device, left_root in left.filesystem_roots
-                           for right_device, right_root in right.filesystem_roots)):
+            if not left.retired and not right.retired:
+                continue
+            retired_resource, active_resource = (left, right) if left.retired else (right, left)
+            if (_path_contains(retired_resource.path, active_resource.path)
+                    or (retired_resource.device, retired_resource.inode) == (active_resource.device, active_resource.inode)
+                    or _roots_contain(retired_resource.filesystem_roots, active_resource.filesystem_roots)):
                 raise VerificationError("resource_ownership_overlap")
 
 
@@ -326,27 +360,34 @@ def _probe_account(account, requests):
 
 
 def _permission_matrix(accounts, resources):
-    owner_access = [False] * len(resources)
+    owner_access = [resource.retired for resource in resources]
     denied_access = False
+    retired_access = False
     for account in accounts:
         requests = []
-        request_owner = []
+        request_meta = []
         for resource_index, resource in enumerate(resources):
             is_owner = account.instance_index == resource.instance_index
-            if is_owner:
-                mode = os.R_OK if resource.kind == "file" else os.R_OK | os.X_OK
-                requests.append((resource.path, mode))
-                request_owner.append((resource_index, True))
-            else:
+            if resource.retired or not is_owner:
                 modes = (os.R_OK, os.W_OK, os.X_OK)
                 requests.extend((resource.path, mode) for mode in modes)
-                request_owner.extend((resource_index, False) for _ in modes)
+                request_meta.extend((resource_index, resource.retired, is_owner) for _ in modes)
+            else:
+                mode = os.R_OK if resource.kind == "file" else os.R_OK | os.X_OK
+                requests.append((resource.path, mode))
+                request_meta.append((resource_index, False, True))
         outcomes = _probe_account(account, requests)
-        for (resource_index, is_owner), allowed in zip(request_owner, outcomes):
-            if is_owner and allowed:
+        for (resource_index, is_retired, is_owner), allowed in zip(request_meta, outcomes):
+            if not allowed:
+                continue
+            if is_retired:
+                retired_access = True
+            elif is_owner:
                 owner_access[resource_index] = True
-            elif not is_owner and allowed:
+            else:
                 denied_access = True
+    if retired_access:
+        raise VerificationError("retired_path_accessible")
     if denied_access:
         raise VerificationError("peer_access")
     if not all(owner_access):

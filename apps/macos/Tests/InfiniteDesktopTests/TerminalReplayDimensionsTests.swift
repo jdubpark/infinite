@@ -286,22 +286,125 @@ import InfiniteCore
         XCTAssertTrue(queue.enqueueReplay(steps, generation: generation))
         XCTAssertTrue(queue.isReplayingHistory)
         XCTAssertFalse(queue.effectiveFollow(desired: true))
+        XCTAssertFalse(queue.effectiveInputEnabled(desired: true))
 
         let first = try XCTUnwrap(queue.dequeue())
         XCTAssertEqual(first, TerminalFeedStep(data: Data("AT_120".utf8), reset: true, dimensions: size120, completesReplay: false))
         XCTAssertFalse(queue.completeStep(first, generation: generation, currentGeneration: generation))
         XCTAssertTrue(queue.isReplayingHistory)
         XCTAssertFalse(queue.effectiveFollow(desired: true))
+        XCTAssertFalse(queue.effectiveInputEnabled(desired: true))
 
         let second = try XCTUnwrap(queue.dequeue())
         XCTAssertEqual(second, TerminalFeedStep(data: Data("AT_88".utf8), reset: false, dimensions: size88, completesReplay: true))
         XCTAssertFalse(queue.completeStep(second, generation: staleGeneration, currentGeneration: generation))
         XCTAssertTrue(queue.isReplayingHistory)
         XCTAssertFalse(queue.effectiveFollow(desired: true))
+        XCTAssertFalse(queue.effectiveInputEnabled(desired: true))
 
         XCTAssertTrue(queue.completeStep(second, generation: generation, currentGeneration: generation))
         XCTAssertFalse(queue.isReplayingHistory)
         XCTAssertTrue(queue.effectiveFollow(desired: true))
         XCTAssertFalse(queue.effectiveFollow(desired: false))
+        XCTAssertTrue(queue.effectiveInputEnabled(desired: true))
+        XCTAssertFalse(queue.effectiveInputEnabled(desired: false))
+
+        queue.markFailed()
+        XCTAssertFalse(queue.effectiveFollow(desired: true))
+        XCTAssertFalse(queue.effectiveInputEnabled(desired: true))
+    }
+
+    func testStreamedCatchUpDefersReplayCompletionAcrossResizesAndMultiPageHistory() throws {
+        let model = makeModel()
+        var queue = TerminalFeedQueue()
+        var renderGeneration = UUID()
+        var readyCount = 0
+
+        model.pipe.receiveStep = { data, reset, cols, rows, completesReplay in
+            let size = TerminalDimensions(columns: cols, rows: rows)
+            if reset { renderGeneration = UUID() }
+            XCTAssertTrue(queue.enqueue(data: data, reset: reset, dimensions: size, completesReplay: completesReplay, generation: renderGeneration))
+        }
+        model.pipe.onCompleteReplay = {
+            if queue.markReplayComplete(writing: false, currentGeneration: renderGeneration) == .completedNow {
+                readyCount += 1
+            }
+        }
+
+        model.receive(.object(["message": .object([
+            "open": .object(["cursor": .number(0), "cols": .number(120), "rows": .number(32)]),
+            "cursor": .number(0),
+            "cols": .number(120),
+            "rows": .number(32),
+        ])]))
+        XCTAssertTrue(model.pipe.streamReplayPending)
+        XCTAssertTrue(queue.isReplayingHistory)
+        XCTAssertFalse(queue.effectiveFollow(desired: true))
+        XCTAssertFalse(queue.effectiveInputEnabled(desired: true))
+
+        model.receive(.object(["message": .object([
+            "events": .array([
+                .object(["seq": .number(1), "type": .string("output"), "data": .object(["text": .string("PAGE1")])]),
+                .object(["seq": .number(2), "type": .string("lifecycle"), "data": .object(["event": .string("resize"), "cols": .number(88), "rows": .number(26)])]),
+            ]),
+            "cursor": .number(2),
+            "more": .bool(true),
+        ])]))
+        let page1Generation = renderGeneration
+        XCTAssertTrue(model.pipe.streamReplayPending)
+        XCTAssertTrue(queue.isReplayingHistory)
+
+        let step1 = try XCTUnwrap(queue.dequeue())
+        XCTAssertEqual(step1, TerminalFeedStep(data: Data("PAGE1".utf8), reset: true, dimensions: TerminalDimensions(columns: 120, rows: 32), completesReplay: false))
+        XCTAssertFalse(queue.completeStep(step1, generation: page1Generation, currentGeneration: renderGeneration))
+        let step2 = try XCTUnwrap(queue.dequeue())
+        XCTAssertEqual(step2, TerminalFeedStep(data: Data(), reset: false, dimensions: TerminalDimensions(columns: 88, rows: 26), completesReplay: false))
+        XCTAssertFalse(queue.completeStep(step2, generation: page1Generation, currentGeneration: renderGeneration))
+        XCTAssertTrue(queue.isReplayingHistory)
+        XCTAssertFalse(queue.effectiveFollow(desired: true))
+        XCTAssertFalse(queue.effectiveInputEnabled(desired: true))
+        XCTAssertEqual(readyCount, 0)
+
+        model.receive(.object(["message": .object([
+            "events": .array([
+                .object(["seq": .number(3), "type": .string("output"), "data": .object(["text": .string("PAGE2")])]),
+            ]),
+            "cursor": .number(3),
+            "more": .bool(false),
+        ])]))
+        XCTAssertFalse(model.pipe.streamReplayPending)
+        let step3 = try XCTUnwrap(queue.dequeue())
+        XCTAssertEqual(step3, TerminalFeedStep(data: Data("PAGE2".utf8), reset: false, dimensions: nil, completesReplay: true))
+        XCTAssertTrue(queue.completeStep(step3, generation: page1Generation, currentGeneration: renderGeneration))
+        XCTAssertFalse(queue.isReplayingHistory)
+        XCTAssertTrue(queue.effectiveFollow(desired: true))
+        XCTAssertTrue(queue.effectiveInputEnabled(desired: true))
+        XCTAssertEqual(readyCount, 0)
+
+        let model2 = makeModel()
+        var queue2 = TerminalFeedQueue()
+        var gen2 = UUID()
+        var completedBarrier = false
+        model2.pipe.receiveStep = { data, reset, cols, rows, completesReplay in
+            let size = TerminalDimensions(columns: cols, rows: rows)
+            if reset { gen2 = UUID() }
+            XCTAssertTrue(queue2.enqueue(data: data, reset: reset, dimensions: size, completesReplay: completesReplay, generation: gen2))
+        }
+        model2.pipe.onCompleteReplay = {
+            if queue2.markReplayComplete(writing: true, currentGeneration: gen2) == .queued {
+                completedBarrier = true
+            }
+        }
+        model2.receive(.object(["message": .object(["open": .object(["cursor": .number(0), "cols": .number(100), "rows": .number(30)])])]))
+        model2.receive(.object(["message": .object(["events": .array([.object(["seq": .number(1), "type": .string("output"), "data": .object(["text": .string("PART")])])])])]))
+        let part = try XCTUnwrap(queue2.dequeue())
+        XCTAssertFalse(part.completesReplay)
+        XCTAssertTrue(queue2.isReplayingHistory)
+        model2.receive(.object(["message": .object(["events": .array([]), "cursor": .number(1), "more": .bool(false)])]))
+        XCTAssertTrue(completedBarrier)
+        let barrier = try XCTUnwrap(queue2.dequeue())
+        XCTAssertEqual(barrier, TerminalFeedStep(data: Data(), reset: false, dimensions: nil, completesReplay: true))
+        XCTAssertTrue(queue2.completeStep(barrier, generation: gen2, currentGeneration: gen2))
+        XCTAssertFalse(queue2.isReplayingHistory)
     }
 }

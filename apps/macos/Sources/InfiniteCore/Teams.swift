@@ -208,7 +208,17 @@ public struct TeamRun: Identifiable, Equatable, Sendable {
         var used = 0
         for character in text {
             let cost = character.utf16.count
-            if used + cost > maxUnits { break }
+            if used + cost > maxUnits {
+                if result.isEmpty {
+                    for scalar in character.unicodeScalars {
+                        let scalarCost = scalar.utf16.count
+                        if used + scalarCost > maxUnits { break }
+                        result.unicodeScalars.append(scalar)
+                        used += scalarCost
+                    }
+                }
+                break
+            }
             result.append(character)
             used += cost
         }
@@ -223,14 +233,27 @@ public struct TeamRun: Identifiable, Equatable, Sendable {
         var used = 0
         for character in text {
             let cost = character.utf16.count
-            if used + cost > maxUnits, !current.isEmpty {
-                chunks.append(current)
-                current = ""
-                used = 0
-            }
             if cost <= maxUnits {
+                if used + cost > maxUnits, !current.isEmpty {
+                    chunks.append(current)
+                    current = ""
+                    used = 0
+                }
                 current.append(character)
                 used += cost
+            } else {
+                for scalar in character.unicodeScalars {
+                    let scalarCost = scalar.utf16.count
+                    if used + scalarCost > maxUnits, !current.isEmpty {
+                        chunks.append(current)
+                        current = ""
+                        used = 0
+                    }
+                    if scalarCost <= maxUnits {
+                        current.unicodeScalars.append(scalar)
+                        used += scalarCost
+                    }
+                }
             }
         }
         if !current.isEmpty { chunks.append(current) }

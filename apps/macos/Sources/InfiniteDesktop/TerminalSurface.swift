@@ -43,6 +43,12 @@ struct TerminalFeedStep: Equatable, Sendable {
 }
 
 struct TerminalFeedQueue: Equatable, Sendable {
+    enum ReplayCompletion: Equatable, Sendable {
+        case none
+        case queued
+        case completedNow
+    }
+
     static let maxPendingBytes = 8 * 1024 * 1024
     static let maxPendingSteps = 4096
 
@@ -55,8 +61,9 @@ struct TerminalFeedQueue: Equatable, Sendable {
     var isReplayingHistory: Bool { activeReplayGeneration != nil }
 
     func effectiveFollow(desired: Bool) -> Bool { desired && !isReplayingHistory && !overflowed }
+    func effectiveInputEnabled(desired: Bool) -> Bool { desired && !isReplayingHistory && !overflowed }
 
-    mutating func enqueueReplay(_ replaySteps: [TerminalFeedStep], generation: UUID) -> Bool {
+    mutating func enqueueReplay(_ replaySteps: [TerminalFeedStep], generation: UUID, awaitsCompletion: Bool = false) -> Bool {
         guard !replaySteps.isEmpty else { return true }
         let bytes = replaySteps.reduce(0) { $0 + $1.data.count }
         if bytes > Self.maxPendingBytes || replaySteps.count > Self.maxPendingSteps {
@@ -65,7 +72,7 @@ struct TerminalFeedQueue: Equatable, Sendable {
         }
         var normalized = replaySteps
         for index in normalized.indices {
-            normalized[index].completesReplay = (index == normalized.count - 1)
+            normalized[index].completesReplay = !awaitsCompletion && (index == normalized.count - 1)
         }
         steps = normalized
         pendingBytes = bytes
@@ -74,10 +81,18 @@ struct TerminalFeedQueue: Equatable, Sendable {
         return true
     }
 
-    mutating func enqueue(data: Data, reset: Bool, dimensions: TerminalDimensions?, generation: UUID = UUID()) -> Bool {
+    mutating func enqueue(
+        data: Data,
+        reset: Bool,
+        dimensions: TerminalDimensions?,
+        completesReplay: Bool = true,
+        generation: UUID = UUID()
+    ) -> Bool {
         if reset {
-            if activeReplayGeneration != nil { activeReplayGeneration = generation }
-            steps = [TerminalFeedStep(data: data, reset: true, dimensions: dimensions, completesReplay: true)]
+            if !completesReplay || activeReplayGeneration != nil {
+                activeReplayGeneration = generation
+            }
+            steps = [TerminalFeedStep(data: data, reset: true, dimensions: dimensions, completesReplay: completesReplay)]
             pendingBytes = data.count
             overflowed = false
             if pendingBytes > Self.maxPendingBytes {
@@ -105,6 +120,22 @@ struct TerminalFeedQueue: Equatable, Sendable {
         steps.append(TerminalFeedStep(data: data, reset: false, dimensions: dimensions, completesReplay: false))
         pendingBytes += data.count
         return true
+    }
+
+    mutating func markReplayComplete(writing: Bool, currentGeneration: UUID) -> ReplayCompletion {
+        guard !overflowed, let replayGeneration = activeReplayGeneration, replayGeneration == currentGeneration else {
+            return .none
+        }
+        if let lastIndex = steps.indices.last {
+            steps[lastIndex].completesReplay = true
+            return .queued
+        }
+        if writing {
+            steps.append(TerminalFeedStep(data: Data(), reset: false, dimensions: nil, completesReplay: true))
+            return .queued
+        }
+        activeReplayGeneration = nil
+        return .completedNow
     }
 
     mutating func dequeue() -> TerminalFeedStep? {
@@ -146,16 +177,20 @@ struct TerminalFeedQueue: Equatable, Sendable {
     static let maxHistoryEntries = 4096
 
     var receive: ((Data, Bool, Int?, Int?) -> Void)?
+    var receiveStep: ((Data, Bool, Int?, Int?, Bool) -> Void)?
+    var onCompleteReplay: (() -> Void)?
     private(set) var activeDimensions: TerminalDimensions?
+    private(set) var streamReplayPending = false
     private var entries: [Entry] = []
     private var totalBytes = 0
     private var replayAvailable = true
 
-    func feed(_ data: Data, reset: Bool = false, columns: Int? = nil, rows: Int? = nil) {
+    func feed(_ data: Data, reset: Bool = false, columns: Int? = nil, rows: Int? = nil, completesReplay: Bool = true) {
         let size = TerminalDimensions(columns: columns, rows: rows)
         if reset {
             activeDimensions = size
             replayAvailable = true
+            streamReplayPending = !completesReplay
             if data.count > Self.maxHistoryBytes {
                 entries = []
                 totalBytes = 0
@@ -165,6 +200,7 @@ struct TerminalFeedQueue: Equatable, Sendable {
                 totalBytes = data.count
             }
             receive?(data, true, size?.columns, size?.rows)
+            receiveStep?(data, true, size?.columns, size?.rows, completesReplay)
             return
         }
         let sizeChanged = size != nil && size != activeDimensions
@@ -197,10 +233,18 @@ struct TerminalFeedQueue: Equatable, Sendable {
             }
         }
         receive?(data, false, size?.columns, size?.rows)
+        receiveStep?(data, false, size?.columns, size?.rows, false)
+    }
+
+    func completeReplay() {
+        guard streamReplayPending else { return }
+        streamReplayPending = false
+        onCompleteReplay?()
     }
 
     func clear() {
         activeDimensions = nil
+        streamReplayPending = false
         entries = []
         totalBytes = 0
         replayAvailable = true
@@ -209,11 +253,11 @@ struct TerminalFeedQueue: Equatable, Sendable {
     func replaySteps() -> [TerminalFeedStep]? {
         guard replayAvailable else { return nil }
         guard !entries.isEmpty else {
-            return [TerminalFeedStep(data: Data(), reset: true, dimensions: activeDimensions, completesReplay: true)]
+            return [TerminalFeedStep(data: Data(), reset: true, dimensions: activeDimensions, completesReplay: !streamReplayPending)]
         }
         let lastIndex = entries.count - 1
         return entries.enumerated().map { index, entry in
-            TerminalFeedStep(data: entry.data, reset: index == 0, dimensions: entry.dimensions, completesReplay: index == lastIndex)
+            TerminalFeedStep(data: entry.data, reset: index == 0, dimensions: entry.dimensions, completesReplay: !streamReplayPending && index == lastIndex)
         }
     }
 
@@ -253,7 +297,12 @@ struct TerminalSurface: NSViewRepresentable {
         let url = FileManager.default.fileExists(atPath: bundled.path) ? bundled : Bundle.module.url(forResource: "terminal", withExtension: "html", subdirectory: "Resources")!
         context.coordinator.allowedRoot = url.deletingLastPathComponent()
         view.loadFileURL(url, allowingReadAccessTo: url.deletingLastPathComponent())
-        pipe.receive = { [weak coordinator = context.coordinator] data, reset, columns, rows in coordinator?.feed(data, reset, columns, rows) }
+        pipe.receiveStep = { [weak coordinator = context.coordinator] data, reset, columns, rows, completesReplay in
+            coordinator?.feed(data, reset, columns, rows, completesReplay: completesReplay)
+        }
+        pipe.onCompleteReplay = { [weak coordinator = context.coordinator] in
+            coordinator?.completeReplay()
+        }
         return view
     }
     func updateNSView(_ view: WKWebView, context: Context) {
@@ -273,6 +322,7 @@ struct TerminalSurface: NSViewRepresentable {
         private var queue = TerminalFeedQueue()
         private var writing = false
         private var renderGeneration = UUID()
+        private var desiredControl = false
         private var controlled: Bool?
         private var desiredFollow = false
         private var following = false
@@ -302,35 +352,65 @@ struct TerminalSurface: NSViewRepresentable {
             Task { try? await view?.callAsyncJavaScript("window.infiniteTerminal.render(enabled)", arguments: ["enabled": enabled], in: nil, contentWorld: .page) }
         }
         func control(_ enabled: Bool) {
+            desiredControl = enabled
+            syncControl()
+        }
+        private func applyControl() async {
             guard !disposed else { return }
-            let next = enabled && !queue.overflowed
-            if controlled == next { return }
+            let next = queue.effectiveInputEnabled(desired: desiredControl)
+            guard controlled != next else { return }
+            controlled = next
+            _ = try? await view?.callAsyncJavaScript("window.infiniteTerminal.control(enabled)", arguments: ["enabled": next], in: nil, contentWorld: .page)
+        }
+        private func syncControl() {
+            guard !disposed else { return }
+            let next = queue.effectiveInputEnabled(desired: desiredControl)
+            guard controlled != next else { return }
             controlled = next
             Task { try? await view?.callAsyncJavaScript("window.infiniteTerminal.control(enabled)", arguments: ["enabled": next], in: nil, contentWorld: .page) }
         }
         init(_ parent: TerminalSurface) { self.parent = parent }
-        private func replay(_ steps: [TerminalFeedStep]) {
+        private func replay(_ steps: [TerminalFeedStep], awaitsCompletion: Bool) {
             guard ready, !disposed else { return }
             let generation = UUID()
             renderGeneration = generation
-            let accepted = queue.enqueueReplay(steps, generation: generation)
+            let accepted = queue.enqueueReplay(steps, generation: generation, awaitsCompletion: awaitsCompletion)
             syncFollow()
+            syncControl()
             if !accepted {
-                renderGeneration = UUID(); control(false)
+                renderGeneration = UUID(); syncControl(); syncFollow()
                 parent.onFailure("Terminal rendering fell behind. Reconnect the terminal for a fresh screen before sending input.")
             }
             drain()
         }
-        func feed(_ data: Data, _ reset: Bool, _ columns: Int?, _ rows: Int?) {
+        func feed(_ data: Data, _ reset: Bool, _ columns: Int?, _ rows: Int?, completesReplay: Bool = true) {
             guard ready, !disposed else { return }
             let size = TerminalDimensions(columns: columns, rows: rows)
             if reset { renderGeneration = UUID() }
-            let accepted = queue.enqueue(data: data, reset: reset, dimensions: size, generation: renderGeneration)
+            let accepted = queue.enqueue(data: data, reset: reset, dimensions: size, completesReplay: completesReplay, generation: renderGeneration)
+            syncFollow()
+            syncControl()
             if !accepted {
-                renderGeneration = UUID(); control(false)
+                renderGeneration = UUID(); syncControl(); syncFollow()
                 parent.onFailure("Terminal rendering fell behind. Reconnect the terminal for a fresh screen before sending input.")
             }
             drain()
+        }
+        func completeReplay() {
+            guard ready, !disposed else { return }
+            let generation = renderGeneration
+            switch queue.markReplayComplete(writing: writing, currentGeneration: generation) {
+            case .none:
+                break
+            case .queued:
+                drain()
+            case .completedNow:
+                Task {
+                    await applyFollow()
+                    await applyControl()
+                    if !disposed && !queue.overflowed && generation == renderGeneration { parent.onReady() }
+                }
+            }
         }
         private func drain() {
             guard !writing, !queue.isEmpty else { return }
@@ -345,11 +425,12 @@ struct TerminalSurface: NSViewRepresentable {
                         _ = try await view.callAsyncJavaScript("await window.infiniteTerminal.feed(bytes, reset, columns, rows)", arguments: ["bytes": step.data.base64EncodedString(), "reset": step.reset, "columns": step.dimensions?.columns ?? 0, "rows": step.dimensions?.rows ?? 0], in: nil, contentWorld: .page)
                         if queue.completeStep(step, generation: generation, currentGeneration: renderGeneration), !disposed {
                             await applyFollow()
+                            await applyControl()
                             if !disposed && !queue.overflowed && generation == renderGeneration { parent.onReady() }
                         }
                     } catch {
                         guard !disposed else { return }
-                        renderGeneration = UUID(); queue.markFailed(); control(false); parent.onFailure("Terminal rendering failed. Reconnect the terminal before sending input."); return
+                        renderGeneration = UUID(); queue.markFailed(); syncControl(); syncFollow(); parent.onFailure("Terminal rendering failed. Reconnect the terminal before sending input."); return
                     }
                 }
             }
@@ -360,16 +441,16 @@ struct TerminalSurface: NSViewRepresentable {
             case "ready":
                 ready = true
                 guard let steps = parent.pipe.replaySteps() else {
-                    queue.markFailed(); control(false)
+                    queue.markFailed(); syncControl(); syncFollow()
                     parent.onFailure("Terminal history exceeded its replay limit. Reconnect the terminal for a fresh screen before sending input.")
                     return
                 }
+                desiredControl = parent.acceptsInput
                 desiredFollow = parent.followsViewport
-                control(parent.acceptsInput)
                 render(parent.isVisible)
-                replay(steps)
+                replay(steps, awaitsCompletion: parent.pipe.streamReplayPending)
                 if let cols = body["cols"] as? Int, let rows = body["rows"] as? Int { parent.onResize(cols, rows) }
-            case "input": if ready, !queue.overflowed, parent.acceptsInput, let text = body["text"] as? String { parent.onInput(text) }
+            case "input": if ready, queue.effectiveInputEnabled(desired: parent.acceptsInput), let text = body["text"] as? String { parent.onInput(text) }
             case "resize": if let cols = body["cols"] as? Int, let rows = body["rows"] as? Int { parent.onResize(cols, rows) }
             default: break
             }
@@ -381,7 +462,7 @@ struct TerminalSurface: NSViewRepresentable {
         }
         private func failed(_ message: String) {
             guard !disposed else { return }
-            renderGeneration = UUID(); ready = false; queue.markFailed(); control(false); parent.onFailure(message)
+            renderGeneration = UUID(); ready = false; queue.markFailed(); syncControl(); syncFollow(); parent.onFailure(message)
         }
         func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) { failed("Terminal renderer could not load: \(error.localizedDescription)") }
         func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) { failed("Terminal renderer failed: \(error.localizedDescription)") }

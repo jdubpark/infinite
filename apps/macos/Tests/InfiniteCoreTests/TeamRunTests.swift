@@ -229,4 +229,29 @@ final class TeamRunTests: XCTestCase {
             XCTAssertTrue(combined.contains(note), "Missing limitation in split review steps")
         }
     }
+
+    func testOversizedGraphemeClusterIsPreservedAcrossSplitLimitationDirections() {
+        let cluster = "Z" + String(repeating: "\u{0301}", count: 9_000)
+        XCTAssertEqual(cluster.count, 1)
+        XCTAssertEqual(cluster.utf16.count, 9_001)
+
+        let taskWithCluster = task("c", "integrated", summary: "Limitations:\n- " + cluster)
+        let steps = run(["status": .string("ready-for-review"), "tasks": .array([taskWithCluster])]).reviewSteps
+        let limitationSteps = steps.filter { $0.title.lowercased().contains("limitation") }
+        XCTAssertGreaterThan(limitationSteps.count, 1)
+
+        var zCount = 0
+        var acuteCount = 0
+        for step in limitationSteps {
+            guard case .direction(let text) = step.action else {
+                XCTFail("Expected direction action for limitation review step")
+                continue
+            }
+            XCTAssertLessThanOrEqual(text.utf16.count, TeamRun.maxSteeringDirectionChars)
+            zCount += text.unicodeScalars.filter { $0 == "Z" }.count
+            acuteCount += text.unicodeScalars.filter { $0 == "\u{0301}" }.count
+        }
+        XCTAssertEqual(zCount, 1)
+        XCTAssertEqual(acuteCount, 9_000)
+    }
 }

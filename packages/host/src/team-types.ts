@@ -246,8 +246,10 @@ const modelProfileFields = {
   limitFallback: z.string().regex(ID_RE).optional(),
 };
 const effort = z.enum(["low", "medium", "high", "xhigh", "max"]);
+export const claudeTeamModelProfileSchema = z.object({ id: modelProfileFields.id, label: modelProfileFields.label, provider: z.literal("claude"), model: modelProfileFields.model, effort, tier: modelProfileFields.tier, dataUse: modelProfileFields.dataUse, limitFallback: modelProfileFields.limitFallback }).strict();
+export type ClaudeTeamModelProfile = z.infer<typeof claudeTeamModelProfileSchema>;
 export const teamModelProfileSchema = z.discriminatedUnion("provider", [
-  z.object({ id: modelProfileFields.id, label: modelProfileFields.label, provider: z.literal("claude"), model: modelProfileFields.model, effort, tier: modelProfileFields.tier, dataUse: modelProfileFields.dataUse, limitFallback: modelProfileFields.limitFallback }).strict(),
+  claudeTeamModelProfileSchema,
   z.object({ id: modelProfileFields.id, label: modelProfileFields.label, provider: z.literal("codex"), model: modelProfileFields.model, effort, tier: modelProfileFields.tier, dataUse: modelProfileFields.dataUse, limitFallback: modelProfileFields.limitFallback }).strict(),
   z.object({ id: modelProfileFields.id, label: modelProfileFields.label, provider: z.literal("opencode"), model: z.string().max(180).regex(/^[A-Za-z0-9][A-Za-z0-9._-]*\/[A-Za-z0-9][A-Za-z0-9._:/-]{0,119}$/), variant: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/).optional(), tier: modelProfileFields.tier, dataUse: modelProfileFields.dataUse, limitFallback: modelProfileFields.limitFallback }).strict(),
 ]);

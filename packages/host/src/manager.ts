@@ -27,7 +27,7 @@ import type { FuseGate } from "./fuse/types.js";
 import { haltReason } from "./halt/rules.js";
 import { agentAcceptOption, isCollapsedPermissionPrompt, oneShotRejectOption, permissionEvidenceHash, oneShotPermissionOption } from "./team-permissions.js";
 import { nativeContinuationSchema, teamModelProfileSchema, type NativeContinuation, type TeamAssignment, type TeamModelProfile, type TeamPermissionDecision } from "./team-types.js";
-import { hasHostLaunchFields, headlessLaunch, matchesSessionRequestFingerprint, missionCoordinatorLaunch, permissionCoordinatorLaunch, sessionAgentProfile, sessionRequestFingerprint, stripHostLaunchFields, teamModelLaunch, withoutSharedContext } from "./launch.js";
+import { hasHostLaunchFields, headlessLaunch, matchesSessionRequestFingerprint, missionCoordinatorLaunch, parseMissionCoordinatorProvider, permissionCoordinatorLaunch, sessionAgentProfile, sessionRequestFingerprint, stripHostLaunchFields, teamModelLaunch, withoutSharedContext } from "./launch.js";
 import { withNativeContinuation } from "./native-continuation.js";
 import { SESSION_PERMISSION_ACTOR_LABEL, isRequesterNotice, sessionPermissionRequestId, type SessionPermissionAnswer } from "./permission-session-requests.js";
 import { deferredCallOpen, type HeadlessPermissionChannel } from "./permission-headless.js";
@@ -994,7 +994,7 @@ export class Manager {
       if (!configuredProfile) throw new Error("Provider is not configured on this host");
       let profile = request.teamModelProfile ? teamModelLaunch(configuredProfile, request.teamModelProfile) : configuredProfile;
       if (request.team?.role === "permission-coordinator") profile = permissionCoordinatorLaunch(request.provider, profile);
-      if (request.team?.role === "mission-coordinator") profile = missionCoordinatorLaunch(request.provider, profile);
+      if (request.team?.role === "mission-coordinator") profile = missionCoordinatorLaunch(parseMissionCoordinatorProvider(request.provider), profile);
       if (request.continuation) profile = withNativeContinuation(profile, request.continuation);
       const context = withoutSharedContext(new ProjectContexts(this.config, this.key).snapshot(request.projectId), executionIdentity);
       const session: Session = {

@@ -8,6 +8,7 @@ import { machineIdentity } from "./machine.js";
 import { autonomyModeSchema } from "./autonomy.js";
 import { projectSourceSchema, teamProjectSchema, teamCommandSchema, teamRetentionSchema, storageFloorSchema, teamLineupSchema } from "./team-types.js";
 import { intakeConfigSchema } from "./intake-types.js";
+import { missionLineupSchema } from "./mission-types.js";
 import { evalHostSchema } from "./eval-config.js";
 import { permissionAgentConfigSchema } from "./permission-agent-config.js";
 import { mcpConfigSchema } from "./mcp-types.js";
@@ -243,6 +244,10 @@ export function validateIntakeConfig(config: Config): void {
   const answerProjectId = intake.mission.answerProjectId;
   if (answerProjectId && !config.projects.some(project => project.id === answerProjectId))
     throw new Error("intake.mission.answerProjectId must name a configured project");
+  if (config.teams?.lineup) {
+    const lineup = missionLineupSchema.safeParse(config.teams.lineup);
+    if (!lineup.success) throw new Error(lineup.error.issues[0]?.message ?? "Intake requires a strong Claude Code coordinator and strong reviewer");
+  }
 }
 function validateMcpCredentials(config: Config): void {
   if (!config.mcp) return;

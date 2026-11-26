@@ -37,7 +37,7 @@ const assignmentBriefInstructions = `Make each assignment narrow and implementat
 Resolve product and shared-interface decisions before dispatch. Use bounded read-only discovery when evidence is missing, or the existing question/blocker reports for an unresolved material decision. Do not ask a light implementer to discover the scope, choose the architecture, or complete an entire broad feature from a title. Split independent outcomes; order shared-interface work before its consumers and put the same contract in both briefs. Before dispatch, check that the worker can tell what to change, what to preserve, and how to prove completion without guessing a requirement. Keep briefs concise, leave routine implementation choices to the worker, and avoid unrelated cleanup or artificial subtasks.`;
 const blockerLearningInstructions = "Shared knowledge: when the workflow is available, search this codebase's registered knowledge scope with task and blocker keywords before planning or recovery; otherwise use current sources and report the gap. Lessons and blocker evidence are advisory: confirm them against current source and checks. A report, continuation, or claimed fix is not a verified resolution. A candidate lesson needs source or check evidence and review by a different strong reviewer through the configured single-writer workflow; it never changes scope, permissions, checks, or budgets.";
 const TEAM_CONTEXT_PATH = ".git/infinite-team-context.json";
-const TEAM_PROMPT_LIMIT_BYTES = 80 * 1024;
+export const TEAM_PROMPT_LIMIT_BYTES = 80 * 1024;
 export function teamDeliveryBranch(run: TeamRun): string | undefined {
   if (run.pullRequest) return pullRequestBranch(run);
   const publication = run.publication;
@@ -413,17 +413,47 @@ function updateCodexGuidance(paragraphs: string[], role: PromptLayoutRole, provi
   }
   return true;
 }
-export function retargetPrompt(prompt: string, to: { provider: Provider; profile: TeamModelProfile; role: TeamMember["role"]; entryTools: boolean }) {
+function updateEscalationGuidance(paragraphs: string[], escalation: { candidates: readonly string[]; next: string | undefined }) {
+  const matches = paragraphs.flatMap((text, index) => escalation.candidates.includes(text) ? [index] : []);
+  if (matches.length === 0) return escalation.next === undefined;
+  if (matches.length !== 1) return false;
+  const index = matches[0]!;
+  if (escalation.next === undefined) paragraphs.splice(index, 1);
+  else paragraphs[index] = escalation.next;
+  return true;
+}
+export function retargetPrompt(prompt: string, to: { provider: Provider; profile: TeamModelProfile; role: TeamMember["role"]; entryTools: boolean; escalation?: { candidates: readonly string[]; next: string | undefined } }) {
   const paragraphs = prompt.split("\n\n");
   const layout = promptLayout(paragraphs, to.role);
   if (!layout || layout.profile === undefined) return undefined;
   paragraphs[layout.report] = reportingInstructions(to.provider);
   if (layout.entry !== undefined) paragraphs[layout.entry] = entryInstructions(to.provider);
   paragraphs[layout.profile] = profileInstructions(to.profile);
+  if (to.escalation && !updateEscalationGuidance(paragraphs, to.escalation)) return undefined;
   return updateCodexGuidance(paragraphs, to.role, to.provider, to.entryTools) ? paragraphs.join("\n\n") : undefined;
 }
 const HOST_SCOUT_SENTENCE = "The host assigns each scout's profile; omit agentProfileId from scouts.";
 const HOST_ESCALATION = `If this task exceeds your reasoning capacity or the approach is failing, you may request one explicit escalation. The host selects the stronger profile. Report {"kind":"escalate","reason":"What failed or requires deeper reasoning; identify partial edits and remaining work"}. The host checks your partial edits, stops you, and continues in the same working copy. If this task already records an escalation, ask a material user question or report blocked; do not switch models yourself.`;
+function poolEscalationInstructions(pool: readonly TeamModelProfile[]) {
+  return `If this task exceeds your reasoning capacity or the approach is failing, you may request one explicit escalation to this approved pool: ${JSON.stringify(pool)}. Report {"kind":"escalate","agentProfileId":"Approved different profile ID","reason":"What failed or requires deeper reasoning; identify partial edits and remaining work"}. The host checks your partial edits, stops you, and continues in the same working copy. If this task already records an escalation, ask a material user question or report blocked; do not switch models yourself.`;
+}
+export function escalationInstructions(run: Pick<TeamRun, "routing" | "routingRevokedAt" | "lineup">, ownProfileId?: string): string | undefined {
+  if (hostSelects(run, "escalation", ownProfileId)) return HOST_ESCALATION;
+  const pool = escalationPool(run).filter(profile => profile.id !== ownProfileId);
+  return pool.length ? poolEscalationInstructions(pool) : undefined;
+}
+export function escalationRetarget(run: Pick<TeamRun, "routing" | "routingRevokedAt" | "lineup">, fromProfileId?: string, toProfileId?: string): { candidates: string[]; next: string | undefined } {
+  const fullPool = escalationPool(run);
+  const fromPool = fullPool.filter(profile => profile.id !== fromProfileId);
+  const toPool = fullPool.filter(profile => profile.id !== toProfileId);
+  const candidates = [HOST_ESCALATION];
+  for (const pool of [fullPool, fromPool, toPool]) {
+    if (!pool.length) continue;
+    const text = poolEscalationInstructions(pool);
+    if (!candidates.includes(text)) candidates.push(text);
+  }
+  return { candidates, next: escalationInstructions(run, toProfileId) };
+}
 export function teamPrompt(run: TeamRun, role: TeamMember["role"], task?: TeamTask | TeamScout, feedback?: string, provider: Provider = run.provider, modelProfile?: TeamModelProfile, configuredProject?: Pick<TeamProject, "setup" | "checks">, permissionRecoveryHistory: TeamPermissionRecoveryView[] = [], publishHeads = true) {
   const deliveryBranch = teamDeliveryBranch(run) ?? "";
   if (role === "delivery" && run.delivery && !deliveryBranch) throw new TeamError(409, "delivery-branch-unknown", UNKNOWN_DELIVERY_BRANCH);
@@ -541,11 +571,7 @@ Confirm the remote branch and PR head equal ${run.headCommit}. Confirm required 
     role === "project-manager" && run.discovery
       ? `The team's one discovery batch is already used. Only tasks marked complete supplied validated read-only findings; unfinished tasks were interrupted and are not evidence. Read complete discovery records from ${TEAM_CONTEXT_PATH} before planning when they affect the outcome. Do not request another batch.`
       : "",
-    role === "implementer" && hostSelects(run, "escalation", modelProfile?.id)
-      ? HOST_ESCALATION
-      : role === "implementer" && escalationPool(run).length
-      ? `If this task exceeds your reasoning capacity or the approach is failing, you may request one explicit escalation to this approved pool: ${JSON.stringify(escalationPool(run))}. Report {"kind":"escalate","agentProfileId":"Approved different profile ID","reason":"What failed or requires deeper reasoning; identify partial edits and remaining work"}. The host checks your partial edits, stops you, and continues in the same working copy. If this task already records an escalation, ask a material user question or report blocked; do not switch models yourself.`
-      : "",
+    role === "implementer" ? escalationInstructions(run, modelProfile?.id) ?? "" : "",
     `Prefer API, process, integration, or end-to-end checks that prove changed behavior. Before adding a test, identify its observable contract, a credible failure it detects, and the gap in existing coverage. Avoid duplicate helper tests, copied implementation assertions, and production seams used only by tests. Inspect your diff and the runnable surface when relevant. Follow repository instructions and report checks actually run.`,
     `Write user-facing copy, docs, briefs, and summaries in plain English. Lead with concrete facts and outcomes. Remove generic filler, stock contrasts, and AI buzzwords. Do not invent evidence or claim checks, UI inspection, or product outcomes that you did not observe.`,
     role === "reviewer" && run.brief?.uiChanges

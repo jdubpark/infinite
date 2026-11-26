@@ -166,8 +166,8 @@ struct MissionHaltBanners: View {
     @ObservedObject var app: AppModel
     @ObservedObject var model: MissionModel
     var body: some View {
-        let ids = model.mission.repoProjectIDs
-        HaltBanners(app: app, page: .projects(ids.isEmpty ? app.haltRepoIDs(group: model.mission.groupID) : ids))
+        let ids = model.mission?.repoProjectIDs ?? []
+        HaltBanners(app: app, page: .projects(ids.isEmpty ? app.haltRepoIDs(group: model.groupID) : ids))
     }
 }
 
@@ -182,5 +182,5 @@ struct CostHaltBanners: View {
 struct TeamHaltBanners: View {
     @ObservedObject var app: AppModel
     @ObservedObject var model: TeamModel
-    var body: some View { HaltBanners(app: app, page: .projects([model.run.projectID].filter { !$0.isEmpty })) }
+    var body: some View { HaltBanners(app: app, page: .projects([model.projectID].filter { !$0.isEmpty })) }
 }

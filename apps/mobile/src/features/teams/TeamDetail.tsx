@@ -23,7 +23,10 @@ import { Clamp, Disclosure, LinearChip, LineupView, ProfileLine, providerName, R
 import { DecisionOptions, OutcomeNote, RecommendationBlock } from "./Recommendation";
 import { useRunRequest } from "./useRunRequest";
 import { AgentApproval } from "./TeamApprovals";
+import { TeamEvidenceSection } from "./TeamEvidenceSection";
+import { TeamOverviewGroups } from "./TeamOverviewGroups";
 import { AgentLog, UnderstandingSummary } from "./TeamSummary";
+import { partitionMobileRoster } from "./inspector-model";
 import { orderedMembers } from "./summary";
 import { CostLine, RatingControl, RubricLine } from "../cost/parts";
 import { useTaskRating } from "../cost/useCost";
@@ -54,6 +57,7 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
   const [direction, setDirection] = useState("");
   const [tab, setTab] = useState<Tab>("overview");
   const [agentId, setAgentId] = useState("");
+  const [finishedOpen, setFinishedOpen] = useState(false);
   const [agentStale, setAgentStale] = useState(false);
   const [dockHeight, setDockHeight] = useState(0);
   const [taskId, setTaskId] = useState("");
@@ -97,9 +101,20 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
   const listed = new Map((sessions ?? []).map(session => [session.id, session]));
   const project = me?.projects?.find(value => value.id === team.projectId)?.name ?? team.projectId;
   const send = (path: string, label: string, fields?: Record<string, string | number>) => request.send(`/teams/${id}${path}`, label, team.revision, fields);
+  const rawRoster = partitionMobileRoster(team.members, team.revision);
+  const memberById = new Map(team.members.map(member => [member.memberId, member]));
+  const replacedByMap = new Map(
+    [...rawRoster.active, ...rawRoster.finished]
+      .filter(entry => entry.replacedByMemberId)
+      .map(entry => [entry.member.memberId, entry.replacedByMemberId!]),
+  );
+  const activeIds = new Set(rawRoster.active.map(entry => entry.member.memberId));
   const members = orderedMembers(team.members, team.revision);
   const current = members.filter(member => member.revision === team.revision);
-  const earlier = members.filter(member => member.revision !== team.revision);
+  const activeRosterMembers = members.filter(member => activeIds.has(member.memberId));
+  const finishedRosterMembers = members.filter(member => !activeIds.has(member.memberId));
+  const isFailedOrStopped = (member: TeamMember) =>
+    member.status === "stopped" || member.status === "unavailable" || Boolean(member.stoppedReason) || Boolean(member.stalledAt);
   const approvals = pendingApprovals(team, sessions ?? []);
   const coordinatorHandling = current.filter(member => live(member) && listed.get(member.sessionId)?.attention.state === "needs-you").length - approvals.length;
   const working = current.filter(live);
@@ -126,7 +141,11 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
     const title = member.title.replace(/^[a-z-]+:\s*/, "");
     return title === team.title ? "" : title;
   };
-  const showAgent = (member: TeamMember) => { setTab("agents"); setAgentId(member.memberId); };
+  const showAgent = (member: TeamMember) => {
+    setTab("agents");
+    setAgentId(member.memberId);
+    if (!activeIds.has(member.memberId)) setFinishedOpen(true);
+  };
   const answered = team.decisions.filter(decision => decision.answer != null);
   const lead = team.lineup?.coordinator;
 
@@ -154,6 +173,13 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
       </Pressable>
       {open ? <>
         {approval ? <View style={s.approval}>{approvalCard(approval)}</View> : null}
+        {(() => {
+          const replacementId = replacedByMap.get(member.memberId);
+          const replacement = replacementId && isFailedOrStopped(member) ? memberById.get(replacementId) : undefined;
+          return replacement ? <View style={s.approval}>
+            <Button compact secondary glyph="forward" title="Jump to replacement" onPress={() => showAgent(replacement)} />
+          </View> : null;
+        })()}
         <AgentLog connection={connection} member={member} live={live(member)} onOpen={() => openSession(member.sessionId)} onStaleChange={setAgentStale} />
       </> : null}
     </View>;
@@ -272,6 +298,8 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
           </Card>
         </Section> : null}
 
+        <TeamOverviewGroups team={team} onSelectMember={showAgent} />
+
         <Section title="Brief"><UnderstandingSummary connection={connection} team={team} /></Section>
       </View> : null}
 
@@ -314,8 +342,8 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
       </View> : null}
 
       {tab === "agents" ? <View>
-        {current.length ? current.map(agentRow) : <Text style={[t.note, s.gapTop]}>No agents yet.</Text>}
-        {earlier.length ? <Disclosure title={`Earlier revisions · ${earlier.length}`}>{earlier.map(agentRow)}</Disclosure> : null}
+        {activeRosterMembers.length ? activeRosterMembers.map(agentRow) : <Text style={[t.note, s.gapTop]}>No active agents.</Text>}
+        {finishedRosterMembers.length ? <Disclosure title={`Finished (${finishedRosterMembers.length})`} expanded={finishedOpen} onToggle={() => setFinishedOpen(open => !open)}>{finishedRosterMembers.map(agentRow)}</Disclosure> : null}
         {team.lineup ? <Disclosure title="Recorded lineup">
           <Text style={t.note}>Requested; providers may override.</Text>
           <LineupView lineup={team.lineup} />
@@ -323,6 +351,7 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
       </View> : null}
 
       {tab === "activity" ? <View>
+        <TeamEvidenceSection connection={connection} team={team} me={me ?? null} onOpenSession={openSession} />
         <Section title="Checks" count={team.checks.length}>
           {team.checks.length ? team.checks.map((check, index) => <CheckRow key={`${check.startedAt}/${index}`} check={check} />) : <Text style={t.note}>None yet.</Text>}
         </Section>

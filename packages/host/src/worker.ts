@@ -64,6 +64,7 @@ import { startNativeOpenCode, validateNativeOpenCodeArgs } from "./native-openco
 import { createExecutorTunnel, type ExecutorTunnel } from "./executor-tunnel.js";
 import { JsonLineAssembler, toolFromRunLine, usageFromRunLine } from "./opencode-usage.js";
 import { createHybridWorkspace } from "./hybrid-workspace.js";
+import { WorkerScreenActivity } from "./worker-screen-activity.js";
 import { normalizeWorkerControlRequest, teamAnswerWorkerRequestSchema, workerControlRequestSchema, workerWorkspaceExportRequestSchema,
   type Bootstrap,
   type ControlActor,
@@ -453,8 +454,7 @@ async function onHook(route: HookRoute, body: unknown, run?: string): Promise<Ho
   return reply;
 }
 
-let lastOutputAt = Date.now();
-let outputSinceCheck = false;
+const screenActivity = new WorkerScreenActivity(config.attention.idleAfterMs);
 let missCount = 0;
 let answering: number | undefined;
 
@@ -532,16 +532,10 @@ function checkScreen() {
     const detected = detectPrompt(lines, provider);
     const nowMs = Date.now();
     const at = new Date(nowMs).toISOString();
-    const idle =
-      !outputSinceCheck &&
-      nowMs - lastOutputAt >= config.attention.idleAfterMs &&
-      isIdleScreen(lines, provider);
-    const freshOutput =
-      outputSinceCheck && lastOutputAt > Date.parse(attention.since);
-    const outputThisCheck = outputSinceCheck;
-    outputSinceCheck = false;
-    watchLimit(lines, nowMs, outputThisCheck);
-    let decision = screenDecision(attention, detected, idle, freshOutput, at);
+    const activity = screenActivity.evaluate(attention, lines, provider, isIdleScreen(lines, provider), nowMs);
+    if (activity.changed) publish(activity.attention);
+    watchLimit(lines, nowMs, activity.substantiveChange);
+    let decision = screenDecision(attention, detected, activity.idle, activity.freshOutput, at);
     const open = attention.prompt;
     const replaced =
       detected !== null &&
@@ -560,7 +554,7 @@ function checkScreen() {
           "screen",
         );
         if (replaced)
-          decision = screenDecision(attention, detected, idle, freshOutput, at);
+          decision = screenDecision(attention, detected, activity.idle, activity.freshOutput, at);
       }
     } else missCount = 0;
     if (decision.kind === "merge" && open && !correlates(open, decision.merge)) {
@@ -568,7 +562,7 @@ function checkScreen() {
         { kind: "prompt-closed", promptId: open.id, reason: "superseded" },
         "screen",
       );
-      decision = screenDecision(attention, detected, idle, freshOutput, at);
+      decision = screenDecision(attention, detected, activity.idle, activity.freshOutput, at);
     }
     switch (decision.kind) {
       case "open": {
@@ -585,12 +579,13 @@ function checkScreen() {
         break;
       case "idle":
         if (!native) {
+          screenActivity.clearSpinner();
           const same = attention.state === decision.idle;
-          publish({ ...attention, prompt: undefined, lastTool: undefined, state: decision.idle, since: same ? attention.since : at, source: same ? attention.source : "screen" });
+          publish({ ...attention, spinnerOnlySince: undefined, prompt: undefined, lastTool: undefined, state: decision.idle, since: same ? attention.since : at, source: same ? attention.source : "screen" });
         }
         break;
       case "working":
-        if (!native) publish({ ...attention, prompt: undefined, state: "working", since: at, source: "screen" });
+        if (!native) publish({ ...attention, spinnerOnlySince: undefined, prompt: undefined, state: "working", since: at, source: "screen" });
         break;
       case "close":
       case "none":
@@ -1633,8 +1628,7 @@ server.listen(workerSocket, async () => {
       } catch {
         recordingFailure();
       }
-      lastOutputAt = Date.now();
-      outputSinceCheck = true;
+      screenActivity.noteRawOutput(Date.now());
       const flushed = pending.length >= 256 * 1024;
       if (flushed) try { flush(); } catch {}
       if (!flushTimer)

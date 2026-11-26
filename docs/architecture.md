@@ -1,219 +1,273 @@
-# Session ownership and protocol
+# Infinite System Architecture
 
-This page describes the implemented **single-tenant runner**. The managed service now requires a separate runner and confidential execution boundary per user. Global control-plane accounts must never become runner data-access roles. See [managed tenants](multi-tenant.md) for the accepted architecture, hardware limitation, development backend, and confidential release gates.
+This document describes the Infinite runtime (verified against `main` at `e0160091`): the implemented single-tenant runner, its multi-tier autonomous orchestration stack, fail-closed governance, encrypted storage and evidence pipelines, workspace intelligence, client surfaces, concurrency invariants, and Ubuntu hard-isolation boundaries.
 
-The native UI and checkpoint requirements are refined in [native interaction and continuity](native-continuity.md), including source reviews of Herdr and Orca. The runner now implements separate runtime identity, snapshot-plus-delta attachment, per-worker capability negotiation, and device-control ownership. A cloud PTY preserves execution but cannot provide local-speed echo over a slow network. Experimental native frontend/backend adapters exist for Codex and OpenCode. Compact chat shows explicit recorded messages and available cmux native transcripts; complete structured transcripts across all providers remain future work. Codex workspace preparation and handoff are described below.
+For managed multi-tenant operator confidentiality, hardware limits, and release gates, see [managed tenants](multi-tenant.md). For task-oriented navigation and a file-level lookup index, see [docs/README.md](README.md).
 
-## Execution model
+---
 
-[Goals and agent teams](teams.md) add durable scheduling above the same detached
-workers. A Goal retains the approved outcome, scope, deadline, attempt limits,
-and model lineup, then starts sequential Team cycles from reviewed commits. A
-Team validates role reports, optionally runs one discovery batch, schedules
-independent tasks in separate Git copies, serializes integration, and runs
-configured checks. Escalation uses a bounded, recorded replacement assignment.
+## System Overview and Monorepo Map
 
-Goal control and Team execution have separate revisions and replayable request
-identities. Public control of a goal-owned Team goes through its Goal; current
-member questions stay on the Team. Agent reports and passing checks never mark
-a product goal achieved. That state requires an explicit user assessment.
-Existing provider permissions and session input leases remain authoritative;
-headless OpenCode workers can reject a permission request without a dialog.
+![Infinite System Architecture](diagrams/system-topology.svg)
 
-Every provider runs on the selected machine by default; `Session.executionLocation` records `cloud` or `laptop`. Codex accepts `--laptop`, which keeps the invoking laptop project as the executor while its conversation backend stays in the cloud, with background preparation and automatic handoff as described in [laptop execution mode](hybrid-execution.md). Native CLI launches without `--project` resolve the local home-relative checkout path into a persistent cloud project and retain the relative launch directory. That cloud project is kept current by the one-way [workspace sync](workspace-sync.md) service. Reconnecting keeps the same conversation and placement.
+Infinite separates agent execution lifetime from API and client lifetimes. Native provider CLIs (`claude`, `codex`, `grok`, `opencode`, plus the synthetic `demo` rehearsal provider) execute inside detached worker processes owned by the host machine, never inside a browser tab, mobile app, or SSH shell. Clients (the laptop CLI, React web app, Expo phone app, and SwiftUI macOS app) attach to the same running processes over authenticated loopback HTTPS or the `infinite-remote-v1` application-encrypted WebSocket channel.
 
-```mermaid
-flowchart LR
-  Laptop[Mac / cmux / browser] --> Private[Tailscale + HTTPS / SSH]
-  Phone[React Native phone] --> Private
-  Other[Another computer] --> Private
-  Private --> API[Loopback control API]
-  API --> IPC[Private Unix sockets]
-  IPC --> Workers[One detached PTY worker per session]
-  Workers --> Native[Claude / Codex / Grok / OpenCode]
-  Workers --> Journal[Encrypted ordered recording]
-  Native --> Files[Cloud workspace + native history]
-  API --> Journal
-```
-
-The native process lives under its worker, not the HTTP server. An API crash leaves workers alive. Each worker owns its recording and input receipt map. The single HTTP listener binds only to `127.0.0.1`; Tailscale Serve can provide private HTTPS. A laptop can use ordinary SSH from a cmux pane to run `infinite attach SESSION_ID` on the host. Web and phone clients can also select independently paired machines. An optional outbound runner connection reaches an opaque relay, which forwards encrypted requests into the same authorized API. The optional cmux backend discovers existing Claude Code and Codex conversations and creates new cmux workspaces. Its process lifecycle and snapshot recording differ from detached Infinite workers. [Remote machines](remote-machines.md) defines those contracts and setup; neither backend changes execution ownership merely because a client switches machines.
-
-Workspace sync and GitHub-tracked sources are the two ways a cloud project
-directory gets its code. Sync uploads a laptop tree and applies it. A `github`
-project instead keeps a bare mirror of its base branch, outside every project
-directory. The host fast-forwards the project directory from that mirror when no
-session is using it, on a timer, before team runs, and after a merge report. Team
-runs clone the mirror, so they start from the current base. The two modes are
-exclusive per project. [Workspace sync](workspace-sync.md#source-modes) and
-[teams](teams.md#github-tracked-sources) define the contracts.
-
-## State and failure behavior
-
-`starting → running → exited`. An unreachable worker is reported as `unavailable`, never “completed.” Recording failure sets `recording-error` and attempts to suspend the native process with SIGSTOP. This favors preserving the record over continuing silently without one. Operator intervention is required if storage fills.
-
-Browser/network loss does not change worker state. API restart discovers existing workers through their private sockets and existing encrypted metadata. Host power loss, a native crash, or loss of the worker process is a different failure: the recording remains, but the process is not recreated automatically. An owner can explicitly resume a confirmed exited conversation with a known native ID for supported providers; this creates a fresh runtime and recording without resending its original prompt. Unknown or unavailable runtimes cannot be resumed this way. There is no second cloud host or high availability claim.
-
-Terminal-native input can include arbitrary keyboard sequences over owner-only terminal connections or SSH/local IPC. Web/mobile text input rejects escape/control injection. Multiline paste is allowed only after the terminal application advertises bracketed-paste support. Explicit Enter/Escape/arrow/interrupt controls handle provider menus. None of these controls infer tool approval.
-
-## Evidence store
-
-The host keeps run evidence in one SQLite database, `evidence/evidence.sqlite3` under the state directory. It holds the typed run events of the self-improving teams design. Later designs add their own tables to the same file as registered modules.
-
-The host process is the only writer. A new file is built under a temporary name and linked into place when complete, so a crash never leaves a half-built store. The file runs in WAL mode, so another process can read it while the host writes. The host's own reads use a separate read-only connection. Removing a run deletes its events. An hourly sweep deletes the events of every run whose sealed record file is gone, which covers a crash between the two steps.
-
-The host also mirrors four entry kinds from each saved run record into the store: `report`, `integration`, `check`, and `direction`. The owner reads them through `GET /api/teams/:id/entries` and `infinite team entries`. Entries hold their text sealed, and the host never reads them into a prompt or a context file. An entry that a crash or a failing store kept from being written is written later without a save: after a restart every retained run is checked, a few runs per scheduler tick. Each member's launch sizes sit beside them, in `member_scopes`, and `GET /api/teams/:id/context-usage` reports those sizes.
-
-With the member entry tools on, a session worker answers member reads from its own read-only connection to this database, and it never writes there. A member post goes into the worker's journal as a `team-entry` event. The host checks that event again and stores it on a later tick. The worker journals each served read as a `team-entry-read` event, and the host records it in `member_scopes`. The host process stays the only writer.
-
-The sealed run record stays the authority for run state. The store never decides a status. When the store cannot open, for example after a key mismatch or on a full disk, it reports `unavailable` with a fixed reason. The host still starts, runs continue, and run removal still works. A module whose stored schema is newer than the host is unavailable on its own, and the other modules keep working. `GET /api/evidence/status` and `infinite evidence status` report the state, each module's state, the file and WAL sizes, and the event count.
-
-## Delivery contract
-
-Creation uses a client UUID as the logical session ID. The stored request fingerprint makes an identical retry return the existing session; a conflicting reuse fails. Deletion keeps a sealed ID receipt so a delayed retry cannot relaunch the deleted request or reuse its ID. Creation does not automatically retry spawning after an ambiguous failure.
-
-New session metadata also pins a separate runtime UUID, execution location, and transport. Records written before execution location was stored are reported as `laptop` when they carry a hybrid workspace and `cloud` otherwise. Detaching and reconnecting never change that runtime. Authenticated Claude/Codex hooks may identify the native conversation; absence means unknown. Native argument passthrough does not inject hooks, so such sessions may have no native conversation mapping. This is not a portable recovery checkpoint or a complete provider-account binding.
-
-Input carries a client-generated `requestId`. The worker durably appends intent, writes to the PTY, then durably appends the result. Every event other than output is durable when its append returns. Output events are durable when the flush that writes them returns; while that flush runs, the host can read them before they are synced, as it can between any single event's write and its sync. Concurrent identical retries return one receipt. If the write may have happened but the result was not recorded, that ID remains uncertain. It must not be silently reissued under another ID. Exactly-once execution of a provider's tool is not guaranteed by exactly-once terminal input.
-
-Each event has `seq`, `at`, `type`, and `data`. The encrypted journal uses 256-record segments. `GET /api/sessions/:id/events?after=N&limit=200` returns `{events,cursor,more}`. Clients advance only to a received cursor and page until `more=false`. Events are retained after native process exit. There is no automatic record deletion or retention quota; the owner can explicitly delete an exited session's record.
-
-`GET /api/sessions` answers `{ sessions }`, every recorded session, with the envelope and content type it always had. A client that polls names the version of the rows it holds: `GET /api/sessions?since=<version>` answers `{ version, unchanged: true }` while the list is still that version, else `{ version, sessions }`; an empty `since` asks for a version. The version is a SHA-256 digest of the serialized rows (22 base64url characters), so equal rows in the same order name the same version and a change to any row names a new one. After a host restart the version holds only when the rows come back in the same order: cmux rows keep the order their directory was enumerated in on load, which the platform does not guarantee, and a changed order costs a client one full read. A row whose worker does not answer carries recorded times, never the time of the read: the saved attention's `lastActivityAt`, and a `since` from the status file's save time when the row turns `unavailable` (the session's creation when no status was saved). An unchanged list therefore keeps its version, and a row's times differ from those an earlier host sent, which dated such rows at the read. A `since` longer than 128 characters or outside `[A-Za-z0-9_-]` is refused with 400. The web, phone and Mac clients keep their rows on `unchanged`; a host that predates `since` ignores it, and an answer a client cannot read is followed by a plain `GET /api/sessions`.
-
-`GET /api/events?topics=sessions,teams,session/<id>&after=<cursor>` provides the shared live feed as authenticated `text/event-stream`. One host loop runs every 750 ms only while it has subscribers. Each tick reads each requested list or session state once and shares journal reads among subscribers at the same session cursor. Different cursors advance independently, so a device replaying older history does not hold back a current device. Each tick admits at most 32 journal page reads, with four running concurrently; rotation across cursor groups keeps older subscribers progressing when that budget is exceeded. The feed emits only when the serialized topic data changes, with two exceptions: a topic in refetch mode repeats its unchanged notice every 15 seconds (see the 128 KiB budget below), and an unchanged inline `sessions` list is sent again once a minute, because the phone ages its rows from when it last received the list. `sessions` matches `GET /api/sessions`, `teams` matches `GET /api/teams`, and `session/<id>` contains the `GET /api/sessions/:id` detail plus a journal page shaped like `GET /api/sessions/:id/events`. The stream sends a comment heartbeat every 15 seconds, disables proxy buffering, and stops work when its last subscriber closes. It uses the same paired-device authentication and read roles as those GET routes.
-
-HTTP subscriptions share a four-stream cap per paired credential, including browser cookies and remote loopback requests. Authentication is checked before every write and at each heartbeat; logout, cookie expiry, or removal of the paired credential closes affected streams. Writes include the next frame in the 256 KiB buffer check.
-
-Live updates have a shared 128 KiB UTF-8 JSON budget. When an update exceeds it, that subscriber's topic switches to `{topic:"refetch",data:{topic:"<original topic>"}}` notifications for the rest of the subscription. The phone's selectors leave this topic to their REST loaders, which retain their own journal cursors. Keeping subsequent updates in refetch mode prevents an inline cursor from skipping omitted events. Unchanged refetch notifications repeat every 15 seconds so failed REST loads can retry while the stream remains connected. Journal and snapshot contents remain available through their existing GET routes.
-
-Phone clients carry `events-open`, `events-event`, `events-closed`, and `events-close` inside the existing encrypted remote channel for both direct and relayed connections. The relay forwards those ciphertext frames without interpreting them. A channel admits four event streams, each with a 256 KiB buffered-event limit; backpressured streams close and reconnect from the last received journal cursor. Buffered remote requests cannot open `/api/events`; subscriptions use `events-open`. The phone shares subscriptions for the same connection and topics, treats iOS `inactive` as foreground, and pauses polling and lease renewals in the background. A screen that another screen covers, or an inactive tab, also stops its polling and live subscription; regaining focus reloads it immediately under the same stale rules, and a response started before it lost focus never marks it fresh. It keeps the shared live stream open for a 30-second background grace period, then closes it to save battery. On return, a still-valid held lease renews immediately; an expired lease is never claimed automatically. Reconnection recovers from the last received journal cursor without premature offline UI; stale/offline appears only after the existing foreground stale delay. While a stream is unavailable, Inbox and session state fall back to their existing 2.5-second and 1.5-second reads, team lists use their existing visible/hidden cadence, and conversation messages use a 15-second fallback. A healthy stream disables those timers. The web client may continue polling; it stops its periodic reads while its tab is hidden and reads again as soon as the tab is visible.
-
-## API capabilities
-
-All API routes except login require a bearer key or same-origin HttpOnly cookie. The web UI and native client use this same API; automation has the same primitives.
-
-`GET /api/me` includes a `security` object with `mode`, `tenancy`, `isolation`, `tenantId`, `contextScope`, `operatorConfidential`, `attestation`, and `dataPolicy`. These are development capability descriptions, not remote attestation evidence. The current implementation always reports `operatorConfidential: false`. Direct single-tenant use needs no VM isolation. Multi-tenant development requires an external VM boundary per runner. Different roles on one API see the same tenant's collection.
-
-| Action | Endpoint | Role |
+| Workspace / Directory | Role | Key Entry Points |
 | --- | --- | --- |
-| Browser login | `POST /api/login` | Valid key, matching Origin |
-| Device capabilities | `GET /api/me` | Any paired role |
-| List / inspect sessions | `GET /api/sessions`, `GET /api/sessions/:id` | Any |
-| Read the decision queue | `GET /api/decision-queue` | Any; a held team answer carries `held: true` and waits for resume; a session prompt that only its terminal can answer carries `terminalOnly: true` |
-| Subscribe to live state | `GET /api/events?topics=...&after=...` | Any |
-| Create session | `POST /api/sessions` | Owner |
-| Archive / unarchive an exited session | `POST /api/sessions/:id/archive` | Owner |
-| Delete an exited session record | `DELETE /api/sessions/:id` | Owner |
-| Read chat / preview a project file | `GET /api/sessions/:id/messages`, `/file?path=` | Any |
-| Read a model-written digest of the chat | `GET /api/sessions/:id/summary?after=` | Any, when `summaries` is configured |
-| Clean a dictated transcript | `POST /api/dictation/cleanup` | Owner, controller; when `dictation` is configured |
-| Explicitly resume an exited conversation | `POST /api/sessions/:id/resume` | Owner |
-| Replay logs | `GET /api/sessions/:id/events`, optionally filtered with `?types=` | Any |
-| Answer an on-screen dialog | `POST /api/sessions/:id/answer` | Owner, controller |
-| Register / remove a push token | `POST /api/devices/push`, `DELETE /api/devices/push` | Any |
-| Claim / renew / release input control | `POST /api/sessions/:id/control` | Owner, controller |
-| Send text | `POST /api/sessions/:id/input` | Owner, controller |
-| Send control key | `POST /api/sessions/:id/key` | Owner, controller |
-| Resize / terminate | `POST /api/sessions/:id/resize`, `/stop` | Owner |
-| Read project context | `GET /api/projects/:id/context` | Any |
-| Replace context with version check | `PUT /api/projects/:id/context` | Owner |
-| Read direct context relationships | `GET /api/projects/:id/context-links` | Any |
-| Replace direct relationships with version check | `PUT /api/projects/:id/context-links` | Owner |
-| Resolve a home-relative project | `POST /api/projects/resolve` | Owner CLI |
-| Project detail and sync state | `GET /api/projects/:id` | Any |
-| Receive a laptop generation | `POST /api/projects/:id/sync/{begin,has,commit}`, `PUT /api/projects/:id/sync/blob/:hash` | Owner CLI |
-| Apply a pending generation | `POST /api/projects/:id/sync/apply` | Owner |
-| Export the cloud tree | `POST /api/projects/:id/sync/export`, `GET /api/projects/:id/sync/blob/:hash` | Owner CLI |
+| `packages/attention/` (`@infinite/attention`) | Pure attention state machine, terminal prompt detection, hook payload mappers, destructive-command detector, one-shot delegation gate (15 modules) | `src/attention.ts`, `src/prompts.ts`, `src/delegation.ts`, `src/destructive.ts` |
+| `packages/remote/` (`@infinite/remote`) | `infinite-remote-v1` E2E encrypted WS channel, `?since=` list sync, data-only Markdown/Mermaid/diagram layouts, Understanding and Memory wire schemas (13 modules) | `src/protocol.ts`, `src/index.ts`, `src/mermaid.ts`, `src/memory.ts` |
+| `packages/host/` (`@infinite/host`) | Control API, detached PTY workers, vault and journals, encrypted SQLite `EvidenceStore`, orchestration services, permission agent, routing, eval, understanding, usage, laptop CLI, blind relay | `src/server.ts`, `src/worker.ts`, `src/manager.ts`, `src/teams.ts`, `src/missions.ts`, `src/goals.ts`, `src/evidence/store.ts` |
+| `apps/web/` (`@infinite/web`) | Read-only Swarm dashboard (Lanes/Wall/Graph), Decision Queue, xterm.js terminal, Sessions, Teams/Goals/Missions, Cost, Permissions, Halt, Dictation | `src/main.tsx`, `src/swarm/SwarmView.tsx`, `src/decision-queue.tsx`, `src/api.ts` |
+| `apps/mobile/` (`@infinite/mobile`) | Expo / React Native client (fixed light theme): Board, Sessions Brief, Understand and native SVG diagrams, Teams/Goals/Missions, Cost, Permissions, Expo Push | `src/api/client.ts`, `src/features/board/`, `src/features/understanding/` |
+| `apps/macos/` (`InfiniteDesktop`) | SwiftUI + CryptoKit desktop client: WKWebView xterm, split panes, Keychain-sealed `DraftStore` actor, Files and Sync, Understand, Cost, Resources, native cmux client | `Sources/InfiniteCore/`, `Sources/InfiniteDesktop/` |
+| `deploy/ubuntu/` & `deploy/proxmox/` | Seven-account Ubuntu 24.04 hardening, `nftables` firewalls, egress and GitHub proxies, ceilings, freeze-watchdog `age` backups, secondary instances, synthetic Proxmox fleet planner | `deploy/ubuntu/README.md`, `deploy/ubuntu/instances.md`, `deploy/proxmox/README.md` |
+| `scripts/`, `tests/`, `verification/` | Zero-dependency proxy daemons, Graphify builder, comment and file-size ratchets, 443 test suites (including seeded simulators and compile-time type tests), formal BFS/TLA+ models | `scripts/egress-proxy.mjs`, `scripts/github-proxy.mjs`, `scripts/run-tests.mjs` |
 
-Mission-managed sessions refuse direct human input, stop/resume, native attach,
-and OpenCode access. While the worker reports an open provider prompt
-(`attention.state === "needs-you"`), owner/controller input and key requests,
-owner raw input, and lease claims and renewals are allowed through the worker's
-normal lease fencing. The host checks that state for each HTTP request and
-terminal write frame; once the prompt closes, those actions return
-`409 mission-managed` again, so a fallback lease lapses within its 30-second
-TTL. Release stays available. Stop, resume, and native/OpenCode attachment
-remain refused throughout; `/answer` and `/resize` retain their existing role
-rules. The window is a convenience boundary for people, not a sandbox: input
-sent while the prompt is open is not limited to the prompt itself.
+### Honesty and Authority Rules
 
-**Owner CLI** routes accept only a paired owner bearer key; a browser session is refused. While a sync commit or apply holds a project, Infinite-managed session creation and resume in that project answer `409` with code `sync-applying`; this includes cmux sessions. [Workspace sync](workspace-sync.md) defines the transfer limits, apply rules, and pending reasons.
+Every subsystem enforces four invariants from [PRODUCT.md](../PRODUCT.md):
 
-Session IDs and project IDs are validated. Executables come from private host configuration. Project roots come from that configuration or owner-created folder mappings in sealed host state. A session can select an existing relative directory within its project; traversal and symlink escapes are refused, and native resumption retains that directory. The owner-only native CLI launch accepts an argument array, including provider flags that may access other files available to the agent account; this is not a sandbox boundary within a tenant. Web and phone creation use configured provider arguments. Infinite workers pass prompts and native arguments directly to the executable. The cmux adapter quotes each configured argument before launching in the chosen workspace shell. Active-host process inspection can see launch arguments.
+1. **Receipts over inference.** A delivered receipt proves bytes reached the PTY, never that a provider accepted or completed a task. An idle terminal or exited process never implies completion.
+2. **Owner authority on outcomes.** Independent evaluator verdicts are labeled as provisional agent assessments. Only an explicit owner assessment (`POST /api/goals/:id/outcome`) records a product goal as `achieved`.
+3. **Unreachable is never exited.** Workers that stop answering report `unavailable` with their last recorded timestamps, never `exited` or `completed`.
+4. **Prompt isolation from scoring.** No outcome score, reward, routing decision, evaluation result, spend fuse counter, or usage figure enters an agent prompt.
 
-The maximum concurrency defaults to 24; it is a count limit, not CPU, memory, spend, or per-provider quota enforcement. Resource limits and isolated worktrees belong to commissioning. Do not run multiple editors against one configured checkout until those directories are separated.
+---
 
-## Signals and attention
+## Session Runtime, Transport and Continuity Protocol
 
-The worker records evidence about what an agent is doing as journaled events with `type = "signal"`, a `kind`, and a `source` of `hook`, `osc`, `screen` or `host`. Hook signals come from the Claude Code and Codex hooks Infinite injects for its own process; Codex hooks are off by default, because the flag that lets them run also lets a repository's own Codex hooks run without review (see `docs/security.md`). OSC signals come only from Codex's OSC 9 terminal notifications. Screen signals come from dialog detection on the rendered terminal. Host signals come from the worker's own answers and prompt bookkeeping, such as an answer and the prompt close it causes. Exit and recording errors are lifecycle events, not signals.
+![Detached Worker Protocol and Permission Pipeline](diagrams/session-protocol-and-permissions.svg)
 
-Every journaled `prompt-open` is closed exactly once. When a turn-end, or a turn or tool hook for a hook-only prompt, would drop the open prompt, the worker journals `prompt-closed` with reason `resolved` first. A prompt detected on screen stays open across turn and tool hooks; only its block leaving the screen or an answer closes it. When a hook opened the prompt and the screen block arrives later, the worker journals a `prompt-merged` notice with the block's own title and detail for the timeline.
+### Detached Worker Lifecycle and Vault Storage
 
-Each session reports one attention state: `working`, `needs-you`, `turn-finished`, `idle`, `exited`, `unavailable` or `recording-error`. The state is derived from the signals; the sources stay labeled so a client can tell a hook from a screen guess.
+Each session spawns one detached `packages/host/src/worker.ts` daemon owning a `node-pty` terminal (`120×32` default) and an `@xterm/headless` screen emulator (5,000-line scrollback). The API server (`packages/host/src/server.ts`) talks to workers exclusively over private Unix domain sockets (`<socketDir or runDir>/<sessionId>.sock`, mode `0600`, path ≤100 bytes, with configurable `socketDir` and lock-free per-host socket namespacing) using single-request NDJSON frames (`packages/host/src/ipc.ts`, timeouts: 4 s default, 12 s `answer`, 300 s `workspace-export`). Restarting or crashing the HTTP server leaves workers untouched; on startup, `Manager` rediscovers live workers via their sockets and sealed metadata.
 
-A hook prompt is merged into the on-screen dialog only when it correlates line-for-line with it. Otherwise it is journaled as a `prompt-mismatch` notice and the on-screen dialog stands. The merged prompt always shows the on-screen detail.
+Session metadata and journals are encrypted by `packages/host/src/vault.ts`:
 
-`POST /api/sessions/:id/answer` answers a dialog the terminal already shows. The client sends only the prompt id. The worker checks that it is still the open prompt and that the hash it stored for that prompt matches the dialog on the live screen. The worker sends keystrokes that navigate to the chosen option and presses Enter only after re-checking that the marker is on that option. A post-check reports `closed`, `still-open` or `changed`. Hooks never decide anything: the worker's reply to a hook is read only by Infinite's relay process, which prints nothing to the provider, so the laptop's dialog always appears and can still be answered there.
+- **Master key:** 32 random bytes (`0600`) stored outside `stateDir` (on Ubuntu: `/run/infinite-key/vault.key`, restored explicitly after host reboot).
+- **Record sealing:** AES-256-GCM with fresh 96-bit nonces and scope-bound AAD (`infinite:v1:<scope>`). Every file write uses `O_CREAT|O_EXCL` temp file (`0600`) -> `fsync` -> atomic `renameSync` -> parent directory `fsync`.
+- **Segmented journals and side indexes:** Append-only 256-record segments (`0000000000.journal`, mode `0600`, AAD `<sessionId>:<seq>`, `fsync` per append; output events are written and synced together by the flush that carries them, so they are durable when that flush returns and every other event is durable when its append returns), paired with a segmented encrypted signal index for `O(signals)` `ContextTouches` and signal-only reads plus a durable PTY-dimension size index so replay frames carry authoritative server dimensions. Workers buffer PTY output for at most 40 ms (8 KiB chunks). Any journal write error latches `recording-error` and sends `SIGSTOP` to the child process rather than continuing unrecorded.
+- **Session states:** `starting -> running -> exited`, plus fault states `unavailable` (socket unreachable) and `recording-error`.
+
+Host power loss or worker crash leaves the recording intact without silently restarting the process. An owner can explicitly resume a confirmed `exited` session with a known native conversation ID (`POST /api/sessions/:id/resume`), creating a fresh runtime UUID without resending the initial prompt. Fresh launches refuse provider resume flags (`assertFreshNativeContext` in `packages/host/src/context-continuation.ts`) so recordings never silently splice into an unrecorded conversation.
+
+### Serialized Worker Write Queue and Input Control Leases
+
+Input control is enforced inside the worker so API restarts cannot erase ownership (`CONTROL_TTL_MS = 30_000`, clients renew every 10 s). Clients identify each instance with `X-Infinite-Client` (UUID) and hold a server-bound lease ID in `X-Infinite-Control`; knowing another client's lease ID grants no authority. Explicit takeover rotates the lease ID.
+
+Every PTY mutation (`input`, `raw`, `key`, `answer`, `team-answer`, `session-permission-answer`, `resize`, `stop`) runs through the worker's single serialized queue in strict order:
+
+1. **Idempotency (`requestId`):** If `requestId` + SHA-256 request digest is already recorded, replay its receipt. Ambiguous writes remain `uncertain` and are never silently reissued under a new ID.
+2. **Control lease check:** Verify `clientId` + `leaseId`. Stale or competing writers receive `409 { code: "control-busy" | "control-lost" }`.
+3. **Attention and screen guard:** Text without `force: true` refuses `409 { error: "prompt-open", attention }` while an on-screen dialog is active. Verified answers check `promptId` and recompute the live screen hash.
+4. **Durable intent and PTY write:** Append `input-intent` and `fsync`, then write to the PTY.
+5. **Result receipt:** Append `input-result` (`delivered`, or `closed | still-open | changed` for verified answers). A refusal at steps 1–3 journals nothing.
+
+Terminal-native clients (owner-only WebSocket/SSH/IPC) may send raw terminal sequences and send text with `force: true`. Web and mobile reject escape/control injection and allow multiline paste only when the terminal advertises bracketed paste.
+
+### Signals, Attention and Verified Answers
+
+`packages/attention/` reduces four labeled signal sources (`hook`, `osc`, `screen`, `host`, plus `protocol` for cmux/native adapters) into seven attention states: `working`, `needs-you`, `turn-finished`, `idle`, `exited`, `unavailable`, and `recording-error` ([ADR-0001](adr/0001-attention-prompt-lifecycle-and-screen-authority.md)).
+
+- **Per-worker hook server (`packages/host/src/hooks.ts`):** Binds `127.0.0.1:0` with a 32-byte random Bearer token (256 KiB cap) serving 11 routes: `/claude`, `/codex`, `/codex-notify`, `/team-report`, `/mission-report`, `/team-handoff`, `/transcript`, `/drain`, `/team-entry`, `/permission-check`, `/permission-request`. Codex hooks stay off by default because enabling them allows untrusted repository Codex hooks to run (`docs/security.md`).
+- **Screen authority and single-close invariant:** Every journaled `prompt-open` closes exactly once. Prompts detected on screen (`prompts.ts`: Code Mode confirmation, numbered option lists, workspace trust, `[y/N]`) survive turn/tool hooks until answered or absent across two consecutive 1 s screen polls. Hook prompts merge into on-screen dialogs only when lines correlate (`correlates()`), journaling `prompt-merged` or `prompt-mismatch`.
+- **Verified answer protocol (`POST /api/sessions/:id/answer`):** Re-parses the live `@xterm/headless` screen, checks `prompt.hash`, steps arrow keys at 40 ms intervals, polls up to 500 ms to confirm the highlight landed on the chosen option (aborting with `changed` before pressing Enter if the dialog shifted), sends `\r`, and polls up to 1,500 ms to report `closed` or `still-open`. Hooks never approve anything.
 
 ### Chat from the provider's own record
 
-Claude Code and Codex hooks are command hooks that run Infinite's relay inside the agent's account. The authenticated primary hook names the provider's transcript file (`transcript_path`; Codex rollouts are located by thread id under its sessions directory). The worker replies with the byte offset it has already seen, and the relay streams the file from there in bounded chunks to the `transcript` hook route. The worker never opens the file itself, which keeps the agent's home private to its account. Each complete transcript record becomes a journaled event with `type = "message"` carrying the provider's own message id, role, text and tool name; injected context, subagent records and model reasoning are dropped, text is bounded, and a repeated chunk cannot duplicate a message. A Claude Code subagent's usage is read from its own transcript file in the session's `subagents` folder, through the same relay, and never becomes chat. After the provider exits, the worker runs the relay once more in drain mode, for at most 10 seconds, so rows written after the last hook still reach chat and usage. On the Ubuntu deployment it runs through the root-owned `transcript-drain` wrapper. Native Codex sessions journal the same events from the app-server's completed items. Once a session has transcript messages its state carries `capabilities.transcript = 1`, and `GET /api/sessions/:id/messages` returns only those (`source: "transcript"`); otherwise it returns delivered prompts and hook-reported replies from the recording (`source: "recording"`) and never fabricates an assistant message from terminal output.
+Command hooks run Infinite's relay inside the agent account (`packages/host/src/transcript.ts`, `transcript-watch.ts`). The relay streams new JSONL bytes from the provider's native transcript file by byte offset to `/transcript`, keeping the agent's home private to `infinite-agent`. Complete records become deduplicated `message` journal events (dropping injected context, subagent chat, and reasoning; Claude subagent usage is tracked separately). On exit, `final-drain.ts` runs the root-owned `transcript-drain` wrapper (10 s cap) so trailing messages and usage settle. Once a session has transcript messages (`capabilities.transcript = 1`), `GET /api/sessions/:id/messages` serves `source: "transcript"`; otherwise it serves recorded user prompts and hook replies (`source: "recording"`) without fabricating assistant text from terminal bytes.
 
-`GET /api/sessions/:id/summary?after=<cursor>` asks the configured model (`summaries.model`, an OpenAI-compatible Responses API) for a plain-text digest of the chat messages after that cursor. The response names the model and the cursor range it covers, and is cached per range. The instructions tell the model to attribute any claimed result to the agent; clients label the text as a summary, and nothing in the host acts on it. Optional `jev` configuration adds cached, encrypted phone readings for eligible turn-finished lines and generated titles; the feature and its exact data flow are documented in [security](security.md). Optional repository briefings provide a cited source snapshot and review brief for supported cloud workspaces; see [repository briefings](repository-briefings.md). A generated brief does not establish completion or review.
+- **Session summaries (`GET /api/sessions/:id/summary?after=`):** Served by `RepositoryBriefings` (`jevcode auto --trigger host`) when configured, falling back to `Summarizer` (`/v1/responses`) for plain-text digests cached per cursor range.
+- **Dictation cleanup (`POST /api/dictation/cleanup`):** Sends platform speech recognition text to `dictation.model` with `store: false` (25 s timeout). Clients fall back to raw transcripts on error, never auto-send, and stop capture if the field locks.
 
-`POST /api/dictation/cleanup` sends a platform speech recognizer's transcript to the configured `dictation.model` through an OpenAI-compatible Responses API. It returns cleaned text and the model name, or an error without partial text. The host sends `store: false`; clients can insert raw transcripts when cleanup is not configured.
+### Delivery contract
 
-Web and phone clients use the browser's or phone's speech recognizer and hide the microphone where recognition is unavailable. Cleanup is bounded at 25 seconds, and clients insert the raw transcript when cleanup is unavailable or fails.
+- **Conditional list polling (`GET /api/sessions?since=<version>`):** Returns `{ version, unchanged: true }` when the 22-char base64url SHA-256 digest of serialized rows matches. Unreachable workers carry recorded timestamps so unchanged lists retain their digest.
+- **SSE Live Feed (`GET /api/events?topics=...&after=...`, `packages/host/src/live.ts`):** One host loop ticks every 750 ms only while subscribers exist. Shares state and journal reads across equal cursors (max 32 journal page reads/tick, 4 concurrent), caps 4 streams per credential, sends 15 s heartbeats, and degrades topics exceeding 128 KiB UTF-8 JSON to `refetch` notices.
+- **Direct Terminal WebSocket (`WS /api/sessions/:id/terminal`):** Owner-only writes, 10 s auth, optional VT snapshot (`snapshot=1`, ≤200 scrollback rows / 512 KiB) followed by `fs.watch`-driven sequence deltas, 15 s ping/pong, and a bounded 256 KiB / 128-frame input queue.
+- **Application-Encrypted Remote Channel (`infinite-remote-v1`, `packages/remote/src/protocol.ts`, `packages/host/src/remote-access.ts`, [ADR-0002](adr/0002-remote-encrypted-channel-and-sync-contracts.md)):** Connects directly to `WS /api/remote` or through the blind `infinite-relay` (`packages/host/src/relay.ts`, `:4790`, outbound host WS `/relay/hosts/:machineId`, optional Cloudflare Access).
+  - *Handshake:* Pre-shared device key (`key = SHA-256(token)`) authenticates `hello`/`welcome` 32-byte nonces via HMAC-SHA256; `HKDF-SHA256(ikm=key, salt=SHA-256(transcript), info="infinite-remote-v1:directional-keys")` derives separate 32-byte `clientKey` and `serverKey`; frames encrypt with AES-256-GCM using monotonic `seq` nonces (`0x00000000 || uint64_be(seq)`) and transcript-bound AAD. There is no forward secrecy; stored device key hashes are transport secrets.
+  - *Multiplexing:* Carries HTTP RPC (`request`/`response`, 96 KiB req / 4 MiB resp, 8 pending/channel), terminal streams (`terminal-open`, max 4/channel), and live event streams (`events-open`, max 4/channel) inside one explicit `allowedPath()` allowlist. Oversized `GET /api/teams` responses fall back to `view=list` for 5 minutes.
+- **Workspace Sync vs GitHub Mirrors:** Exclusive per project (`docs/workspace-sync.md`). `sync` uploads changed files from a laptop checkout in batched 256 KiB content-addressed chunks (`PUT /api/projects/:id/sync/blobs`, ≤2 MiB / 512 chunks per request) into a shared content pool and atomically swaps when idle. `github` projects maintain a host-private bare mirror and fast-forward the project directory when idle and before team runs.
+- **Hybrid `--laptop` and `--local-ui` Bridges (`packages/host/src/native-bridge.ts`, `executor-tunnel.ts`, `hybrid-workspace.ts`):** Codex `--laptop` keeps tools on the laptop while streaming incremental checkpoints (`sync/*`); losing the laptop for >5 s hands execution over to the prepared cloud tree (`docs/hybrid-execution.md`). Experimental `--local-ui` proxies local Codex (`WS /api/sessions/:id/native`, 64 KiB binary catalog chunks) and OpenCode (`ALL /api/sessions/:id/opencode/*`) UIs to host-managed backends under the worker's control lease (`docs/native-continuity.md`).
+- **cmux Backend (`packages/host/src/cmux/`):** Discovers existing Claude/Codex sessions via `cmux rpc`, verifies foreground processes via `ps`, maps prompts into Infinite's session model, and enforces a 30 s control lease (`docs/remote-machines.md`).
 
-Dictation appends to the field's latest text and never sends it. When a field locks while dictation runs, for example during a send or while a delivery awaits retry, the client stops the recognizer, discards any cleanup reply, and says that nothing was added. "Use original" is offered only while the field is editable and still shows the cleaned text. In the web session composer, delivery errors, control messages, and receipts take the shared feedback line ahead of dictation notices. The phone has one native recognizer for the whole app: one field holds it from start until its capture ends, another field that tries to start is told so, and a cancelled capture keeps it reserved until its late end event arrives, so that event cannot finish a newer capture. Starting again before then says that dictation is still stopping. Leaving a screen stops its capture the way a lock does.
+---
 
-`POST /api/sessions/:id/input` refuses text while the open prompt's dialog is on screen, with `409 { error: "prompt-open", attention }`, because text and Enter would select the dialog's highlighted option. Nothing is typed or journaled. A request with `force: true` is delivered anyway; only terminal surfaces, where the person sees the dialog, send it.
+## Orchestration Stack and State Machines
 
-The `Notifier` in the API process polls session attention plus goal and team lifecycle state, and sends configured priority push events through Expo on transitions. Goal-owned team runs use goal notifications. `turn-finished` and `exited` remain opt-in; items already present when the API starts are primed silently. Push only happens while the API runs.
+![Orchestration Hierarchy and Team Pipeline](diagrams/orchestration-hierarchy.svg)
 
-## Request intake
+Infinite layers five durable coordination primitives above detached session workers. Every service stores AES-256-GCM `.sealed` state files, enforces optimistic concurrency (`revision`), and deduplicates mutations by `requestId` + payload fingerprint.
 
-Intake is a second way to start a mission, next to `POST /api/missions`. The host
-polls Linear for issues the owner filed with the intake label, checks each one, and
-keeps a record per issue in sealed state. The Slack surface posts into the thread a
-record is bound to and applies the owner's replies to the mission. Intake starts
-missions through the same admission function as `POST /api/missions`, so the group
-and handoff checks apply to both. Only the owner's messages are stored as
-requests or acted on. See [intake](intake.md).
+### Hierarchy and Ownership
 
-## Provider boundary
+| Layer | Module and States | Scope and Invariants |
+| --- | --- | --- |
+| Intake and External MCP | `intake.ts`, `mcp-requests.ts` (`queued`, `started`, `finished`, `skipped`) | Polls Linear (30 s) + Slack Socket Mode + dedicated loopback `/mcp` (5 tools). Admits owner-only requests as Missions; `ask:`/`work:` prefix or Jev classifier routes questions to `mode: "answer"` (≤30 min, zero subteams). Outbound text scrubs local paths and IPv4s. |
+| Mission | `missions.ts`, 7 states (`planning`, `working`, `needs-input`, `paused`, `blocked`, `ready-for-review`, `cancelled`) | Coordinates a cross-repository `ProjectGroup` via a read-only Claude Code coordinator running outside every repo (`dontAsk`, Read/Glob/Grep + `mission_report` MCP; max 60 attempts, 10 report kinds, conversation rotation on idle/tokens/age). Dispatches 1–12 subtask `TeamRun`s, auto-chains same-repo subtasks sequentially, and reserves active repositories. Intake missions freeze working clocks while `needs-input` or `paused`. |
+| Routine | `routines.ts`, 7 states (`scheduled`, `running`, `paused`, `blocked`, `completed`, `cancelled`, `expired`) | Bounded recurring approval (≤30 days, 1–100 occurrences, 5–10,080 min interval, max 1,000 retained). Pins a SHA-256 `authority` digest over project path, policies, source, Linear, and agents; any drift blocks the routine. Checks that the prior goal `safelySettled` before launching the next occurrence using a crash-safe pre-persisted `launch.requestId`. |
+| Goal | `goals.ts`, 9 states (`running`, `needs-input`, `paused`; terminal: `blocked`, `ready-for-review`, `no-opportunity`, `limit-reached`, `cancelled`, `achieved`) | Runs sequential single-repo `TeamRun` cycles from reviewed/merged commits. Finite goals bound `maxRuns` (1–10), `maxMinutes`, and `maxMembers`. Standing objectives require `autonomy === "autonomous"` and a cross-family evaluator, run on cadence or `SignalService` wakes, keep 50 detailed cycles (folding older totals), and auto-pause on supervised switch or 3 consecutive failed/no-progress cycles. Never auto-sets `achieved`. |
+| TeamRun | `teams.ts`, 14 states (10 active + 4 settled: `ready-for-review`, `merged`, `no-change`, `cancelled`) | Single-repo multi-role run across 10 roles: `project-manager`, `scout`, `implementer` (1–4 parallel isolated Git worktrees with disjoint paths and topological DAG validation), `integrator` (serial merge + ≤2 repair rounds), `reviewer` (strong cross-family + acceptance/UI evidence check), `delivery` (PR or auto-merge on exact reviewed commit), `permission-coordinator` (legacy fallback), `intent-checker`, `evaluator`, and `judge`. |
+| Handoff | `handoffs.ts` (`available`, `unavailable`, `requested`, `waiting-for-control`, `started`, `blocked`) | Cleanly transfers an interactive session into a `TeamRun` after reserving the project and detaching client control. |
 
-Ordinary sessions use each provider's native interactive CLI in a PTY. This preserves the native interface and conversation history. Model-routed OpenCode team members use headless `run` mode, with the permission limits described in [agent teams](teams.md#model-routing). Local `--help` confirmed launch/resume flags; all four providers have now completed authenticated turns and tool edits on the owner-controlled host; see the [commissioning record](../deploy/ubuntu/commissioning.md).
+### Projects over Checkouts (`INF-98`), Contexts and Verified Organization Scope (`#304`)
 
-Future structured adapters can normalize user/assistant messages, approvals, tool calls, and model usage while preserving native IDs. Codex exposes thread/turn lifecycle methods; Grok and OpenCode expose ACP/server interfaces. Each provider must be tested independently; an adapter mock is insufficient. [Codex app server](https://learn.chatgpt.com/docs/app-server), [Grok scripting and ACP](https://docs.x.ai/build/cli/headless-scripting), [OpenCode server](https://opencode.ai/docs/server/).
+- **Immutable Checkout Identity (`packages/host/src/checkout-identity.ts`, `project-groups.ts`):** Captured once into `project-groups/identities.sealed` (preferring GitHub source remote -> `origin` URL -> earliest root commit) so agent edits to `.git/config` cannot regroup repositories. Checkouts of one repository fold automatically into a `ProjectGroup`; cross-repo grouping is explicit and never merges `ProjectContext`, Linear mappings, delivery policies, or permission delegations. Moving a project increments `ownerMoveMark`, invalidating active permission delegations.
+- **Root-Pinned Project Context (`project-context.ts`):** Sealed contexts (≤24 KiB) and directional cross-project links (≤16 links, ≤48 KiB combined) pin `realpathSync(project.path)`. Any root drift sets `binding: "review-required"` and blocks launches (`409`).
+- **Verified Organization Intake (`#304`, `intake-audience.ts`, `slack-client.ts`):** When `intake.slack.organizationScope` is configured, every Slack event, interaction, thread read, reply, and mission creation re-verifies live via `conversations.info` that the channel is an allowed single-workspace non-shared channel (`is_shared=false`, `shared_team_ids=[teamId]`, `is_member=true`) and that `intake.mission.groupId` matches the exact 1:1 canonical `realpath` and Git remote / root-commit pins in `organizationScope.workspaces` (`GET /api/intake/workspace-scope`).
 
-Claude Remote Control keeps execution on the originating machine, so it cannot itself keep a laptop-hosted agent working after laptop shutdown. [Claude documentation](https://code.claude.com/docs/en/remote-control).
+### Blackboard, Internal MCP and Board Aggregation
 
-Herdr supplied the useful client/runtime separation and native-terminal reference. Nuphos supplied a reference for remote runtimes and mobile conversations. No code was copied from either. Their advertised multi-machine features are not evidence that an arbitrary running Mac process can migrate intact to Linux. [Herdr machines](https://herdr.dev/docs/connecting-machines/), [Nuphos](https://github.com/nuphos/nuphos).
+- **Blackboard (`evidence/blackboard.ts`, `team-entry-*.ts`):** Host automatically mirrors `report`, `integration`, `check`, and `direction` entries (sealed; never auto-injected into prompts). When `config.teams.blackboard.tools` is enabled at run creation, eligible roles (`project-manager`, `scout`, `implementer`, `integrator`, `reviewer`) receive `entry_post`, `entry_list`, and `entry_get` through the internal stdio MCP server (`packages/host/src/team-mcp.ts`, server `infinite-team`, schemas verified via `Exact<A, B>` in `team-mcp-results.ts`) or stdin fallback. Workers serve reads from a read-only SQLite connection and journal posts as `team-entry` events that the host secret-scans (`evidence/secret-scan.ts`) and ingests (caps: 16 KiB/req, 20 posts/attempt, 400/run).
+- **Board (`GET /api/board`, `missions.ts`):** Groups missions plus standalone teams and goals into four columns (`needs-input`, `working`, `review`, `ended`). Running items with a user-owned provider prompt (`waitsOnProvider` / `promptedSubtask`) surface in `needs-input`. Repeated identical objectives group into `BoardAttempt`s.
 
-## Laptop terminal transport
+---
 
-The experimental Codex local UI is a separate attachment mode. Its worker starts a persistent authenticated loopback app server and a cloud observer terminal, then records the protocol-reported conversation ID. Each laptop runs its installed native TUI through an authenticated loopback relay; the owner's device key stays in Infinite. The host gateway accepts paired owner bearers only and forwards to a per-session worker gate. Every native client frame is checked against the worker's current input lease. A takeover also closes stale connections. Browser cookies and controller/viewer keys cannot use this raw provider protocol.
+## Fail-Closed Governance: Halt, Fuse and Host Permission Agent
 
-The gateway pins thread operations to the recorded conversation, refuses new/fork/archive/delete operations, and bounds message and buffering sizes. Native frontend exits do not terminate the backend. The cloud observer supplies terminal recordings and phone interaction; only that observer records provider turn notifications, avoiding duplicate events from multiple UIs. Provider turn completion is labeled `protocol` and does not imply that the task or background subprocesses finished. Native method intents are recorded, but these are not provider-acceptance receipts. Provider-native history remains authoritative for message acceptance. Initial launch requires a real prompt and verified readable history before another native UI attaches. See [the CLI contract](cli.md#experimental-local-codex-interface) for supported arguments and limitations.
+Refer to the right panel of [FIG 05](diagrams/session-protocol-and-permissions.svg). Every automatic launch and permission review passes through a three-layer fail-closed stack:
 
-OpenCode uses a separate authenticated HTTP/event-stream adapter. Its worker starts one private server, creates a conversation once, and launches a persistent observer terminal attached to that ID. Each local native interface receives a temporary loopback password; Infinite supplies its paired owner identity and control lease to the cloud gateway. The worker rechecks control after reading each request body and while streaming events, forces the configured cloud directory, and filters other conversations. Only the worker’s independent event subscription records turn and permission events. Empty conversations can be resumed; no initial prompt is injected. Provider administration, thread creation/forking/deletion, and child-session navigation are refused in this initial adapter. See [OpenCode usage](cli.md#experimental-local-opencode-interface).
+1. **Emergency Halt (`packages/host/src/halt/service.ts`):** Checked ahead of everything with zero exempt roles. Writes `halt-epochs.sealed` before `halt.sealed` so restoring an older halt file cannot revert permission-invalidating epochs. Unreadable files fail closed host-wide (`409 halt-unreadable`). `POST /api/halt` pauses work via `pauseWithPendingCreates` in deterministic order (`routines -> goals -> missions -> teams`, pausing `needs-input` runs in place); `POST /api/halt/release` resumes in reverse order.
+2. **Launch-Rate Fuse (`packages/host/src/fuse/service.ts`):** Rolling 1-hour launch caps (default `30/hr` per project, `80/hr` host-wide; `permission-coordinator` exempt). First daily trip auto-closes below 50% rolling count; second same-day trip requires `POST /api/fuse/close`. Unreadable baseline fails closed (`cause: "unmeasurable"`). Optional `hostLoad` (`docs/hosting.md`) holds automatic launches when Linux `MemAvailable` or 1-minute load per CPU crosses configured bounds.
+3. **Host Permission Pipeline (`packages/host/src/permission-*.ts`):** Active only when the workspace is explicitly delegated (`PermissionDelegationService` matching `realpath` and `ownerMoveMark`) and `PermissionAgentCore` passes replay readiness (tool-less light profile, strong profiles from ≥2 model families, replay Wilson upper miss-rate bound within cap for the current `bindingDigest`). Any delegation, policy, rule, profile, or halt-epoch change rotates `authorityHash` and invalidates in-flight reviews immediately:
+   - **Step 1 (Class rules v8):** Deterministic shell AST + realpath check catches 5 `INTERRUPT_CLASSES` (`production-or-staging`, `credentials`, `money`, `destructive-outside-workspace`, `global-or-account-settings`), trust prompts, and persistent-only dialogs -> immediate `owner` escalation.
+   - **Step 2 (Qualification):** Requires untruncated hook/screen evidence, `oneShotAccept`, and `oneShotReject`.
+   - **Step 3 (Repeat lock and replay):** Two repeated open effect rejects (`outside-workspace | unrelated | unsafe`) lock the assignment (`reject(locked)`) until owner `unlock` / `reopen`. Replay cache never replays `owner` or `host:read-source` allows.
+   - **Step 4 (2-tier tool-less AI review):** Unraised allowed requests try a tool-less light model (`allow | refer`); raised or referred requests go to a strictly cross-family strong model (`--safe-mode --tools "" --strict-mcp-config --setting-sources ""`, zero hooks, ≤2 attempts, ≤8 read-only file paths once). Host rejects invalid verdicts fail-closed as `unavailable`.
+   - **Step 5 (Guarded delivery and write fence):** `EvidenceDeliveryLedger` records `intent` before sending; re-verifies session liveness, absence of human control lease, prompt/evidence/source/task hashes, `authorityHash`, and `strongTier` for destructive accepts; sends one-shot keystroke + fixed host `requesterNotice(code)`. Express middleware (`permissionWriteFence`) holds revocation/halt HTTP responses until in-flight deliveries are fenced. Headless Claude uses `0600` `permission-channel.sock` + per-session HMAC (`PreToolUse` 15 s, `PermissionRequest` 345 s).
 
-The native laptop client uses one authenticated WebSocket for sequence-numbered output, ordered input, and delivery receipts. Input does not wait for the preceding receipt. Journal changes wake output immediately; a periodic check handles lifecycle changes and missed filesystem notifications. The stream ends when the session has exited, or after three consecutive checks find the worker unavailable, so one late answer does not close it. Older hosts retain the HTTPS stream and input fallback. Both transports detach without stopping the worker and reject arbitrary terminal input from browser cookies or controller/viewer keys. Monitoring suppresses input locally and does not resize the agent.
+Every user-owned session prompt, standalone/goal team decision, and mission decision collects oldest-first into `GET /api/decision-queue` (web `#/decisions`).
 
-New workers advertise `capabilities.terminalSnapshot: 1` and `capabilities.inputControl: 1`. A terminal stream opened with `snapshot=1` may begin with `{snapshot:{ansi,seq,cols,rows,capturedAt},cursor}`. The worker briefly fences its own output intake, flushes the encrypted journal prefix, waits for the terminal parser, then captures the matching frame. Following events have sequence numbers greater than the snapshot cursor. Frames contain at most 200 scrollback rows and 512 KiB. Partial escape sequences, unsupported terminal state, or a busy renderer fall back to full recording replay. Snapshot capture does not create a portable process or file checkpoint.
+---
 
-Input control is enforced in the detached worker, so API restart cannot erase it. `POST /control` accepts `{action:"claim"|"renew"|"release",leaseId?,takeover?}` and returns `{control:{id,label,expiresAt}|null}`. HTTP mutations carry `X-Infinite-Control`; clients use a per-instance UUID in `X-Infinite-Client`. WebSocket authentication carries the same `clientId`, with subsequent control operations and input carrying the lease ID. The authenticated device and client instance are bound server-side; knowing another client's visible lease ID grants no authority.
+## Evidence Store, Self-Improvement and Evaluation
 
-One lease lasts 30 seconds and clients renew every 10 seconds while controlling. Explicit takeover or reattachment by the same client without its former lease rotates the ID. Stale input, answers, resize, stop, renewal, and release cannot affect the new owner. Recorded request IDs remain idempotent across control changes. A known refusal carries `control-busy` or `control-lost`; no new input intent is written for that refused attempt. Legacy HTTP/IPC mutations are allowed only while no lease exists. Old workers without this capability retain legacy behavior. Input leases do not fence execution on another host or provide tenant isolation.
+![Evidence Store, Adaptive Routing, and Self-Improvement Loops](diagrams/self-improvement-loop.svg)
 
-Every write to the PTY (text, terminal bytes, keys, answers, stop and resize) runs in the worker's one serialized queue, in this order: a recorded `requestId` replays its receipt; the lease is checked (`control-busy`, `control-lost`); the attention guards run (`prompt-open` for text without `force`, then the answer's prompt checks); only then is the intent journaled and the PTY written. A refusal at any step journals nothing. The API answers lease refusals with `409 {code, error}` and attention refusals with `409 {error: <code>, attention}`. The laptop terminal transport is a terminal surface and sends text with `force`. The phone and the laptop CLI enforce control before input: the phone sends nothing, including a one-tap answer, without its own lease, and the CLI claims one before it turns interactive. The worker enforces exclusivity once a lease exists; while no device holds one it still accepts lease-less input.
+### Evidence store
 
-A worker started before attention existed answers without an `attention` block. The API fills one in so list rows never break, but it never invents an idle or finished state: a live old worker reads as `unavailable`, and a stopped one keeps its lifecycle state.
+`stateDir/evidence/evidence.sqlite3` (`packages/host/src/evidence/`, mode `0600`, WAL mode, `node:sqlite`) is the unified telemetry and learning store with the host process as sole writer. New databases build under `<file>.creating-<pid>-<uuid>` and publish via atomic `linkSync`.
 
-Web and mobile screens show the time of the last successful refresh and distinguish cached views from fresh data. Foregrounding triggers a refresh; it never silently reacquires input control. A response started before the client went into the background cannot mark its returning view fresh. Web and mobile drafts and uncertain request IDs remain in client memory across navigation and network disconnects. Removing the pairing, reloading the browser, or exiting those clients discards them; drafts are not synchronized between devices.
+- **Cryptography (`evidence/crypto.ts`):** Derives three HKDF-SHA-256 subkeys from the host vault key (`row-encryption`, `blind-index`, `event-key`). Plain columns hold only opaque IDs, enums, numbers, timestamps, and 13 domain-separated keyed HMAC-SHA-256 blind indexes; all free text, file paths, patches, rubrics, and payloads live in AES-256-GCM envelopes bound to `infinite:evidence:v1:<table>:<rowId>`.
+- **SQL sandbox and soft availability:** `checkedSql` rejects transaction/pragma keywords and Tcl parameters; mutations execute synchronously under `BEGIN IMMEDIATE`. If the store cannot open (key mismatch, full disk, newer module schema), it reports `unavailable` at `GET /api/evidence/status` while sealed run records remain authoritative.
+- **15 Registered Modules and 4 Outbox Projectors:** Modules cover `store`, `event-outbox`, `blackboard`, `configurations`, `outcomes` (11 tables), `routing`, `objective-verdicts` (730 d retention), `eval-corpus`, `eval-trials` (7 tables), `judge-calibrations`, `usage`, `fuse`, `signals` (30 d), `permission-journal`, and `permission-measurements` (plus pipeline/delivery tables). `EventOutbox` transactionally advances four synchronous projectors (`configurations`, `outcomes`, `routing`, `verdicts`) off append-only `run_events`.
 
-The CLI's Ctrl+E editor additionally saves encrypted local drafts across process restarts. Each client writes a separate atomic file, keyed to its pairing, project, session, and runtime. Only a closed or dead writer's draft is recovered. Before insertion the client durably records its request ID as uncertain; a delivered receipt clears the record, a confirmed control refusal returns it to unsent, and every other failure retains the uncertainty. Recovery never dispatches text. See the [draft controls](cli.md#terminal-controls) for review and discard behavior and the limits of native provider edit buffers.
+### Online Verification, Outcomes and Wake Signals
 
-Browser URLs retain the selected machine, session ID and view, without including draft text or credentials. A bounded memory cache keeps the last 20 session views for immediate display during navigation; input stays disabled until fresh host state and any required lease arrive. Initial activity reads start near the latest sequence and retain at most 100 control events. Mobile recording pages are also bounded; the complete journal remains available on the host. Search and filtering affect the client list, not record retention.
+1. **Objective Record and Pre-Plan Intent Check (`objective-*.ts`, `team-intent.ts`):** Goals and standalone teams maintain a digest-sealed `ObjectiveRecord` (≤8 criteria, ≤32 assumptions, ≤8 open questions). When `intentCheck` is `on`, a read-only cross-family `intent-checker` screens the PM's plan before dispatch.
+2. **Host Checks, Metrics and Cross-Family Merge Gate (`check-metrics.ts`, `delivery-review.ts`, `team-acceptance.ts`):** Passing check stdout emits `infinite-metric <name> <number>` series (`GET /api/goals/:id/metrics`). Reviewer approval checks `TeamBrief.acceptance` and UI evidence. Automatic merge requires a strong reviewer outside every author model family recorded in `DeliveryReviewLineage`.
+3. **Assumption Register and Provisional Verdicts (`team-register.ts`, `team-verdicts.ts`, `verdict-compose.ts`):** `TeamRegister` verifies blackboard assumption proposals and produces host blob/check receipts. `TeamVerdicts` runs a cross-family read-only `evaluator`, then `composeVerdict` enforces host-receipt supremacy (overriding contradicting evaluator claims and invalidating `met` if pinned files changed). All-`met` autonomous goals stop at `provisional-met` for owner confirmation.
+4. **Outcome Ledger, `BaseScanner` and `SignalService` (`outcome-*.ts`, `signals/`):** `outcomeProjector` computes four hierarchical levels per attempt (`integrated -> accepted -> firstPass -> held`) with round attribution and exclusion flags. `BaseScanner` polls GitHub mirrors to confirm landed commits and detect reverts over hold windows, updating `held` and emitting deduplicated signals (`delivery-landed`, `revert`, `external-commit`) into `SignalService` to wake standing goals and routines. `scorecard.ts` serves Wilson intervals, median metered USD, and cheaper-comparable profile suggestions at `GET /api/usage/models`.
 
-The native interface remains the default. Ctrl+E offers a local draft editor that keeps typing on the laptop and inserts text only when requested. It does not remove network latency from the remote native interface. Native CLI arguments are passed without shell evaluation, encrypted with session metadata, and omitted from list rows. The [CLI contract](cli.md) covers flag placement, context behavior, reconnect, and explicit native recovery after a process exit.
+### Adaptive Model Routing (Thompson Sampling)
+
+`packages/host/src/routing-*.ts` (14 modules) selects profiles at `start`, `escalation`, and `scout` points within a 250 ms budget:
+
+- **Featurization (`task-features.ts`):** Maps owned paths to `FeatureMap` areas, task `kind`, and `risk: "normal" | "elevated"` (path prefixes + 28 security/infra tokens).
+- **Hierarchical Beta-Binomial Posterior (`routing-posterior.ts`):** Shrinks `tenant -> project -> cell` (`LEVEL_STRENGTH = 20`, `EARLIER_MASS = 10`, 30-day half-life, 180-day cap, `0.5×` weight on non-router-chosen outcomes) over reward `theta` and first-pass rate `phi` using `production` and `duel` outcome rows.
+- **Cost-Aware Thompson Sampling (`routing-sample.ts`, `routing-choice.ts`, `routing-guards.ts`):** Seeded SHA-256 + Marsaglia-Tsang Beta draws maximize `value * theta - listWeight * (costUsd + (1 - phi) * rescueUsd)`. `elevated` risk tasks disable exploration (greedy `thetaMean - thetaSd` with 3× value weight). Exploration also halts when paused, spare attempts are low, or rolling `maxExploreShare` is reached. Projects graduate from `shadow` to `auto` after 14 days and ≥50 recorded start decisions.
+
+### Offline Replay Eval Corpus and Blind Judge Calibration
+
+`EvalHost` (`packages/host/src/eval-*.ts`) builds a continuous private benchmark directly from repository work:
+
+- **Capture and Mining:** `TaskCapture` extracts approved production tasks (excluding same-model reviews); `Miner` scans up to 50 base-branch commits/pass (2,000 backfill) for commits with code + test diffs. `GroupPass` deduplicates overlapping lineages via union-find; `eval-sets.ts` splits 70% `dev` / 30% `holdout` via keyed blind index with one-way `markExposed` tainting and rotation every 5 confirms or 120 days.
+- **Isolated Validation (`eval-grader.ts`, `eval-validate.ts`):** Runs fail-to-pass, anti-flake, and guard checks under the dedicated `infinite-grader` UID with pre-task canary probes, accepting only 3 consistent JUnit XML/TAP reports (≤8 MiB).
+- **Isolated Trials and Paired Statistics (`eval-trial-pump.ts`, `eval-stats.ts`, `eval-priors.ts`):** `TrialPump` executes `baseline`, `compare` (dev, reuse allowed), and one-shot blind `confirm` (holdout) runs via `TeamReplay` under `infinite-eval` (`eval.nft` loopback-only). `ComparisonPass` computes deterministic `xoshiro128ss` 10,000-resample paired bootstrap CIs, exact sign tests, and Holm corrections, and materializes `eval_priors` (`GET /api/eval/projects/:id/priors`, advisory for operators and not auto-fed into `routing-posterior.ts`).
+- **Blind Judge Calibration (`judge-*.ts`, `duel-cli.ts`):** Phase 1 of duels draws exposed dev resolved/unresolved trial patch pairs, excludes the judge's own provider/model, runs both A/B and swapped B/A orderings via `TrialPump` over read-only `.git/infinite-judge/` packages, and certifies a judge when 95% Wilson lower bound ≥0.60 over ≥30 pairs (valid 60 days).
+
+### Implemented Unwired and Spec-Only Horizons
+
+- **Search Mode (`packages/host/src/search-engine.ts`):** Pure state machine (7-condition admission, fail-at-base check, `after-fail`/`together` multi-family challengers, rescue-rate brake) verified by `search-engine-sim.test.ts`; not yet wired into `teams.ts`.
+- **Read Pools (`read-phases.ts`, `read-request.ts`):** Phase/request data models built and tested; not yet wired into `teams.ts` (`crossing-digest.ts`, `goal-digest.ts`, and `context-touches.ts` are live).
+- **Live Duels (`INF-188`), Improvement Gate (`INF-189`) and Class A Auto-Adoption:** Phase 1 judge calibration, `source: "duel"` hooks, `SessionPurpose = "gate"`, and `C19` cross-family merge review are shipped; live production duels, prompt-slot candidate registries, and automated lesson/prompt adoption remain spec-only.
+
+---
+
+## Workspace Understanding, Telemetry and Memory
+
+![Workspace Intelligence Pipelines and Four-Client Surface Matrix](diagrams/understanding-and-clients.svg)
+
+Infinite separates deterministic source extraction, advisory model prose, formal finite-state verification, cost telemetry, and governed memory so advisory artifacts never gain execution authority.
+
+### Code Graphs, Briefings, Understanding and Behavior Checks
+
+- **Repository Graphs (`repository-graphs.ts`, `scripts/repository_graph.py`, [docs/repository-graphs.md](repository-graphs.md)):** Builds Graphify checkpoints in a project `shared` lane and private per-team-run `run-<teamId>` lanes. Injects exact-head graph paths into code-consuming team member prompts (falling back to source inspection on mismatch or failure) and publishes bounded directory `CodeMap`s (≤120 areas, ≤400 links, ≤256 KiB) to `GET /api/projects/:id/graph/map` for the Web Swarm Graph view.
+- **Repository Briefings and TypeSafe Jev (`repository-briefings.ts`, `readings.ts`, [docs/repository-briefings.md](repository-briefings.md)):** Drives `jevcode auto --trigger host` on turn-end/exit to produce cited session summaries (`GET /api/sessions/:id/summary`) and retained workspace briefs. `readings.ts` calls TypeSafe Jev System One for three bounded classifications: phone turn-finished `now`/`waitingOnYou` lines, prompt-to-title fallback gating, and Slack/intake `answer` vs `work` routing.
+- **Understanding Engine and Work Briefs (`understanding*.ts`):** `UnderstandingRuntime` runs scheduled (15 m, 24/day) deterministic `jevcode context --repo` source/import maps, bounded synthesis on fingerprint changes, and read-only `gh` PR/check/deploy reads, enforcing a final synchronous all-repository source+plan fence before publication. Merges with owner-curated `UnderstandingCatalog` (2 MiB/workspace) to show `Current`, `Planned`, and `Difference`. `WorkBriefService` deterministically maps `run.changes` onto workspace components (`basis: source|agent|owner|model|host`) with optional on-demand narratives (`WorkNarrativeStore`, 2-slot pool, 48/day).
+- **Finite Behavior Verification (`behavior-checker.ts`, `behavior-suite.ts`, [docs/behavior-verification.md](behavior-verification.md)):** Data-only explicit-state BFS safety checker (never executes code; host runs ≤10k states/2 s, CLI ≤50k states/500k transitions) that rejects vacuous unreachable scopes, returns shortest counterexamples, and exports integer-ordinal `Current.tla`/`Planned.tla` suites for independent TLC runs. `verification/understanding-refresh/` formally models `UnderstandingRuntime`'s own publication fence.
+
+### Usage, cost accounting and provider limits
+
+`UsageService` (`packages/host/src/usage*.ts`, `price-catalog.ts`, `balances.ts`, `provider-limits.ts`) polls session journals every 2 s into the `usage` EvidenceStore module. OpenCode steps are priced metered (configured overrides -> `PRICE_CATALOG` with DeepSeek weekday UTC 2× peak pricing -> provider `reportedCost` -> `unknown`), backed by 15 m DeepSeek `/user/balance` polls. Claude and Codex track subscription tokens via transcript tail + exit `transcript-drain` (10 s) with owner-editable monthly `planUsd` (`usage-plans.sealed`). Every rollup reports explicit `coverage` (`none | partial | complete`) rather than hiding unmeasured work as `$0`. `ProviderLimits` tracks corroborated rate-limit observations and feeds active exclusions into routing, evaluators, and eval trials.
+
+### Canonical memory foundation (unwired)
+
+`packages/host/src/memory/` implements a standalone 17-table encrypted SQLite `MemoryStoreService` (separate from `evidence.sqlite3`, 30 s `MemoryReadFence` transport revalidation, 10k/workspace and 100k/host quotas), Ed25519 external-witness revocation recovery (`MemoryRecoveryCoordinator`), `SqliteProjectionLedger`, `LexicalMemoryAdapter`, and a fail-closed `HonchoMemoryAdapter` (`health: "degraded"`). `deploy/ubuntu/memory/` contains an offline digest-pinned Honcho v3.4.0 qualification suite. None of these modules are wired into `server.ts` routes or agent prompts pending AGPL-3.0 review and a metered egress proxy.
+
+---
+
+## Client Surfaces and Transport Matrix
+
+See the bottom panel of [FIG 06](diagrams/understanding-and-clients.svg) for the visual matrix. Client invariants ([ADRs 0004, 0005, 0012, 0014, 0015](adr/README.md)):
+
+- **Freshness and Anti-Jump:** Web and mobile show last successful refresh time, treat stale responses started before backgrounding as ineligible to mark a returning view fresh, wait ~3 seconds before showing offline banners while immediately disabling steering controls, and never silently reclaim a control lease on foreground return.
+- **Local Drafts:** Web and mobile retain drafts and uncertain `requestId`s in process/tab memory only (discarded on reload/exit; never synced cross-device). CLI `Ctrl+E` persists per-client HKDF-derived AES-GCM draft files with PID liveness recovery; macOS `DraftStore` actor seals drafts under a device-only Keychain `SymmetricKey`.
+- **Verified Transport Gap:** Mobile's `WorkBriefScreen` calls `GET/POST /api/project-groups/:id/understanding/work/:workId[/refresh]`, which are served by `packages/host/src/server.ts` but currently omitted from `packages/host/src/remote-access.ts` `allowedPath()` (producing `403 remote-endpoint-denied` over remote channels).
+
+---
+
+## Concurrency, Storage and Type Safety
+
+Waves 1–5 eliminated global mutexes, `.lock` crash wedges, `NSLock`/`NSCondition`, and unvalidated state combinations across all workspaces ([ADRs 0003, 0006–0009, 0015–0016, 0019, 0022](adr/README.md)):
+
+- **Partitioned `KeyedQueue` and `PendingCreates` (`packages/host/src/keyed-queue.ts`):** Per-key FIFO promise chains that propagate caller errors without poisoning tails and auto-evict when idle. Strict acyclic lock order prevents deadlocks:
+  - `HaltService.engage`: `Routine -> Goal -> Mission -> Team` (`pauseWithPendingCreates` catches racing creates without holding outer locks).
+  - Service queues: `Routine(routine:id -> project:id -> goalId)` -> `Goal(goalId -> teamId)` -> `Team(runId -> project:id)` -> `Manager(sessionId -> provider:nativeId -> createAdmission)`.
+  - Heavy operations (worktree prep, check execution, GitHub publication, permission AI review, graph builds) execute outside entity queues and enqueue only brief state commits. `mapConcurrent` caps scheduler fan-out (8 for goals/missions/routines, 16 for teams).
+- **Non-Blocking Locks and Swift Actors:** `workspace-trust.ts` uses async timer backoff and fd-pinned `(dev, ino)` stale-lock recovery (10 s) instead of `Atomics.wait`. macOS replaces all locks with `DraftStore` / `UnderstandingSnapshotStore` Swift actors, C11 atomic `CmuxOutputBuffer` latches (512 events / 16 MiB stdout), and single-owner `AsyncStream` WebSocket writers.
+- **Compile-Time State Machines:** Parallel optional fields have been replaced with discriminated unions and matching Zod schemas (`@infinite/attention`, `@infinite/remote`, `team-state-schemas.ts`, `mission-types.ts`, `goal-types.ts`, mobile `Freshness<T>`, Swift enums), pinned by `@ts-expect-error` negative tests in `tsconfig.type-tests.json` and `Exact<A, B>` MCP output checks.
+
+### Build, Ratchets and Verification Suite
+
+- **Zero-comment ratchet (`scripts/check-comments.mjs`):** `0` prose comments across all checked TS/JS/Swift/Python/C/sh/CSS/systemd files (`scripts/comments-baseline.json`).
+- **File-size ratchet (`scripts/check-file-size.mjs`):** 1,000-line cap on new files; downward-only baseline on 24 grandfathered files.
+- **Seeded crash, fault and differential simulators (`tests/`):** Every durable state machine carries a deterministic seeded simulator checking named invariants across crashes, restarts, outbox reorders, virtual clocks, and intentional mutants (`team-run-sim`, `delivery-review-sim`, `goal-plan-sim`, `goal-metrics-sim`, `main-check-sim`, `outcome-projector-sim`, `search-engine-sim`, `team-cli-defaults-sim`).
+
+---
+
+## Hard Security Boundaries and Deployment Topology
+
+![Security and Hard Isolation Boundaries](diagrams/security-boundaries.svg)
+
+On Ubuntu 24.04 (`deploy/ubuntu/`, [ADR-0010](adr/0010-egress-and-github-proxy-security.md), [ADR-0013](adr/0013-ubuntu-deployment-and-isolation.md)), Infinite enforces privilege separation across seven Linux service accounts and three atomic `nftables` `inet` tables:
+
+| Account | Boundary and Enforcement |
+| --- | --- |
+| `infinite-host` | Loopback API (`127.0.0.1:4780`, Tailscale Serve only) + detached workers; owns `/srv/infinite-data/control` (`0700`), `/run/infinite` (`0700`), reads `/run/infinite-key/vault.key` (`0600`). `KillMode=process`, `UMask=0077`, `LimitCORE=0`, narrow `sudoers` (`!log_allowed, !log_denied`). |
+| `infinite-agent` | Runs provider CLIs, checks, Jevcode, Graphify under root-owned byte-anchored wrappers (`/usr/local/libexec/infinite/*`) + `agent-env.sh` literal loader. Groups: `infinite-agent` + `infinite-workspace` only. Protected by root-owned provider ceilings (`/etc/claude-code/managed-settings.json`, `/etc/codex/requirements.toml`) and AppArmor `bwrap-userns-restrict`. Shared single-tenant boundary across sessions. |
+| `infinite-egress` | Stdlib-only loopback proxy (`127.0.0.1:4785`) verifying stateless HMAC `Proxy-Authorization`, single-resolve DNS anti-SSRF checks, strict HTTP framing, and fail-closed `407` on key errors. Paired with `inet infinite_egress` (`egress-observe.nft` / `egress-enforce.nft`, reload-only switches). |
+| `infinite-github-proxy` | Loopback Git smart-HTTP + `POST /gh` broker (`127.0.0.1:8417`). Root 5 m timer refreshes 1 h repo-scoped App tokens (`tokenCache: "proxy-only"` verified via `getfacl`). Enforces HMAC v2 role grants (owner full, team `fetch`, delivery single-branch push/PR/merge, coordinators/evaluators zero grant), inspects `git-receive-pack` (blocks tags/deletes), and allowlists `gh` subcommands/flags. |
+| `infinite-eval` | Isolated replay-trial UID (`cron.deny`/`at.deny`, `!env_keep`, 9-op `eval-command.sh`, SysV IPC + 6 temp-dir purge on `stop`, `scrub` keeps 3 auth files). `inet infinite_eval` (`eval.nft`) allows loopback only; uses restricted `_eval` / `_eval-setup` egress identities. |
+| `infinite-grader` | Isolated untrusted test-runner UID (`env_reset`, 9-op `grader-command.sh` with `setsid` + `timeout` + `prlimit`). Host never opens grader files directly; it reads only `reports/round-[1-6].{xml,tap}` (≤8 MiB). `inet infinite_grader` (`grader.nft`) drops RFC1918, link-local, ULA, CGNAT, and multicast. |
+| `infinite-relay` | Optional blind ciphertext relay (`127.0.0.1:4790` + `proxy.sock`) behind `cloudflared` + Cloudflare Access; zero device keys, zero web UI, 60 upgrades/min/IP rate cap. |
+
+Storage at rest sits on LUKS2 `/srv/infinite-data` with plaintext swap and core dumps disabled. Daily `backup.py` verifies `/dev/mapper/` and systemd cgroup membership, arms an independent 45 s `systemd-run` thaw watchdog before `systemctl freeze`, copies within 30 s (preserving SQLite WALs and PAX ACLs), and encrypts to an owner-held `age` public key (`verify-backup.py` checks SHA-256, manifests, and `PRAGMA integrity_check`). Secondary instances (`scripts/render-instance.mjs`, `deploy/ubuntu/instances.md`) isolate every account, vault key, port, HTTPS origin, and Slack app, checked every 5 minutes by `deploy/ubuntu/verify-instance-boundaries.py`.
+
+---
+
+## API Surface Index
+
+All `/api/*` routes except `POST /api/login` require a paired Bearer key or same-origin `HttpOnly; SameSite=Strict` cookie (`12 h`, login rate-limited 10/min/IP). Mission-managed sessions refuse direct human mutations (`409 mission-managed`) except while the worker reports a user-owned `needs-you` provider prompt. Owner CLI routes require an owner Bearer key (browser cookies refused).
+
+| Domain | Endpoints | Roles and Notes |
+| --- | --- | --- |
+| Auth, Health and Queue | `POST /api/login`, `POST /api/logout`, `GET /api/me`, `GET /api/machine/resources`, `GET /api/decision-queue`, `GET /api/board`, `GET /api/events?topics=&after=`, `POST/DELETE /api/devices/push`, `POST /api/dictation/cleanup` | `login`: key + matching Origin; `dictation`: owner/controller; others: any paired role (`GET /api/me` exposes `security` and `capabilities`) |
+| Sessions and Terminal | `GET /api/sessions[?since=]`, `POST /api/sessions`, `GET/DELETE /api/sessions/:id`, `POST /api/sessions/:id/{control,input,key,answer,resize,stop,resume,archive,workspace-export}`, `GET /api/sessions/:id/{events,messages,summary,file,handoff,context,stream}`, `WS /api/sessions/:id/{terminal,native,executor}`, `ALL /api/sessions/:id/opencode/*` | Create/resize/stop/resume/archive/delete/terminal-write/native/opencode: owner; control/input/key/answer: owner, controller; reads: any |
+| Projects, Context, Sync and Files | `GET /api/projects`, `GET /api/projects/:id`, `POST /api/projects/resolve`, `GET/PUT /api/projects/:id/{context,context-links}`, `GET /api/projects/:id/graph[/map]`, `GET/POST/PUT/DELETE /api/projects/:id/{files,file,directories,uploads/*}`, `POST/PUT/GET /api/projects/:id/sync/{status,begin,has,blobs,blob/:hash,commit,apply,manifest,export}` | Sync ingest/export and `resolve`: owner CLI; `sync/apply`, context writes, uploads: owner; sync commit/apply holds project with `409 sync-applying` |
+| Project Groups and Understanding | `GET/POST/PUT/DELETE /api/project-groups[/:id]`, `GET /api/project-groups/:id/understanding[/{catalog,components,briefs,planned,work,work/:workId,generated,brief,diagrams/:id,behaviors,behaviors/:id,behaviors/:id/suite}]`, `POST .../understanding/{refresh,work/:workId/refresh,behaviors,behaviors/:id/run,catalog/...}` | Mutations and refresh: owner; reads: any (see remote `work/:workId` gap above) |
+| Teams, Blackboard, Goals, Missions and Routines | `/api/teams/*` (entries, withdraw, context-usage, record, reconcile-delivery, reconcile-verification, members/:id/retire, routing/:taskId, permissions/revoke, routing/revoke), `/api/goals/*` (record, verdicts, metrics, outcome), `/api/missions/*` (extend, progress, steer, answer/:id, pause, resume, cancel), `/api/routines/*` | Create/pause/resume/cancel/reconcile/retire/outcome/mission-answer: owner; team steer/answer: owner, controller; reads: any |
+| Governance and Intake | `GET/POST /api/halt`, `POST /api/halt/release`, `GET /api/fuse`, `POST /api/fuse/close`, `GET/POST /api/permissions/*`, `GET/POST /api/projects/:id/signals`, `GET /api/intake`, `GET /api/intake/workspace-scope`, `POST /mcp` (separate loopback port) | Halt/fuse/delegations/signals/workspace-scope: owner; `/mcp`: dedicated connector Bearer token + explicit `projectIds` allowlist |
+| Evidence, Outcomes, Routing, Eval, Duels and Usage | `GET /api/evidence/status`, `GET/POST /api/outcomes[/{rollup,runs/:id,signals,epochs,legacy}]`, `GET/POST /api/routing/*`, `GET/POST /api/eval/*`, `GET/POST /api/duels/judges/*`, `GET/PUT/POST /api/usage[/{daily,models,projects,projects/:id,balances/refresh,accounts/:id/plan}]` | Writes/jobs/plan edits: owner; reads: any (`eval_priors` at `GET /api/eval/projects/:id/priors`) |
+| Encrypted Remote | `WS /api/remote` (direct), `WS /relay/hosts/:machineId` and `/relay/clients/:machineId` (blind relay) | Authenticated inside `infinite-remote-v1` ciphertext; subject to `remote-access.ts` `allowedPath()` |

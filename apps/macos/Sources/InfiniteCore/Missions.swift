@@ -88,12 +88,7 @@ public struct BoardItem: Identifiable, Equatable, Sendable {
         guard let counts = subtasks, counts.total > 0 else { return nil }
         return "\(counts.done)/\(counts.total) subtask\(counts.total == 1 ? "" : "s")"
     }
-    public var detailBesideProgress: String {
-        guard let counts = subtasks, subtaskLabel != nil,
-              let match = detail.firstMatch(of: #/(?:^|\.\s+)(\d+) of (\d+) subtasks? done$/#),
-              Int(match.1) == counts.done, Int(match.2) == counts.total else { return detail }
-        return String(detail[..<match.range.lowerBound])
-    }
+    public var detailBesideProgress: String { detail }
     public var progressFraction: Double {
         guard let counts = subtasks, counts.total > 0 else { return 0.25 }
         return max(0.25, Double(counts.done) / Double(counts.total))
@@ -110,7 +105,7 @@ public struct Board: Equatable, Sendable {
 
     public func items(in group: ProjectGroup?) -> [BoardItem] {
         guard let group else { return items }
-        return items.filter { $0.groupID.isEmpty ? $0.projectName == group.name : $0.groupID == group.id }
+        return items.filter { !$0.groupID.isEmpty && $0.groupID == group.id }
     }
     public func columns(in group: ProjectGroup? = nil) -> [(column: BoardColumn, items: [BoardItem])] {
         let rows = items(in: group)

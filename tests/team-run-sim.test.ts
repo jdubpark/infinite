@@ -90,7 +90,7 @@ const patchLateStopEffects: Variant = { patch: service => {
     else emit(stored, text);
   };
   host.invalidatePermissionDecisions = async (stored, reason, fenceAgent) => {
-    if (!stopping || reason !== `The team was ${stopping.action} before the permission request could be answered.`)
+    if (!stopping || reason !== `The team was ${stopping.action === "pause" ? "paused" : "cancelled"} before the permission request could be answered.`)
       return invalidate(stored, reason, fenceAgent);
     const reasonAtFence = stored.run.reason;
     stored.run.reason = stopping.reason;

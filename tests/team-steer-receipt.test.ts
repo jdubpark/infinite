@@ -14,6 +14,7 @@ type Fixture = ReturnType<typeof schedulerFixture>;
 type Saved = { run: TeamRun; receipts: Record<string, string>; pending?: { kind: string } };
 const revokedEvent = "Delegated permission decisions were revoked by the owner.";
 const count = (view: TeamView, text: string) => view.events.filter(event => event.text.startsWith(text)).length;
+const decisions = (saved: Saved) => saved.run.permissionDecisions?.map(decision => [decision.status, decision.reason]);
 
 function hostStop(f: Fixture, stopAt: number) {
   let armed = false, writes = 0, restore: (() => void) | undefined;
@@ -122,7 +123,6 @@ test("a host stop between a resume's permission withdrawal and its own write lea
     f.run.status = "paused"; f.run.members[0]!.status = "stopped";
     delegatedRun(f);
     const request = { requestId: randomUUID(), revision: 1 }, withdrawn = [["stale", "A resume started before the permission request could be answered."]];
-    const decisions = (saved: Saved) => saved.run.permissionDecisions?.map(decision => [decision.status, decision.reason]);
     const stop = hostStop(f, 1), first = f.openTeam({ entries: stop.entries });
     stop.arm();
     await first.resume(f.run.id, request).catch(() => undefined);
@@ -134,6 +134,37 @@ test("a host stop between a resume's permission withdrawal and its own write lea
     const retried = await f.openTeam().resume(f.run.id, request);
     assert.deepEqual([retried.status, retried.revision, count(retried, "Team resumed with a fresh plan.")], ["planning", 2, 1]);
     assert.deepEqual(decisions(f.readRecord<Saved>("team", f.run.id)), withdrawn, "the retried resume neither restores the decision nor changes its reason");
+    assert.equal(f.permissionAnswers(), 0, "no provider answer is sent for the withdrawn decision");
+  } finally { f.close(); }
+});
+
+for (const [action, stopped] of [["pause", "paused"], ["cancel", "cancelled"]] as const) {
+  test(`a ${action} withdraws the run's open permission decision with a reason that says the team was ${stopped}`, async () => {
+    const f = schedulerFixture();
+    try {
+      delegatedRun(f);
+      const view = await f.openTeam()[action](f.run.id, { requestId: randomUUID(), revision: 1 });
+      assert.equal(view.status, stopped);
+      assert.deepEqual(decisions(f.readRecord<Saved>("team", f.run.id)), [["stale", `The team was ${stopped} before the permission request could be answered.`]]);
+      assert.equal(f.permissionAnswers(), 0, "no provider answer is sent for the withdrawn decision");
+    } finally { f.close(); }
+  });
+}
+
+test("a verification recovery's resume withdraws a permission decision still open when it starts, with the resume's reason", async () => {
+  const f = schedulerFixture();
+  try {
+    const at = new Date().toISOString(), pending = { id: randomUUID(), kind: "check", revision: 1 };
+    f.run.status = "blocked"; f.run.members[0]!.status = "stopped"; f.run.headCommit = f.run.baseCommit;
+    f.run.checks = [{ command: { command: "node", args: ["check.js"] }, startedAt: at, finishedAt: at, output: "", revision: 1, status: "passed" }];
+    delegatedRun(f);
+    const teams = f.openTeam();
+    Object.assign((teams as unknown as { records: Map<string, object> }).records.get(f.run.id)!, { pending,
+      verificationRecovery: { pendingId: pending.id, pendingKind: "check", revision: 1, headCommit: f.run.baseCommit, failure: "verification-changed-files" } });
+    const resumed = await teams.resume(f.run.id, { requestId: randomUUID(), revision: 1 });
+    assert.deepEqual([resumed.status, resumed.revision], ["planning", 2]);
+    assert.notEqual(resumed.workspace, f.run.workspace, "the resume replans from the recovery's clean copy");
+    assert.deepEqual(decisions(f.readRecord<Saved>("team", f.run.id)), [["stale", "A resume started before the permission request could be answered."]]);
     assert.equal(f.permissionAnswers(), 0, "no provider answer is sent for the withdrawn decision");
   } finally { f.close(); }
 });

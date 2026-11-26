@@ -6,7 +6,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameS
 import { join, relative, sep } from "node:path";
 import type { Prompt } from "@infinite/attention";
 import { claimControl, waitFor } from "./helpers.js";
-import { fixture, git, limitLineup } from "./team-fixture.js";
+import { addInspectableCheckPackage, fixture, git, limitLineup } from "./team-fixture.js";
 import { DEFAULT_PERMISSION_LIMIT, DEFAULT_PERMISSION_SCOPE, LEGACY_DEFAULT_PERMISSION_SCOPES, currentPermissions, type TeamLineup, type TeamPermissionDecision } from "../packages/host/src/team-types.js";
 import { isCollapsedPermissionPrompt, permissionEvidenceHash, refusedBeforeSend } from "../packages/host/src/team-permissions.js";
 import { permissionEvidenceDigest } from "../packages/host/src/team-permission-evidence.js";
@@ -20,15 +20,6 @@ const permissionLineup: TeamLineup = {
   ...limitLineup,
   coordinator: { ...limitLineup.coordinator, id: "claude-coordinator", label: "Claude coordinator", provider: "claude", model: "claude-opus-5-5", effort: "xhigh", tier: "strong" },
 };
-
-function addInspectableCheckPackage(f: Awaited<ReturnType<typeof fixture>>) {
-  const source = f.host.config.projects.find(project => project.id === "rehearsal")!.path;
-  const packageManifest = `${JSON.stringify({ scripts: { check: "node check.mjs" } }, null, 2)}\n`;
-  writeFileSync(join(source, "package.json"), packageManifest);
-  git(source, "add", "package.json");
-  git(source, "-c", "user.name=Example Developer", "-c", "user.email=dev@example.invalid", "commit", "-m", "Add inspectable check script");
-  return { packageManifest, checkSource: readFileSync(join(source, "check.mjs"), "utf8") };
-}
 
 test("a saved default policy follows the current default; an owner-written scope or lowered limit is kept", () => {
   for (const scope of LEGACY_DEFAULT_PERMISSION_SCOPES) {

@@ -18,6 +18,15 @@ export const git = (cwd: string, ...args: string[]) => execFileSync("git", ["-c"
   cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" },
 }).trim();
 
+export function addInspectableCheckPackage(f: Awaited<ReturnType<typeof fixture>>) {
+  const source = f.host.config.projects.find(project => project.id === "rehearsal")!.path;
+  const packageManifest = `${JSON.stringify({ scripts: { check: "node check.mjs" } }, null, 2)}\n`;
+  writeFileSync(join(source, "package.json"), packageManifest);
+  git(source, "add", "package.json");
+  git(source, "-c", "user.name=Example Developer", "-c", "user.email=dev@example.invalid", "commit", "-m", "Add inspectable check script");
+  return { packageManifest, checkSource: readFileSync(join(source, "check.mjs"), "utf8") };
+}
+
 export const mixedLineup: TeamLineup = {
   coordinator: { id: "opus-coordinator", label: "Opus coordinator", provider: "claude", model: "claude-opus-5-5", effort: "xhigh" },
   implementers: [

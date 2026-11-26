@@ -332,6 +332,7 @@ test("h. close during a real long command finishes it as host-stop within the bo
     const service = await sandbox.start();
     sandbox.fetch();
     await sandbox.until("the sleep", () => sandbox.pid() !== undefined);
+    await sandbox.until("the sleep's start recorded", () => sandbox.record().running !== undefined && sandbox.record().running?.recording === undefined);
     const pid = sandbox.pid()!;
     const begun = Date.now();
     await service.close();

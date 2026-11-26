@@ -1,6 +1,7 @@
 import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { createServer } from "node:http";
 import { WebSocket, WebSocketServer } from "ws";
+import { STARTUP_DISCOVERY_METHODS, resolveContainedReadPath } from "./codex-environment-store.js";
 import { NATIVE_COMPRESSION, NATIVE_MAX_BUFFERED, NATIVE_MAX_MESSAGE } from "./native-transport.js";
 
 const MAX_CHANNELS = 16;
@@ -8,7 +9,7 @@ const MAX_PENDING_MESSAGES = 128;
 const CONNECT_TIMEOUT = 10000;
 const HEARTBEAT_INTERVAL = 15000;
 
-type Frame = { type: "ready"; cwd: string } | { type: "open" | "close"; id: string } | { type: "data"; id: string; data: string }
+type Frame = { type: "ready"; cwd: string } | { type: "open"; id: string; confined?: boolean } | { type: "close"; id: string } | { type: "data"; id: string; data: string }
   | { type: "request"; id: string; method: string; params: unknown }
   | { type: "response"; id: string; result?: unknown; error?: string };
 export type ExecutorControl = (method: string, params?: unknown) => Promise<any>;
@@ -31,7 +32,8 @@ function parseFrame(text: string): Frame {
   const frame = value as Record<string, unknown>;
   if (frame.type === "ready" && typeof frame.cwd === "string" && Object.keys(frame).length === 2) return frame as Frame;
   if (typeof frame.id !== "string" || !frame.id.length || frame.id.length > 128) throw new Error("Invalid executor tunnel channel");
-  if ((frame.type === "open" || frame.type === "close") && Object.keys(frame).length === 2) return frame as Frame;
+  if (frame.type === "open" && (Object.keys(frame).length === 2 || (Object.keys(frame).length === 3 && typeof frame.confined === "boolean"))) return frame as Frame;
+  if (frame.type === "close" && Object.keys(frame).length === 2) return frame as Frame;
   if (frame.type === "data" && typeof frame.data === "string" && Object.keys(frame).length === 3) return frame as Frame;
   if (frame.type === "request" && typeof frame.method === "string" && frame.method.startsWith("sync/") && frame.method.length < 64) return frame as Frame;
   if (frame.type === "response" && (frame.error === undefined || typeof frame.error === "string")) return frame as Frame;
@@ -63,7 +65,7 @@ function send(socket: WebSocket, text: string, buffered: number, failed: () => v
 }
 
 export interface ExecutorTunnel {
-  environment: { environmentId: string; url: string; token: string; cwd: string };
+  environment: { environmentId: string; url: string; token: string; cwd: string; filesystem: "remote" };
   ready: Promise<void>;
   attach: () => { url: string; token: string };
   retire: () => void;
@@ -72,10 +74,14 @@ export interface ExecutorTunnel {
 }
 
 export async function createExecutorTunnel(options: {
-  cwd: string; onConnection?: (online: boolean) => void;
+  cwd: string; environmentId?: string; onConnection?: (online: boolean) => void;
   onControl?: ExecutorControl; onActivity?: (activity: ExecutorActivity) => void;
   record?: (data: Record<string, unknown>) => void;
 }): Promise<ExecutorTunnel> {
+  if (options.environmentId !== undefined && !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/.test(options.environmentId)) {
+    throw new Error("Invalid executor environment ID");
+  }
+  const environmentId = options.environmentId ?? randomUUID();
   const providerToken = randomBytes(32).toString("hex"), deviceToken = randomBytes(32).toString("hex");
   const server = createServer((_req, res) => { res.writeHead(404); res.end(); });
   const sockets = new WebSocketServer({ noServer: true, maxPayload: NATIVE_MAX_MESSAGE, perMessageDeflate: false });
@@ -226,6 +232,7 @@ export async function createExecutorTunnel(options: {
         });
       } else {
         const id = randomUUID();
+        const confined = req.headers["x-infinite-confined-discovery"] === "1";
         channels.set(id, connection);
         heartbeat(connection, () => dropChannel(id, true));
         connection.on("error", () => dropChannel(id, true));
@@ -252,7 +259,7 @@ export async function createExecutorTunnel(options: {
             if (!sendDevice({ type: "data", id, data: text })) activity();
           } catch { dropChannel(id, true); }
         });
-        if (phase.state === "ready" && !sendDevice({ type: "open", id })) dropChannel(id, false);
+        if (phase.state === "ready" && !sendDevice({ type: "open", id, ...(confined ? { confined: true } : {}) })) dropChannel(id, false);
       }
     });
   });
@@ -266,7 +273,7 @@ export async function createExecutorTunnel(options: {
   server.on("error", close);
   const base = `ws://127.0.0.1:${(server.address() as { port: number }).port}`;
   return {
-    environment: { environmentId: randomUUID(), url: `${base}/executor`, token: providerToken, cwd: options.cwd },
+    environment: { environmentId, url: `${base}/executor`, token: providerToken, cwd: options.cwd, filesystem: "remote" },
     ready,
     attach: () => { if (phase.state === "closed") throw new Error("Executor tunnel is closed"); return { url: `${base}/device`, token: deviceToken }; },
     retire: () => {
@@ -291,11 +298,12 @@ export async function createExecutorTunnel(options: {
 }
 
 export async function forwardExecutor(options: {
-  url: string; token: string; executorUrl: string; executorToken: string; cwd: string;
+  url: string; token: string; executorUrl: string; executorToken: string; cwd: string; roots?: string[];
   deviceHeaders?: Record<string, string>; signal?: AbortSignal; onReady?: (control: ExecutorControl) => void;
 }): Promise<void> {
   if (options.signal?.aborted) return;
   if (!/^ws:\/\/127\.0\.0\.1:\d+\/?$/.test(options.executorUrl)) throw new Error("Invalid local executor endpoint");
+  const roots = options.roots && options.roots.length > 0 ? options.roots : [options.cwd];
   return new Promise<void>((resolve, reject) => {
     let cloud: WebSocket;
     try {
@@ -305,7 +313,7 @@ export async function forwardExecutor(options: {
         perMessageDeflate: NATIVE_COMPRESSION, handshakeTimeout: CONNECT_TIMEOUT,
       });
     } catch { reject(new Error("Could not connect executor tunnel")); return; }
-    const channels = new Map<string, { socket: WebSocket; queued: string[]; bytes: number }>();
+    const channels = new Map<string, { socket: WebSocket; queued: string[]; bytes: number; confined: boolean }>();
     const controls = new Map<string, { resolve: (value: any) => void; reject: (error: Error) => void }>();
     let queuedBytes = 0;
     const timeout = setTimeout(() => finish(new Error("Executor tunnel did not become ready")), CONNECT_TIMEOUT);
@@ -375,7 +383,7 @@ export async function forwardExecutor(options: {
             headers: { Authorization: `Bearer ${options.executorToken}` }, maxPayload: NATIVE_MAX_MESSAGE,
             perMessageDeflate: false, handshakeTimeout: CONNECT_TIMEOUT,
           });
-          const channel = { socket, queued: [] as string[], bytes: 0 };
+          const channel = { socket, queued: [] as string[], bytes: 0, confined: Boolean(frame.confined) };
           channels.set(frame.id, channel);
           const failed = () => { if (channels.get(frame.id) === channel) dropChannel(frame.id, true); };
           socket.on("error", failed);
@@ -399,6 +407,24 @@ export async function forwardExecutor(options: {
         else if (frame.type === "data") {
           const channel = channels.get(frame.id);
           if (!channel) return;
+          if (channel.confined) {
+            const rpc = JSON.parse(frame.data) as { id?: unknown; method?: unknown; params?: { path?: unknown } };
+            const allowed = typeof rpc.method === "string" && STARTUP_DISCOVERY_METHODS.has(rpc.method) &&
+              resolveContainedReadPath(rpc.params?.path, options.cwd, roots);
+            if (!allowed) {
+              if (typeof rpc.id === "string" || typeof rpc.id === "number") {
+                sendCloud({
+                  type: "data",
+                  id: frame.id,
+                  data: JSON.stringify({
+                    id: rpc.id,
+                    error: { code: -32000, message: "This request was not executed. Startup discovery path escapes the registered workspace roots" },
+                  }),
+                });
+              }
+              return;
+            }
+          }
           if (channel.socket.readyState === WebSocket.OPEN) send(channel.socket, frame.data, buffered(), () => dropChannel(frame.id, true));
           else if (channel.socket.readyState === WebSocket.CONNECTING) {
             const bytes = Buffer.byteLength(frame.data);

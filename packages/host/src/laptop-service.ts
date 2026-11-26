@@ -283,7 +283,7 @@ async function runLaptopService(): Promise<void> {
       const transfer = new AbortController();
       try {
         await forwardExecutor({
-          url: url.href, token: options.token, deviceHeaders: { "X-Infinite-Executor": options.workspaceToken }, executorUrl, executorToken, cwd: options.cwd, signal: abort.signal,
+          url: url.href, token: options.token, deviceHeaders: { "X-Infinite-Executor": options.workspaceToken }, executorUrl, executorToken, cwd: options.cwd, roots: options.roots, signal: abort.signal,
           onReady: control => {
             retryDelay = 1000;
             void synchronizeWorkspace(options, control, AbortSignal.any([abort.signal, transfer.signal])).catch(() => {});

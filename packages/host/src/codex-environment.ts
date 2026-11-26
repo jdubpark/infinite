@@ -6,6 +6,7 @@ import { NATIVE_MAX_BUFFERED, NATIVE_MAX_MESSAGE } from "./native-transport.js";
 import {
   CODEX_ENVIRONMENT_STATE_FILE,
   MAX_CODEX_ENVIRONMENT_STATE_BYTES,
+  STARTUP_DISCOVERY_METHODS,
   activeSelectionOf,
   clonePlacement,
   cloneSelection,
@@ -13,6 +14,7 @@ import {
   hydrateThreadPlacements,
   openCodexEnvironmentStore,
   pathWithinRoots,
+  resolveContainedReadPath,
   revisionOf,
   serializeThreadPlacements,
   usedOf,
@@ -43,6 +45,7 @@ export interface CodexExecutor {
   token: string;
   cwd: string;
   roots: string[];
+  filesystem?: "local" | "remote";
 }
 
 export type CodexEnvironmentSelection = PersistedCodexSelection;
@@ -94,8 +97,6 @@ export class CodexEnvironmentError extends Error {
 
 type RecordValue = Record<string, unknown>;
 type StoreHealth = { ok: true } | { ok: false; reason: string };
-
-const STARTUP_DISCOVERY_METHODS = new Set(["fs/getMetadata", "fs/readFile"]);
 
 const object = (value: unknown): RecordValue | undefined =>
   value !== null && typeof value === "object" && !Array.isArray(value) ? value as RecordValue : undefined;
@@ -207,7 +208,7 @@ export async function connectCodexEnvironments(options: {
   const reserved = new Map<string, CodexExecutor>();
   const validatedExecutors = new Map<string, CodexExecutor>();
   const registering = new Map<string, Promise<void>>();
-  const bootstrapDiscovery = new Map<string, { cwd: string; roots: string[]; count: number }>();
+  const bootstrapDiscovery = new Map<string, { cwd: string; roots: string[]; filesystem: "local" | "remote"; count: number }>();
   const turns = new Map<string, { turnId?: string; revision: number }>();
   const threadQueues = new Map<string, Promise<unknown>>();
   let fence: CodexToolFence | undefined;
@@ -255,7 +256,9 @@ export async function connectCodexEnvironments(options: {
     }
     const discovery = bootstrapDiscovery.get(environmentId);
     if (discovery && method && STARTUP_DISCOVERY_METHODS.has(method)) {
-      if (discoveryPathWithinRoots(params, discovery.cwd, discovery.roots)) {
+      const contained = discoveryPathWithinRoots(params, discovery.cwd, discovery.roots) &&
+        (discovery.filesystem === "remote" || resolveContainedReadPath(params?.path, discovery.cwd, discovery.roots));
+      if (contained) {
         return { allowed: true, generation: 0, bootstrap: true };
       }
       return { allowed: false, code: "conflict", reason: "Startup discovery path is outside the registered workspace roots" };
@@ -410,6 +413,10 @@ export async function connectCodexEnvironments(options: {
       if (state.kind === "verified" && state.placement.environmentId !== environmentId && state.used.has(environmentId)) {
         throw new CodexEnvironmentError("conflict", "Execution environment placement is stale and has been superseded");
       }
+      if (state.kind === "pending-verification" && state.persisted.placement.environmentId === environmentId &&
+          !sameSelectionValues(state.persisted.placement, { environmentId: reg.environmentId, cwd: reg.cwd, runtimeWorkspaceRoots: reg.roots })) {
+        throw new CodexEnvironmentError("conflict", "Registered executor workspace does not match persisted placement");
+      }
       if (state.kind === "pending-verification" && state.persisted.placement.environmentId !== environmentId &&
           state.persisted.usedEnvironmentIds.includes(environmentId)) {
         throw new CodexEnvironmentError("conflict", "Execution environment placement is stale and has been superseded");
@@ -417,7 +424,7 @@ export async function connectCodexEnvironments(options: {
     }
     const existing = bootstrapDiscovery.get(environmentId);
     if (existing) existing.count += 1;
-    else bootstrapDiscovery.set(environmentId, { cwd: reg.cwd, roots: [...reg.roots], count: 1 });
+    else bootstrapDiscovery.set(environmentId, { cwd: reg.cwd, roots: [...reg.roots], filesystem: reg.filesystem ?? "local", count: 1 });
     let ended = false;
     return () => {
       if (ended) return;
@@ -581,8 +588,8 @@ export async function connectCodexEnvironments(options: {
     }
     let live: { threadId: string; environments: CodexEnvironmentSelection[] };
     try { live = await read(threadId); } catch (error) {
-      if (error instanceof CodexEnvironmentError && error.code === "rejected") {
-        markUncertain(threadId, "Provider returned an invalid environment selection during verification", expected, used);
+      if (current.kind === "verified" || (error instanceof CodexEnvironmentError && (error.code === "rejected" || (!closed && error.code === "unavailable")))) {
+        markUncertain(threadId, "Provider did not confirm execution environment placement during verification", expected, used);
       }
       throw error;
     }
@@ -605,6 +612,11 @@ export async function connectCodexEnvironments(options: {
     if (current.kind === "selecting") throw new CodexEnvironmentError("conflict", "Execution environment selection is in progress; wait for completion");
     if (current.kind === "uncertain") throw new CodexEnvironmentError("uncertain", current.reason);
     const expected = activeSelectionOf(current)!;
+    const reg = validatedExecutors.get(expected.environmentId);
+    if (!reg || !sameSelectionValues(expected, { environmentId: reg.environmentId, cwd: reg.cwd, runtimeWorkspaceRoots: reg.roots })) {
+      markUncertain(threadId, "Executor has not completed validated registration matching persisted placement; reconcile before dispatching tools", expected, usedOf(current));
+      throw new CodexEnvironmentError("conflict", "Executor has not completed validated registration matching persisted placement");
+    }
     const endDiscovery = beginStartupDiscovery(expected.environmentId);
     let resumed: RecordValue | undefined;
     try {
@@ -692,8 +704,7 @@ export async function connectCodexEnvironments(options: {
     return { status: "uncertain", generation: state.generation, reason: state.reason, ...(state.expected ? { expected: cloneSelection(state.expected) } : {}) };
   };
 
-  const applySelection = (request: CodexSelectionRequest, allowReconcile: boolean): Promise<CodexSelectionReceipt> =>
-    serialThread(request.threadId, async () => {
+  const applySelectionUnlocked = async (request: CodexSelectionRequest, allowReconcile: boolean): Promise<CodexSelectionReceipt> => {
       if (closed) throw new CodexEnvironmentError("unavailable", "The internal provider connection is unavailable");
       if (!storeHealth.ok) throw new CodexEnvironmentError("uncertain", storeHealth.reason);
       if (!store) throw new CodexEnvironmentError("unavailable", "Durable execution environment persistence is required before confirming placement");
@@ -801,6 +812,24 @@ export async function connectCodexEnvironments(options: {
         markUncertain(threadId, message, nextSelection, nextUsed);
         throw new CodexEnvironmentError("uncertain", message);
       }
+    };
+
+  const applySelection = (request: CodexSelectionRequest, allowReconcile: boolean): Promise<CodexSelectionReceipt> =>
+    serialThread(request.threadId, () => applySelectionUnlocked(request, allowReconcile));
+
+  const reconcileThread = (request: Omit<CodexSelectionRequest, "turnId">): Promise<CodexSelectionReceipt> =>
+    serialThread(request.threadId, async () => {
+      if (closed) throw new CodexEnvironmentError("unavailable", "The internal provider connection is unavailable");
+      if (!storeHealth.ok) throw new CodexEnvironmentError("uncertain", storeHealth.reason);
+      if (!turns.has(request.threadId)) {
+        const resumed = object(await call("thread/resume", { threadId: request.threadId }));
+        const thread = object(resumed?.thread);
+        if (thread?.id !== request.threadId) {
+          throw new CodexEnvironmentError("unavailable", "Provider did not resume the requested thread");
+        }
+        observe({ method: "thread/started", params: { thread: { id: request.threadId } } });
+      }
+      return applySelectionUnlocked(request, true);
     });
 
   let providerSupportsSelection = false;
@@ -843,6 +872,7 @@ export async function connectCodexEnvironments(options: {
     assertObservedEnvironments,
     verify,
     restoreThread,
+    reconcileThread,
     checkDispatch,
     assertDispatchAllowed,
     dispatchTool,

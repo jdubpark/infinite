@@ -44,6 +44,10 @@ if (args[0] === "exec-server") {
   const stateFile = process.env.FIXTURE_THREAD_STATE_FILE;
   const omitStartEnvironments = process.env.FIXTURE_OMIT_START_ENVIRONMENTS === "1";
   const omitReadEnvironments = process.env.FIXTURE_OMIT_READ_ENVIRONMENTS === "1";
+  const omitReadFlagFile = process.env.FIXTURE_OMIT_READ_FLAG_FILE;
+  const omitResumeEnvironments = process.env.FIXTURE_OMIT_RESUME_ENVIRONMENTS === "1";
+  const holdFrontendReadFile = process.env.FIXTURE_HOLD_FRONTEND_READ_FILE;
+  const floodDuringStartRead = process.env.FIXTURE_FLOOD_DURING_START_READ === "1";
   const startupWriteAttempt = process.env.FIXTURE_STARTUP_WRITE_ATTEMPT === "1";
   const http = createServer();
   const wss = new WebSocketServer({ noServer: true });
@@ -51,6 +55,7 @@ if (args[0] === "exec-server") {
   const history = Array.isArray(saved?.history) ? [...saved.history] : [];
   let threadId = saved?.threadId, activeTurn, selections = saved?.selections, activeSelections = saved?.selections, releaseHeldTurn, replayCompletedTurn;
   let discoveredInstructions, startupWriteBlocked;
+  let flooded = false;
   const saveState = () => {
     if (!stateFile) return;
     writeFileSync(stateFile, JSON.stringify({ threadId, history, selections }));
@@ -137,7 +142,36 @@ if (args[0] === "exec-server") {
           else { if (params.environments) activeSelections = params.environments; reply({ status: "applied" }); }
         }
         else if (method === "thread/read" || method === "thread/resume") {
-          const includeEnvs = method === "thread/read" ? !omitReadEnvironments : !omitStartEnvironments;
+          const omitReadNow = omitReadEnvironments || Boolean(omitReadFlagFile && existsSync(omitReadFlagFile));
+          const includeEnvs = method === "thread/read" ? !omitReadNow : (!omitStartEnvironments && !omitResumeEnvironments);
+          if (method === "thread/read" && clientName === "infinite_execution" && floodDuringStartRead && !flooded) {
+            flooded = true;
+            const big = "x".repeat(15 * 1024 * 1024);
+            const payload = JSON.stringify({ method: "fixture/flood", params: { threadId, chunk: big } });
+            const targets = [...wss.clients].filter(peer => peer !== client && peer.readyState === WebSocket.OPEN);
+            for (const peer of targets) {
+              for (let i = 0; i < 5; i++) {
+                if (peer.readyState !== WebSocket.OPEN) break;
+                await new Promise(done => peer.send(payload, () => done()));
+              }
+            }
+            const until = Date.now() + 2000;
+            while (Date.now() < until && targets.some(peer => peer.readyState === WebSocket.OPEN)) {
+              await new Promise(done => setTimeout(done, 25));
+            }
+          }
+          if (method === "thread/read" && clientName !== "infinite_execution" && holdFrontendReadFile && existsSync(holdFrontendReadFile)) {
+            const snapshot = thread(includeEnvs);
+            const waitRelease = () => {
+              if (!existsSync(holdFrontendReadFile)) {
+                reply({ thread: snapshot, pid: process.pid });
+              } else {
+                setTimeout(waitRelease, 15);
+              }
+            };
+            waitRelease();
+            return;
+          }
           if (method === "thread/resume" && selections?.length && process.env.FIXTURE_STARTUP_DISCOVERY === "1" && environments.has(selections[0].environmentId)) {
             const env = selections[0];
             const instructionsPath = join(env.cwd, "AGENTS.md");

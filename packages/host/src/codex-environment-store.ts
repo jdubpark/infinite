@@ -1,11 +1,13 @@
 import { randomBytes } from "node:crypto";
-import { closeSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeSync } from "node:fs";
-import { dirname, isAbsolute, normalize, relative, sep } from "node:path";
+import { closeSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, rmSync, writeSync } from "node:fs";
+import { dirname, isAbsolute, normalize, relative, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { seal, unseal } from "./vault.js";
 
 export const CODEX_ENVIRONMENT_STATE_FILE = "codex-environments.sealed";
 export const MAX_CODEX_ENVIRONMENT_STATE_BYTES = 2 * 1024 * 1024;
+export const STARTUP_DISCOVERY_METHODS = new Set(["fs/getMetadata", "fs/readFile"]);
 const ENVIRONMENT_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/;
 
 export interface PersistedCodexSelection {
@@ -126,6 +128,43 @@ export const pathWithinRoots = (cwd: string, roots: string[]): boolean =>
     const rel = relative(root, cwd);
     return !rel || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
   });
+
+export function resolveContainedReadPath(rawPath: unknown, cwd: string, roots: string[]): boolean {
+  if (typeof rawPath !== "string" || !rawPath || rawPath.includes("\0") || roots.length === 0) return false;
+  try {
+    const converted = rawPath.startsWith("file:") ? fileURLToPath(rawPath) : rawPath;
+    const candidate = isAbsolute(converted) ? normalize(converted) : normalize(resolve(cwd, converted));
+    const normalizedRoots = roots.map(root => normalize(root));
+    if (!pathWithinRoots(candidate, normalizedRoots)) return false;
+    const canonicalRoots = normalizedRoots.map(root => realpathSync(root));
+    let exists = false;
+    try {
+      lstatSync(candidate);
+      exists = true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") return false;
+    }
+    if (exists) {
+      return pathWithinRoots(realpathSync(candidate), canonicalRoots);
+    }
+    let ancestor = dirname(candidate);
+    while (true) {
+      try {
+        lstatSync(ancestor);
+        const resolvedAncestor = realpathSync(ancestor);
+        const resolvedCandidate = normalize(resolve(resolvedAncestor, relative(ancestor, candidate)));
+        return pathWithinRoots(resolvedCandidate, canonicalRoots);
+      } catch (ancestorError) {
+        if ((ancestorError as NodeJS.ErrnoException).code !== "ENOENT") return false;
+        const parent = dirname(ancestor);
+        if (parent === ancestor) return false;
+        ancestor = parent;
+      }
+    }
+  } catch {
+    return false;
+  }
+}
 
 const selectionSchema: z.ZodType<PersistedCodexSelection> = z.object({
   environmentId: environmentIdSchema,

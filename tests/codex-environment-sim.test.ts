@@ -422,7 +422,8 @@ async function runSimulation(seed: number, mutant?: Mutant): Promise<void> {
   }
 }
 
-test(`codex environment durable-state simulator holds all invariants across seeds [${SEEDS.join(", ")}]`, { timeout: 60000 }, async () => {
+test(`codex environment durable-state simulator holds all invariants across seeds [${SEEDS.join(", ")}]`, { timeout: 60000 }, async t => {
+  t.diagnostic(`codex-environment-sim seeds=[${SEEDS.join(", ")}]`);
   for (const seed of SEEDS) {
     await runSimulation(seed);
   }
@@ -438,7 +439,8 @@ const MUTATION_CASES: Array<{ mutant: Mutant; invariant: string }> = [
 ];
 
 for (const { mutant, invariant } of MUTATION_CASES) {
-  test(`codex environment simulator catches mutation ${mutant} via invariant ${invariant}`, { timeout: 20000 }, async () => {
+  test(`codex environment simulator catches mutation ${mutant} via invariant ${invariant}`, { timeout: 20000 }, async t => {
+    t.diagnostic(`codex-environment-sim mutant=${mutant} seed=1`);
     await assert.rejects(
       runSimulation(1, mutant),
       (error: unknown) => error instanceof SimViolation && error.invariant === invariant,

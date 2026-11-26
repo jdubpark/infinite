@@ -97,6 +97,8 @@ export interface FakeProvider {
   failThreadUpdate: boolean;
   failTurnUpdate: boolean;
   omitReadEnvironments: boolean;
+  resumeCount: number;
+  onResume?: (threadId: string) => Promise<void>;
   tamperReadEnvironments?: (threadId: string) => CodexEnvironmentSelection[];
   invokeTool: (environmentId: string, method: string, params?: unknown) => Promise<{ result?: any; error?: { code: number; message: string } }>;
   openPersistentToolChannel: (environmentId: string, overrideTarget?: { url: string; token: string }) => Promise<{
@@ -193,6 +195,7 @@ export async function startFakeProvider(initialThreads?: Map<string, CodexEnviro
     failThreadUpdate: false,
     failTurnUpdate: false,
     omitReadEnvironments: false,
+    resumeCount: 0,
     invokeTool: callExecutor,
     openPersistentToolChannel,
     close: async () => {
@@ -239,6 +242,10 @@ export async function startFakeProvider(initialThreads?: Map<string, CodexEnviro
               reply({});
             }
           } else if (msg.method === "thread/read" || msg.method === "thread/resume") {
+            if (msg.method === "thread/resume") {
+              provider.resumeCount += 1;
+              await provider.onResume?.(msg.params.threadId);
+            }
             if (provider.omitReadEnvironments && msg.method === "thread/read") {
               reply({ thread: { id: msg.params.threadId } });
               return;

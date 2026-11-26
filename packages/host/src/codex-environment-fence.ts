@@ -104,14 +104,18 @@ export async function createCodexToolFence(options: {
     }
     sockets.handleUpgrade(req, socket, head, frontend => {
       let upstream: WebSocket | undefined;
+      let bootstrapUpstream: WebSocket | undefined;
       const queued: QueuedFrame[] = [];
+      const bootstrapQueued: QueuedFrame[] = [];
       let queuedBytes = 0;
       const teardown = () => {
         channels.delete(channel);
         queued.length = 0;
+        bootstrapQueued.length = 0;
         queuedBytes = 0;
         frontend.terminate();
         upstream?.terminate();
+        bootstrapUpstream?.terminate();
       };
       const closeSocket = (sock: WebSocket | undefined) => {
         if (!sock) return;
@@ -125,24 +129,84 @@ export async function createCodexToolFence(options: {
           error: { code: -32000, message: `This request was not executed. ${reason}` },
         }), teardown);
       };
-      const rejectQueuedToolFrames = (reason: string) => {
-        if (queued.length === 0) return;
+      const rejectQueue = (list: QueuedFrame[], reason: string) => {
+        if (list.length === 0) return;
         const retained: QueuedFrame[] = [];
-        let retainedBytes = 0;
-        for (const frame of queued) {
+        for (const frame of list) {
+          const bytes = Buffer.byteLength(frame.text);
           if (frame.probe) {
             retained.push(frame);
-            retainedBytes += Buffer.byteLength(frame.text);
           } else {
+            queuedBytes = Math.max(0, queuedBytes - bytes);
             options.onFenced?.({ environmentId: endpoint.environmentId, method: frame.method, code: "conflict", reason });
             sendError(frame.id, reason);
           }
         }
-        queued.length = 0;
-        queued.push(...retained);
-        queuedBytes = retainedBytes;
+        list.length = 0;
+        list.push(...retained);
       };
-      const ensureUpstream = (): WebSocket => {
+      const rejectQueuedToolFrames = (reason: string) => {
+        rejectQueue(queued, reason);
+        rejectQueue(bootstrapQueued, reason);
+        const confined = bootstrapUpstream;
+        bootstrapUpstream = undefined;
+        closeSocket(confined);
+      };
+      const flushQueue = (target: WebSocket, list: QueuedFrame[]) => {
+        const pending = list.splice(0, list.length);
+        for (const frame of pending) {
+          queuedBytes = Math.max(0, queuedBytes - Buffer.byteLength(frame.text));
+          if (!frame.probe) {
+            const decision = options.authorize(endpoint.environmentId, frame.method, frame.params);
+            if (!decision.allowed) {
+              options.onFenced?.({ environmentId: endpoint.environmentId, method: frame.method, code: decision.code, reason: decision.reason });
+              sendError(frame.id, decision.reason);
+              continue;
+            }
+            if (decision.generation !== frame.authorizedGeneration || Boolean(decision.bootstrap) !== frame.bootstrap) {
+              const reason = "Execution environment placement generation changed while the request was queued";
+              options.onFenced?.({ environmentId: endpoint.environmentId, method: frame.method, code: "conflict", reason });
+              sendError(frame.id, reason);
+              continue;
+            }
+          }
+          if (!sendSafe(target, frame.text, teardown)) return;
+        }
+      };
+      const ensureUpstream = (confined: boolean): WebSocket => {
+        if (confined) {
+          if (bootstrapUpstream && (bootstrapUpstream.readyState === WebSocket.OPEN || bootstrapUpstream.readyState === WebSocket.CONNECTING)) {
+            return bootstrapUpstream;
+          }
+          const next = new WebSocket(endpoint.upstreamUrl, {
+            headers: {
+              Authorization: `Bearer ${endpoint.upstreamToken}`,
+              "X-Infinite-Confined-Discovery": "1",
+            },
+            maxPayload: NATIVE_MAX_MESSAGE,
+            perMessageDeflate: false,
+            handshakeTimeout: 10000,
+          });
+          bootstrapUpstream = next;
+          next.on("error", () => {
+            if (bootstrapUpstream === next) bootstrapUpstream = undefined;
+            rejectQueue(bootstrapQueued, "Confined startup discovery channel failed");
+            next.terminate();
+          });
+          next.on("close", () => {
+            if (bootstrapUpstream === next) bootstrapUpstream = undefined;
+            rejectQueue(bootstrapQueued, "Confined startup discovery channel closed");
+          });
+          next.on("open", () => {
+            if (closed || bootstrapUpstream !== next) { next.terminate(); return; }
+            flushQueue(next, bootstrapQueued);
+          });
+          next.on("message", (data, binary) => {
+            if (binary || closed) { teardown(); return; }
+            sendSafe(frontend, data.toString(), teardown);
+          });
+          return next;
+        }
         if (upstream) return upstream;
         const next = new WebSocket(endpoint.upstreamUrl, {
           headers: { Authorization: `Bearer ${endpoint.upstreamToken}` },
@@ -152,28 +216,10 @@ export async function createCodexToolFence(options: {
         });
         upstream = next;
         next.on("error", teardown);
-        next.on("close", () => { channels.delete(channel); closeSocket(frontend); });
+        next.on("close", () => { channels.delete(channel); closeSocket(bootstrapUpstream); closeSocket(frontend); });
         next.on("open", () => {
           if (closed) { teardown(); return; }
-          const pending = queued.splice(0, queued.length);
-          queuedBytes = 0;
-          for (const frame of pending) {
-            if (!frame.probe) {
-              const decision = options.authorize(endpoint.environmentId, frame.method, frame.params);
-              if (!decision.allowed) {
-                options.onFenced?.({ environmentId: endpoint.environmentId, method: frame.method, code: decision.code, reason: decision.reason });
-                sendError(frame.id, decision.reason);
-                continue;
-              }
-              if (decision.generation !== frame.authorizedGeneration || Boolean(decision.bootstrap) !== frame.bootstrap) {
-                const reason = "Execution environment placement generation changed while the request was queued";
-                options.onFenced?.({ environmentId: endpoint.environmentId, method: frame.method, code: "conflict", reason });
-                sendError(frame.id, reason);
-                continue;
-              }
-            }
-            if (!sendSafe(next, frame.text, teardown)) return;
-          }
+          flushQueue(next, queued);
         });
         next.on("message", (data, binary) => {
           if (binary || closed) { teardown(); return; }
@@ -190,7 +236,7 @@ export async function createCodexToolFence(options: {
       channels.add(channel);
 
       frontend.on("error", teardown);
-      frontend.on("close", () => { channels.delete(channel); closeSocket(upstream); });
+      frontend.on("close", () => { channels.delete(channel); closeSocket(upstream); closeSocket(bootstrapUpstream); });
 
       frontend.on("message", (data, binary) => {
         if (binary || closed) { teardown(); return; }
@@ -214,16 +260,17 @@ export async function createCodexToolFence(options: {
             authorizedGeneration = decision.generation;
             bootstrap = Boolean(decision.bootstrap);
           }
-          const target = ensureUpstream();
+          const target = ensureUpstream(bootstrap);
+          const targetQueue = bootstrap ? bootstrapQueued : queued;
           if (target.readyState === WebSocket.OPEN) {
             sendSafe(target, text, teardown);
           } else if (target.readyState === WebSocket.CONNECTING) {
             const bytes = Buffer.byteLength(text);
-            if (queued.length >= MAX_QUEUED_FRAMES || queuedBytes + bytes > MAX_QUEUED_BYTES) {
+            if (queued.length + bootstrapQueued.length >= MAX_QUEUED_FRAMES || queuedBytes + bytes > MAX_QUEUED_BYTES) {
               teardown();
               return;
             }
-            queued.push({ text, method, params, id, probe, authorizedGeneration, bootstrap });
+            targetQueue.push({ text, method, params, id, probe, authorizedGeneration, bootstrap });
             queuedBytes += bytes;
           } else {
             teardown();

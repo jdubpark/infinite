@@ -14,6 +14,7 @@ import {
   type CodexEnvironmentStore,
   type PersistedCodexEnvironmentState,
 } from "../packages/host/src/codex-environment.js";
+import { createExecutorTunnel, forwardExecutor } from "../packages/host/src/executor-tunnel.js";
 import { writeSealed } from "../packages/host/src/vault.js";
 import { makeExecutor, startFakeExecServer, startFakeProvider, type FakeProvider } from "./fixtures/codex-environment-harness.js";
 
@@ -505,6 +506,130 @@ test("crash, write failure, oversized sealed state, unconfigured store, and corr
     await exec1.close();
     await exec2.close();
     await exec3.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("startup discovery blocks escaping symlinks on both local and remote executor tunnels, and restoreThread matches workspace before discovery", { timeout: 25000 }, async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "infinite-codex-symlink-")));
+  const ws = join(root, "ws"), docs = join(ws, "docs"), outside = join(root, "outside"), other = join(root, "other");
+  mkdirSync(docs, { recursive: true });
+  mkdirSync(outside);
+  mkdirSync(other);
+  writeFileSync(join(docs, "AGENTS.md"), "SAFE_IN_ROOT_AGENTS");
+  writeFileSync(join(outside, "secret.txt"), "OUTSIDE_SECRET");
+  writeFileSync(join(other, "AGENTS.md"), "OTHER_AGENTS");
+  symlinkSync(join(docs, "AGENTS.md"), join(ws, "inroot-link.md"));
+  symlinkSync(join(outside, "secret.txt"), join(ws, "AGENTS.md"));
+  symlinkSync(outside, join(ws, "escape-dir"));
+  symlinkSync(join(outside, "missing-target.txt"), join(ws, "dangling.md"));
+
+  const key = randomBytes(32);
+  const scope = `session-${randomUUID()}:codex-environments`;
+  const persistence = { file: join(root, CODEX_ENVIRONMENT_STATE_FILE), key, scope };
+  const localExec = await startFakeExecServer(ws);
+  const remoteExec = await startFakeExecServer(ws);
+  const tunnel = await createExecutorTunnel({ cwd: ws, environmentId: "env-remote-tunnel-1" });
+  const device = tunnel.attach();
+  const forwardAbort = new AbortController();
+  const forwardPromise = forwardExecutor({
+    url: device.url,
+    token: device.token,
+    executorUrl: remoteExec.url,
+    executorToken: remoteExec.token,
+    cwd: ws,
+    roots: [ws],
+    signal: forwardAbort.signal,
+  });
+  await tunnel.ready;
+
+  const provider1 = await startFakeProvider();
+  let provider2: FakeProvider | undefined;
+  const client1 = await connectCodexEnvironments({ endpoint: provider1.endpoint, token: provider1.token, persistence });
+  let client2: Awaited<ReturnType<typeof connectCodexEnvironments>> | undefined;
+  try {
+    const localEnv = makeExecutor("env-local-symlink", localExec, [ws]);
+    await client1.register(localEnv);
+    const endLocalDiscovery = client1.beginStartupDiscovery(localEnv.environmentId);
+    try {
+      const okInRoot = await provider1.invokeTool(localEnv.environmentId, "fs/readFile", { path: join(ws, "inroot-link.md") });
+      assert.equal(okInRoot.error, undefined);
+      assert.equal(okInRoot.result.contents, "SAFE_IN_ROOT_AGENTS");
+      const okMissingProbe = await provider1.invokeTool(localEnv.environmentId, "fs/getMetadata", { path: join(ws, "NO_SUCH_AGENTS.md") });
+      assert.equal(okMissingProbe.error, undefined);
+      assert.equal(okMissingProbe.result.exists, false);
+
+      const escapedLeaf = await provider1.invokeTool(localEnv.environmentId, "fs/readFile", { path: join(ws, "AGENTS.md") });
+      assert.equal(escapedLeaf.error?.code, -32000);
+      const escapedMeta = await provider1.invokeTool(localEnv.environmentId, "fs/getMetadata", { path: join(ws, "AGENTS.md") });
+      assert.equal(escapedMeta.error?.code, -32000);
+      const escapedDir = await provider1.invokeTool(localEnv.environmentId, "fs/readFile", { path: join(ws, "escape-dir", "secret.txt") });
+      assert.equal(escapedDir.error?.code, -32000);
+      const escapedDirMissing = await provider1.invokeTool(localEnv.environmentId, "fs/getMetadata", { path: join(ws, "escape-dir", "absent.md") });
+      assert.equal(escapedDirMissing.error?.code, -32000);
+      const dangling = await provider1.invokeTool(localEnv.environmentId, "fs/readFile", { path: join(ws, "dangling.md") });
+      assert.equal(dangling.error?.code, -32000);
+      assert.equal(localExec.received.filter(item => item.method === "fs/readFile").length, 1);
+    } finally {
+      endLocalDiscovery();
+    }
+
+    const remoteEnv = { ...tunnel.environment, roots: [ws] };
+    await client1.register(remoteEnv);
+    const endRemoteDiscovery = client1.beginStartupDiscovery(remoteEnv.environmentId);
+    try {
+      const remoteOk = await provider1.invokeTool(remoteEnv.environmentId, "fs/readFile", { path: join(ws, "inroot-link.md") });
+      assert.equal(remoteOk.error, undefined);
+      assert.equal(remoteOk.result.contents, "SAFE_IN_ROOT_AGENTS");
+
+      const remoteEscapedLeaf = await provider1.invokeTool(remoteEnv.environmentId, "fs/readFile", { path: join(ws, "AGENTS.md") });
+      assert.equal(remoteEscapedLeaf.error?.code, -32000);
+      const remoteEscapedDir = await provider1.invokeTool(remoteEnv.environmentId, "fs/readFile", { path: join(ws, "escape-dir", "secret.txt") });
+      assert.equal(remoteEscapedDir.error?.code, -32000);
+      const remoteEscapedDirMissing = await provider1.invokeTool(remoteEnv.environmentId, "fs/getMetadata", { path: join(ws, "escape-dir", "absent.md") });
+      assert.equal(remoteEscapedDirMissing.error?.code, -32000);
+      const remoteDangling = await provider1.invokeTool(remoteEnv.environmentId, "fs/readFile", { path: join(ws, "dangling.md") });
+      assert.equal(remoteDangling.error?.code, -32000);
+      assert.equal(remoteExec.received.filter(item => item.method === "fs/readFile").length, 1);
+    } finally {
+      endRemoteDiscovery();
+    }
+
+    const threadId = `thread-resume-ws-${randomUUID()}`;
+    client1.observe({ method: "thread/started", params: { thread: { id: threadId } } });
+    await client1.select({ threadId, executor: localEnv });
+    const persistedThreads = new Map(provider1.threads);
+    client1.close();
+    await provider1.close();
+
+    provider2 = await startFakeProvider(persistedThreads);
+    const readsBefore = localExec.received.filter(item => item.method === "fs/readFile").length;
+    provider2.onResume = async () => {
+      await provider2!.invokeTool(localEnv.environmentId, "fs/readFile", { path: join(other, "AGENTS.md") });
+    };
+    client2 = await connectCodexEnvironments({ endpoint: provider2.endpoint, token: provider2.token, persistence });
+    const widenedEnv = makeExecutor(localEnv.environmentId, localExec, [root]);
+    await client2.register(widenedEnv);
+    assert.throws(
+      () => client2!.beginStartupDiscovery(widenedEnv.environmentId),
+      (error: unknown) => error instanceof CodexEnvironmentError && error.code === "conflict",
+    );
+    await assert.rejects(
+      client2.restoreThread(threadId),
+      (error: unknown) => error instanceof CodexEnvironmentError && error.code === "conflict",
+    );
+    assert.equal(provider2.resumeCount, 0, "restoreThread must reject mismatched roots before sending thread/resume");
+    assert.equal(localExec.received.filter(item => item.method === "fs/readFile").length, readsBefore, "no discovery reads may occur on mismatched workspace");
+  } finally {
+    forwardAbort.abort();
+    await forwardPromise.catch(() => {});
+    tunnel.close();
+    client1.close();
+    client2?.close();
+    await provider1.close();
+    await provider2?.close();
+    await localExec.close();
+    await remoteExec.close();
     rmSync(root, { recursive: true, force: true });
   }
 });

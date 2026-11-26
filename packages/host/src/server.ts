@@ -11,7 +11,7 @@ import { z } from "zod";
 import { existsSync, realpathSync } from "node:fs";
 import { join, resolve, sep } from "node:path";
 import { Manager, publicAttention } from "./manager.js";
-import { MainCheckService } from "./main-check.js";
+import { MainCheckService, type HostProcesses } from "./main-check.js";
 import { mainCheckRoute } from "./main-check-route.js";
 import { hashToken, validateLinearConfig, validateMcpConfig } from "./config.js";
 import { runtimeSecurity } from "./deployment.js";
@@ -63,6 +63,7 @@ import { withoutCodeMode } from "./session-listing.js";
 import { parseGoalCreateBody } from "./objective-input.js";
 import { routingRoutes } from "./routing-routes.js";
 import { spawnTeamBundle } from "./team-workspace.js";
+import { signalGroup, watchLeader } from "./process-group.js";
 import { createTeamSchema, teamContinueSchema, teamMutationSchema, teamDeliveryReconcileSchema, teamVerificationReconcileSchema, teamMemberRetireSchema, teamActionSchema, teamTaskRatingSchema, teamParallelismSchema } from "./team-types.js";
 import { scorecardFromRows, type ProfileIdentityOf } from "./scorecard.js";
 import { profileIdentity } from "./run-events.js";
@@ -204,7 +205,7 @@ const inputSchema = z
     force: z.boolean().optional(),
   })
   .strict();
-export function createApp(config: Config, key: Buffer, options: { configFile?: string } = {}) {
+export function createApp(config: Config, key: Buffer, options: { configFile?: string; processCensus?: HostProcesses } = {}) {
   config.machine = machineIdentity(config, key);
   if ((config.cmux?.enabled || config.remote?.enabled) && runtimeSecurity(config.deployment).tenancy !== "single-tenant")
     throw new Error("Machine access and cmux require a single-tenant host");
@@ -275,7 +276,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
     graphs: repositoryGraphs,
     events: outbox,
     capture: evalHost.capture,
-    entries: blackboard,
+    entries: blackboard, ...(options.processCensus ? { processes: options.processCensus } : {}),
     onMerged: id => void projectSource.refresh(id).then(status => {
       sourceChanged(id);
       if (status.appliedHead && !status.pending) scheduleGraphForSession(id);
@@ -512,7 +513,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
   permissionTurnGate.hold = () => { const view = halt.view(); return view.readable && !view.host; };
   halt.useServices({ routines, goals, missions, teams }, teamId => goals.ownsActiveTeam(teamId) || missions.ownsActiveSubteam(teamId));
   const gate = halt.gate(fuse);
-  mainCheck = new MainCheckService({ config, key, mirrorPath: id => projectSource.mirrorPath(id), halt, hostLoad: manager.hostLoad });
+  mainCheck = new MainCheckService({ config, key, mirrorPath: id => projectSource.mirrorPath(id), halt, hostLoad: manager.hostLoad, ...(options.processCensus ? { ports: { processes: options.processCensus } } : {}) });
   manager.useFuse(gate);
   teams.useFuse(gate);
   goals.useFuse(gate);
@@ -1270,7 +1271,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
     let finished = false, child: ReturnType<typeof spawnTeamBundle> | undefined;
     const stop = () => {
       if (!child || finished) return;
-      try { if (child.pid && process.platform !== "win32") process.kill(-child.pid, "SIGKILL"); else child.kill("SIGKILL"); } catch {}
+      signalGroup(child, "SIGKILL");
       child.stdout.destroy();
     };
     const disconnect = () => { if (!res.writableEnded) { stop(); finished = true; clearTimeout(timer); } };
@@ -1283,6 +1284,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
     if (req.aborted || res.destroyed || res.writableEnded) return;
     const limit = 512 * 1024 * 1024;
     child = spawnTeamBundle(bundle.workspace, bundle.branch, config.teams?.commandPrefix);
+    const leader = watchLeader(child);
     res.status(200).set({ "Content-Type": "application/octet-stream", "X-Infinite-Branch": bundle.branch, "X-Infinite-Head": bundle.head });
     let size = 0;
     child.stdout.on("data", (chunk: Buffer) => {
@@ -1297,7 +1299,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
       if (finished) return;
       finished = true;
       clearTimeout(timer);
-      if (code !== 0) res.destroy(); else res.end();
+      if (code !== 0 || leader.leftover) res.destroy(); else res.end();
     });
   });
   app.post("/api/teams", requireRole(["owner"]), async (req, res) => {
@@ -2016,7 +2018,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
     );
   });
   app.use("/api", (_req, res) =>
-    res.status(404).json({ error: "Endpoint not found" }),
+    res.status(404).json({ code: "route-not-found", error: "Endpoint not found" }),
   );
   const serveWeb = express.static(fileURLToPath(new URL("../../../apps/web/dist/", import.meta.url)));
   app.use((req, res, next) => {

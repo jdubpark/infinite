@@ -27,6 +27,8 @@ import {
   subjectOf,
   type ComparisonPlan,
 } from "../packages/host/src/eval-compare-jobs.js";
+import { validateJobSchema } from "../packages/host/src/eval-jobs.js";
+import { baselineJobSchema } from "../packages/host/src/eval-trial-jobs.js";
 import type { ComparisonJobRequest, EvalRefusal, TrialConfiguration, TrialGrade } from "../packages/host/src/eval-types.js";
 import type { TeamModelProfile } from "../packages/host/src/team-types.js";
 
@@ -377,5 +379,39 @@ test("the pins follow the epoch and the prompt version", () => {
     assert.match(subjectOf(pins), /^[0-9a-f]{64}$/);
   } finally {
     f.close();
+  }
+});
+
+test("validate, baseline, and comparison job schemas share window and configuration rules", () => {
+  const wrapWindow = [{ startHourUtc: 22, endHourUtc: 6 }];
+  const emptyWindow = [{ startHourUtc: 10, endHourUtc: 10 }];
+  const outOfRangeWindow = [{ startHourUtc: 0, endHourUtc: 25 }];
+
+  assert.equal(validateJobSchema.safeParse({ kind: "validate", limits: { maxWallMinutes: 60 }, windows: wrapWindow }).success, true);
+  assert.equal(validateJobSchema.safeParse({ kind: "validate", limits: { maxWallMinutes: 60 }, windows: emptyWindow }).success, false);
+  assert.equal(validateJobSchema.safeParse({ kind: "validate", limits: { maxWallMinutes: 60 }, windows: outOfRangeWindow }).success, false);
+
+  const baseline = (extra: Record<string, unknown>) => ({
+    kind: "baseline",
+    configurations: [CONFIG_A],
+    limits: { maxTrials: 10, maxWallMinutes: 60 },
+    ...extra,
+  });
+  assert.equal(baselineJobSchema.safeParse(baseline({ windows: wrapWindow })).success, true);
+  assert.equal(baselineJobSchema.safeParse(baseline({ windows: emptyWindow })).success, false);
+  assert.equal(baselineJobSchema.safeParse(baseline({ windows: outOfRangeWindow })).success, false);
+  assert.equal(comparisonJobSchema.safeParse(request("compare", [CONFIG_A, CONFIG_B], { windows: wrapWindow })).success, true);
+  assert.equal(comparisonJobSchema.safeParse(request("compare", [CONFIG_A, CONFIG_B], { windows: emptyWindow })).success, false);
+  assert.equal(comparisonJobSchema.safeParse(request("compare", [CONFIG_A, CONFIG_B], { windows: outOfRangeWindow })).success, false);
+
+  const invalidConfigs: unknown[] = [
+    { profile: { provider: "unknown" }, guidance: "as-of-base", knowledge: "none" },
+    { profile: PROFILE_A, guidance: "latest", knowledge: "none" },
+    { profile: PROFILE_A, guidance: "as-of-base", knowledge: "full" },
+    { profile: PROFILE_A, guidance: "as-of-base", knowledge: "none", extra: 1 },
+  ];
+  for (const bad of invalidConfigs) {
+    assert.equal(baselineJobSchema.safeParse(baseline({ configurations: [bad] })).success, false);
+    assert.equal(comparisonJobSchema.safeParse({ ...request("compare", [CONFIG_A, CONFIG_B]), configurations: [bad, CONFIG_B] }).success, false);
   }
 });

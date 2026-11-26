@@ -1,15 +1,20 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import { canonicalJson } from "./evidence/crypto.js";
-import { isScopedPath, parseCreateGoal } from "./goal-types.js";
+import { parseCreateGoal } from "./goal-types.js";
 import type { CreateGoal } from "./goal-types.js";
 import { OBJECTIVE_LIMITS, thresholdSchema } from "./objective-types.js";
 import type { Check, Criterion, Threshold } from "./objective-types.js";
 import { objectiveError } from "./objective-record.js";
-import { teamCommandSchema } from "./team-types.js";
-import type { TeamCommand } from "./team-types.js";
+import { idSchema, isScopedPath, teamCommandSchema } from "./schema-primitives.js";
+import type { TeamCommand } from "./schema-primitives.js";
 
-export const CORRECTION_LIMITS = { ops: 16, creationCriteria: 7, version: 1_000_000, criterionCanonicalBytes: 2_048 } as const;
+export const CORRECTION_LIMITS = {
+  ops: 16,
+  creationCriteria: OBJECTIVE_LIMITS.activeCriteria - 1,
+  version: 1_000_000,
+  criterionCanonicalBytes: OBJECTIVE_LIMITS.inlineValueBytes,
+} as const;
 
 export type CheckInput = Exclude<Check, { kind: "command" } | { kind: "artifact" }>
   | { kind: "command"; run: TeamCommand }
@@ -26,11 +31,9 @@ export const RATING_SCALE = { min: 1, max: 5, step: 0.5 } as const;
 export type Correction = { requestId: string; version: number; ops: CorrectionOp[] };
 
 const L = OBJECTIVE_LIMITS;
-const ID_RE = /^[a-z][a-z0-9-]{0,39}$/;
 const POINTER_RE = /^(?:\/[^/\x00-\x1f]{1,64}){1,8}$/;
 
 const byteLength = (value: string): number => Buffer.byteLength(value, "utf8");
-const idSchema = z.string().regex(ID_RE);
 const pointer = z.string().regex(POINTER_RE);
 const pathSchema = z.string().refine(value => value.length <= L.pathChars && isScopedPath(value), "Use a repository-relative file or folder, or . for the whole project");
 const statementSchema = z.string().refine(value => byteLength(value) >= 1 && byteLength(value) <= L.criterionBytes, "A criterion statement is 1 to 1,000 bytes");

@@ -18,8 +18,8 @@ import {
   objectiveRecordSchema,
 } from "./objective-types.js";
 import type { Assumption, AssumptionTest, Criterion, Direction, LogEntry, LogValue, ObjectiveRecord, Question } from "./objective-types.js";
-import { RECORD_DIGEST_BYTES, recordDigestBytes, teamCommandSchema } from "./team-types.js";
-import type { TeamCommand } from "./team-types.js";
+import { SHARED_INPUT_LIMITS, teamCommandSchema, type TeamCommand } from "./schema-primitives.js";
+import { RECORD_DIGEST_BYTES, recordDigestBytes } from "./team-types.js";
 import { TeamError } from "./team-workspace.js";
 
 export const INTENT_DEFAULTS_ANSWER = "Use the stated defaults";
@@ -53,7 +53,7 @@ const L = OBJECTIVE_LIMITS;
 const NO_OWN = { token: "", url: "" };
 const SUMMARY_WITHHELD = "Summary withheld: it matched a secret shape.";
 const DIRECTION_REF = "record:direction:";
-const ANSWER_DIRECTIONS_BELOW = 20;
+const ANSWER_DIRECTIONS_BELOW = L.directions - SHARED_INPUT_LIMITS.steeringEntries;
 const DECISION_LINE_CHARS = 440;
 const DECISION_CHARS = 4_000;
 const reportCommandTest = z.strictObject({ kind: z.literal("command"), run: teamCommandSchema, refutesOn: z.enum(["fail", "pass"]) });

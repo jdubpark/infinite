@@ -3,7 +3,7 @@ import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
 import { entryToolsFor } from "./entry-roles.js";
 import { registerText, scopeSentence } from "./register-prompt.js";
-import { criteriaRowsText } from "./verdict-types.js";
+import { criteriaRowsText } from "./schema-primitives.js";
 import { outputSchemas } from "./team-mcp-results.js";
 import { toolSignature } from "./tool-signature.js";
 import { KNOWN_RULE_TEXTS } from "./team-rule-texts.js";

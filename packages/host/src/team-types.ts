@@ -726,6 +726,7 @@ export interface TeamRun {
   status: TeamStatus;
   createdAt: string;
   updatedAt: string;
+  lastActivityAt?: string;
   workspace: string;
   branch: string;
   baseCommit: string;
@@ -743,6 +744,7 @@ export interface TeamRun {
   round: number;
 }
 export type TeamView = Omit<TeamRun, "members" | "permissionDecisions" | "permissionRecovery"> & {
+  lastActivityAt: string;
   pendingOperation?: TeamPendingOperation;
   members: Omit<TeamMember, "prompt" | "contextFeedback" | "nativeSessionId" | "continuation" | "turns" | "pendingFeedback" | "goalCriteriaPlan">[];
   permissionDecisions?: Omit<TeamPermissionDecision, "prompt" | "coordinatorSessionId">[];

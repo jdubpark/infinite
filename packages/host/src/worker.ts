@@ -333,10 +333,10 @@ function onTranscript(body: unknown): HookReply | void {
 let handoffReceipt: string | undefined;
 let handoffStopping = false;
 let handoffInFlight = false;
-async function onHook(route: HookRoute, body: unknown): Promise<HookReply | HookAnswer | void> {
+async function onHook(route: HookRoute, body: unknown, run?: string): Promise<HookReply | HookAnswer | void> {
   if (route === "permission-check" || route === "permission-request") {
     if (!permissionChannel) throw new HookPayloadError(404);
-    return route === "permission-check" ? permissionChannel.check(body) : permissionChannel.request(body);
+    return route === "permission-check" ? permissionChannel.check(body, run) : permissionChannel.request(body, run);
   }
   if (route === "team-entry") {
     if (!entryRoute) throw new HookPayloadError(403, ENTRY_REFUSALS["entry-tools-off"]);
@@ -1519,7 +1519,7 @@ server.listen(socketPath(runDir, session.id), async () => {
       session.teamModelProfile,
       session.handoff?.policy ? session.id : undefined,
       session.workspaceTrusted ? session.cwd : undefined,
-      Boolean(session.team?.entryTools), Boolean(permissionChannel),
+      Boolean(session.team?.entryTools), permissionChannel?.run ?? false,
       egress.status !== "off",
       config.codeMode,
       session.runtime?.nativeUi ? 0 : session.nativeArgs?.length,
@@ -1701,7 +1701,7 @@ server.listen(socketPath(runDir, session.id), async () => {
         provider, headlessResumeProfile(profile, nativeSessionId), "",
         hookServer ? { url: hookServer.url, token: hookToken } : null, relayPath, config.attention.hooks,
         Boolean(session.team), session.teamModelProfile, session.handoff?.policy ? session.id : undefined,
-        session.workspaceTrusted ? session.cwd : undefined, Boolean(session.team?.entryTools), true, egress.status !== "off",
+        session.workspaceTrusted ? session.cwd : undefined, Boolean(session.team?.entryTools), permissionChannel!.run, egress.status !== "off",
         config.codeMode,
       );
       const pty = spawn(next.command, next.args, { cwd: session.cwd, env, cols: terminal.cols, rows: terminal.rows, name: "xterm-256color" });

@@ -7,8 +7,8 @@ import { join } from "node:path";
 import { once } from "node:events";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
-import { WITNESS_LIMIT, directoryCensus, extendWitness, newWitness, operationCensus, processStart, readProcessTable, recordCommand, statusRunsAs, witnessFindings,
-  type ProcessRow, type ProcessTable, type ProcessWitness } from "../packages/host/src/process-census.js";
+import { WITNESS_LIMIT, directoryCensus, excuseEarlier, extendWitness, newWitness, operationCensus, processStart, readProcessTable, recordCommand, statusRunsAs, witnessFindings,
+  type CensusFinding, type EarlierProcesses, type ProcessRow, type ProcessTable, type ProcessWitness } from "../packages/host/src/process-census.js";
 
 const censusFile = fileURLToPath(new URL("../packages/host/src/process-census.ts", import.meta.url));
 
@@ -75,6 +75,29 @@ test("a started command is recorded as the leader of its session and group, and 
   assert.deepEqual(witnessFindings(w, t), [{ pid: 31, reason: "recorded-session" }]);
   assert.equal(extendWitness(w, t), true);
   assert.deepEqual(witnessFindings(w, t), [{ pid: 31, reason: "recorded-session" }, { pid: 32, reason: "recorded-session" }]);
+});
+
+test("only a process that refused inspection and still has the start token recorded before the operation is excused (INF-403)", async () => {
+  const positive = { finding: { pid: 10, reason: "unreadable" } as CensusFinding, earlier: [{ pid: 10, start: "a" }] as EarlierProcesses, current: "a" as string | undefined | Error };
+  const excused = async (fixture: typeof positive) => excuseEarlier([fixture.finding], fixture.earlier, async () => {
+    if (fixture.current instanceof Error) throw fixture.current;
+    return fixture.current;
+  });
+  assert.deepEqual(await excused(positive), [], "the recorded process is excused");
+  const negatives: [string, typeof positive][] = [
+    ["another start token: the pid was reused", { ...positive, current: "b" }],
+    ["the process has gone and its start cannot be read", { ...positive, current: undefined }],
+    ["the start read failed", { ...positive, current: new Error("EIO") }],
+    ["another pid", { ...positive, earlier: [{ pid: 11, start: "a" }] }],
+    ["nothing recorded", { ...positive, earlier: [] }],
+    ["a finding that is not unreadable", { ...positive, finding: { pid: 10, reason: "working-directory" } }],
+  ];
+  for (const [name, fixture] of negatives) assert.deepEqual(await excused(fixture), [fixture.finding], name);
+  assert.deepEqual(await excuseEarlier([positive.finding], undefined, async () => "a"), [positive.finding], "no anchor excuses nothing");
+  const mixed: CensusFinding[] = [{ pid: 10, reason: "unreadable" }, { pid: 11, reason: "recorded-group" }, { pid: 12, reason: "open-file" }, { pid: 13, reason: "unreadable" }];
+  let asked = 0;
+  assert.deepEqual(await excuseEarlier(mixed, "all", async () => { asked += 1; return undefined; }), [mixed[1], mixed[2]], "all excuses every unreadable finding and nothing else");
+  assert.equal(asked, 0);
 });
 
 test("a witness that reached its limit drops nothing and cannot say that no process is left", async () => {
@@ -201,6 +224,30 @@ test("a process that hides is still reported when its first thread has exited (I
     assert.deepEqual(census.ok ? census.findings.filter(finding => finding.pid === child.pid) : [], [{ pid: child.pid, reason: "unreadable" }]);
   } finally {
     try { process.kill(child.pid!, "SIGKILL"); } catch { }
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("a hidden process recorded with its start token is excused, and one started later or with another token is not (INF-403)", { skip: !canHideFromItsAccount }, async () => {
+  const directory = mkdtempSync(join(tmpdir(), "census-"));
+  const script = ["import ctypes, sys, time", "assert ctypes.CDLL(None).prctl(4, 0, 0, 0, 0) == 0", "print('hidden', flush=True)", "time.sleep(60)", ""].join("\n");
+  const children = [0, 1].map(() => spawn("python3", ["-c", script], { detached: true, stdio: ["ignore", "pipe", "ignore"] }));
+  try {
+    for (const child of children) assert.equal(String((await createInterface({ input: child.stdout! })[Symbol.asyncIterator]().next()).value), "hidden");
+    const [before, after] = children.map(child => child.pid!);
+    const start = await processStart(before!);
+    assert.equal(typeof start, "string");
+    const reported = async (earlier: EarlierProcesses | undefined) => {
+      const census = await operationCensus(newWitness(), directory, undefined, earlier);
+      assert.equal(census.ok, true, census.ok ? "" : census.problem);
+      return census.ok ? census.findings.filter(finding => finding.pid === before || finding.pid === after).sort((a, b) => a.pid - b.pid) : [];
+    };
+    assert.deepEqual(await reported(undefined), [{ pid: before, reason: "unreadable" }, { pid: after, reason: "unreadable" }]);
+    assert.deepEqual(await reported([{ pid: before!, start: start! }]), [{ pid: after, reason: "unreadable" }]);
+    assert.deepEqual(await reported([{ pid: before!, start: `${start}0` }]), [{ pid: before, reason: "unreadable" }, { pid: after, reason: "unreadable" }]);
+    assert.deepEqual(await reported("all"), []);
+  } finally {
+    for (const child of children) try { process.kill(child.pid!, "SIGKILL"); } catch { }
     rmSync(directory, { recursive: true, force: true });
   }
 });

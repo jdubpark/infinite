@@ -115,7 +115,7 @@ import { Summarizer, SummaryError } from "./summary.js";
 import { DictationCleaner, DictationError } from "./dictation.js";
 import { RepositoryBriefings } from "./repository-briefings.js";
 import { RepositoryGraphs } from "./repository-graphs.js";
-import { ContextTouches, type SessionTouches } from "./context-touches.js";
+import { ContextTouches, hostProviderCapabilities, type SessionTouches } from "./context-touches.js";
 import { UnderstandingService } from "./understanding.js";
 import { UnderstandingCatalog, CatalogError } from "./understanding-catalog.js";
 import { UnderstandingRuntime } from "./understanding-runtime.js";
@@ -759,6 +759,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
       providers: Object.keys(config.agents).filter(
         (p) => p !== "demo" || config.enableDemo,
       ),
+      providerCapabilities: hostProviderCapabilities(config.enableDemo),
       teams: { enabled: Boolean(config.teams), repoEnrollment: 1, permissionDelegation: 1, establishChecks: 1, sessionHandoff: 1, projectSource: 1, autonomyMode: 1, routing: 1, routingAuto: 1, routingPoints: 1, maxParallelism: 4, ...(config.teams?.lineup ? { lineup: config.teams.lineup } : {}) },
       permissions: { workspaceDelegation: 1, decisionLog: 1, onboardingCoverage: 1 },
       goals: { enabled: goals.enabled() },

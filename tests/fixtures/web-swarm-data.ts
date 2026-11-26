@@ -67,7 +67,7 @@ export function swarmFixture(now = Date.parse("2026-11-13T14:00:00.000Z")): Swar
     });
     const value: SwarmTeam = {
       id: teamId, projectId: spec.projectId, provider: "claude", title: spec.title, status: spec.status, revision,
-      createdAt: ago(spec.created), updatedAt: ago(2),
+      createdAt: ago(spec.created), updatedAt: ago(2), lastActivityAt: ago(spec.updated ?? 8),
       baseCommit: "a".repeat(40), headCommit: "b".repeat(40), ...(spec.missionId ? { missionId: spec.missionId } : {}), lineup: { coordinator: { tier: "strong" } }, members, tasks,
       checks: (spec.checks ?? []).map(status => ({ status, revision })),
       decisions: Array.from({ length: spec.decisions ?? 0 }, () => ({ id: id(), revision })),

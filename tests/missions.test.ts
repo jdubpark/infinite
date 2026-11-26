@@ -2023,6 +2023,20 @@ test("extending a running mission adds time once and refuses ended or ordinarily
   } finally { h.close(); }
 });
 
+test("extending a mission rechecks authorization inside the mutation queue", { timeout: 60000 }, async () => {
+  const h = scripted();
+  try {
+    const created = await h.missions.create(missionRequest());
+    const before = h.missions.peek(created.id)!;
+    const denied = new TeamError(403, "intake-audience-denied", "The Slack audience changed.");
+    await assert.rejects(h.missions.extend(created.id,
+      { requestId: randomUUID(), revision: before.revision, minutes: 10 }, () => { throw denied; }), error => error === denied);
+    const after = h.missions.peek(created.id)!;
+    assert.equal(after.revision, before.revision);
+    assert.equal(after.deadlineAt, before.deadlineAt);
+  } finally { h.close(); }
+});
+
 test("a mission started from the apps keeps the wall-clock deadline", { timeout: 60000 }, async () => {
   const h = scripted();
   mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-11-13T09:00:00Z") });

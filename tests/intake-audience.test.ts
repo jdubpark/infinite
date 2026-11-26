@@ -2,7 +2,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import type { ProjectGroup } from "../packages/host/src/project-group-types.js";
 import type { Config } from "../packages/host/src/types.js";
-import { createIntakeAudienceGuard, createIntakeMissionCreator } from "../packages/host/src/intake-audience.js";
+import type { IntakeRecord } from "../packages/host/src/intake-types.js";
+import type { Mission } from "../packages/host/src/mission-types.js";
+import { createIntakeAudienceGuard, createIntakeMissionCreator, intakeRecordAudienceAllowed, slackAudienceIdentity } from "../packages/host/src/intake-audience.js";
 import { SlackClient, SlackError } from "../packages/host/src/slack-client.js";
 import { startSlackServer } from "./fixtures/slack-server.js";
 
@@ -21,7 +23,8 @@ function setup(options: { pins?: { projectId: string; path: string; repository: 
   const config = {
     intake: {
       mission: { groupId: "work", ...(options.answerProjectId ? { answerProjectId: options.answerProjectId } : {}) },
-      slack: { organizationScope: { workspaces: options.pins ?? [{ projectId: "alpha", path: "/srv/work/alpha", repository: "Example/alpha" }] } },
+      slack: { teamId: "T00000000", ownerUserId: "U00000000",
+        organizationScope: { workspaces: options.pins ?? [{ projectId: "alpha", path: "/srv/work/alpha", repository: "Example/alpha" }] } },
     },
     projects: [configuredProject],
   } as unknown as Config;
@@ -52,6 +55,86 @@ test("opt-in Slack audience admits only the fully pinned default group and same-
   assert.equal(guard.missionAllowed({ requestId: "11111111-1111-4111-8111-111111111111", groupId: "work", objective: "Review alpha" }), true);
   assert.equal(guard.missionAllowed({ requestId: "11111111-1111-4111-8111-111111111111", groupId: "foreign", objective: "Review alpha" }), false);
   assert.equal(guard.missionAllowed({ requestId: "11111111-1111-4111-8111-111111111111", groupId: "work", checkouts: ["foreign"], objective: "Review alpha" }), false);
+});
+
+test("a configured Slack surface with no workspace scope fails closed", () => {
+  const current = setup();
+  const config = { ...current.config, intake: { ...current.config.intake!, slack: { ...current.config.intake!.slack!, organizationScope: undefined } } } as unknown as Config;
+  const guard = createIntakeAudienceGuard({ config, groups: { get: () => current.group }, git: () => undefined, realpath: path => path });
+  const request = { requestId: "11111111-1111-4111-8111-111111111111", groupId: "work", objective: "Review alpha" };
+
+  assert.deepEqual([guard.workspacesAllowed(), guard.missionAllowed(request)], [false, false]);
+});
+
+test("a sealed intake record is usable only for its exact Slack audience and mission identity", () => {
+  const current = setup();
+  const audienceId = slackAudienceIdentity(current.config)!;
+  const record = {
+    issueId: "11111111-1111-4111-8111-111111111111", identifier: "TEST-1", url: "https://example.invalid/issue",
+    title: "Review alpha", description: "Review alpha", issueCreatedAt: "2026-01-01T00:00:00.000Z",
+    issueUpdatedAt: "2026-01-01T00:00:00.000Z", state: "started", rule: "owner request", missionId: "mission-1",
+    slackAudienceId: audienceId, comments: {}, messages: [], questions: [], inbound: [], createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z",
+  } as IntakeRecord;
+  const mission = { id: "mission-1", groupId: "work", repoProjectIds: ["alpha"] } as Mission;
+  assert.equal(current.guard.recordAllowed(record, mission), true);
+  assert.equal(current.guard.recordAllowed(record, { ...mission, groupId: "foreign" }), false,
+    "A valid digest cannot authorize a mission that belongs to another group");
+
+  current.config.intake!.mission.groupId = "another-group";
+  assert.equal(current.guard.recordAllowed(record, mission), false,
+    "Reconfiguring the approved group invalidates the sealed record without changing its audit copy");
+  assert.equal(record.slackAudienceId, audienceId);
+});
+
+test("an intake replay is checked against the current workspace before looking up a prior mission", async () => {
+  const { guard, config, group } = setup();
+  let replayChecks = 0;
+  const missions = {
+    replayCreate: () => { replayChecks += 1; return { id: "old-mission" }; },
+    create: () => { throw new Error("a replay must not create a mission"); },
+  } as any;
+  const creator = createIntakeMissionCreator({ config, missions, groups: { get: () => group }, audience: guard, assertNoHandoff: () => {} });
+  await assert.rejects(creator({ requestId: "11111111-1111-4111-8111-111111111111", groupId: "foreign", objective: "Review alpha" },
+    { kind: "intake", issueId: "22222222-2222-4222-8222-222222222222", identifier: "TEST-1", url: "https://example.invalid/issue", rule: "owner request" }),
+  (error: unknown) => error instanceof Error && error.message.includes("outside the configured Slack workspace"));
+  assert.equal(replayChecks, 0, "An out-of-audience replay never reaches mission lookup");
+});
+
+test("removing Slack keeps old Slack-linked records inert while no-Slack intake records remain usable", () => {
+  const current = setup();
+  const record = {
+    issueId: "11111111-1111-4111-8111-111111111111", identifier: "TEST-1", url: "https://example.invalid/issue",
+    title: "Review alpha", description: "Review alpha", issueCreatedAt: "2026-01-01T00:00:00.000Z",
+    issueUpdatedAt: "2026-01-01T00:00:00.000Z", state: "started", rule: "owner request", missionId: "mission-1",
+    slackAudienceId: slackAudienceIdentity(current.config), thread: { channelId: "C0000000000", threadTs: "1.000001" },
+    comments: {}, messages: [], questions: [], inbound: [], createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z",
+  } as IntakeRecord;
+  const linearOnly = { ...record, slackAudienceId: undefined, thread: undefined, direct: undefined } as IntakeRecord;
+  const noSlack = { intake: { mission: { groupId: "work" } } } as unknown as Config;
+
+  assert.equal(intakeRecordAudienceAllowed(noSlack, record), false, "Removing Slack never reclassifies its sealed records as Linear-only");
+  assert.equal(intakeRecordAudienceAllowed(noSlack, linearOnly), true, "A record admitted without Slack remains usable independently");
+});
+
+test("a scoped connector mission is not constrained by the Slack intake group", async () => {
+  const { guard, config, group } = setup();
+  let created = false;
+  const missions = {
+    replayCreate: () => undefined,
+    create: (request: { groupId: string }, _original: unknown, _origin: unknown, authorize?: () => void) => {
+      authorize?.();
+      created = request.groupId === "connector-group";
+      return Promise.resolve({ id: "connector-mission" });
+    },
+  } as any;
+  const connectorGroup = { ...group, id: "connector-group" };
+  const creator = createIntakeMissionCreator({ config, missions, groups: { get: id => id === "connector-group" ? connectorGroup : group },
+    audience: guard, assertNoHandoff: () => {} });
+  await creator({ requestId: "11111111-1111-4111-8111-111111111111", groupId: "connector-group", objective: "Review alpha" },
+    { kind: "intake", issueId: "22222222-2222-4222-8222-222222222222", identifier: "TEST-1", url: "https://example.invalid/issue", rule: "connector grant",
+      source: { connectorId: "connector", requestId: "request" } as any });
+  assert.equal(created, true, "The connector's own scoped grant chooses its group independently of Slack intake");
 });
 
 test("audience is denied after repository identity or canonical checkout changes", () => {
@@ -93,10 +176,10 @@ test("remote-free GitHub checkouts must match the source service applied head", 
 
 test("a repository drift denies the composed Slack send before any actor reply is posted", async t => {
   const { guard, config } = setup();
-  const slack = await startSlackServer({ organizationScope: {} });
+  const slack = await startSlackServer();
   t.after(() => slack.close());
   const client = new SlackClient({ botTokenFile: slack.botTokenFile, appTokenFile: slack.appTokenFile, endpoint: slack.endpoint,
-    timeoutMs: 2000, teamId: slack.teamId, organizationScope: {}, workspaceAllowed: guard.workspacesAllowed });
+    timeoutMs: 2000, teamId: slack.teamId, organizationScope: config.intake!.slack!.organizationScope, workspaceAllowed: guard.workspacesAllowed });
   const thread = { channelId: "C0000000000", threadTs: "1700000000.000100" };
   await client.post(thread, "same-org reply", "audience:valid");
   assert.equal(slack.posts(thread).length, 1);

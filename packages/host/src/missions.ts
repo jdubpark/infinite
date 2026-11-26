@@ -381,10 +381,11 @@ export class MissionService {
   }
   resume(id: string, input: Action, source?: MissionInputSource, authorize?: () => void) { return this.action(id, "resume", { ...missionActionSchema.parse(input), ...(source === undefined ? {} : { source }) }, authorize); }
   cancel(id: string, input: Action, source?: MissionInputSource, authorize?: () => void) { return this.action(id, "cancel", { ...missionActionSchema.parse(input), ...(source === undefined ? {} : { source }) }, authorize); }
-  extend(id: string, input: { requestId: string; revision: number; minutes: number }): ReturnType<MissionService["resume"]> {
+  extend(id: string, input: { requestId: string; revision: number; minutes: number }, authorize?: () => void): ReturnType<MissionService["resume"]> {
     const body = missionExtendSchema.parse(input);
     return this.enqueue(id, () => {
       const stored = this.record(id), mission = stored.mission;
+      authorize?.();
       if (this.replay(stored, "extend", body)) return this.view(stored);
       const deadlineBlocked = mission.status === "blocked" && mission.stopReason === "deadline";
       if (!(live.has(mission.status) || mission.status === "paused" || deadlineBlocked))

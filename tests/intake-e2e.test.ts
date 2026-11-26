@@ -16,6 +16,7 @@ const OWNER = "U00000000", AGENT = "U11111111";
 const BINDING: IntakeThread = { channelId: "C0000000000", threadTs: "1700000000.000100" };
 
 const git = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, stdio: "ignore" });
+const gitOutput = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
 const slackLink = (thread: IntakeThread) => `https://example.slack.com/archives/${thread.channelId}/p${thread.threadTs.replace(".", "")}`;
 
 async function intakeHost(withSlack: boolean, options: {
@@ -32,8 +33,9 @@ async function intakeHost(withSlack: boolean, options: {
     git(path, "init", "--initial-branch=main");
     git(path, "add", "check.mjs");
     git(path, "-c", "user.name=Example Developer", "-c", "user.email=dev@example.invalid", "-c", "core.hooksPath=/dev/null", "commit", "-m", `Initial ${name}`);
-    return { id: name, path };
+    return { id: name, path, rootCommit: gitOutput(path, "rev-list", "--max-parents=0", "HEAD") };
   });
+  const workspacePins = repos.map(repo => ({ projectId: repo.id, path: repo.path, repository: null, rootCommit: repo.rootCommit }));
 
   const linear = await startIntakeLinearServer();
   const slack = withSlack ? await startSlackServer() : undefined;
@@ -48,7 +50,8 @@ async function intakeHost(withSlack: boolean, options: {
       ...(slack ? { slack: { appTokenFile: slack.appTokenFile, botTokenFile: slack.botTokenFile, teamId: "T00000000", ownerUserId: OWNER,
         linearAgentUserId: AGENT, bindByMention: false, endpoint: slack.endpoint, ...(direct ? { directRequests: true } : {}),
         ...(answerQuestions ? { answerQuestions: true } : {}), ...(requestChannelIds ? { requestChannelIds } : {}),
-        ...(ownerOnlyInJoinedChannels ? { ownerOnlyInJoinedChannels } : {}) } } : {}),
+        ...(ownerOnlyInJoinedChannels ? { ownerOnlyInJoinedChannels } : {}),
+        organizationScope: { workspaces: workspacePins.filter(pin => pin.projectId === "api") } } } : {}),
       mission: { groupId: "api", maxSubtasks: 8, maxMinutes: 30 },
       maxActive: 3,
       requireSlackThread: slack !== undefined,
@@ -105,6 +108,7 @@ test("a question reaches the thread and the owner's tagged reply answers it", { 
     const group = await host.fetchApi("/project-groups", "owner", { requestId: randomUUID(), name: "Shop", repos: ["api", "web"] });
     assert.equal(group.status, 200, JSON.stringify(group.body));
     host.config.intake!.mission.groupId = group.body.id;
+    host.config.intake!.slack!.organizationScope.workspaces = workspacePins;
 
     slack!.seedThread(BINDING, [{ user: OWNER, text: `<@${AGENT}> file this: which response format should the endpoint use?` }]);
     const issue = linear.file({ attachmentUrls: [slackLink(BINDING)] });
@@ -157,6 +161,7 @@ test("without a Slack block intake still starts missions and comments in Linear"
       "Infinite agent report: ready for review.",
     ]);
     assert.equal("slack" in body, false, "The API has no slack member without an intake Slack block");
+    assert.deepEqual((await host.fetchApi("/intake/workspace-scope", "owner")).body, { state: "unconfigured" });
   } finally {
     await world.close();
   }
@@ -180,6 +185,7 @@ test("a teammate proposes work and checks its progress while the owner runs the 
     const group = await host.fetchApi("/project-groups", "owner", { requestId: randomUUID(), name: "Shop", repos: ["api", "web"] });
     assert.equal(group.status, 200);
     host.config.intake!.mission.groupId = group.body.id;
+    host.config.intake!.slack!.organizationScope.workspaces = workspacePins;
     writeFileSync(join(receipts, "release-dispatch"), "go");
     writeFileSync(join(receipts, "release-web-question"), "go");
     await waitFor(async () => (await host.fetchApi("/intake")).body.slack?.connected, Boolean, 30_000);

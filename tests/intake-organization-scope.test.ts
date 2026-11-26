@@ -4,11 +4,13 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { IntakeStore } from "../packages/host/src/intake-store.js";
 import { IntakeLinear, parseSlackThreadLink, type IntakeIssue } from "../packages/host/src/intake-linear.js";
 import { IntakeService } from "../packages/host/src/intake.js";
+import { intakeRecordAudienceAllowed, slackAudienceIdentity } from "../packages/host/src/intake-audience.js";
 import { LinearService } from "../packages/host/src/linear.js";
 import { SlackError } from "../packages/host/src/slack-client.js";
 import type { Config } from "../packages/host/src/types.js";
 import type { IntakeRecord, IntakeThread, IntakeThreadReader, SlackThreadMessage } from "../packages/host/src/intake-types.js";
-import { missionHarness } from "./mission-harness.js";
+import type { Mission } from "../packages/host/src/mission-types.js";
+import { git, missionHarness } from "./mission-harness.js";
 import { startIntakeLinearServer, type IntakeFixtureIssue } from "./fixtures/intake-linear-server.js";
 
 const OWNER = "U00000000", BOT = "U11111111";
@@ -41,17 +43,19 @@ async function setup(options: { requireSlackThread?: boolean; answerQuestions?: 
       linear: { teamIds: [linearServer.teamId], creatorId: linearServer.ownerId, label: "infinite", commentsMirrorToSlack: false },
       slack: { appTokenFile: "/srv/infinite-data/slack-app-token", botTokenFile: "/srv/infinite-data/slack-bot-token", teamId: "T00000000",
         ownerUserId: OWNER, linearAgentUserId: BOT, bindByMention: false, directRequests: true, answerQuestions: options.answerQuestions ?? false,
-        organizationScope: {} },
+        organizationScope: { workspaces: target.projects.map(project => ({ projectId: project.id, path: project.path, repository: null,
+          rootCommit: git(project.path, "rev-list", "--max-parents=0", "HEAD") })) } },
       mission: { groupId: "shop", maxSubtasks: 8, maxMinutes: 30 }, maxActive: 3,
       requireSlackThread: options.requireSlackThread ?? true,
     };
   } });
   const { missions } = harness.open();
   const key = randomBytes(32), store = new IntakeStore(config, key);
+  const audience = { recordAllowed: (item: IntakeRecord, mission?: Mission) => intakeRecordAudienceAllowed(config, item, mission) };
   const enabled = Date.parse(store.enabledAt());
   const linear = new LinearService(config, randomBytes(32));
   const service = (client = new IntakeLinear(linear)) => new IntakeService(config, store, missions, client, {
-    threads, pollMs: 3600000, create: (request, origin) => missions.create(request, undefined, origin),
+    threads, audience, pollMs: 3600000, create: (request, origin) => missions.create(request, undefined, origin),
   });
   const intake = service();
   const addThread = (offset: number) => {
@@ -64,7 +68,7 @@ async function setup(options: { requireSlackThread?: boolean; answerQuestions?: 
     return linearServer.file({ createdAt: new Date(enabled + 3000).toISOString(), attachmentUrls: [thread.link], ...overrides });
   };
   return {
-    config, threads, store, enabled, missions, linear, linearServer, intake, service, issue,
+    config, threads, store, enabled, missions, linear, linearServer, intake, service, issue, audience,
     close: async () => { intake.close(); linear.close(); await linearServer.close(); await harness.close(); },
   };
 }
@@ -75,10 +79,10 @@ function direct(ctx: Awaited<ReturnType<typeof setup>>, text = "Export fails on 
   return { thread, ts, eventId: `Ev${randomUUID().slice(0, 8)}`, text };
 }
 
-function record(issue: IntakeIssue, thread: IntakeThread, comments: IntakeRecord["comments"] = {}): IntakeRecord {
+function record(issue: IntakeIssue, thread: IntakeThread, comments: IntakeRecord["comments"] = {}, missionId = randomUUID(), slackAudienceId?: string): IntakeRecord {
   const now = new Date().toISOString();
   return { issueId: issue.id, identifier: issue.identifier, url: issue.url, title: issue.title, description: issue.description,
-    issueCreatedAt: issue.createdAt, issueUpdatedAt: issue.updatedAt, state: "started", rule: "owner Slack request", missionId: randomUUID(),
+    ...(slackAudienceId ? { slackAudienceId } : {}), issueCreatedAt: issue.createdAt, issueUpdatedAt: issue.updatedAt, state: "started", rule: "owner Slack request", missionId,
     thread, comments, messages: [], questions: [], inbound: [], createdAt: now, updatedAt: now };
 }
 
@@ -154,7 +158,8 @@ test("Linear comment outbox rechecks Slack grant and current allowed team before
   const issue = ctx.linearServer.file({ createdAt: new Date(ctx.enabled + 4000).toISOString() });
   const thread = { channelId: "C0000000000", threadTs: "1700000000.000100" };
   const receipt = { id: randomUUID(), body: "Started receipt", delivered: false, attempts: 0 };
-  ctx.store.create(record(issue, thread, { started: receipt }));
+  const { id } = await ctx.h.create("Outbox test mission");
+  ctx.store.create(record(issue, thread, { started: receipt }, id, slackAudienceIdentity(ctx.config)));
   const linear = new IntakeLinear(ctx.linear), getStates = linear.states.bind(linear);
   let calls = 0;
   linear.states = async ids => {

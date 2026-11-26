@@ -12,6 +12,7 @@ import type { ConnectorSource } from "./mcp-types.js";
 import { reportName } from "./config.js";
 import type { Config } from "./types.js";
 import { ROUTE_INPUT_LIMIT, decideRoute, explicitRoute, type RouteReading } from "./intake-route.js";
+import { intakeRecordAudienceAllowed, intakeRecordAudienceIdentityMatches, slackAudienceIdentity } from "./intake-audience.js";
 
 const objectiveLimit = 24000, descriptionLimit = 12000, threadUnreadableMs = 60 * 60 * 1000;
 const omissionReserve = 40;
@@ -228,8 +229,19 @@ export class IntakeService {
   private readonly log: (line: string, error: unknown) => void;
   private readonly pollMs: number;
   private readonly pendingMentions = new Map<string, string>();
+  private recordAudienceAllowed(record: IntakeRecord): boolean {
+    if (!intakeRecordAudienceIdentityMatches(this.config, record)) return false;
+    const mission = record.missionId ? this.missions.peek(record.missionId) : undefined;
+    if (this.config.intake?.slack) return this.options.audience?.recordAllowed(record, mission) ?? false;
+    return intakeRecordAudienceAllowed(this.config, record, mission);
+  }
+
+  private requireRecordAudience(record: IntakeRecord): void {
+    if (!this.recordAudienceAllowed(record)) throw new SlackError("organization_scope_denied", false);
+  }
+
   private async organizationSourceAllowed(thread: IntakeThread | undefined): Promise<boolean> {
-    if (!thread || !this.config.intake?.slack?.organizationScope) return true;
+    if (!thread || !this.config.intake?.slack) return true;
     const check = this.options.threads?.organizationChannelAllowed;
     return check ? check.call(this.options.threads, thread.channelId) : false;
   }
@@ -246,7 +258,8 @@ export class IntakeService {
     private readonly missions: MissionService,
     private readonly linear: IntakeLinear,
     private readonly options: { threads?: IntakeThreadReader; pollMs?: number; create?: (request: CreateMission, origin: MissionOrigin, authorize?: () => void) => Promise<Mission>; log?: (line: string, error: unknown) => void;
-      router?: (text: string) => Promise<RouteReading | undefined>; routeWaitMs?: number } = {},
+      router?: (text: string) => Promise<RouteReading | undefined>; routeWaitMs?: number;
+      audience?: { recordAllowed(record: IntakeRecord, mission?: Mission): boolean } } = {},
   ) {
     this.pollMs = options.pollMs ?? 30000;
     this.log = options.log ?? ((line, error) => console.warn(line, error));
@@ -285,7 +298,9 @@ export class IntakeService {
 
   requestFromSlack(input: { thread: IntakeThread; ts: string; eventId: string; text: string; entrypoint?: "channel-message" }): "accepted" | "duplicate" {
     if (!this.enabled() || this.closed) return "duplicate";
-    if (this.store.list().some(record => record.direct && (record.direct.eventId === input.eventId
+    const slackAudienceId = slackAudienceIdentity(this.config);
+    if (!slackAudienceId) return "duplicate";
+    if (this.store.list().some(record => this.recordAudienceAllowed(record) && record.direct && (record.direct.eventId === input.eventId
       || (record.direct.ts === input.ts && record.thread?.channelId === input.thread.channelId)))) return "duplicate";
     const slack = this.config.intake?.slack;
     const explicit = slack?.answerQuestions ? explicitRoute(input.text) : undefined;
@@ -297,7 +312,7 @@ export class IntakeService {
     const issueId = this.pendingMentions.get(mention) ?? randomUUID();
     this.pendingMentions.set(mention, issueId);
     this.store.create({
-      issueId, identifier: "", url: "", title: (firstLine ?? "Request from a Slack thread").slice(0, 120),
+      issueId, identifier: "", url: "", slackAudienceId, title: (firstLine ?? "Request from a Slack thread").slice(0, 120),
       description: text.trim().slice(0, descriptionLimit), issueCreatedAt: now, issueUpdatedAt: now,
       state: "queued", thread: input.thread,
       direct: { eventId: input.eventId, ts: input.ts, text, ...(input.entrypoint ? { entrypoint: input.entrypoint } : {}), ...(slack?.answerQuestions ? { routable: true as const } : {}), ...(explicit ? { route: { kind: explicit.route, by: "owner" as const, at: now } } : {}) },
@@ -312,7 +327,7 @@ export class IntakeService {
   }
 
   list(): IntakeView[] {
-    return this.store.list().map(record => {
+    return this.store.list().filter(record => this.recordAudienceAllowed(record)).map(record => {
       const started = record.comments.started, outcome = record.comments.outcome;
       return {
         issueId: record.issueId, identifier: record.identifier, url: record.url, title: record.title, state: record.state,
@@ -342,6 +357,7 @@ export class IntakeService {
     this.reopenScan = false;
     for (const record of this.store.list())
       if (record.state === "started" || reopening && record.state === "finished") {
+        if (!this.recordAudienceAllowed(record)) continue;
         const mission = this.missions.peek(record.missionId);
         if (mission) this.observe(mission);
       }
@@ -377,7 +393,8 @@ export class IntakeService {
   }
 
   private async file(): Promise<void> {
-    for (const record of this.store.list().filter(item => item.state === "queued" && item.external && !item.external.filedAt)) {
+    for (const record of this.store.list().filter(item => item.state === "queued" && item.external && !item.external.filedAt
+      && this.recordAudienceAllowed(item))) {
       if (this.closed) return;
       try { await this.fileExternal(record); }
       catch (error) {
@@ -385,10 +402,11 @@ export class IntakeService {
         this.hold(record.issueId, "External tracking or scope is unavailable.");
       }
     }
-    for (const record of this.store.list().filter(item => item.state === "queued" && item.direct && !item.request
+    for (const record of this.store.list().filter(item => item.state === "queued" && item.direct && !item.request && this.recordAudienceAllowed(item)
       && (item.direct.route !== undefined || !item.direct.routable))) {
       if (this.closed) return;
       try {
+        this.requireRecordAudience(record);
         await this.requireOrganizationSource(record.thread);
         await (isAnswerRecord(record) ? this.prepareAnswer(record) : this.fileRecord(record));
       }
@@ -405,10 +423,12 @@ export class IntakeService {
   private async route(): Promise<void> {
     const slack = this.config.intake?.slack;
     const router = slack?.answerQuestions && slack.classify ? this.options.router : undefined;
-    const pending = this.store.list().filter(item => item.direct?.routable === true && !item.request && !item.direct.route);
+    const pending = this.store.list().filter(item => item.direct?.routable === true && !item.request && !item.direct.route
+      && this.recordAudienceAllowed(item));
     for (const record of pending) {
       if (this.closed) return;
       try {
+        this.requireRecordAudience(record);
         await this.requireOrganizationSource(record.thread);
         const text = record.direct!.text.trim().slice(0, ROUTE_INPUT_LIMIT);
         const reading = router && text !== "" ? await this.reading(router, text) : undefined;
@@ -438,6 +458,7 @@ export class IntakeService {
   }
 
   private async prepareAnswer(record: IntakeRecord): Promise<void> {
+    this.requireRecordAudience(record);
     const intake = this.config.intake!;
     const direct = record.direct!, thread = record.thread!;
     if (!this.options.threads) throw new Error("No Slack thread reader is configured.");
@@ -464,6 +485,7 @@ export class IntakeService {
   }
 
   private async fileExternal(record: IntakeRecord): Promise<void> {
+    this.requireRecordAudience(record);
     this.admitExternal(record);
     const intake = this.config.intake!;
     const teamId = intake.linear.teamIds[0];
@@ -481,6 +503,7 @@ export class IntakeService {
   }
 
   private async fileRecord(record: IntakeRecord): Promise<void> {
+    this.requireRecordAudience(record);
     const intake = this.config.intake!;
     const direct = record.direct!, thread = record.thread!;
     if (!this.options.threads) throw new Error("No Slack thread reader is configured.");
@@ -543,7 +566,7 @@ export class IntakeService {
       messages = read;
     } else if (issue.thread && this.options.threads) {
       messages = await this.readBackground(issue.thread);
-      if (intake.slack?.organizationScope && messages === undefined) return;
+      if (intake.slack && messages === undefined) return;
     }
     const thread = messages !== undefined ? issue.thread : undefined;
     await this.requireOrganizationSource(thread);
@@ -553,6 +576,7 @@ export class IntakeService {
       ...(intake.requireSlackThread ? ["owner Slack mention"] : []),
     ].join(", ");
     const now = new Date().toISOString();
+    const slackAudienceId = slackAudienceIdentity(this.config);
     const request: CreateMission = {
       requestId: missionRequestId(issue.id),
       groupId: intake.mission.groupId,
@@ -562,7 +586,7 @@ export class IntakeService {
       maxMinutes: intake.mission.maxMinutes,
     };
     this.store.create({
-      ...this.facts(issue), state: "queued", rule, ...(thread ? { thread } : {}), request,
+      ...this.facts(issue), ...(slackAudienceId ? { slackAudienceId } : {}), state: "queued", rule, ...(thread ? { thread } : {}), request,
       comments: {}, messages: [], questions: [], inbound: [], createdAt: now, updatedAt: now,
     });
   }
@@ -584,7 +608,8 @@ export class IntakeService {
 
   private skip(issue: IntakeIssue, reason: IntakeSkipReason): void {
     const now = new Date().toISOString();
-    this.store.create({ ...this.facts(issue), title: "", description: "", state: "skipped", skipReason: reason, comments: {}, messages: [], questions: [], inbound: [], createdAt: now, updatedAt: now });
+    const slackAudienceId = slackAudienceIdentity(this.config);
+    this.store.create({ ...this.facts(issue), ...(slackAudienceId ? { slackAudienceId } : {}), title: "", description: "", state: "skipped", skipReason: reason, comments: {}, messages: [], questions: [], inbound: [], createdAt: now, updatedAt: now });
   }
 
   private facts(issue: IntakeIssue): Pick<IntakeRecord, "issueId" | "identifier" | "url" | "title" | "description" | "issueCreatedAt" | "issueUpdatedAt"> {
@@ -599,6 +624,7 @@ export class IntakeService {
     for (const record of records) {
       if (record.state !== "queued" || !record.request || !record.rule || (record.external && !record.external.filedAt)) continue;
       if (this.closed) return;
+      if (!this.recordAudienceAllowed(record)) continue;
       const answer = isAnswerRecord(record);
       if (!answer && slots <= 0) { this.hold(record.issueId, "max-active"); continue; }
       try {
@@ -658,7 +684,7 @@ export class IntakeService {
     const stopped = deadlineStopped(mission);
     if (!stopped && !finishedStatuses.has(mission.status)) return;
     const record = this.store.forMission(mission.id);
-    if (!record || record.state !== "started") return;
+    if (!record || record.state !== "started" || !this.recordAudienceAllowed(record)) return;
     if (stopped) {
       this.observeDeadline(record, mission);
       return;
@@ -672,7 +698,7 @@ export class IntakeService {
 
   private reopen(mission: Mission): void {
     const record = this.store.forMission(mission.id);
-    if (record?.state !== "finished") return;
+    if (record?.state !== "finished" || !this.recordAudienceAllowed(record)) return;
     try { this.store.update(record.issueId, next => { next.state = "started"; }); }
     catch (error) { this.reopenScan = true; this.fail("observe", error, record.identifier); }
   }
@@ -693,7 +719,7 @@ export class IntakeService {
 
   private async watch(): Promise<void> {
     const watched = this.store.list().filter((record): record is Extract<IntakeRecord, { state: "started" | "finished" }> =>
-      record.state === "started" && record.closure === undefined && !isAnswerRecord(record));
+      record.state === "started" && record.closure === undefined && !isAnswerRecord(record) && this.recordAudienceAllowed(record));
     if (watched.length === 0) return;
     let states: Map<string, IntakeIssue | "deleted">;
     try { states = await this.linear.states(watched.map(record => record.issueId)); }
@@ -705,6 +731,7 @@ export class IntakeService {
   }
 
   private async watchRecord(record: Extract<IntakeRecord, { state: "started" | "finished" }>, current: IntakeIssue | "deleted" | undefined): Promise<void> {
+    this.requireRecordAudience(record);
     if (current === undefined) return;
     if (current !== "deleted") {
       if (record.tracked === undefined && (record.direct || record.external) && !record.editNotedAt) {
@@ -734,12 +761,13 @@ export class IntakeService {
 
   private async deliver(): Promise<void> {
     for (const record of this.store.list()) {
+      if (!this.recordAudienceAllowed(record)) continue;
       for (const kind of ["started", "outcome"] as const) {
         if (this.closed) return;
         const pending = record.comments[kind];
         if (!pending || pending.delivered) continue;
         try {
-          if (record.thread && this.config.intake!.slack?.organizationScope) {
+          if (record.thread && this.config.intake!.slack) {
             if (!await this.organizationSourceAllowed(record.thread)) continue;
             const current = (await this.linear.states([record.issueId])).get(record.issueId);
             if (!current || current === "deleted" || !this.config.intake!.linear.teamIds.includes(current.teamId)) continue;

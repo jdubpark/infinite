@@ -4,7 +4,11 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { WebSocket, WebSocketServer } from "ws";
-import type { IntakeThread } from "../../packages/host/src/intake-types.js";
+import type { Config } from "../../packages/host/src/types.js";
+import { intakeRecordAudienceAllowed, slackAudienceIdentity } from "../../packages/host/src/intake-audience.js";
+import type { IntakeRecord, IntakeThread } from "../../packages/host/src/intake-types.js";
+import type { Mission } from "../../packages/host/src/mission-types.js";
+import { SlackClient } from "../../packages/host/src/slack-client.js";
 
 interface StoredMessage {
   channel: string; threadTs: string; ts: string; text: string;
@@ -18,6 +22,19 @@ const toMicros = (ts: string) => {
   return Number(seconds) * 1_000_000 + Number(fraction.padEnd(6, "0").slice(0, 6));
 };
 const fromMicros = (micros: number) => `${Math.floor(micros / 1_000_000)}.${String(micros % 1_000_000).padStart(6, "0")}`;
+
+export function slackAudienceFixture(groupId = "shop", teamId = "T00000000", ownerUserId = "U00000000") {
+  const scope = { workspaces: [
+    { projectId: "api", path: "/data/instances/work/api", repository: "Example/api" },
+    { projectId: "web", path: "/data/instances/work/web", repository: "Example/web" },
+  ] };
+  const config = { intake: { mission: { groupId }, slack: { teamId, ownerUserId, organizationScope: scope } } } as unknown as Config;
+  return { scope, identity: slackAudienceIdentity(config)! };
+}
+
+export const testIntakeAudience = (config: Config) => ({
+  recordAllowed: (record: IntakeRecord, mission?: Mission) => intakeRecordAudienceAllowed(config, record, mission),
+});
 
 export async function startSlackServer(options: { teamId?: string; botUserId?: string } = {}) {
   const teamId = options.teamId ?? "T00000000", botUserId = options.botUserId ?? "U00000001", botId = "B00000000";
@@ -228,6 +245,11 @@ export async function startSlackServer(options: { teamId?: string; botUserId?: s
     },
   };
 }
+
+export const slackClientForFixture = (slack: Awaited<ReturnType<typeof startSlackServer>>) => new SlackClient({
+  botTokenFile: slack.botTokenFile, appTokenFile: slack.appTokenFile, endpoint: slack.endpoint, timeoutMs: 2000,
+  teamId: "T00000000", organizationScope: slackAudienceFixture().scope, workspaceAllowed: () => true,
+});
 
 function bearer(request: IncomingMessage) {
   return (request.headers.authorization ?? "").replace(/^Bearer\s+/, "");

@@ -52,7 +52,7 @@ export class SlackClient implements IntakeThreadReader {
   private readonly endpoint: string;
 
   constructor(private readonly options: { botTokenFile: string; appTokenFile: string; endpoint?: string; timeoutMs?: number;
-    teamId?: string; organizationScope?: SlackOrganizationScope; workspaceAllowed?: () => boolean }) {
+    teamId: string; organizationScope: SlackOrganizationScope; workspaceAllowed: () => boolean }) {
     this.endpoint = (options.endpoint ?? DEFAULT_ENDPOINT).replace(/\/+$/, "");
   }
 
@@ -66,8 +66,8 @@ export class SlackClient implements IntakeThreadReader {
 
   async organizationChannelAllowed(channelId: string): Promise<boolean> {
     const scope = this.options.organizationScope;
-    if (!scope) return true;
-    if (this.options.workspaceAllowed && !this.options.workspaceAllowed()) return false;
+    const workspaceAllowed = this.options.workspaceAllowed;
+    if (!scope?.workspaces?.length || typeof workspaceAllowed !== "function" || !workspaceAllowed()) return false;
     const teamId = this.options.teamId;
     if (!teamId || (scope.channelIds !== undefined && !scope.channelIds.includes(channelId))) return false;
     let data: Record<string, any>;
@@ -80,7 +80,7 @@ export class SlackClient implements IntakeThreadReader {
     if (!isRecord(channel)) return false;
     const channelType = (channel.is_channel === true && channel.is_group === false && channel.is_private === false)
       || (channel.is_group === true && channel.is_channel === false && channel.is_private === true);
-    return (!this.options.workspaceAllowed || this.options.workspaceAllowed())
+    return workspaceAllowed()
       && channel.id === channelId && channelType
       && channel.is_im === false && channel.is_mpim === false
       && channel.context_team_id === teamId

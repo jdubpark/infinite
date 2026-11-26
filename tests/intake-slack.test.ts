@@ -17,7 +17,7 @@ import type { MissionService } from "../packages/host/src/missions.js";
 import type { TeamService } from "../packages/host/src/teams.js";
 import type { Mission, MissionReport, MissionSubtaskPlan } from "../packages/host/src/mission-types.js";
 import type { TeamPublication } from "../packages/host/src/team-types.js";
-import { startSlackServer } from "./fixtures/slack-server.js";
+import { slackAudienceFixture, slackClientForFixture as slackClient, startSlackServer, testIntakeAudience } from "./fixtures/slack-server.js";
 
 const delay = (ms: number) => new Promise(done => setTimeout(done, ms));
 const OWNER = "U00000000", TEAMMATE = "U00000002", BOT = "U00000001";
@@ -25,6 +25,7 @@ const BINDING: IntakeThread = { channelId: "C0000000000", threadTs: "1700000000.
 const OTHER: IntakeThread = { channelId: "C0000000001", threadTs: "1700000000.000200" };
 const THIRD: IntakeThread = { channelId: "C0000000002", threadTs: "1700000000.000300" };
 const PROJECT_PATH = "/data/instances/work/api";
+const { scope: TEST_SCOPE, identity: TEST_AUDIENCE_ID } = slackAudienceFixture();
 const ISSUE = randomUUID();
 const NOW = new Date().toISOString();
 const ACK = 'Started on TEST-1 "Export fails on empty rows". I\'ll post questions and the result here.\nReply with a mention to answer or steer.';
@@ -46,7 +47,7 @@ const origin = (issueId: string): MissionOrigin => ({
 });
 
 function intakeRecord(issueId: string, state: IntakeRecord["state"], extra: Record<string, unknown> = {}): IntakeRecord {
-  const base = { issueId, identifier: "TEST-1", url: "https://linear.example.invalid/issue/TEST-1", title: "Export fails on empty rows",
+  const base = { issueId, identifier: "TEST-1", url: "https://linear.example.invalid/issue/TEST-1", slackAudienceId: TEST_AUDIENCE_ID, title: "Export fails on empty rows",
     description: "Rows with no values fail the export.", issueCreatedAt: NOW, issueUpdatedAt: NOW, comments: {}, messages: [], questions: [], inbound: [], createdAt: NOW, updatedAt: NOW };
   if (state === "skipped") return { ...base, ...extra, state, skipReason: "creator-mismatch" } as IntakeRecord;
   if (state === "queued") return { ...base, ...extra, state } as IntakeRecord;
@@ -60,17 +61,19 @@ async function surfaceFor(services: Services, stateRoot: string, options: { bind
   directRequests?: boolean; direct?: (store: IntakeStore) => DirectRequest } = {}) {
   const slack = await startSlackServer({ teamId: options.serverTeamId });
   for (const thread of [BINDING, OTHER]) slack.seedThread(thread, [{ user: OWNER, text: "Export fails on empty rows" }]);
-  const realClient = new SlackClient({ botTokenFile: slack.botTokenFile, appTokenFile: slack.appTokenFile, endpoint: slack.endpoint, timeoutMs: 2000 });
+  const realClient = slackClient(slack);
   const client = options.wrapClient ? options.wrapClient(realClient) : realClient;
   const config = { stateDir: join(stateRoot, "intake"), runDir: join(stateRoot, "run"), projects: [{ id: "api", name: "API", path: PROJECT_PATH }], intake: {
     linear: { teamIds: [randomUUID()], creatorId: randomUUID(), label: "infinite", commentsMirrorToSlack: false },
     slack: { appTokenFile: slack.appTokenFile, botTokenFile: slack.botTokenFile, teamId: "T00000000", ownerUserId: OWNER,
-      bindByMention: options.bindByMention ?? false, endpoint: slack.endpoint, ...(options.directRequests !== undefined ? { directRequests: options.directRequests } : {}) },
+      bindByMention: options.bindByMention ?? false, endpoint: slack.endpoint, organizationScope: TEST_SCOPE,
+      ...(options.directRequests !== undefined ? { directRequests: options.directRequests } : {}) },
     mission: { groupId: "shop", maxSubtasks: 8, maxMinutes: 30 }, maxActive: 3, requireSlackThread: true,
   } } as unknown as Config;
   const store = new IntakeStore({ stateDir: join(stateRoot, "intake") } as Config, randomBytes(32));
   const surface = new IntakeSlackSurface(config, store, services.missions, services.teams, client,
-    { log: options.log ?? collector().log, ...(options.direct ? { direct: options.direct(store) } : {}) });
+    { log: options.log ?? collector().log, audience: testIntakeAudience(config),
+      ...(options.direct ? { direct: options.direct(store) } : {}) });
   return {
     slack, store, surface, client, realClient, config,
     texts: (binding: IntakeThread = BINDING) => slack.posts(binding).map(post => post.text),
@@ -165,15 +168,15 @@ test("decision controls commit only on valid submit and denial keeps the questio
     const slack = await startSlackServer();
     const config = { stateDir: join(h.root, `state-${mode}`), runDir: join(h.root, `run-${mode}`), projects: [{ id: "api", name: "API", path: PROJECT_PATH }], intake: {
       linear: { teamIds: [randomUUID()], creatorId: randomUUID(), label: "infinite", commentsMirrorToSlack: false },
-      slack: { appTokenFile: slack.appTokenFile, botTokenFile: slack.botTokenFile, teamId: "T00000000", ownerUserId: OWNER, endpoint: slack.endpoint },
+      slack: { appTokenFile: slack.appTokenFile, botTokenFile: slack.botTokenFile, teamId: "T00000000", ownerUserId: OWNER, endpoint: slack.endpoint, organizationScope: TEST_SCOPE },
       mission: { groupId: "shop", maxSubtasks: 8, maxMinutes: 30 }, maxActive: 3, requireSlackThread: true,
     } } as unknown as Config;
     const stateKey = randomBytes(32);
     const store = new IntakeStore(config, stateKey);
     store.create(intakeRecord(ISSUE, "started", { thread: BINDING, missionId: services.mission.id }));
-    const client = new SlackClient({ botTokenFile: slack.botTokenFile, appTokenFile: slack.appTokenFile, endpoint: slack.endpoint, timeoutMs: 2000 });
+    const client = slackClient(slack);
     let restartedSurface: IntakeSlackSurface | undefined;
-    const surface = new IntakeSlackSurface(config, store, services.missions, { get: () => { throw new Error("unused"); } } as unknown as TeamService, client);
+    const surface = new IntakeSlackSurface(config, store, services.missions, { get: () => { throw new Error("unused"); } } as unknown as TeamService, client, { audience: testIntakeAudience(config) });
     await surface.start(); await waitFor(async () => surface.status().connected, Boolean, 10000);
     await waitFor(async () => slack.posts(BINDING), posts => posts.some(post => post.text.includes("Choose the export behavior?")));
     const question = slack.posts(BINDING).find(post => post.text.includes("Choose the export behavior?"))!;
@@ -249,7 +252,7 @@ test("decision controls commit only on valid submit and denial keeps the questio
         surface.close();
         const restoredStore = new IntakeStore(config, stateKey);
         restartedSurface = new IntakeSlackSurface(config, restoredStore, services.missions, { get: () => { throw new Error("unused"); } } as unknown as TeamService,
-          new SlackClient({ botTokenFile: slack.botTokenFile, appTokenFile: slack.appTokenFile, endpoint: slack.endpoint, timeoutMs: 2000 }));
+          slackClient(slack), { audience: testIntakeAudience(config) });
         await restartedSurface.start(); await waitFor(async () => restartedSurface!.status().connected, Boolean, 10000);
         await slack.redeliver(submitted);
         await delay(200);
@@ -786,7 +789,7 @@ test("a post is marked uncertain before it is sent, so a crash inside the send i
     s.store.create(intakeRecord(ISSUE, "started", { thread: BINDING }));
     await s.surface.start();
     await waitFor(async () => died, done => done, 15000);
-    const second = new IntakeSlackSurface(s.config, s.store, sh.missions, sh.teams, s.realClient);
+    const second = new IntakeSlackSurface(s.config, s.store, sh.missions, sh.teams, s.realClient, { audience: testIntakeAudience(s.config) });
     await second.start();
     await waitFor(async () => s.store.get(ISSUE)!.messages[0]?.status, status => status === "sent", 20000);
     second.close();

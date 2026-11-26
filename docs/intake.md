@@ -313,7 +313,7 @@ The `intake` block is validated by `intakeConfigSchema` in
 | `slack.answerQuestions` | boolean, default `false` | Lets the owner's mention be a question that a read-only mission answers in the thread. Needs `slack.directRequests`. See [questions](#questions). |
 | `slack.classify` | boolean, default `false` | Lets the reading service choose the route when the mention has no `ask:` or `work:`. Needs `slack.answerQuestions` and the top-level `jev` block. An instance that wants only the route reading sets `jev.sessionReadings` to `false`. |
 | `slack.bindByMention` | boolean, default `false` | Binds a thread by a mention of an identifier. Cannot be used with `requireSlackThread`. |
-| `slack.organizationScope` | object, optional | Fail-closed channel and workspace isolation boundary (`#304`): optional `channelIds` allowlist (empty list denies all) plus required non-empty `workspaces` array pinning each checkout's canonical `path` and GitHub `repository` (or `null` with `rootCommit`). Re-verified live via Slack `conversations.info` (rejects IMs, MPIMs, shared/external/org-shared channels, and non-member channels) and exact 1:1 `mission.groupId` checkout checks before accepting events, reading threads, starting missions, or posting replies. See [secondary instances](../deploy/ubuntu/instances.md). |
+| `slack.organizationScope` | object, required with `slack` | Fail-closed channel and workspace isolation boundary (`#304`): optional `channelIds` allowlist (an empty list denies all; omission allows every otherwise verified internal channel) plus a required non-empty `workspaces` array pinning each checkout's canonical `path` and GitHub `repository` (or `null` with `rootCommit`). Re-verified live via Slack `conversations.info` (rejects IMs, MPIMs, shared/external/org-shared channels, and non-member channels) and exact 1:1 `mission.groupId` checkout checks before accepting events, reading threads, starting missions, or posting replies. Slack has no unscoped mode or compatibility flag. See [secondary instances](../deploy/ubuntu/instances.md). |
 | `slack.endpoint` | URL, optional | The Slack Web API base. Only the official HTTPS endpoint, or loopback HTTP when `environment` is `"local"`. |
 | `mission.groupId` | project group ID, required | The group new missions start in. A host project ID works as an alias. |
 | `mission.maxSubtasks` | integer 1 to 12, default `8` | The subtask limit for each mission. |
@@ -332,6 +332,22 @@ A record is bound to a Slack thread in one of two ways: the host read that threa
 successfully at admission, or the owner bound it with a mention when
 `bindByMention` is on. A linked thread that was not read, because the read failed
 or Slack refused it, is not bound, and the record's comments go to Linear.
+
+Every Slack-enabled host must pin a nonempty workspace audience. Each admitted
+record keeps an immutable digest of its Slack workspace, owner, configured
+mission group, workspace pins, and channel policy. Before reading, publishing,
+binding, replaying, or acting on a record, the host checks that digest and the
+linked mission's group and repository IDs against the current audience. When
+the audience changes, older records that cannot be proven stay sealed as audit
+evidence, are omitted from runtime intake views, and receive no automatic
+migration or inferred audience. Hosts without a Slack block continue to use
+Linear intake independently, and their `/api/intake/workspace-scope` state is
+`unconfigured`.
+
+On a Slack-enabled host, both ends of a cross-project context link must be
+pinned. Excluded links contribute no text or relationship to new sessions,
+including links between two unlisted projects because no shared enrollment is
+proven; hosts without Slack continue to use explicit owner-granted links.
 
 Without an `intake.slack` block, no thread is read or bound, so every record's
 comments go to Linear. `linear.commentsMirrorToSlack` without a Slack block is
@@ -512,7 +528,7 @@ it, so a lost response does not post a second comment. With
   Present only when `intake.slack` is configured. `dropped` counts inbound events
   that were refused, and `reason` says why the surface is not connected.
 
-`GET /api/intake/workspace-scope` (owner-only) returns HTTP 200 with `{ "state": "verified" | "blocked" | "unconfigured" }` by running `intakeAudience.workspacesAllowed()` against the configured `intake.mission.groupId` and `intake.slack.organizationScope.workspaces` checkout pins (plus `answerProjectId`). It checks only local checkout/workspace binding—it does not call Slack `conversations.info`, does not return mismatch details, and does not return `403` when `"blocked"`.
+`GET /api/intake/workspace-scope` (owner-only) returns HTTP 200 with `{ "state": "verified" | "blocked" | "unconfigured" }`. Slack-enabled hosts check `intake.mission.groupId` against the required workspace pins (plus `answerProjectId`); a host without Slack reports `unconfigured`. It checks only local checkout/workspace binding—it does not call Slack `conversations.info`, does not return mismatch details, and does not return `403` when `"blocked"`.
 
 Separately, live Slack channel and membership verification (`conversations.info`, rejecting IMs, MPIMs, shared/external/org-shared channels, non-allowlisted channels, and channels the bot has not joined, alongside `workspacesAllowed()`) runs during Slack event handling, thread reads, replies, and again before a queued thread-bound request files or starts a mission (`IntakeService.startQueued()` calls `requireOrganizationSource(record.thread)`, placing a queued request on hold if bot channel membership was lost). When starting a mission, the internal mission creator also enforces `organizationScope` checkout bounds and throws an internal `TeamError` (`403 intake-audience-denied`) on mismatch, which the intake queue catches to place the queued request on hold rather than returning an HTTP 403 directly to the Slack requester.
 

@@ -562,15 +562,19 @@ Slack surface:
   comes from that thread's records and contains counts and state. The host
   neither stores the teammate's proposal text on arrival nor sends their
   status request to a model. Channel membership grants no mission controls.
-- When `intake.slack.organizationScope` is configured (typically on dedicated
-  secondary instances; see [instances](../deploy/ubuntu/instances.md)), the host
-  additionally enforces fail-closed channel and workspace pins (`#304`): live
+- Every configured Slack intake requires `intake.slack.organizationScope`
+  with a nonempty workspace pin list (see
+  [instances](../deploy/ubuntu/instances.md)); there is no unscoped or
+  compatibility mode. The host enforces fail-closed channel and workspace pins
+  (`#304`): live
   Slack `conversations.info` checks confirm a single-workspace non-shared
   channel (`is_shared=false`, `shared_team_ids=[teamId]`, `is_member=true`) in
   the optional `channelIds` allowlist, and `createIntakeAudienceGuard` verifies
   an exact 1:1 canonical `realpath` and Git remote / root-commit match for every
   checkout in `intake.mission.groupId` (`GET /api/intake/workspace-scope`,
-  refusing mismatches with `403 intake-audience-denied`).
+  refusing mismatches with `403 intake-audience-denied`). Intake records are
+  bound to an immutable digest of that audience; a changed or unprovable record
+  cannot be read, delivered, rebound, replayed, or acted on by Slack intake.
 - The thread the issue links is read once, at admission. The objective keeps only
   the owner's own messages from it. Messages from anyone else, and bot messages,
   are read at admission to check authorship and are not stored, shown to agents,

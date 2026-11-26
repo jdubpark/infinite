@@ -9,6 +9,7 @@ struct AgentSession: Identifiable, Equatable {
     var project: String { value["projectId"].string }
     var path: String { value["cwd"].string }
     var status: String { value["status"].string }
+    var outputTailIncomplete: Bool { value["outputTailIncomplete"].bool }
     var attention: String { value["attention"]["state"].string }
     var now: String { value["attention"]["now"].string }
     var backend: String { value["backend"].string }

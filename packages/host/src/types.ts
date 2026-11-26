@@ -166,6 +166,7 @@ export interface Session {
   archivedAt?: string;
   pid?: number;
   exitCode?: number;
+  outputTailIncomplete?: true;
   projectRoot?: string;
   contextSources?: import("./project-context.js").ContextSource[];
   contextLinksVersion?: number;
@@ -330,6 +331,7 @@ export interface WorkerState {
   socketPath?: string;
   permissionSocketPath?: string;
   exitCode?: number;
+  outputTailIncomplete?: true;
   seq: number;
   screen: string;
   attention: Attention;

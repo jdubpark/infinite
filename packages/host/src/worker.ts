@@ -58,6 +58,7 @@ import { clearEgressEnvironment, workerEgressEnvironment } from "./egress.js";
 import { claudeConfigPath, recordClaudeTrustAsync } from "./workspace-trust.js";
 import { TerminalSnapshots } from "./terminal-snapshot.js";
 import { DEFAULT_TERMINAL_SIZE, isPtyTerminalSize, TERMINAL_SIZE_INDEX_FILE, TerminalBarrier, TerminalSizeIndex } from "./terminal-size.js";
+import { ptyTails } from "./pty-tail.js";
 import { startNativeCodex, validateNativeCodexArgs } from "./native-codex.js";
 import { startNativeOpenCode, validateNativeOpenCodeArgs } from "./native-opencode.js";
 import { createExecutorTunnel, type ExecutorTunnel } from "./executor-tunnel.js";
@@ -1644,6 +1645,7 @@ server.listen(workerSocket, async () => {
     };
     const onData = (data: string) => terminalBarrier.dispatch(() => output(data), Buffer.byteLength(data, "utf8"));
     child.onData(onData);
+    const tails = ptyTails(child, onData);
     const finalDrain = async () => {
       try {
         if (!hookServer || !transcriptWatch.reading) return;
@@ -1667,9 +1669,10 @@ server.listen(workerSocket, async () => {
       try {
         flush();
         controller = null;
-        state = { ...state, status: "exited", exitCode, control: null };
+        const tail = tails.marker();
+        state = { ...state, status: "exited", exitCode, control: null, ...tail };
         publish(applyLifecycle(attention, "exited", new Date().toISOString()));
-        append("lifecycle", { status: "exited", exitCode });
+        append("lifecycle", { status: "exited", exitCode, ...tail });
         persist();
       } catch {
         recordingFailure();
@@ -1701,6 +1704,7 @@ server.listen(workerSocket, async () => {
       sizeIndex.append(resumedEvent.seq, { cols: terminal.cols, rows: terminal.rows });
       persist();
       pty.onData(onData);
+      tails.track(pty);
       pty.onExit(onExit);
     };
     endSession = () => exited(0);

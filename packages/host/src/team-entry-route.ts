@@ -1,5 +1,6 @@
 import { canonicalJson } from "./evidence/crypto.js";
 import { getForMember, listForMember, readMemberScope, supersedeTarget, type MemberEntry, type MemberList } from "./evidence/entry-reads.js";
+import type { PendingEntry } from "./evidence/entry-types.js";
 import { MAX_ENTRY_BODY_BYTES, MAX_ENTRY_REQUEST_BYTES, memberEntryEnvelopeSchema, memberEntryId, postAllowed, refusalPath, type MemberEntryPost, type MemberScope } from "./evidence/member-entry.js";
 import type { EvidenceReader } from "./evidence/reader.js";
 import { findSecret, type SecretClass } from "./evidence/secret-scan.js";
@@ -8,12 +9,12 @@ import { ENTRY_ROLES } from "./entry-roles.js";
 import { HookPayloadError, type HookReply } from "./hooks.js";
 import type { TeamAssignment, TeamRole } from "./team-types.js";
 
+export type { PendingEntry } from "./evidence/entry-types.js";
+
 export const MAX_ATTEMPT_POSTS = 20;
 export const MAX_ATTEMPT_POST_BYTES = 64 * 1024;
 export const MAX_ATTEMPT_SERVED_BYTES = 256 * 1024;
 export const MAX_ATTEMPT_READ_CALLS = 200;
-
-export type PendingEntry = { entryId: string; state: "pending" };
 
 export type EntryRefusal = "entry-tools-off" | "entry-too-large" | "entry-invalid" | "entry-binding" | "entry-closed"
   | "entry-id-mismatch" | "entry-kind-forbidden" | "entry-task-forbidden" | "entry-supersede-forbidden" | "entry-secret"

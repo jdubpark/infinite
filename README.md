@@ -193,6 +193,8 @@ npm run check
 python3 scripts/cloud-check.py -- node --import tsx --test tests/chat.test.ts
 ```
 
+The failed-operation cleanup tests need their own process table so the host can see when the last command has ended. `npm test` runs them in a disposable, digest-pinned container on the enrolled Linux guest. Run this suite alone with `infinite-check -- node scripts/run-tests.mjs --team-operation-failure`.
+
 Each run transfers the current Git revision, staged and unstaged edits, deletions, and eligible nonignored untracked files into a disposable cloud checkout. Git history stops at the captured commit. Ignored inputs, credentials, Git remotes and unrelated refs stay outside the snapshot. The runner installs dependencies with `npm ci` from that checkout's lockfile. The receipt identifies the source snapshot, lockfile, platform, tool versions, and exit status. Concurrent calls use separate directories. Keep commands that share build output, a service, or a browser session in a single invocation.
 
 Run `python3 scripts/install-cloud-check.py` once to install `infinite-check` for older worktrees as well. Run it again when upgrading the launcher. `infinite-check -- COMMAND ARG...` snapshots the calling worktree, including when invoked from a subdirectory. A checkout that predates both toolchain pins uses the installed launcher's pins.

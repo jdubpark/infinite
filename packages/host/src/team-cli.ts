@@ -8,6 +8,7 @@ import { pipeline } from "node:stream/promises";
 import { z } from "zod";
 import { createTeamSchema, gitBranchSchema, githubRepositorySchema, teamDeliverySchema, teamDeliveryReconcileSchema, teamPermissionsSchema, type ProjectSource, type TeamDelivery, DEFAULT_PERMISSION_LIMIT, DEFAULT_PERMISSION_SCOPE} from "./team-types.js";
 import { describeSource } from "./client.js";
+import type { ClientApi as Api, ClientConfig } from "./client-api.js";
 import { assertRoutingSupport, requestedRouting, ROUTING_AUTO_NOTE } from "./routing-cli.js";
 import { autonomyModeSchema } from "./autonomy.js";
 import type { EntryPage } from "./evidence/blackboard.js";
@@ -18,13 +19,9 @@ import { uploadMissingChunks } from "./chunk-upload.js";
 import { localProjectPath } from "./mirrored-projects.js";
 import { readSyncState, stopSyncService, syncServiceRunning } from "./sync-service.js";
 import { openQuestionLines } from "./team-watch.js";
-import { runTeamWatch } from "./team-watch-board.js";
+import { askForBrief, runTeamWatch } from "./team-watch-board.js";
+export { askForBrief };
 
-type ClientConfig = { origin: string; token: string; projectId?: string };
-type Api = {
-  request(path: string, body?: unknown, signal?: AbortSignal, headers?: Record<string, string>, method?: string): Promise<Response>;
-  json<T>(path: string, body?: unknown, signal?: AbortSignal, headers?: Record<string, string>, method?: string): Promise<T>;
-};
 type Options = Record<string, string | boolean>;
 const commandSchema = z.object({ command: z.string().min(1).max(4096).refine(value => !value.includes("\0")), args: z.array(z.string().max(4096).refine(value => !value.includes("\0"))).max(64).default([]) }).strict();
 const projectConfigSchema = z.object({ setup: commandSchema.optional(), checks: z.array(commandSchema).max(8), establishChecks: z.literal(true).optional() }).strict();
@@ -436,7 +433,10 @@ function onboardingPermissionLine(agent: unknown): string | undefined {
 }
 
 const BATCH_TIMEOUT = 120000, CHUNK_TIMEOUT = 60000;
-const olderHost = (error: unknown) => (error as { status?: unknown; code?: unknown })?.status === 404 && (error as { code?: unknown }).code === undefined;
+export const olderHost = (error: unknown): boolean => {
+  const failure = error as { status?: unknown; code?: unknown } | null | undefined;
+  return failure?.status === 404 && (failure.code === "route-not-found" || failure.code === undefined);
+};
 async function uploadCommit(api: Api, projectId: string, root: string, commit: string, tempStore: string, captured: (manifestId: string) => void) {
   const detail = await api.json<any>(`/projects/${projectId}`);
   if (detail.sync?.pendingGeneration) throw new Error("The cloud project has a pending sync generation. Resolve it before capturing local source.");
@@ -461,8 +461,7 @@ async function uploadCommit(api: Api, projectId: string, root: string, commit: s
       },
       put: async (hash, bytes, signal) => { await (await api.request(`/projects/${projectId}/sync/blob/${hash}`, bytes, AbortSignal.any([signal, AbortSignal.timeout(CHUNK_TIMEOUT)]), octets, "PUT")).body?.cancel(); },
     } });
-    const commitResponse = await api.request(`/projects/${projectId}/sync/commit`, { generation, manifest }, AbortSignal.timeout(300000));
-    const committed = await commitResponse.json() as any;
+    const committed = await api.json<any>(`/projects/${projectId}/sync/commit`, { generation, manifest }, undefined, undefined, undefined, 300000);
     const current = await api.json<any>(`/projects/${projectId}`);
     return { manifestId: manifest.id, committed, sync: current.sync };
   } finally { rmSync(cloned, { recursive: true, force: true }); }

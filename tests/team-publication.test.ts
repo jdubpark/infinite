@@ -547,12 +547,14 @@ test("the integration head is published before reviewer and delivery members sta
     await until(() => existsSync(join(h.f.receipts, "push-started")), Boolean, 60000, "the first head publication did not start");
     const waiting = await h.f.get(created.body.id);
     assert.ok(waiting.headCommit);
+    assert.equal(waiting.publishing, true, "TeamView exposes an in-flight background head publication");
     assert.equal(waiting.members.some(member => member.role === "reviewer" || member.role === "delivery"), false,
       "neither review nor delivery starts while the integration head is unpublished");
 
     writeFileSync(join(h.f.receipts, "push-release"), "continue");
     const delivering = await until(() => h.f.get(created.body.id), run =>
       run.status === "delivering" && existsSync(join(h.f.receipts, "delivery-started.json")), 90000, "delivery did not start after publication and review");
+    assert.equal(delivering.publishing, undefined, "TeamView clears publishing after the head push settles");
     assert.equal(delivering.review?.verdict, "approved");
     assert.equal(delivering.publication?.commit, delivering.headCommit);
     assert.equal(git(h.remote, "rev-parse", `refs/heads/${delivering.branch}`), delivering.headCommit,

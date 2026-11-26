@@ -12,6 +12,7 @@ import type { Config } from "../packages/host/src/types.js";
 import type { CreateTeam, NativeContinuation, TeamAssignment, TeamLineup, TeamView } from "../packages/host/src/team-types.js";
 import type { CreateMission, MissionReport } from "../packages/host/src/mission-types.js";
 import type { MissionMessage } from "../packages/host/src/team-prompts.js";
+import type { MissionReviewDestination } from "../packages/host/src/mission-review.js";
 import { emptyRollup, type UsageRollup } from "../packages/host/src/team-usage.js";
 import { applySignal, initialAttention, screenDecision, type Attention, type Signal, type SignalEvent } from "@infinite/attention";
 
@@ -86,7 +87,7 @@ export function missionHarness(options?: { configure?: (config: Config) => void;
 
 type FakeRun = { id: string; projectId: string; missionId: string; status: TeamView["status"]; revision: number; updatedAt: string; parallelism?: number; parallelismCeiling?: number;
   blockCode?: string; reason?: string; members?: TeamView["members"];
-  usage?: UsageRollup; workspaceRemovedAt?: string;
+  usage?: UsageRollup; workspaceRemovedAt?: string; pullRequest?: TeamView["pullRequest"];
   recovery?: { attempts: number; status: "stopping" | "planning" | "exhausted"; source: { code: string; memberId: string; revision: number; reportKind?: string; reason: string; at: string } };
   decisions: { id: string; memberId: string; revision: number; question: string; options: string[]; answerMode?: "approval" | "single" | "multiple"; createdAt: string; answer?: string;
     recommendation?: TeamView["decisions"][number]["recommendation"] }[] };
@@ -157,13 +158,22 @@ export function scriptedMissionHarness(options?: { configure?: (config: Config) 
   const capacityReceipts = new Map<string, string>();
   let loseCapacityReply = false, bumpCapacityRevision = false;
   const steerReceipts = new Map<string, string>();
-  let steerLimit: boolean | Set<string> = false, steerBusy = false, loseSteerReply = false;
+  let steerLimit: boolean | Set<string> = false, steerBusy = false, loseSteerReply = false, steerBroken = false;
+  let readReview: (reviewId: string) => Promise<boolean> = async () => true;
+  const githubChecks: string[] = [], steerSources: unknown[] = [];
   const key = randomBytes(32);
   const view = (run: FakeRun) => ({ ...structuredClone(run), title: run.id, tasks: [], usage: run.usage ?? emptyRollup() }) as unknown as TeamView;
   const run = (id: string) => { const value = runs.get(id); if (!value) throw new TeamError(404, "team-not-found", "This team does not exist."); return value; };
   const set = (id: string, patch: Partial<FakeRun>) => Object.assign(run(id), patch, { updatedAt: new Date().toISOString() });
   const teams = {
     useMissionReservations(_lookup: (projectId: string, exceptMissionId?: string) => string | undefined) {},
+    useMissionReviews(_destination: MissionReviewDestination) {
+      return { receipt: (_runId: string, requestId: string) => steerReceipts.has(requestId),
+        stillCurrent: (_runId: string, reviewId: string) => {
+          githubChecks.push(reviewId);
+          return readReview(reviewId);
+        } };
+    },
     isActiveRun(id: string) {
       const current = runs.get(id);
       return Boolean(current && !["cancelled", "ready-for-review", "merged", "no-change"].includes(current.status));
@@ -200,8 +210,12 @@ export function scriptedMissionHarness(options?: { configure?: (config: Config) 
       if (loseCapacityReply) { loseCapacityReply = false; throw new TeamError(409, "team-operation-running", "The reply was lost after the capacity change was recorded."); }
       return view(target);
     },
-    async steer(id: string, body: { requestId: string; revision: number; text: string }) {
+    async steer(id: string, body: { requestId: string; revision: number; text: string }, source?: unknown) {
       const fingerprint = JSON.stringify(body);
+      if (steerBroken) {
+        steerBroken = false;
+        throw new Error("The team record could not be written.");
+      }
       if (steerReceipts.has(body.requestId)) {
         if (steerReceipts.get(body.requestId) !== fingerprint) throw new TeamError(409, "request-conflict", "This request ID belongs to a different team action.");
         return view(run(id));
@@ -211,6 +225,7 @@ export function scriptedMissionHarness(options?: { configure?: (config: Config) 
       if (steerLimit === true || (steerLimit && steerLimit.has(id))) throw new TeamError(409, "team-steering-limit", "This team reached its steering limit. Start a new team from the reviewed integration branch.");
       steerReceipts.set(body.requestId, fingerprint);
       steers.push({ teamId: id, text: body.text });
+      steerSources.push(source);
       const steered = view(set(id, { status: "planning", revision: run(id).revision + 1 }));
       if (loseSteerReply) { loseSteerReply = false; throw new TeamError(409, "team-operation-running", "The reply was lost after the steer was recorded."); }
       return steered;
@@ -222,6 +237,7 @@ export function scriptedMissionHarness(options?: { configure?: (config: Config) 
     },
     async cancel(id: string) { return view(set(id, { status: "cancelled" })); },
     async removeRun(id: string) { runs.delete(id); },
+    ensureMissionCapacityCeiling: (id: string) => run(id).parallelism,
     activeForProject: (projectId: string) => standalone.has(projectId) ||
       [...runs.values()].some(item => item.projectId === projectId && !["cancelled", "ready-for-review", "merged", "no-change"].includes(item.status)),
   };
@@ -242,10 +258,14 @@ export function scriptedMissionHarness(options?: { configure?: (config: Config) 
   return {
     get missions() { return missions; },
     restart: async () => { missions.close(); await missions.idle(); missions = open(); },
-    config, teams, runs, standalone, failing, created, answers, steers, capacityCalls, set,
+    config, teams, runs, standalone, failing, created, answers, steers, steerSources, capacityCalls, set, githubChecks,
+    readReview: (read: (reviewId: string) => Promise<boolean>) => {
+      readReview = read;
+    },
     limitSteering: (teamIds?: string[]) => { steerLimit = teamIds ? new Set(teamIds) : true; },
     holdSteers: (held: boolean) => { steerBusy = held; },
     loseNextSteerReply: () => { loseSteerReply = true; },
+    breakNextSteer: () => { steerBroken = true; },
     loseNextCapacityReply: () => { loseCapacityReply = true; },
     bumpNextCapacityRevision: () => { bumpCapacityRevision = true; },
     remove: () => { removed = true; },

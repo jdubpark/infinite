@@ -1,4 +1,5 @@
 import { setTimeout as delay } from "node:timers/promises";
+import type { ClientApi } from "./client-api.js";
 import type { EntryPage } from "./evidence/blackboard.js";
 import type { EntryHead, EntryKind } from "./evidence/entry-types.js";
 import {
@@ -24,10 +25,7 @@ import {
   type TeamWatchCommand,
 } from "./team-watch.js";
 
-export type WatchApi = {
-  request(path: string, body?: unknown, signal?: AbortSignal, headers?: Record<string, string>, method?: string): Promise<Response>;
-  json<T>(path: string, body?: unknown, signal?: AbortSignal, headers?: Record<string, string>, method?: string): Promise<T>;
-};
+export type WatchApi = ClientApi;
 
 export const BOARD_KIND_FILTERS: readonly (EntryKind | "all")[] = [
   "all",
@@ -387,15 +385,14 @@ async function printTeamLogs(api: WatchApi, team: any, signal: AbortSignal) {
   if (current.length > shown.length) console.log(`+ ${current.length - shown.length} more agents. Follow one with infinite team watch ${clean(team?.id)} --logs\n`);
 }
 
-async function askForBrief(api: WatchApi, team: any, rows: TeamBriefRow[], signal: AbortSignal, show: (text: string) => void, checkedAt: string): Promise<TeamBriefRow[]> {
+export async function askForBrief(api: WatchApi, team: any, rows: TeamBriefRow[], signal: AbortSignal, show: (text: string) => void, checkedAt: string): Promise<TeamBriefRow[]> {
   const chosen = chooseTeamBrief(rows, summaryMember(team)?.sessionId);
   if (!chosen || !canAskForBrief(team, rows)) return rows;
   const card = teamSummaryText(team, rows, checkedAt, true, Date.now()).split("\n");
   const footer = card.pop() ?? "";
   show([...card, "", "Refreshing the Brief. This can take a few minutes.", "", footer].join("\n"));
   try {
-    const response = await api.request(`/sessions/${chosen.sessionId}/summary?after=0`, undefined, AbortSignal.any([signal, AbortSignal.timeout(180000)]));
-    const summary = await response.json() as TeamBriefStatus["summary"];
+    const summary = await api.json<TeamBriefStatus["summary"]>(`/sessions/${chosen.sessionId}/summary?after=0`, undefined, signal, undefined, undefined, 180000);
     const ready = Boolean(summary?.repository?.brief?.summary || summary?.text);
     const next: TeamBriefRow = { sessionId: chosen.sessionId, status: { state: ready ? "ready" : "empty", summary, ...(ready ? {} : { error: "No recorded chat is available for a repository brief." }) } };
     return [...rows.filter(row => row.sessionId !== chosen.sessionId), next];

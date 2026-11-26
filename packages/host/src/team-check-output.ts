@@ -210,18 +210,25 @@ export function checkFeedback(checks: readonly TeamCheck[]): string {
   const head = [`Configured verification failed: check ${at + 1} of ${checks.length} did not pass.`];
   checks.forEach((check, position) => head.push(`Check ${position + 1}: ${check.status}, exit ${check.exitCode ?? "none"}, command ${clean([check.command.command, ...check.command.args].join(" "))}.`));
   head.push(HOST_NOTE);
-  const scan = failed.scan ?? scanCheckOutput(failed.output);
   const kept = Buffer.byteLength(failed.output);
-  head.push(`The command wrote ${scan.bytes} bytes.${scan.bytes > kept ? ` The host kept only the last ${kept} bytes.` : ""}`);
-  const limit = FEEDBACK_BYTES - size(head) - size([FOOTER]) - END_RESERVE_BYTES - FAILURE_HEADING_BYTES;
+  const scan = failed.scan;
   const shown: string[] = [];
-  let blocks = 0, used = 0;
-  for (const failure of scan.failures) {
-    const block = [`| ${clean(failure.line)}`, ...(failure.detail ? failure.detail.split("\n").map(row => `|   ${clean(row)}`) : [])];
-    if (used + size(block) > limit) break;
-    shown.push(...block); used += size(block); blocks++;
+  const failures: string[] = [];
+  if (scan) {
+    head.push(`The command wrote ${scan.bytes} bytes.${scan.bytes > kept ? ` The host kept only the last ${kept} bytes.` : ""}`);
+    const limit = FEEDBACK_BYTES - size(head) - size([FOOTER]) - END_RESERVE_BYTES - FAILURE_HEADING_BYTES;
+    let blocks = 0, used = 0;
+    for (const failure of scan.failures) {
+      const block = [`| ${clean(failure.line)}`, ...(failure.detail ? failure.detail.split("\n").map(row => `|   ${clean(row)}`) : [])];
+      if (used + size(block) > limit) break;
+      shown.push(...block); used += size(block); blocks++;
+    }
+    failures.push(`The host found ${scan.capped ? "at least " : ""}${scan.failureCount} failure lines and shows ${blocks} of them (parsed from the output, not interpreted; a failing suite and its failing test each count).`);
+  } else {
+    head.push(kept > 0
+      ? `No output scan was recorded for this check. The host kept ${kept} bytes of raw output without synthesizing failure counts.`
+      : "No output scan was recorded for this check, and the command left no kept output.");
   }
-  const failures = [`The host found ${scan.capped ? "at least " : ""}${scan.failureCount} failure lines and shows ${blocks} of them (parsed from the output, not interpreted; a failing suite and its failing test each count).`];
   const room = FEEDBACK_BYTES - size(head) - size(failures) - size(shown) - size([FOOTER]) - END_HEADING_BYTES;
   const rows = failed.output === "" ? [] : failed.output.replace(/\n$/, "").split("\n");
   const tail: string[] = [];

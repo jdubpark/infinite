@@ -1,7 +1,5 @@
 import React, { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { Terminal } from "@xterm/xterm";
-import { FitAddon } from "@xterm/addon-fit";
 import {
   ArrowLeft,
   ArrowDown,
@@ -38,7 +36,7 @@ import { SessionPicker, sessionStatus, useSessionLocation, type SessionTab } fro
 import "@fontsource/instrument-sans/400.css";
 import "@fontsource/instrument-sans/500.css";
 import "@fontsource/instrument-sans/600.css";
-import "@xterm/xterm/css/xterm.css";
+import { TerminalView } from "./terminal-view";
 import { useLiveRefresh } from "./live-refresh";
 import { useSessionControl } from "./session-control";
 import { TeamCreate, TeamDetail, TeamList, TeamPicker, clearTeamRequests, type TeamListItem } from "./teams";
@@ -546,94 +544,6 @@ function Create({
     </div>
   );
 }
-function TerminalView({ id, readOnly }: { id: string; readOnly: boolean }) {
-  const api = useApi();
-  const element = useRef<HTMLDivElement>(null);
-  const [error, setError] = useState("");
-  useEffect(() => {
-    const terminal = new Terminal({
-      convertEol: false,
-      disableStdin: true,
-      fontSize: 13,
-      fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
-      scrollback: 10000,
-      theme: {
-        background: "#202923",
-        foreground: "#e4e9de",
-        cursor: "#e4e9de",
-      },
-    });
-    const fit = new FitAddon();
-    terminal.loadAddon(fit);
-    terminal.open(element.current!);
-    fit.fit();
-    const observer = new ResizeObserver(() => fit.fit());
-    observer.observe(element.current!);
-    let active = true,
-      cursor = 0,
-      retry = 1800,
-      generation = 0,
-      inFlight: number | undefined;
-    let timer: ReturnType<typeof setTimeout>;
-    const poll = async () => {
-      clearTimeout(timer);
-      if (!active || inFlight === generation || document.visibilityState === "hidden") return;
-      const started = generation;
-      const current = () => active && started === generation;
-      inFlight = started;
-      try {
-        const page = await api<{
-          events: LogEvent[];
-          cursor: number;
-          more: boolean;
-        }>(`/sessions/${id}/events?after=${cursor}`);
-        if (!current()) return;
-        for (const event of page.events)
-          if (event.type === "output") terminal.write(String(event.data.text));
-        cursor = page.cursor;
-        setError("");
-        retry = 1800;
-        timer = setTimeout(poll, page.more ? 0 : 800);
-      } catch {
-        if (current()) {
-          setError("Waiting for the host. Recorded output will resume here.");
-          timer = setTimeout(poll, retry);
-          retry = Math.min(retry * 2, 15000);
-        }
-      } finally {
-        if (inFlight === started) inFlight = undefined;
-      }
-    };
-    const resume = () => { generation++; void poll(); };
-    const retryNow = () => { if (inFlight === undefined) void poll(); };
-    document.addEventListener("visibilitychange", resume);
-    window.addEventListener("online", retryNow);
-    window.addEventListener("focus", retryNow);
-    void poll();
-    return () => {
-      active = false;
-      clearTimeout(timer);
-      document.removeEventListener("visibilitychange", resume);
-      window.removeEventListener("online", retryNow);
-      window.removeEventListener("focus", retryNow);
-      observer.disconnect();
-      terminal.dispose();
-    };
-  }, [id]);
-  return (
-    <div className="terminal-shell">
-      <div className="terminal-caption">
-        {readOnly ? "Recorded terminal · read-only" : "Recorded terminal · use the composer to send input"}
-      </div>
-      <div className="terminal" ref={element} />
-      {error && (
-        <p className="terminal-error" role="status">
-          {error}
-        </p>
-      )}
-    </div>
-  );
-}
 function SessionView({
   id,
   me,
@@ -916,7 +826,7 @@ function SessionView({
           setFollowing(false);
       }}>
         {tab === "chat" ? <Conversation id={id} /> : tab === "files" ? <ProjectFiles id={id} online={connected && view.fresh} /> : tab === "terminal" ? (
-          <TerminalView id={id} readOnly={managedLocked} />
+          <TerminalView id={id} readOnly={managedLocked} terminalSize={session.terminalSize} />
         ) : tab === "context" ? (
           <Context session={session} me={me} connected={connected && view.fresh} />
         ) : (

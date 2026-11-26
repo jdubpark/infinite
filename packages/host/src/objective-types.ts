@@ -1,20 +1,30 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import { canonicalJson } from "./evidence/crypto.js";
-import { isScopedPath } from "./goal-types.js";
+import { CRITERIA_ROWS_MAX, ID_RE, SHARED_INPUT_LIMITS, idSchema, isScopedPath } from "./schema-primitives.js";
+
+export { ID_RE };
+
+const UTF8_MAX_BYTES_PER_UTF16_UNIT = 3;
+const DIRECTION_CORRECTION_RESERVE = 20;
 
 export const OBJECTIVE_SCHEMA_VERSION = 1;
 export const RUBRIC_VERSION_DEFAULT = 1;
 export const OBJECTIVE_LIMITS = {
-  cappedBytes: 32 * 1024, activeCriteria: 8, assumptions: 32, openQuestions: 8, definitions: 16, rules: 16, logEntries: 400, logBytes: 256 * 1024,
+  cappedBytes: 32 * 1024, activeCriteria: CRITERIA_ROWS_MAX, assumptions: 32, openQuestions: 8, definitions: 16, rules: 16, logEntries: 400, logBytes: 256 * 1024,
   intentItems: 16, scoutQuestions: 3, intentChecksPerRevision: 1,
   followUpsPerReport: 6, openFollowUps: 24, followUpGeneration: 3, repeatWindowCycles: 10, ideas: 20,
   newAssumptionsPerAttempt: 4, proposalsPerAssumption: 8,
   usedWindowCycles: 1,
-  c0Bytes: 16_000, criterionBytes: 1_000, derivedFromBytes: 500, assumptionBytes: 500, noteBytes: 500, inlineValueBytes: 2 * 1024,
+  c0Bytes: Math.max(16_000, SHARED_INPUT_LIMITS.goalSuccessCriteriaChars * UTF8_MAX_BYTES_PER_UTF16_UNIT),
+  criterionBytes: 1_000, derivedFromBytes: 500, assumptionBytes: 500, noteBytes: 500, inlineValueBytes: 2 * 1024,
   evidenceHandles: 16, pinnedPaths: 8,
-  criteria: 64, questions: 64, questionAssumptions: 16, allowedPaths: 32, excludedPaths: 32, pathChars: 300, nonGoals: 20, nonGoalChars: 1_000,
-  ownerEvidence: 20, evidenceChars: 2_000, directions: 40, directionChars: 8_000, goalObjectiveChars: 12_000, runObjectiveChars: 24_000,
+  criteria: 64, questions: 64, questionAssumptions: 16,
+  allowedPaths: SHARED_INPUT_LIMITS.allowedPaths, excludedPaths: SHARED_INPUT_LIMITS.allowedPaths, pathChars: SHARED_INPUT_LIMITS.pathChars,
+  nonGoals: SHARED_INPUT_LIMITS.nonGoals, nonGoalChars: SHARED_INPUT_LIMITS.nonGoalChars,
+  ownerEvidence: SHARED_INPUT_LIMITS.evidence, evidenceChars: SHARED_INPUT_LIMITS.evidenceChars,
+  directions: SHARED_INPUT_LIMITS.steeringEntries + DIRECTION_CORRECTION_RESERVE, directionChars: SHARED_INPUT_LIMITS.steeringChars,
+  goalObjectiveChars: SHARED_INPUT_LIMITS.goalObjectiveChars, runObjectiveChars: SHARED_INPUT_LIMITS.runObjectiveChars,
   termBytes: 100, meaningBytes: 1_000, ruleBytes: 1_000, questionBytes: 1_000, summaryBytes: 500, handleChars: 200,
 } as const;
 
@@ -54,8 +64,7 @@ export type ObjectiveRecord = { schemaVersion: 1; owner: ObjectiveOwner; version
   questions: Question[]; rubricVersion: number; log: LogEntry[] };
 
 const L = OBJECTIVE_LIMITS;
-export const ID_RE = /^[a-z][a-z0-9-]{0,39}$/;
-const HANDLE_RE = /^[A-Za-z0-9:._-]{1,200}$/;
+const HANDLE_RE = new RegExp(`^[A-Za-z0-9:._-]{1,${L.handleChars}}$`);
 const OP_RE = /^[a-z]+(?:[.-][a-z]+)*$/;
 const HEX64_RE = /^[0-9a-f]{64}$/;
 const BLOB_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
@@ -68,7 +77,6 @@ const bytesBetween = (min: number, max: number) =>
 const charsBetween = (min: number, max: number) =>
   z.string().refine(value => charLength(value) >= min && charLength(value) <= max, `Text must be ${min} to ${max} characters`);
 
-const idSchema = z.string().regex(ID_RE);
 const handleSchema = z.string().regex(HANDLE_RE);
 const hex64 = z.string().regex(HEX64_RE);
 const pointer = z.string().regex(POINTER_RE);

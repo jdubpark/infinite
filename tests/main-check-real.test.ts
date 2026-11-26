@@ -1,21 +1,21 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createInterface } from "node:readline";
 import { setTimeout as delay } from "node:timers/promises";
 import { MainCheckService, type MainCheckPorts, type MainCheckView } from "../packages/host/src/main-check.js";
-import { recordDirectory, recordScope } from "../packages/host/src/main-check-ports.js";
+import { readAnchor } from "../packages/host/src/main-check-anchors.js";
+import { anchorDirectory, defaultMainCheckPorts, recordDirectory, recordScope } from "../packages/host/src/main-check-ports.js";
 import { checksDigest, type MainCheckRecord } from "../packages/host/src/main-check-state.js";
 import { bootId } from "../packages/host/src/process-census.js";
 import type { TeamCommand, TeamProject } from "../packages/host/src/team-types.js";
 import { teamCommand } from "../packages/host/src/team-workspace.js";
 import type { Config } from "../packages/host/src/types.js";
 import { unseal, writeSealed } from "../packages/host/src/vault.js";
-import { censusPast, earlierProcesses } from "./main-check-earlier.js";
-
-const PROCESSES = censusPast(await earlierProcesses());
+import { anchorSeeded } from "./main-check-earlier.js";
 
 const KEY = Buffer.alloc(32, 7);
 const WAIT_MS = 20_000;
@@ -81,7 +81,7 @@ class Sandbox {
   async start(ports?: Partial<MainCheckPorts>) {
     this.service = new MainCheckService({
       config: this.config, key: KEY, mirrorPath: () => this.mirror,
-      halt: { check: () => ({ state: this.halted ? "halted" : "clear" }) }, hostLoad: { held: () => undefined }, ports: { processes: PROCESSES, ...ports },
+      halt: { check: () => ({ state: this.halted ? "halted" : "clear" }) }, hostLoad: { held: () => undefined }, ports,
     });
     await this.service.start();
     return this.service;
@@ -103,6 +103,10 @@ class Sandbox {
 
   seed(projectId: string, record: MainCheckRecord) {
     writeSealed(join(recordDirectory(this.config), `${projectId}.sealed`), KEY, recordScope(projectId), record);
+  }
+
+  anchor(projectId: string, directory: string) {
+    return anchorSeeded(defaultMainCheckPorts({ config: this.config, key: KEY, halt: { check: () => ({ state: "clear" }) }, hostLoad: { held: () => undefined } }).anchors, projectId, directory);
   }
 
   async until(what: string, ready: () => boolean, drive?: string) {
@@ -271,6 +275,7 @@ test("f. entries whose directories never existed leave retiring, with no team ro
       running: runningEntry(sandbox, "alpha-2026-11-20-main-check-0000f00d", "an-earlier-boot", true),
       retiring: [{ directory: "alpha-2026-11-20-main-check-0000beef", root: sandbox.teams, witness: { boot: bootId(), processes: [], sessions: [], groups: [] } }],
     });
+    await sandbox.anchor("alpha", "alpha-2026-11-20-main-check-0000beef");
     await sandbox.start();
     assert.equal(sandbox.view().retiring, 2, "R8 moved running to retiring");
     await sandbox.until("retirement", () => sandbox.view().retiring === 0);
@@ -293,6 +298,7 @@ test("g. host start with running and a real directory: retired without recording
   try {
     prepare(plain);
     plain.seed("alpha", { version: 1, attempts: [{ head: plain.head, checks: plain.digest, count: 1 }], running: runningEntry(plain, directory, bootId(), false) });
+    await plain.anchor("alpha", directory);
     await plain.start();
     await plain.until("retirement", () => plain.view().retiring === 0);
     assert.deepEqual(plain.runDirectories(), []);
@@ -305,6 +311,7 @@ test("g. host start with running and a real directory: retired without recording
   try {
     prepare(recording);
     recording.seed("alpha", { version: 1, attempts: [{ head: recording.head, checks: recording.digest, count: 1 }], running: runningEntry(recording, directory, bootId(), true) });
+    await recording.anchor("alpha", directory);
     await recording.start();
     recording.fetch("beta");
     await recording.until("both projects waiting", () => recording.view("alpha").waiting === "processes" && recording.service!.view("beta")?.readable === true && recording.view("beta").waiting === "another-check");
@@ -401,5 +408,103 @@ test("j. under a command prefix the removal of a copy ends with its launcher: a 
     assert.equal(gone(pid), false, "the sleep the launcher left behind still runs half a second after the host stop");
   } finally {
     await sandbox.dispose();
+  }
+});
+
+const canHide = process.platform === "linux" && process.getuid?.() !== 0 && spawnSync("python3", ["-c", "import ctypes; ctypes.CDLL(None).prctl"]).status === 0;
+const HIDDEN = { timeout: 120_000, skip: !canHide && "hiding a process from its own account needs Linux, an account other than root and python3 with ctypes" };
+const HIDE = ["import ctypes, time", "assert ctypes.CDLL(None).prctl(4, 0, 0, 0, 0) == 0", "print('hidden', flush=True)", "time.sleep(300)", ""].join("\n");
+
+async function hiddenProcess(...args: string[]): Promise<ChildProcess> {
+  const child = spawn("python3", ["-c", HIDE, ...args], { detached: true, stdio: ["ignore", "pipe", "ignore"] });
+  const first = await createInterface({ input: child.stdout! })[Symbol.asyncIterator]().next();
+  assert.equal(String(first.value), "hidden");
+  return child;
+}
+
+function end(child: ChildProcess | undefined): Promise<void> {
+  return new Promise(resolve => {
+    if (!child || child.exitCode !== null || child.signalCode !== null) return resolve();
+    child.once("exit", () => resolve());
+    try { process.kill(child.pid!, "SIGKILL"); } catch { resolve(); }
+  });
+}
+
+const anchorFiles = (sandbox: Sandbox) => existsSync(anchorDirectory(sandbox.config)) ? readdirSync(anchorDirectory(sandbox.config)) : [];
+const anchored = (sandbox: Sandbox, directory: string, pid: number) =>
+  readAnchor(defaultMainCheckPorts({ config: sandbox.config, key: KEY, halt: { check: () => ({ state: "clear" }) }, hostLoad: { held: () => undefined } }).anchors, "alpha", directory)?.processes.some(item => item.pid === pid) ?? false;
+
+test("k. a hidden process alive before the admission is anchored and does not hold the copy; one hidden after the admission holds it until it ends (INF-403)", HIDDEN, async () => {
+  const sandbox = new Sandbox({ "tracked.txt": "one\n" }, () => [sh("sleep 2; test -f tracked.txt")]);
+  const before = await hiddenProcess();
+  let after: ChildProcess | undefined;
+  try {
+    await sandbox.start();
+    sandbox.fetch();
+    await sandbox.until("the admission", () => sandbox.view().running !== undefined);
+    assert.equal(anchored(sandbox, sandbox.record().running!.directory, before.pid!), true, "the earlier hidden process is in the copy's anchor");
+    after = await hiddenProcess();
+    await sandbox.until("a result", () => sandbox.view().results.length === 1);
+    assert.equal(sandbox.view().results[0]!.outcome, "passed");
+    await sandbox.until("the copy waiting on the later hidden process", () => sandbox.view().retiring === 1 && sandbox.view().waiting === "processes", "alpha");
+    for (const hold = Date.now() + 4_000; Date.now() < hold; await delay(500)) {
+      sandbox.fetch("alpha");
+      assert.equal(sandbox.view().retiring, 1, "the later hidden process holds the copy at every pass");
+    }
+    assert.equal(sandbox.runDirectories().length, 1);
+    await end(after);
+    await sandbox.until("retirement", () => sandbox.view().retiring === 0, "alpha");
+    assert.equal(gone(before.pid!), false, "the earlier hidden process still runs");
+    assert.deepEqual(sandbox.runDirectories(), [], "the copy was removed");
+    assert.deepEqual(anchorFiles(sandbox), [], "the anchor went with the copy");
+  } finally {
+    await sandbox.dispose();
+    await end(before);
+    await end(after);
+  }
+});
+
+test("l. after a host stop the next service retires the copy with the anchor the first one wrote (INF-403)", HIDDEN, async () => {
+  const sandbox = new Sandbox({ "tracked.txt": "one\n" }, () => [sh("sleep 1; test -f tracked.txt")]);
+  const before = await hiddenProcess();
+  let after: ChildProcess | undefined;
+  try {
+    await sandbox.start();
+    sandbox.fetch();
+    await sandbox.until("the admission", () => sandbox.view().running !== undefined);
+    after = await hiddenProcess();
+    await sandbox.until("a result", () => sandbox.view().results.length === 1);
+    await sandbox.until("the copy waiting", () => sandbox.view().retiring === 1 && sandbox.view().waiting === "processes", "alpha");
+    await sandbox.service!.close();
+    assert.equal(anchorFiles(sandbox).length, 1, "the anchor is on disk after the host stop");
+    await end(after);
+    sandbox.halted = true;
+    await sandbox.start();
+    await sandbox.until("retirement by the next service", () => sandbox.view().retiring === 0);
+    assert.equal(gone(before.pid!), false, "the earlier hidden process still runs");
+    assert.deepEqual(sandbox.runDirectories(), []);
+    assert.deepEqual(anchorFiles(sandbox), []);
+  } finally {
+    await sandbox.dispose();
+    await end(before);
+    await end(after);
+  }
+});
+
+test("m. a hidden process alive before the admission that names a path under the team root is anchored, and the copy retires while it runs (INF-403)", HIDDEN, async () => {
+  const sandbox = new Sandbox({ "tracked.txt": "one\n" }, () => [sh("sleep 1; test -f tracked.txt")]);
+  const before = await hiddenProcess(join(sandbox.teams, "some-run", "workspace"));
+  try {
+    await sandbox.start();
+    sandbox.fetch();
+    await sandbox.until("the admission", () => sandbox.view().running !== undefined);
+    assert.equal(anchored(sandbox, sandbox.record().running!.directory, before.pid!), true, "the gate census names nothing a process could mention, so the process is anchored");
+    await sandbox.until("a result", () => sandbox.view().results.length === 1);
+    await sandbox.until("retirement while that process runs", () => sandbox.view().retiring === 0, "alpha");
+    assert.equal(gone(before.pid!), false);
+    assert.deepEqual(sandbox.runDirectories(), []);
+  } finally {
+    await sandbox.dispose();
+    await end(before);
   }
 });

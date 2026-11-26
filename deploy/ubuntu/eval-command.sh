@@ -7,6 +7,10 @@ TEMPLATE=/usr/local/share/infinite-eval/home
 EVAL_TMP=/var/lib/infinite-eval/tmp
 LOGIN_PATHS=".claude/.credentials.json .codex/auth.json .local/share/opencode/auth.json"
 STOP_DIRS="/tmp /var/tmp /dev/shm /dev/mqueue /run/lock /var/crash"
+PRLIMIT_NPROC=512
+SYSVIPC_DIR=/proc/sysvipc
+STOP_KILL_MODE=kill
+OVERRIDE_ACTIVE=0
 TRIALS=$ROOT/trials
 TRIAL_DIR=
 REAL_TRIAL=
@@ -115,13 +119,18 @@ run_trial() {
     set -- HTTPS_PROXY="$proxy" HTTP_PROXY="$proxy" https_proxy="$proxy" http_proxy="$proxy" \
       NO_PROXY=localhost,127.0.0.1,::1 no_proxy=localhost,127.0.0.1,::1 NODE_USE_ENV_PROXY=1 "$@"
   fi
+  set -- /usr/bin/env -i \
+    PATH=/usr/local/bin:/usr/bin:/bin HOME="$EVAL_HOME" TMPDIR="$TRIALS/$trial/tmp" \
+    LANG=C.UTF-8 LC_ALL=C.UTF-8 GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+    GIT_TERMINAL_PROMPT=0 GIT_OPTIONAL_LOCKS=0 GIT_NO_REPLACE_OBJECTS=1 \
+    "$@"
+  if [ "$PRLIMIT_NPROC" = off ]; then
+    set -- /usr/bin/prlimit --fsize=4294967296 --core=0 --nofile=4096 "$@"
+  else
+    set -- /usr/bin/prlimit --nproc="$PRLIMIT_NPROC" --fsize=4294967296 --core=0 --nofile=4096 "$@"
+  fi
   status=0
-  /usr/bin/prlimit --nproc=512 --fsize=4294967296 --core=0 --nofile=4096 \
-    /usr/bin/env -i \
-      PATH=/usr/local/bin:/usr/bin:/bin HOME="$EVAL_HOME" TMPDIR="$TRIALS/$trial/tmp" \
-      LANG=C.UTF-8 LC_ALL=C.UTF-8 GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
-      GIT_TERMINAL_PROMPT=0 GIT_OPTIONAL_LOCKS=0 GIT_NO_REPLACE_OBJECTS=1 \
-    "$@" || status=$?
+  "$@" || status=$?
   if [ "$status" -eq 137 ]; then exit 124; fi
   exit "$status"
 }
@@ -180,8 +189,13 @@ op_probe() {
   leftovers=$(count_leftovers)
   printf '{"version":1,"uid":%s,"root":"%s","rootMode":"%s","rootOwner":%s,"readable":[%s],"metadata":"%s",' \
     "$uid" "$ROOT" "$mode" "$owner" "$readable" "$meta"
-  printf '"freeBytes":%s,"freeInodes":%s,"ancestorsWritable":%s,"tools":%s,"trials":%s,"leftovers":%s,"fetch":"%s"}\n' \
-    "$((avail * bsize))" "$inodes" "$ancestors" "$tools" "$trials" "$leftovers" "$fetch"
+  if [ "$OVERRIDE_ACTIVE" -eq 1 ]; then
+    printf '"freeBytes":%s,"freeInodes":%s,"ancestorsWritable":%s,"tools":%s,"trials":%s,"leftovers":%s,"stopKillMode":"%s","fetch":"%s"}\n' \
+      "$((avail * bsize))" "$inodes" "$ancestors" "$tools" "$trials" "$leftovers" "$STOP_KILL_MODE" "$fetch"
+  else
+    printf '"freeBytes":%s,"freeInodes":%s,"ancestorsWritable":%s,"tools":%s,"trials":%s,"leftovers":%s,"fetch":"%s"}\n' \
+      "$((avail * bsize))" "$inodes" "$ancestors" "$tools" "$trials" "$leftovers" "$fetch"
+  fi
 }
 
 count_entries() {
@@ -241,12 +255,15 @@ count_account_state() {
       n=$((n + 1))
     fi
   done
+  set -f
+  # shellcheck disable=SC2086
   for dir in $STOP_DIRS; do
     if [ -d "$dir" ]; then
       found=$(/usr/bin/find "$dir" -xdev -mindepth 1 -user "$uid" -printf x 2>/dev/null | /usr/bin/head -c 10000 | /usr/bin/wc -c)
       n=$((n + found))
     fi
   done
+  set +f
   printf '%s' "$n"
 }
 
@@ -366,9 +383,9 @@ op_setup() {
 ipc_ids() {
   ipc_uid=$(/usr/bin/id -u)
   case "$1" in
-    m) ipc_table=/proc/sysvipc/shm ;;
-    s) ipc_table=/proc/sysvipc/sem ;;
-    q) ipc_table=/proc/sysvipc/msg ;;
+    m) ipc_table=$SYSVIPC_DIR/shm ;;
+    s) ipc_table=$SYSVIPC_DIR/sem ;;
+    q) ipc_table=$SYSVIPC_DIR/msg ;;
     *) return 1 ;;
   esac
   [ -r "$ipc_table" ] || return 1
@@ -410,8 +427,15 @@ EOF
 
 op_stop() {
   [ $# -eq 0 ] || refuse
-  kill -KILL -1 2>/dev/null || true
-  /usr/bin/sleep 1
+  case "$STOP_KILL_MODE" in
+    kill)
+      kill -KILL -1 2>/dev/null || true
+      /usr/bin/sleep 1
+      ;;
+    skip) ;;
+    refuse) exit 99 ;;
+    *) refuse ;;
+  esac
   uid=$(/usr/bin/id -u)
   status=0
   for kind in m s q; do
@@ -422,6 +446,8 @@ op_stop() {
     left=$(ipc_ids "$kind") || { status=1; continue; }
     if [ -n "$left" ]; then status=1; fi
   done
+  set -f
+  # shellcheck disable=SC2086
   for dir in $STOP_DIRS; do
     if [ -d "$dir" ]; then
       /usr/bin/find "$dir" -xdev -type d -user "$uid" ! -perm -u=rwx -exec /usr/bin/chmod u+rwx -- {} \; 2>/dev/null || true
@@ -431,6 +457,7 @@ op_stop() {
       fi
     fi
   done
+  set +f
   exit "$status"
 }
 
@@ -487,6 +514,117 @@ op_scrub() {
   /usr/bin/timeout 60 /usr/bin/find "$EVAL_HOME" -mindepth 1 -depth "$@"
   /usr/bin/timeout 60 /usr/bin/cp -R -- "$TEMPLATE/." "$EVAL_HOME/"
 }
+
+valid_abs_path() {
+  case "$1" in
+    /*) ;;
+    *) return 1 ;;
+  esac
+  case "$1" in
+    /|*/|*[[:cntrl:]\"\\]*) return 1 ;;
+  esac
+  case "/$1/" in
+    */../*) return 1 ;;
+  esac
+  return 0
+}
+
+allow_test_overrides() {
+  [ "$(/usr/bin/id -u)" -ne 0 ] || return 1
+  [ "$(/usr/bin/id -un)" != "$ACCOUNT" ] || return 1
+  [ -z "${SUDO_USER+set}" ] && [ -z "${SUDO_UID+set}" ] && [ -z "${SUDO_GID+set}" ] && [ -z "${SUDO_COMMAND+set}" ] || return 1
+  [ -z "${DOAS_USER+set}" ] && [ -z "${PKEXEC_UID+set}" ] || return 1
+  self_real=$(/usr/bin/realpath -e -- "$0" 2>/dev/null) || return 1
+  case "$self_real" in
+    /usr/local/libexec/*|/usr/local/sbin/*|/usr/libexec/*|/usr/sbin/*|/sbin/*|/usr/bin/*|/bin/*|/opt/infinite*) return 1 ;;
+  esac
+  return 0
+}
+
+load_test_overrides() {
+  if allow_test_overrides; then
+    override_active=0
+    has_stop_dirs=0
+    has_sysvipc_dir=0
+    if [ "${INFINITE_EVAL_TEST_ROOT+set}" = set ]; then
+      override_active=1
+      valid_abs_path "$INFINITE_EVAL_TEST_ROOT" || refuse
+      ROOT=$INFINITE_EVAL_TEST_ROOT
+    fi
+    if [ "${INFINITE_EVAL_TEST_ACCOUNT+set}" = set ]; then
+      override_active=1
+      case "$INFINITE_EVAL_TEST_ACCOUNT" in
+        ''|root|*[!A-Za-z0-9._-]*) refuse ;;
+      esac
+      ACCOUNT=$INFINITE_EVAL_TEST_ACCOUNT
+    fi
+    if [ "${INFINITE_EVAL_TEST_HOME+set}" = set ]; then
+      override_active=1
+      valid_abs_path "$INFINITE_EVAL_TEST_HOME" || refuse
+      EVAL_HOME=$INFINITE_EVAL_TEST_HOME
+    fi
+    if [ "${INFINITE_EVAL_TEST_TEMPLATE+set}" = set ]; then
+      override_active=1
+      valid_abs_path "$INFINITE_EVAL_TEST_TEMPLATE" || refuse
+      TEMPLATE=$INFINITE_EVAL_TEST_TEMPLATE
+    fi
+    if [ "${INFINITE_EVAL_TEST_TMP+set}" = set ]; then
+      override_active=1
+      valid_abs_path "$INFINITE_EVAL_TEST_TMP" || refuse
+      EVAL_TMP=$INFINITE_EVAL_TEST_TMP
+    fi
+    if [ "${INFINITE_EVAL_TEST_STOP_DIRS+set}" = set ]; then
+      override_active=1
+      has_stop_dirs=1
+      stop_count=0
+      set -f
+      # shellcheck disable=SC2086
+      for stop_dir in $INFINITE_EVAL_TEST_STOP_DIRS; do
+        valid_abs_path "$stop_dir" || { set +f; refuse; }
+        stop_count=$((stop_count + 1))
+      done
+      set +f
+      [ "$stop_count" -ge 1 ] || refuse
+      STOP_DIRS=$INFINITE_EVAL_TEST_STOP_DIRS
+    fi
+    if [ "${INFINITE_EVAL_TEST_PRLIMIT_NPROC+set}" = set ]; then
+      override_active=1
+      case "$INFINITE_EVAL_TEST_PRLIMIT_NPROC" in
+        off) PRLIMIT_NPROC=off ;;
+        *)
+          valid_count "$INFINITE_EVAL_TEST_PRLIMIT_NPROC" && [ "$INFINITE_EVAL_TEST_PRLIMIT_NPROC" -ge 1 ] || refuse
+          PRLIMIT_NPROC=$INFINITE_EVAL_TEST_PRLIMIT_NPROC
+          ;;
+      esac
+    fi
+    if [ "${INFINITE_EVAL_TEST_SYSVIPC_DIR+set}" = set ]; then
+      override_active=1
+      has_sysvipc_dir=1
+      valid_abs_path "$INFINITE_EVAL_TEST_SYSVIPC_DIR" || refuse
+      SYSVIPC_DIR=$INFINITE_EVAL_TEST_SYSVIPC_DIR
+    fi
+    if [ "${INFINITE_EVAL_TEST_STOP_KILL_MODE+set}" = set ]; then
+      override_active=1
+      case "$INFINITE_EVAL_TEST_STOP_KILL_MODE" in
+        skip)
+          [ "$has_stop_dirs" -eq 1 ] && [ "$has_sysvipc_dir" -eq 1 ] || refuse
+          STOP_KILL_MODE=skip
+          ;;
+        refuse) STOP_KILL_MODE=refuse ;;
+        *) refuse ;;
+      esac
+    elif [ "$override_active" -eq 1 ]; then
+      STOP_KILL_MODE=refuse
+    fi
+    OVERRIDE_ACTIVE=$override_active
+  fi
+  unset INFINITE_EVAL_TEST_ROOT INFINITE_EVAL_TEST_ACCOUNT INFINITE_EVAL_TEST_HOME \
+    INFINITE_EVAL_TEST_TEMPLATE INFINITE_EVAL_TEST_TMP INFINITE_EVAL_TEST_STOP_DIRS \
+    INFINITE_EVAL_TEST_PRLIMIT_NPROC INFINITE_EVAL_TEST_SYSVIPC_DIR INFINITE_EVAL_TEST_STOP_KILL_MODE
+}
+
+load_test_overrides
+TRIALS=$ROOT/trials
 
 [ "$(/usr/bin/id -un)" = "$ACCOUNT" ] || refuse
 [ "$(/usr/bin/id -u)" -ne 0 ] || refuse

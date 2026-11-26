@@ -16,6 +16,8 @@ const templates = [
   ["infinite-github-refresh.service", name => name ? `infinite-${name}-github-refresh.service` : "infinite-github-refresh.service"],
   ["infinite-github-refresh.timer", name => name ? `infinite-${name}-github-refresh.timer` : "infinite-github-refresh.timer"],
   ["github-app-gh.sh", () => "github-app-gh.sh"],
+  ["jevcode-wrapper.sh", () => "jevcode-wrapper.sh"],
+  ["repository-graph-wrapper.py", () => "repository-graph-wrapper.py"],
   ["transcript-drain.sh", () => "transcript-drain.sh"],
   ["process-census.sh", () => "process-census.sh"],
   ["config.example.json", () => "config.example.json"],
@@ -84,12 +86,6 @@ function renderTemplate(filename, name) {
     text = text.replace(/^Description=(.*)$/m, `Description=$1 (instance ${name})`);
     text = text.replace(/^(?:MemoryHigh|MemoryMax|CPUQuota)=.*\n/gm, "");
     text = text.replace(/^TasksMax=.*$/m, "TasksMax=infinity\nCPUWeight=50\nIOWeight=50\nOOMScoreAdjust=500");
-  }
-  if (filename === "infinite.sudoers") {
-    text = text.replace(`, /usr/local/libexec/infinite-${name}/jevcode *`, "");
-    text = text.replace(/^# Optional code graph extraction.*\n.*\/repository-graph \*\n/m,
-      "# Repository briefings and the code graph need instance wrappers; until they exist, this instance permits neither.\n");
-    if (/jevcode|repository-graph/.test(text)) fail("The instance sudoers still permits jevcode or repository-graph.");
   }
   if (filename === "agent-wrapper.sh")
     text = text.replace("export PATH=/usr/local/bin:/usr/bin:/bin", `export PATH=/usr/local/libexec/infinite-${name}/bin:/usr/local/bin:/usr/bin:/bin`);

@@ -1,11 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHmac, randomBytes } from "node:crypto";
-import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { chmodSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { mintGithubGrant, readGithubGrantKey, sessionGithubScope } from "../packages/host/src/github-grants.js";
 import { loadGrantKey, verifyGrant } from "../scripts/github-proxy.mjs";
+import { mkdtempSecure } from "./helpers.js";
 
 const key = randomBytes(32);
 const now = Date.UTC(2026, 10, 14, 12, 0, 0);
@@ -68,9 +68,8 @@ test("unknown or malformed fields are refused even with a valid signature", () =
 
 test("the host and the proxy read the grant key only from a root-owned file below root-owned directories", () => {
   const uid = process.getuid!();
-  const root = realpathSync(mkdtempSync(join(homedir(), ".github-grant-key-")));
+  const root = mkdtempSecure("github-grant-key-");
   try {
-    chmodSync(root, 0o700);
     const keyHex = randomBytes(32).toString("hex");
     const write = (path: string, mode: number) => { writeFileSync(path, `${keyHex}\n`); chmodSync(path, mode); return path; };
     const host = (path: string, trustedUid = uid) => readGithubGrantKey(path, { trustedUid });

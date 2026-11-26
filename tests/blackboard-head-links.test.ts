@@ -55,21 +55,23 @@ test("remote access admits team entries, context-usage, and mission progress rou
 
     const list = await client.request<{ path: string }>(`/teams/${teamId}/entries?limit=20`);
     const detail = await client.request<{ path: string }>(`/teams/${teamId}/entries/${entryId}`);
-    const withdraw = await client.request<{ path: string }>(`/teams/${teamId}/entries/${entryId}/withdraw`, { method: "POST", body: { requestId: randomUUID() } });
     const usage = await client.request<{ path: string }>(`/teams/${teamId}/context-usage`);
     const progress = await client.request<{ path: string }>(`/missions/${missionId}/progress?cursor=abc`);
 
     assert.deepEqual(
-      [list.path, detail.path, withdraw.path, usage.path, progress.path],
+      [list.path, detail.path, usage.path, progress.path],
       [
         `/api/teams/${teamId}/entries?limit=20`,
         `/api/teams/${teamId}/entries/${entryId}`,
-        `/api/teams/${teamId}/entries/${entryId}/withdraw`,
         `/api/teams/${teamId}/context-usage`,
         `/api/missions/${missionId}/progress?cursor=abc`,
       ],
     );
 
+    await assert.rejects(
+      client.request(`/teams/${teamId}/entries/${entryId}/withdraw`, { method: "POST", body: { requestId: randomUUID() } }),
+      (error: RemoteError) => error.status === 403 && error.code === "remote-endpoint-denied",
+    );
     await assert.rejects(
       client.request(`/teams/${teamId}/entries/not-a-uuid`),
       (error: RemoteError) => error.status === 403 && error.code === "remote-endpoint-denied",

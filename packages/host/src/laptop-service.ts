@@ -11,6 +11,7 @@ import { forwardExecutor, type ExecutorControl } from "./executor-tunnel.js";
 import { captureWorkspace, hasWorkspaceBlobs, materializeWorkspace, putWorkspaceBlob, readWorkspaceBlob, validateWorkspaceManifest, type WorkspaceManifest } from "./workspace-checkpoint.js";
 import { shouldCaptureWorkspace, watchWorkspaceChanges } from "./workspace-changes.js";
 import { transferWorkspaceBlobs } from "./workspace-transfer.js";
+import { supervisorArgs } from "./group-supervisor.js";
 
 interface LaptopServiceOptions {
   origin: string;
@@ -194,19 +195,6 @@ export async function startLaptopService(options: LaptopServiceOptions): Promise
   });
 }
 
-const EXECUTOR_SUPERVISOR = `
-  const {spawn}=require('node:child_process');
-  const child=spawn(process.argv[1],process.argv.slice(2),{detached:true,stdio:['ignore','pipe','pipe']});
-  let stopping=false;
-  const kill=signal=>{if(child.pid)try{process.kill(-child.pid,signal)}catch{}};
-  const stop=()=>{if(stopping)return;stopping=true;kill('SIGTERM');setTimeout(()=>{kill('SIGKILL');process.exit(1)},2000)};
-  process.on('exit',()=>kill('SIGKILL'));process.stdout.on('error',stop);process.stderr.on('error',stop);
-  child.stdout.pipe(process.stdout);child.stderr.pipe(process.stderr);
-  process.stdin.resume();process.stdin.on('end',stop);process.stdin.on('error',stop);
-  for(const signal of ['SIGINT','SIGTERM','SIGHUP'])process.on(signal,stop);
-  child.on('error',()=>process.exit(1));child.on('exit',code=>{kill('SIGKILL');process.exit(code??1)});
-`;
-
 function executorEndpoint(child: ChildProcess, signal: AbortSignal): Promise<string> {
   return new Promise((resolve, reject) => {
     let text = "", done = false;
@@ -266,8 +254,8 @@ async function runLaptopService(): Promise<void> {
     });
     if (abort.signal.aborted) throw new Error(STARTUP_ERROR);
     const executorToken = randomBytes(32).toString("hex");
-    executor = spawn(process.execPath, ["-e", EXECUTOR_SUPERVISOR, "codex", "exec-server", "--listen", "ws://127.0.0.1:0", "--ws-auth", "capability-token",
-      "--ws-token-sha256", createHash("sha256").update(executorToken).digest("hex")], { cwd: options.cwd, stdio: ["pipe", "pipe", "pipe"] });
+    executor = spawn(process.execPath, supervisorArgs("codex", ["exec-server", "--listen", "ws://127.0.0.1:0", "--ws-auth", "capability-token",
+      "--ws-token-sha256", createHash("sha256").update(executorToken).digest("hex")], { cwd: options.cwd }), { cwd: options.cwd, stdio: ["pipe", "pipe", "pipe"] });
     executor.on("error", stop); executor.on("exit", stop);
     executor.stdin?.on("error", stop);
     const executorUrl = await executorEndpoint(executor, abort.signal);

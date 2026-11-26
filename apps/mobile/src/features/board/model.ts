@@ -38,6 +38,10 @@ export function attemptLabel(item: BoardItem) {
   return item.attempt ? `Attempt ${item.attempt.number} of ${item.attempt.of}` : undefined;
 }
 
+export function subtaskProgressLabel(item: Pick<BoardItem, "subtasks">): string | undefined {
+  return item.subtasks?.total ? `${item.subtasks.done}/${item.subtasks.total}` : undefined;
+}
+
 export function findBoardItem(items: BoardItem[], kind: BoardItem["kind"], id: string) {
   return items.find(item => item.kind === kind && item.id === id);
 }

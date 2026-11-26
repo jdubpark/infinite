@@ -197,6 +197,7 @@ export async function startHost(options: { agents?: Config["agents"]; config?: P
         }
       },
       (status) => status === 200,
+      20000,
     );
   };
   const stop = async () => {

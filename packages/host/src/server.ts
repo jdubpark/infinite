@@ -111,7 +111,7 @@ import { LinearService } from "./linear.js";
 import { goalActionSchema, goalExtendSchema, goalSteerSchema, goalOutcomeSchema, goalParallelismSchema } from "./goal-types.js";
 import { createProjectGroupSchema, projectGroupIdSchema, updateProjectGroupSchema } from "./project-group-types.js";
 import { DesktopError, DesktopFiles, DesktopResources, DESKTOP_LIMITS } from "./desktop.js";
-import { type Config, type Role, type Receipt, type Session, httpControlRequestSchema, learningPurpose, normalizeControlRequest } from "./types.js";
+import { type Config, type Role, type Receipt, type Session, httpControlRequestSchema, isEvalSession, normalizeControlRequest } from "./types.js";
 import { Summarizer, SummaryError } from "./summary.js";
 import { DictationCleaner, DictationError } from "./dictation.js";
 import { RepositoryBriefings } from "./repository-briefings.js";
@@ -427,7 +427,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
     session.executionLocation ?? (session.workspace ? "laptop" : "cloud");
   const usageRow = (id: string) => { const row = usage.session(id); return row.measured ? { usage: row } : {}; };
   const listSessions = async (options: { includeFullMessage?: boolean } = {}) => {
-    const native = (await manager.list({ includeFullMessage: options.includeFullMessage === true || Boolean(config.jev && config.jev.sessionReadings !== false) })).filter(session => !learningPurpose(session.purpose)).map(session => {
+    const native = (await manager.list({ includeFullMessage: options.includeFullMessage === true || Boolean(config.jev && config.jev.sessionReadings !== false) })).filter(session => !isEvalSession(session)).map(session => {
       const handoff = handoffs.listedView(session.id);
       const managed = managedBy(session);
       return { ...session, ...(managed ? { managedBy: managed } : {}), handoff, ...usageRow(session.id), executionLocation: executionLocation(session), backend: "infinite" as const, machineId: config.machine!.id,

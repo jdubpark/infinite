@@ -1,5 +1,5 @@
 import { HANDOFF_INSTRUCTIONS } from "./handoff-types.js";
-import { learningPurpose, type AgentProfile, type Config, type Provider, type SessionPurpose } from "./types.js";
+import type { AgentProfile, Config, ExecutionIdentity, Provider } from "./types.js";
 import { dirname, join } from "node:path";
 import { teamModelProfileSchema, type TeamModelProfile } from "./team-types.js";
 import { TeamError } from "./team-workspace.js";
@@ -8,8 +8,8 @@ import { sudoShape } from "./sudo-profile.js";
 import { EGRESS_ENVIRONMENT_NAMES } from "./egress.js";
 import { CLAUDE_CODE_MODE_ENV, codeModeEnabled } from "./code-mode.js";
 
-export function sessionAgentProfile(config: Pick<Config, "agents" | "eval">, provider: Provider, purpose: SessionPurpose | undefined): AgentProfile | undefined {
-  if (!learningPurpose(purpose)) return config.agents[provider];
+export function sessionAgentProfile(config: Pick<Config, "agents" | "eval">, provider: Provider, executionIdentity: ExecutionIdentity = "production"): AgentProfile | undefined {
+  if (executionIdentity !== "eval") return config.agents[provider];
   const agents = config.eval?.member?.agents;
   const profile = agents && (provider === "claude" || provider === "codex" || provider === "opencode") ? agents[provider] : undefined;
   if (!profile) throw new TeamError(409, "eval-identity-missing", "The eval identity has no launch profile for this provider.");
@@ -23,8 +23,8 @@ export function memberCodeModeExpected(config: Pick<Config, "agents" | "codeMode
   return codeModeEnabled(config.codeMode?.claude, "claude", { headless: shape.headless, served: shape.headless && shape.unservable === undefined, excluded: false });
 }
 
-export function withoutSharedContext<T extends { text: string; sources: readonly unknown[] }>(context: T, purpose: SessionPurpose | undefined): T {
-  return learningPurpose(purpose) ? { ...context, text: "", sources: [] } : context;
+export function withoutSharedContext<T extends { text: string; sources: readonly unknown[] }>(context: T, executionIdentity: ExecutionIdentity = "production"): T {
+  return executionIdentity === "eval" ? { ...context, text: "", sources: [] } : context;
 }
 
 export function teamModelLaunch(profile: AgentProfile, input: TeamModelProfile): AgentProfile {

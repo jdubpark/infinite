@@ -65,7 +65,7 @@ import { createExecutorTunnel, type ExecutorTunnel } from "./executor-tunnel.js"
 import { JsonLineAssembler, toolFromRunLine, usageFromRunLine } from "./opencode-usage.js";
 import { createHybridWorkspace } from "./hybrid-workspace.js";
 import { WorkerScreenActivity } from "./worker-screen-activity.js";
-import { normalizeWorkerControlRequest, teamAnswerWorkerRequestSchema, workerControlRequestSchema, workerWorkspaceExportRequestSchema,
+import { normalizeWorkerControlRequest, resolveBootstrapExecutionIdentity, teamAnswerWorkerRequestSchema, workerControlRequestSchema, workerWorkspaceExportRequestSchema,
   type Bootstrap,
   type ControlActor,
   type ControlLease,
@@ -86,6 +86,7 @@ for await (const chunk of process.stdin) {
 const config = JSON.parse(bootstrap) as Bootstrap;
 bootstrap = "";
 const { session, profile, stateDir, runDir, socketDir } = config;
+const executionIdentity = resolveBootstrapExecutionIdentity(config);
 const workerSocket = socketPath({ runDir, socketDir: ensureSocketDir(socketDir ?? runDir, socketDir !== undefined ? "socketDir" : "runDir") }, session.id);
 const provider = session.provider;
 const key = Buffer.from(config.key, "base64");
@@ -1494,7 +1495,7 @@ server.listen(workerSocket, async () => {
       env.INFINITE_HOOK_URL = hookServer.url;
       env.INFINITE_HOOK_TOKEN = hookToken;
     }
-    const egress = workerEgressEnvironment(session.projectId, session.id, process.env, Date.now(), session.purpose);
+    const egress = workerEgressEnvironment(session.projectId, session.id, process.env, Date.now(), executionIdentity);
     if (egress.status === "invalid") throw new Error("The egress proxy address this worker inherited is unusable, so the session was not started");
     clearEgressEnvironment(env); Object.assign(env, egress.env);
     if (egress.status === "no-key") journal.append("lifecycle", { egress: "no-credential" });

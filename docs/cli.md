@@ -211,6 +211,7 @@ infinite team resume TEAM_ID
 infinite team continue TEAM_ID ["direction"]
 infinite team revoke-routing TEAM_ID
 infinite team cancel TEAM_ID
+infinite team processes-ended TEAM_ID
 infinite team delete TEAM_ID [--json]
 infinite team entries TEAM_ID [--kind KIND] [--task TASK_ID] [--since SEQ] [--json]
 infinite team entry TEAM_ID ENTRY_ID [--json]
@@ -232,8 +233,10 @@ The bottom line always lists the keys for the current view. A non-interactive
 watch prints again only when the visible text changes. `--logs` starts in the
 review log, `--board` starts in the blackboard entry view, and
 `infinite team status TEAM_ID --logs` prints the current revision's logs once.
-`team delete` removes a settled cancelled, merged, or no-change run and its
-workspace. Repeating the command after removal prints `already removed` and
+`team processes-ended` states, as the owner, that the processes of a stopped
+setup or check command have ended, for a run whose process census cannot tell;
+see [Goals and agent teams](teams.md). `team delete` removes a settled
+cancelled, merged, or no-change run and its workspace. Repeating the command after removal prints `already removed` and
 exits successfully. `--json` prints the final team record. See [Goals and agent teams](teams.md) for the
 full key list.
 

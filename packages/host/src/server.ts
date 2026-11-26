@@ -67,7 +67,7 @@ import { parseGoalCreateBody } from "./objective-input.js";
 import { routingRoutes } from "./routing-routes.js";
 import { spawnTeamBundle } from "./team-workspace.js";
 import { signalGroup, watchLeader } from "./process-group.js";
-import { createTeamSchema, teamContinueSchema, teamMutationSchema, teamDeliveryReconcileSchema, teamVerificationReconcileSchema, teamMemberRetireSchema, teamActionSchema, teamTaskRatingSchema, teamParallelismSchema } from "./team-types.js";
+import { createTeamSchema, teamContinueSchema, teamMutationSchema, teamDeliveryReconcileSchema, teamVerificationReconcileSchema, teamProcessesEndedSchema, teamMemberRetireSchema, teamActionSchema, teamTaskRatingSchema, teamParallelismSchema } from "./team-types.js";
 import { scorecardFromRows, type ProfileIdentityOf } from "./scorecard.js";
 import { profileIdentity } from "./run-events.js";
 import { CellQueryRefused, type CellQuery, type CostLookup } from "./outcome-cells.js";
@@ -1339,6 +1339,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
     res.json(await teams.reconcileDelivery(standaloneTeam(req.params.id), teamDeliveryReconcileSchema.parse(req.body))));
   app.post("/api/teams/:id/reconcile-verification", requireRole(["owner"]), async (req, res) =>
     res.json(await teams.reconcileVerification(standaloneTeam(req.params.id), teamVerificationReconcileSchema.parse(req.body))));
+  app.post("/api/teams/:id/processes-ended", requireRole(["owner"]), async (req, res) => res.json(await teams.processesEnded(id.parse(req.params.id), teamProcessesEndedSchema.parse(req.body))));
   app.get("/api/teams/:id/members/:memberId/runtime", requireRole(["owner"]), async (req, res) =>
     res.json(await teams.inspectMemberRuntime(standaloneTeam(req.params.id), id.parse(req.params.memberId))));
   app.post("/api/teams/:id/members/:memberId/retire", requireRole(["owner"]), async (req, res) =>

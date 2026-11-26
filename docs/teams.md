@@ -443,22 +443,26 @@ ready-for-review, and blocked workspaces are removed. After a blocked run's
 workspace removal completes, the host closes it as `cancelled` with the last
 blocker in its reason; it does not claim the work is complete. Its record then
 uses the normal `cancelledMinutes` retention. The outcome ledger keeps the run
-as blocked: the close writes no second settled event. A blocked run that
-still holds an unresolved operation keeps its workspaces unless the host looks
-and finds no process of that operation. The host records each command an
+as blocked: the close writes no second settled event. A blocked or cancelled
+run that still holds an unresolved operation with a process record keeps its
+workspaces unless the host looks and finds no process of that operation.
+Such a cancelled run's workspaces are removed after `cancelledMinutes` only when
+a look taken at that moment, in two passes, finds neither kind of process
+described below. The host records each command an
 operation starts, as the leader of its own session and process group, in the
-step that starts it, and while the operation runs it samples the process table
-for descendants that moved to other sessions or groups. The saved intent says
-that this record may be incomplete from before a command starts until a save
-holds it. When an operation fails, the host ends the operation's commands that
-are still running, as a halt does, and refuses the commands that have not
-started: one that the operation asks for later, and one that was still waiting
-for its turn to start. Such a command is refused at its turn or, when its turn
-came before the failure, just before its start, because its stop came first.
-The saved failure holds every command that has started, so it marks
-the record incomplete only while a command is still starting, not while the host
-still reads a command's start time. While such a run
-is blocked or paused with no command of its own running, the host looks at most
+step that starts it, and while
+the operation runs it samples the process table for descendants that moved to
+other sessions or groups. The saved intent says that this record may be
+incomplete from before a command starts until a save holds it. When an
+operation fails, the host ends the operation's commands that are still running,
+as a halt does, and refuses the commands that have not started: one that the
+operation asks for later, and one that was still waiting for its turn to start.
+Such a command is refused at its turn or, when its turn came before the failure,
+just before its start, because its stop came first. The saved failure holds
+every command that has started, so it marks the record incomplete only while a
+command is still starting, not while the host still reads a command's start
+time. While such a run
+is blocked, paused or cancelled with no command of its own running, the host looks at most
 every ten minutes for processes that match the record, and for any process of
 the host account or of the account that runs team commands that uses the run
 directory as a working directory, open file, or command-line argument. The
@@ -494,7 +498,10 @@ from it after a deadline stop; cancelling updates the cycle to `cancelled` so
 goal cleanup removes the run record after workspace removal. An owner can also
 cancel a blocked mission subteam directly after its mission is no longer active.
 `DELETE /api/teams/:id` and `infinite team delete ID` remove a settled
-cancelled, merged, or no-change run (clones and record) immediately. A live
+cancelled, merged, or no-change run (clones and record) immediately. A run that
+still holds an unresolved operation with a process record is removed only when a
+look taken at that moment finds no process of that operation and none using the
+run directory; otherwise the request receives `team-operation-running`. A live
 goal, mission, or handoff that still uses the run as its source receives
 `team-retained`; `team-in-use` means another run has a pending preparation that
 clones from this workspace. Both removals can be retried once the reference
@@ -2979,12 +2986,11 @@ remain visible.
 Each configured check may run for `teams.checkMinutes` (default 60). A check that
 runs past the limit is stopped and blocks the team with a resumable reason. The
 timeout does not count as one of the team's two correction rounds, because it is
-host evidence about the check, not about the agents' work. When the command runs
-through a `teams.commandPrefix` such as `sudo`, the stop does not reach it. The
-host is refused permission to signal it, and the check output then says so; or
-the signal ends only the `sudo` process, and the output says nothing. In both
-cases the command is left to finish and its result is not used. Size the limit
-for the project's full check on the execution host.
+host evidence about the check, not about the agents' work. A check that runs
+through a `teams.commandPrefix` such as `sudo` is stopped in the prefix's way
+described below, and the run is then held until the host sees that the check
+ended; its result is never used. Size the limit for the project's full check on
+the execution host.
 
 Setup and check commands run with a small fixed environment, not a login shell.
 Where the agent egress boundary is configured (see
@@ -2998,10 +3004,14 @@ test independent of the variables.
 Every command that the host's team command runner starts for a team (setup,
 checks, member setup, the Git commands it runs and, under a command prefix,
 workspace removal) ends with the process that the host started for it.
-While that process runs, a stop (the time limit, a pause, a cancel, a block or a
-host stop) kills its process group. A command whose stop comes before its start,
-for example while it waits for its turn to start, is never started: it returns
-as interrupted, with no output. Once that process has exited, the host sends
+While that process runs, a stop (the time limit, a pause, a cancel, a steer, a
+block or a host stop) ends the command in one of two ways. Without a command
+prefix the host kills the command's process group at once. Under a command
+prefix the host sends SIGTERM to the process group, and SIGKILL five seconds
+later if that process still runs, because a prefix such as `sudo` passes on the
+signals it can catch and cannot pass on SIGKILL. A command whose stop comes
+before its start, for example while it waits for its turn to start, is never
+started: it returns as interrupted, with no output. Once that process has exited, the host sends
 no signal to anything the command started: the group may be empty by then, and
 its id may already belong to an unrelated process. The host reads output that is
 still open for at most one second. It then reads what the pipes already hold:
@@ -3023,15 +3033,89 @@ incomplete read; the few that decide by Git's exit code alone read only output
 that is complete when Git exits. A stop that arrives within the second ends the
 command at once with the output read so far, and still sends no signal.
 
-The rule has two limits. A command that was stopped before its process exited
-ends when its output closes, or at the caller's limit where the caller sets
-one. Setup and check commands set none, so a check or setup command that ran
-past its time limit and left a process in another session holding its output
-keeps its operation open until that process ends. Under a command prefix that
-runs the command as another account, such as `sudo`, the stop does not reach
-the command: the host's signal is refused, or it ends only the `sudo` process.
-The command keeps running and holds the output, so the operation stays open
-until the command ends. Two Git runners outside the
+The rule has three limits. First, a command that was stopped before its
+process exited ends when its output closes, or at the caller's limit where the
+caller sets one. Setup and check commands set ten seconds after the stop. A
+setup or check command whose output is still open then, because a process in
+another session holds it, fails its operation with `command-stop-unconfirmed`.
+
+Second, under a command prefix that runs the command as another account, the
+stop reaches only part of the command. Measured with sudo 1.9.15p5 started
+without a terminal, with and without `use_pty`: `sudo` passes the SIGTERM to the
+command's first process only, the processes that process started get no signal,
+and a SIGKILL ends `sudo` while the command keeps running. Neither a delivered
+signal nor closed output shows that such a command ended. A setup or check
+command stopped under a prefix therefore fails its operation with
+`command-stop-unconfirmed` in every case: when its output closes, and at the
+ten-second limit when it does not.
+
+An operation that failed with `command-stop-unconfirmed` stays pending with its
+process record, whatever stopped the command: the time limit, a pause, a cancel,
+a steer or a block. A host stop records no such failure: the host closes its
+team service before the stop settles, so after the restart the run is blocked
+with the reason for an operation that a restart interrupted, and its process
+record holds the run's directories in the same way. A restart after the failure
+was recorded keeps the failure, its reason and its process record.
+
+The run's reason says that the earlier command may still be running. Until the
+host looks and finds none of that operation's processes and none using the run
+directory, it starts nothing more for the run: no Git command, no further setup
+or check, no member, and no workspace removal. Resume and steering answer
+`team-command-running` (409) until then. Each of these requests takes a fresh
+look before it enters the run's queue; requests that arrive during a look share
+it, and the run's other requests are answered meanwhile. The host also looks
+once right after it records the failure, and the retention sweep looks every
+ten minutes. The run shows as resumable once a look has found the operation
+ended.
+
+The host clears the operation only in the step that accepts a request: a
+Resume, a steer, the owner's release of a halt, or a mission's release of its
+run. A refused request leaves the operation in place, and the next request
+looks again. A run paused during such a command accepts its first Resume after
+the command ended. A mission's release of a run whose command may still run is
+answered `team-operation-running`; the mission keeps its halt and retries, and
+a retry within 30 seconds reuses the last look. A goal's or a mission's Resume
+or steer of such a run is answered `team-command-running`. The goal or mission
+keeps the request and retries it, with the same 30-second reuse. The goal's
+reason, or one event of the mission for each answer it gets, says that the
+request waits for the run's stopped command. While the look cannot tell, that
+answer names the owner's statement for the run; while the look sees the
+command's processes, the host refuses the statement. The owner's review on
+GitHub waits the same way, whether it steers the run directly or through the
+mission coordinator's forward: the run records one event for each answer to a
+direct review, the mission one for each answer to its forward, and the wait
+does not count as a refusal of the coordinator's report. The owner's pause or
+cancel of the goal, or a halt, replaces a goal's Resume or steer that waits this
+way; a replaced steer's direction stays in the goal's steering and does not
+reach the run. A mission's pause or cancel is not held by such a request: the
+request waits while the mission is paused, and a cancel drops it.
+
+The look supports no prefix, or a `sudo` prefix whose launcher has the
+`process-census` wrapper beside it. Under any other prefix, the instance
+skeleton's root-owned launcher among them, the look cannot tell whether the
+command ended. The run's reason then says that the owner's statement is the
+only way out and names its command. After checking the host, the owner runs
+`infinite team processes-ended RUN_ID`, which sends
+`POST /api/teams/:id/processes-ended` with `{ "requestId": "<uuid>" }`. The
+route takes the owner role only, accepts no other field, and answers a repeated
+request ID with the run unchanged. The host looks first:
+
+- When the look finds the operation's processes, or processes using the run
+  directory, it answers `team-command-running` (409) and records nothing.
+- When the look finds none, it records nothing more, and Resume is accepted as
+  after any look that found the operation ended.
+- When the look cannot tell, the host records the statement on the pending
+  operation and an event that names the look's result. Resume, steering, a
+  halt release and workspace removal then treat the operation as ended.
+
+A run without a process record answers `team-no-process-record` (409). No client
+offers the statement yet; it is a CLI and API action only. Census support for
+the instance launcher is a follow-up. A process that survives the stop is held
+off in this way, not killed; ending it is follow-up INF-428. Other commands
+under the prefix, the Git commands among them, are stopped the same way but do
+not hold the run.
+
+Third, two Git runners outside the
 team command runner, the streamed patch and file reads and the team bundle
 download, are not covered yet: they wait for their output to close, and a stop
 signals the command's process group.
@@ -3804,7 +3888,7 @@ The host sends one push per device when the health of main changes. It sends the
 
 The main check never starts an agent, never writes a project signal, and never changes a session, a routine or a team. It does not merge, deploy or change a branch.
 
-A command of a check ends when the process that the host started for it exits, as every team command does. While that process runs, a halt, the command's time limit and a host stop end the command: the host kills the command's process group, and a check that ends this way has no result. After that process has exited, the host sends no signal to anything the command started. It reads output that is still open for at most one second, reads what the pipes already hold, then closes it, and the command passes or fails by its exit code. A stop that arrives in that second ends the check with no result, and still sends no signal. A process that a check left behind is therefore never signalled by the host. When such a process writes to the closed output, the write fails as a write to a closed pipe does. The host removes the copy only after a process census finds nothing of the run alive. Until then the project waits on `processes`, and no main check starts on the host. Under a command prefix the removal is a command too, and the same rule holds for it: once the process that the host started for the removal has exited, the host signals nothing.
+A command of a check ends when the process that the host started for it exits, as every team command does. While that process runs, a halt, the command's time limit and a host stop end the command: the host kills the command's process group, or under a command prefix sends SIGTERM to it and SIGKILL five seconds later if that process still runs, and a check that ends this way has no result. After that process has exited, the host sends no signal to anything the command started. It reads output that is still open for at most one second, reads what the pipes already hold, then closes it, and the command passes or fails by its exit code. A stop that arrives in that second ends the check with no result, and still sends no signal. A process that a check left behind is therefore never signalled by the host. When such a process writes to the closed output, the write fails as a write to a closed pipe does. The host removes the copy only after a process census finds nothing of the run alive. Until then the project waits on `processes`, and no main check starts on the host. Under a command prefix the removal is a command too, and the same rule holds for it: once the process that the host started for the removal has exited, the host signals nothing.
 
 If the host cannot read a project's main-check record, the owner's read answers `readable: false`. The record may name a copy that is not removed yet, so the host never overwrites it and starts no main check on the whole host until it can be read; it tries again on every pass. The record is `main-check/PROJECT_ID.sealed` in the host state directory. When it cannot be restored, removing that file clears the state at the next pass, and a copy the record named stays under the team workspace until someone removes it.
 
@@ -3818,8 +3902,8 @@ Limits of this first slice, stated in full:
 - If the host's API process ends before it has recorded the end of the check, for example when it crashes or is killed, in the short window while a command of the check is starting, the run directory is not removed until the host boots again, and no main check on the host starts until then: that project waits on `processes` and the others on `another-check`. An orderly stop records the end of a running check first. Once the end is recorded, the record holds the process id of every command the check started, even while the host still reads a command's start time, and the copy is removed once a census finds nothing of the run, without a reboot. Earlier versions also held the copy until the next boot when the host stopped after recording the end, while it still read a command's start time. A copy held that way at the upgrade still waits for the host to boot again. The record does not say whether the end of the check or a host start after a crash marked such a copy, and only a host start can leave a command's process id out of the record.
 - Preparing the copy has no time limit of its own. It ends by the Git helpers' own limits, a halt, or a host stop.
 - Two different heads observed with the same stamp are ordered by their results' order in the record. Fetches of one mirror are serial, so their stamps differ in practice.
-- The host may not signal a command that the command prefix runs as another account. A halt, a time limit or a host stop then cannot end the command. The check is recorded as an error ten seconds later, the command runs on, and no main check on the host starts until the command has ended: that project waits on `processes` and the others on `another-check`. A team's checks have the same limit.
-- The host learns that a command's process has exited when its event loop next runs. A stop that the host handles before it has learned of the exit is a stop of a running command, and it kills the command's process group.
+- The host may not signal a command that the command prefix runs as another account. A halt, a time limit or a host stop reaches it only as far as the prefix passes the SIGTERM on: `sudo` passes it to the command's first process, not to the processes that process started. The check is recorded as an error ten seconds later, the command runs on, and no main check on the host starts until the command has ended: that project waits on `processes` and the others on `another-check`. A team's checks have the same limit.
+- The host learns that a command's process has exited when its event loop next runs. A stop that the host handles before it has learned of the exit is a stop of a running command, and it signals the command's process group.
 - The census cannot inspect some processes of the host's account and of the account that runs commands; on Linux a login session has such processes (its service manager and its SSH processes). When it admits a check, the host takes a census of a path under the team root that no copy uses (`main-check-gate`), and records each process that census cannot inspect by its id and start time, at most 256 of them, in a sealed anchor of that copy (`main-check-anchors/` in the host state directory). A process that names the team root in its arguments is recorded like any other. If `main-check-gate` under the team root is a symbolic link or another project's folder, a process the census cannot inspect that names that folder in its arguments is not recorded and holds the copy until it ends; this can delay a removal, never cause an early one. When it retires the copy, it disregards a process it cannot inspect only if the copy's anchor names the same id with the same start time, on the boot the check started in. Every other process it cannot inspect keeps the copy from being removed for as long as that process runs, whether or not a check started it: one that started after the admission, one past the first 256, one that received the id of an anchored process, and all of them when the anchor is missing or cannot be read. No main check on the host starts meanwhile: that project waits on `processes` and the others on `another-check`. A host that runs under a login account therefore also waits on a login session that starts while a copy waits; run the host under an account of its own, as the Ubuntu deployment does. A process that the account only started and that runs as another account, such as a `sudo` process, is not one of them. The anchor is deleted after the record no longer names the copy; after a host start, once every main-check record can be read, the host deletes every anchor that no record names.
 - An anchor is not an inspection. A process of the account that runs commands that was alive and could not be inspected before the admission enters the anchor without any tampering, for example a process that a team run's checks left behind, and the census never examines it while it stays that way: if it uses the copy, the copy is removed while it runs. A process that cannot be inspected and starts after the admission holds the copy until it ends, at every pass, so such processes that keep arriving during the wait extend it. On a machine where other login sessions of the account start at any time, such as a shared test runner, a copy can therefore wait for as long as each new session lasts.
 - Nothing of a run survives a reboot. On Linux, the host disregards every process it cannot inspect when it retires a copy recorded in an earlier boot. On macOS the boot id can change when the clock is set, so a changed boot id there keeps such a copy waiting on those processes, as before.

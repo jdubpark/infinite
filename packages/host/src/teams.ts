@@ -8,14 +8,14 @@ import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { type Config, type Session, isEvalSession } from "./types.js";
 import { TeamStopRefused, type Manager } from "./manager.js";
-import { bootId, extendWitness, hostProcesses, newWitness, recordCommand, type CensusResult, type HostProcesses, type ProcessWitness } from "./process-census.js";
+import { extendWitness, hostProcesses, newWitness, recordCommand, type HostProcesses, type ProcessWitness } from "./process-census.js";
 import type { WorkerError } from "./ipc.js";
 import { writeSealed, unseal } from "./vault.js";
 import { accountSettingPrompt, PROVIDER_NAMES, recoveryTurnEnd, type AttentionState, type Prompt, type SignalData } from "@infinite/attention";
 import { activeStageForRole, evaluateStallRecovery, MEMBER_STALL_REASON, syncObservedMemberState, type LivePromptRef } from "./stall-recovery.js";
 import { describeTeamWaitReasons, PERMISSION_AGENT_REASON, PERMISSION_REVIEW_REASON, PROVIDER_INPUT_REASON, SESSION_SLOT_REASON } from "./team-wait-reasons.js";
 import { autonomyOf, type AutonomyMode } from "./autonomy.js";
-import { buildTeamPendingOperation, createTeamSchema, decisionAnswerLabel, inputSourceLabel, lineupProfiles, resolveLimitFallback, teamActionSchema, teamGoalContextSchema, teamLineupSchema, teamMutationSchema, teamMemberRetireSchema, teamParallelismSchema, recordedTeamReportEnvelopeSchema, type CreateTeam, type SteeringSource, type TeamContinue, type TeamGoalContext, type TeamLineup, type TeamMember, type TeamMemberRetire, type TeamModelProfile, type TeamParallelism, type TeamPermissionDecision, type TeamPermissionRecoveryView, type TeamReport, type TeamRun, type TeamScout, type TeamTask, type TeamView, type TeamVerificationReconcile, type TeamDeliveryReconcile, currentPermissions, DEFAULT_STORAGE_FLOOR, hostClosedBlockedReason, autoPinned, coversPoint, escalationPool, hostProfilesFor, memberLimit, switchFallback } from "./team-types.js";
+import { buildTeamPendingOperation, createTeamSchema, lineupProfiles, resolveLimitFallback, teamActionSchema, teamGoalContextSchema, teamLineupSchema, teamMutationSchema, teamMemberRetireSchema, teamParallelismSchema, teamProcessesEndedSchema, recordedTeamReportEnvelopeSchema, type CreateTeam, type TeamContinue, type TeamGoalContext, type TeamLineup, type TeamMember, type TeamMemberRetire, type TeamModelProfile, type TeamParallelism, type TeamPermissionDecision, type TeamProcessesEnded, type TeamPermissionRecoveryView, type TeamReport, type TeamRun, type TeamScout, type TeamTask, type TeamView, type TeamVerificationReconcile, type TeamDeliveryReconcile, currentPermissions, DEFAULT_STORAGE_FLOOR, hostClosedBlockedReason, autoPinned, coversPoint, escalationPool, hostProfilesFor, memberLimit, switchFallback, decisionAnswerLabel, inputSourceLabel, type SteeringSource } from "./team-types.js";
 import { memberConfiguration, type MemberConfiguration } from "./config-identity.js";
 import { appendBuiltPrompt, appendStoredMemberPrompt, attachMemberScratchPrompt, builtPromptForMember, commitMemberPromptStore, deliveryPromptStale, getMemberPromptSections, pruneMemberPromptSections, pullRequestBranch, refreshBuiltPrompt, refreshMemberPromptForLaunch, setMemberPromptSections, setStoredMemberPrompt, storedWithPrunedPromptSections, takeMemberPromptStore, TEAM_PROMPT_LIMIT_BYTES, teamContext, teamDeliveryBranch, teamPromptSpec, type BuiltPrompt, type StoredMemberPromptSections, type TeamPromptSection } from "./team-prompts.js";
 import { reviewEvidenceProblems } from "./team-acceptance.js";
@@ -50,8 +50,9 @@ import type { Readings } from "./readings.js";
 import { projectGithubRepository, sessionGithubScope } from "./github-grants.js";
 import type { ProjectSourceService } from "./project-source.js";
 import type { RepositoryGraphs, RepositoryGraphResult } from "./repository-graphs.js";
-import { LEGACY_READ_ONLY_ROLE_CHANGED_FILES_REASON, TeamError, assertMemberReadOnly, assertMemberScope, assertTeamPath, captureDeliveryBaseline, captureMemberResult, ensureDefaultTeamRoot, ensureHostDirectory, integrateMemberResult, prepareMemberScratch, prepareMemberWorkspace, prepareRecoveryWorkspaceFromSource, prepareTeamWorkspace, prepareTeamWorkspaceFromMirror, prepareVerificationWorkspace, commandScope, type CommandResult, type CommandScope, teamCommand, teamHead, teamWorkspacePath, teamGitArgs, validateTeamPlan, writeTeamContext } from "./team-workspace.js";
+import { LEGACY_READ_ONLY_ROLE_CHANGED_FILES_REASON, TeamError, assertMemberReadOnly, assertMemberScope, assertTeamPath, captureDeliveryBaseline, captureMemberResult, ensureDefaultTeamRoot, ensureHostDirectory, integrateMemberResult, prepareMemberScratch, prepareMemberWorkspace, prepareRecoveryWorkspaceFromSource, prepareTeamWorkspace, prepareTeamWorkspaceFromMirror, prepareVerificationWorkspace, commandScope, type CommandResult, type CommandScope, CommandStopUnconfirmed, teamOperationCommand, teamCommand, teamHead, teamWorkspacePath, teamGitArgs, validateTeamPlan, writeTeamContext } from "./team-workspace.js";
 import { assertTeamworkPath } from "./repo-enrollment.js";
+import { CommandFence, HALT_CENSUS_MS, commandStopReasons, ownerStatementEvent, stopFenceLifted, stopFenced, type OwnerStatement, type TakenCensus } from "./team-command-fence.js";
 import { HOST_LOAD_REASON_PREFIX, LaunchHeldError } from "./host-load.js";
 import { permissionEvidenceHash } from "./team-permissions.js";
 import { storageShortfall, volumeUsage, type VolumeUsage } from "./storage.js";
@@ -114,17 +115,11 @@ export type PendingOperation = { id: string; kind: "prepare" | "member" | "resul
   failure?: { code?: string; reason: string; at: string };
   witness?: ProcessWitness;
   recording?: true;
+  processesEnded?: OwnerStatement;
 };
 type OperationCensus = { pendingId: string; at: string; state: "running" | "in-use" | "ended" | "unknown"; recorded?: number; using?: number; detail?: string };
-const CENSUS_TTL_MS = 10 * 60_000;
 const WITNESS_SAVE_MS = 200;
 type OperationRecorder = { pendingId: string; inFlight: number; spawning: number; sampling?: true; save?: NodeJS.Timeout };
-function operationCensusEvent(kind: PendingOperation["kind"], census: Omit<OperationCensus, "at" | "pendingId">) {
-  if (census.state === "running") return `The host still sees ${census.recorded} process(es) that match its record of the interrupted ${kind} operation${census.using ? `, and ${census.using} more using this run's directory` : ""}.`;
-  if (census.state === "in-use") return `The host sees ${census.using} process(es) using this run's directory. None matches its record of the interrupted ${kind} operation.`;
-  if (census.state === "ended") return `The host sees no process that matches its record of the interrupted ${kind} operation, and none using this run's directory. The intent stays recorded and is not replayed.`;
-  return `The host cannot tell whether the interrupted ${kind} operation left processes: ${census.detail}.`;
-}
 export type Stored = {
   run: TeamRun; fingerprint: string; receipts: Record<string, string>; prepared: boolean; root?: string; anchor?: string;
   goalPlanCorrectionRevision?: number;
@@ -233,7 +228,7 @@ export function blockedTeamCanResume(input: {
   verificationRecovery?: boolean;
 }): boolean {
   return input.status === "blocked"
-    && (input.verificationRecovery === true || input.reason === memberStallReason || input.reason === memberTimeLimitReason || input.reason === checkTimeoutReason)
+    && (input.verificationRecovery === true || input.reason === memberStallReason || input.reason === memberTimeLimitReason || input.reason === checkTimeoutReason || commandStopReasons.has(input.reason ?? ""))
     && input.prepared
     && !input.pending
     && !input.deliveryAttempt
@@ -272,13 +267,14 @@ export class TeamService {
   private readonly commands = new Map<string, AbortController>();
   private readonly recorders = new Map<string, OperationRecorder>();
   private readonly sampleTimers = new Set<NodeJS.Timeout>();
+  private readonly fence = new CommandFence(this.retentionHost(), (stored, pending) => this.recorderOf(stored, pending));
   private readonly retention = new TeamRetention(this.retentionHost());
   private readonly publisher = new TeamPublisher(this.publisherHost());
   private readonly recovery = new TeamRecovery(this.recoveryHost());
   private readonly permissions = new TeamPermissionReview(this.permissionHost());
   private readonly reviewFeedback = new TeamReviewFeedback((service => ({ get records() { return service.records; }, get config() { return service.config; },
     get key() { return service.key; }, get directory() { return service.directory; }, save: stored => service.save(stored), event: (stored, text) => service.event(stored, text),
-    enqueue: (runId, task) => service.enqueue(runId, task), steer: (id, input, source) => service.steer(id, input, source), held: projectId => Boolean(service.fuse?.held?.([projectId])),
+    enqueue: (runId, task) => service.enqueue(runId, task), steer: (id, input, source, censusReuseMs) => service.steer(id, input, source, censusReuseMs), held: projectId => Boolean(service.fuse?.held?.([projectId])),
     now: () => service.options?.now?.() ?? Date.now(), block: (stored, error) => service.block(stored, error), step: stored => service.step(stored),
     rebuildDeliveryPrompts: stored => service.rebuildDeliveryPrompts(stored) }) satisfies ReviewFeedbackHost)(this));
   private readonly directory: string;
@@ -359,6 +355,10 @@ export class TeamService {
         } else if (stored.run.status === "cancelled") {
           stored.halt = "cancel";
           this.event(stored, "The host restarted with an unresolved operation from a cancelled team. The intent remains retained and will not be replayed.");
+        } else if (stopFenced(stored)) {
+          run.status = "blocked";
+          stored.halt = "block";
+          this.event(stored, "The host restarted while a configured command it had stopped may still run. The run keeps its reason and its record of that operation's processes.");
         } else if (obsoletePermissionResult(stored, pending)) {
           stored.pending = undefined;
           stored.halt = undefined;
@@ -509,7 +509,7 @@ export class TeamService {
     return blockedTeamCanResume({
       status: run.status,
       reason: verificationRecovery ? verificationRecoveryReason : run.reason,
-      pending: Boolean(stored.pending) && !verificationRecovery,
+      pending: Boolean(stored.pending) && !verificationRecovery && !stopFenceLifted(stored),
       deliveryAttempt: Boolean(stored.deliveryAttempt),
       deliveryReceipt: Boolean(run.deliveryReceipt),
       prepared: stored.prepared,
@@ -872,7 +872,8 @@ export class TeamService {
       publicationTarget: stored => service.publicationTarget(stored),
       needsPublication: stored => service.needsPublication(stored),
       startPublication: stored => service.startPublication(stored),
-      refreshOperationCensus: (stored, force) => service.refreshOperationCensus(stored, force),
+      refreshOperationCensus: (stored, force) => service.fence.refresh(stored, force),
+      get fence() { return service.fence; },
       closeStaleBlockedRun: (stored, hours) => service.closeStaleBlockedRun(stored, hours),
       onBackgroundTask: () => service.diag.idle.bump(),
     };
@@ -1133,7 +1134,7 @@ export class TeamService {
               : await prepareTeamWorkspace(workspaceSource.path, root, directoryName, branch, this.config.teams?.commandPrefix, signal, workspaceSource.head, anchor, workspaceSource.startCommit);
             assertParent();
             if (project.team?.setup) {
-              const setup = await teamCommand(project.team.setup, workspace.workspace, signal, 600000, this.config.teams?.commandPrefix);
+              const setup = await teamOperationCommand(project.team.setup, workspace.workspace, signal, 600000, this.config.teams?.commandPrefix);
               await this.noteLeftover(stored, setup);
               if (setup.exitCode !== 0 || setup.interrupted) throw new TeamError(409, "team-setup-failed", "The configured setup command failed. Inspect the isolated workspace before restarting.");
               await assertMemberReadOnly(workspace.workspace, workspace.baseCommit, this.config.teams?.commandPrefix, signal, "setup");
@@ -1180,14 +1181,16 @@ export class TeamService {
     stored.receipts[requestId] = fingerprint;
     stored.ownerHalt = undefined;
   }
-  steer(id: string, input: Mutation, source?: SteeringSource) {
+  steer(id: string, input: Mutation, source?: SteeringSource, censusReuseMs = 0) {
     const body = { ...teamMutationSchema.parse(input), ...(source === undefined ? {} : { source }) };
-    return this.enqueue(id, async () => {
+    return this.fence.recent(id, censusReuseMs).then(taken => this.enqueue(id, async () => {
       const stored = this.record(id);
       if (this.replay(stored, "steer", body)) return this.view(stored);
       if (stored.deliveryAttempt || stored.run.deliveryReceipt) throw new TeamError(409, "delivery-reconciliation-required", "Inspect the recorded pull request before starting another run; steering cannot replay a started delivery.");
-      if (stored.pending && !this.commands.has(id)) throw new TeamError(409, "team-reconciliation-required", "This team has an unresolved workspace or verification operation. Inspect its evidence and start a new team rather than replaying uncertain work.");
-      if (stored.pending && stored.pending.kind !== "check") throw new TeamError(409, "team-operation-running", "A workspace operation is in progress. Retry steering after it settles.");
+      this.fence.check(stored, taken);
+      const pending = stopFenceLifted(stored) ? undefined : stored.pending;
+      if (pending && !this.commands.has(id)) throw new TeamError(409, "team-reconciliation-required", "This team has an unresolved workspace or verification operation. Inspect its evidence and start a new team rather than replaying uncertain work.");
+      if (pending && pending.kind !== "check") throw new TeamError(409, "team-operation-running", "A workspace operation is in progress. Retry steering after it settles.");
       if (stored.run.workspaceRemovedAt) throw new TeamError(409, "team-workspace-removed", "This run's workspaces were removed under the retention policy; start a new run.");
       if (Buffer.byteLength(stored.run.steering.map(item => item.text).join("")) + Buffer.byteLength(body.text) > 32 * 1024) throw new TeamError(409, "team-steering-limit", "This team reached its 32 KiB steering limit. Start a new team with consolidated requirements.");
       if (stored.run.steering.length >= 20) throw new TeamError(409, "team-steering-limit", "This team reached its steering limit. Start a new team from the reviewed integration branch.");
@@ -1197,6 +1200,7 @@ export class TeamService {
       this.commands.get(id)?.abort();
       await this.invalidatePermissionDecisions(stored, "A steer started before the permission request could be answered.");
       this.recordReceipt(stored, body.requestId, receipt);
+      this.fence.lift(stored);
       if (stored.run.recovery && stored.run.recovery.status !== "exhausted") {
         stored.run.recovery.status = "exhausted";
         this.event(stored, `${source ? inputSourceLabel(source) : "User"} steering superseded automatic recovery; its original report remains recorded as evidence.`);
@@ -1211,7 +1215,7 @@ export class TeamService {
       if (stored.run.discovery && !stored.run.discovery.completedAt) stored.run.discovery.completedAt = timestamp();
       this.event(stored, `${source ? inputSourceLabel(source) : "User"} steering recorded. Earlier reports cannot satisfy the new revision.`); this.save(stored);
       return this.view(stored);
-    });
+    }));
   }
 
   private recoveryHost(): RecoveryHost {
@@ -1229,7 +1233,7 @@ export class TeamService {
       emit: (stored, kind, keyParts, ids, data) => service.emit(stored, kind, keyParts, ids, data),
       assertDelivery: stored => service.assertDelivery(stored),
       prepareMember: (stored, role, task, feedback, onPrepared) => service.prepareMember(stored, role, task, feedback, onPrepared),
-      refreshOperationCensus: (stored, force) => service.refreshOperationCensus(stored, force),
+      refreshOperationCensus: (stored, force) => service.fence.refresh(stored, force),
       verificationCommands: run => service.verificationCommands(run),
       canContinue: (stored, linearStatus, allowRemovedWorkspace) => service.canContinue(stored, linearStatus, allowRemovedWorkspace),
       canResume: (stored, linearStatus, allowRemovedWorkspace) => service.canResume(stored, linearStatus, allowRemovedWorkspace),
@@ -1418,8 +1422,31 @@ export class TeamService {
     if (left.length) stored.unfencedAnswers = left; else delete stored.unfencedAnswers;
   }
   pause(id: string, input: Action, source?: ConnectorSource) { return this.action(id, "pause", { ...teamActionSchema.parse(input), ...(source ? { source } : {}) }); }
-  resume(id: string, input: Action, source?: ConnectorSource) { const body = { ...teamActionSchema.parse(input), ...(source ? { source } : {}) }; return this.confirmed(id).then(() => this.action(id, "resume", body)); }
+  resume(id: string, input: Action, source?: ConnectorSource, censusReuseMs = 0) { const body = { ...teamActionSchema.parse(input), ...(source ? { source } : {}) }; return this.confirmed(id).then(() => this.fence.recent(id, censusReuseMs)).then(taken => this.action(id, "resume", body, taken)); }
   cancel(id: string, input: Action, source?: ConnectorSource) { return this.action(id, "cancel", { ...teamActionSchema.parse(input), ...(source ? { source } : {}) }); }
+  processesEnded(id: string, input: TeamProcessesEnded) {
+    const body = teamProcessesEndedSchema.parse(input), fingerprint = receiptDigest({ operation: "processes-ended", ...body });
+    const replayed = this.records.get(id)?.receipts[body.requestId] === fingerprint;
+    return (replayed ? Promise.resolve(undefined) : this.fence.take(id, true)).then(taken => this.enqueue(id, async () => {
+      const stored = this.record(id), pending = stored.pending, prior = stored.receipts[body.requestId];
+      if (prior) {
+        if (prior !== fingerprint) throw new TeamError(409, "request-conflict", "This request ID belongs to a different team action.");
+        return this.view(stored);
+      }
+      if (!pending?.witness) throw new TeamError(409, "team-no-process-record", "This run holds no record of an operation's processes for the owner to state as ended.");
+      const state = taken && this.fence.apply(stored, taken);
+      if (state === undefined) throw new TeamError(409, "team-operation-running", "The run's operation is running, or changed during the host's census. Retry the statement after it settles.");
+      if (state === "running" || state === "in-use") throw new TeamError(409, "team-command-running", "The host still sees processes of this run's operation, or processes using its directory, so it does not accept the statement. Retry after they have exited.");
+      if (state === "unknown") {
+        pending.processesEnded = { requestId: body.requestId, at: timestamp(), detail: stored.census?.detail ?? "" };
+        this.event(stored, ownerStatementEvent(pending.kind, pending.processesEnded.detail));
+      }
+      stored.receipts[body.requestId] = fingerprint;
+      this.save(stored);
+      this.trackBlocked(stored);
+      return this.view(stored);
+    }));
+  }
   private async closeStaleBlockedRun(stored: Stored, hours: number) {
     const { run } = stored;
     if (run.status !== "blocked" || !run.workspaceRemovedAt || filesystemEntryExists(teamRunDirectory(run.workspace))) return;
@@ -1434,7 +1461,7 @@ export class TeamService {
     this.commands.get(run.id)?.abort();
     await this.invalidatePermissionDecisions(stored, "The host closed the blocked team before the permission request could be answered.");
   }
-  private action(id: string, action: "pause" | "resume" | "cancel", body: Action & { source?: ConnectorSource }) {
+  private action(id: string, action: "pause" | "resume" | "cancel", body: Action & { source?: ConnectorSource }, taken?: TakenCensus) {
     return this.enqueue(id, async () => {
       const stored = this.record(id), run = stored.run;
       if (this.replay(stored, action, body)) return this.view(stored);
@@ -1443,6 +1470,7 @@ export class TeamService {
         if (tracking && JSON.stringify(run.linear) !== JSON.stringify(tracking)) { run.linear = tracking; this.save(stored); }
       }
       if (action === "pause" && (["ready-for-review", "merged", "no-change"].includes(run.status) || run.status === "blocked" && !run.workspaceRemovedAt)) throw new TeamError(409, "team-not-running", "This team is not running and cannot be paused.");
+      if (action === "resume") this.fence.check(stored, taken);
       const verificationRecovery = action === "resume" && validVerificationRecovery(stored) ? stored.verificationRecovery : undefined;
       if (action === "resume") { const refusal = this.resumeRefusal(stored, verificationRecovery); if (refusal) throw refusal; }
       if (action === "resume" && verificationRecovery) return this.resumeVerificationRecovery(stored, body, verificationRecovery);
@@ -1452,6 +1480,7 @@ export class TeamService {
       const record = () => this.recordReceipt(stored, body.requestId, receipt);
       if (action === "resume") {
         if (run.status !== "paused" && !this.canResume(stored)) { record(); this.save(stored); return this.view(stored); }
+        this.fence.lift(stored);
         await this.resumeRun(stored, inPlace, record);
         this.event(stored, `Team ${inPlace ? "resumed where it waited for input" : "resumed with a fresh plan"}${body.source ? ` by ${inputSourceLabel(body.source)}` : ""}.`); this.save(stored);
       } else { record(); await this.stopRun(stored, action, undefined, body.source, `Team ${action === "pause" ? "paused" : "cancelled"}${body.source ? ` by ${inputSourceLabel(body.source)}` : ""}.`); }
@@ -1467,7 +1496,7 @@ export class TeamService {
       if (stored.halt) return new TeamError(409, "members-stopping", "Wait for the team's active members to stop before resuming.");
       return undefined;
     }
-    if ((stored.pending && !verificationRecovery) || stored.deliveryAttempt || run.deliveryReceipt)
+    if ((stored.pending && !verificationRecovery && !stopFenceLifted(stored)) || stored.deliveryAttempt || run.deliveryReceipt)
       return new TeamError(409, "team-reconciliation-required", "This team requires workspace reconciliation. Inspect its evidence and start a new team rather than replaying uncertain work.");
     if (run.workspaceRemovedAt) return new TeamError(409, "team-workspace-removed", "This run's workspaces were removed under the retention policy; start a new run.");
     if (!stored.prepared || (run.status === "blocked" && !this.canResume(stored, undefined, true)))
@@ -1522,6 +1551,7 @@ export class TeamService {
     return { reason, ...(stored.ownerHalt?.waiting ? { waiting: true as const } : {}) };
   }
   private async haltResumeRun(stored: Stored) {
+    this.fence.lift(stored);
     const inPlace = heldWaiting(stored);
     await this.resumeRun(stored, inPlace);
     stored.ownerHalt = undefined;
@@ -1544,7 +1574,7 @@ export class TeamService {
   }
   async haltResume(haltId: string, heldBy: HaltHeldBy, keep: boolean): Promise<HaltOutcome[]> {
     const ids = [...this.records.keys()];
-    const outcomes = await Promise.all(ids.map(id => this.enqueue<HaltOutcome | undefined>(id, async () => {
+    const outcomes = await Promise.all(ids.map(id => (keep ? Promise.resolve(undefined) : this.fence.forHalt(id, haltId)).then(taken => this.enqueue<HaltOutcome | undefined>(id, async () => {
       const stored = this.records.get(id);
       if (!stored || stored.ownerHalt?.haltId !== haltId) return undefined;
       const run = stored.run, base = { kind: "team" as const, id: run.id, title: run.title };
@@ -1566,7 +1596,7 @@ export class TeamService {
           this.save(stored);
           return { ...base, result: "held", reason: STILL_HALTED } satisfies HaltOutcome;
         }
-        const refusal = this.resumeRefusal(stored, undefined);
+        const refusal = this.fence.refusal(stored, taken) ?? this.resumeRefusal(stored, undefined);
         if (refusal) {
           stored.ownerHalt = this.releasedMark(stored, releaseRefusal(refusal.message));
           if (!stored.halt) run.reason = stored.ownerHalt.reason;
@@ -1576,7 +1606,7 @@ export class TeamService {
         await this.haltResumeRun(stored);
         return { ...base, result: "resumed" } satisfies HaltOutcome;
       } catch (error) { return { ...base, result: "refused", reason: error instanceof Error ? error.message : "The run could not resume." } satisfies HaltOutcome; }
-    })));
+    }))));
     return outcomes.filter((item): item is HaltOutcome => item !== undefined);
   }
   haltPauseChild(id: string, token: string, reason: string): Promise<boolean> {
@@ -1596,9 +1626,11 @@ export class TeamService {
     });
   }
   haltResumeChild(id: string, token: string): Promise<boolean> {
-    return this.enqueue(id, async () => {
+    return this.fence.forHalt(id, token, HALT_CENSUS_MS).then(taken => this.enqueue(id, async () => {
       const stored = this.record(id), run = stored.run;
       if (run.status !== "paused" || stored.ownerHalt?.haltId !== token) return false;
+      const fence = this.fence.refusal(stored, taken, "team-operation-running");
+      if (fence) throw fence;
       const refusal = this.resumeRefusal(stored, undefined);
       if (refusal?.code === "members-stopping") throw refusal;
       if (refusal) {
@@ -1609,7 +1641,7 @@ export class TeamService {
       }
       await this.haltResumeRun(stored);
       return true;
-    });
+    }));
   }
   haltSettleChild(id: string, token: string, reason: string): Promise<boolean> {
     return this.enqueue(id, async () => {
@@ -1803,35 +1835,14 @@ export class TeamService {
     timer.unref();
     this.sampleTimers.add(timer);
   }
-  private async refreshOperationCensus(stored: Stored, force = false): Promise<OperationCensus["state"] | undefined> {
-    const { run } = stored, pending = stored.pending;
-    if (!pending?.witness || this.commands.has(run.id)) return undefined;
-    const now = this.options?.now?.() ?? Date.now();
-    const previous = stored.census?.pendingId === pending.id ? stored.census : undefined;
-    if (!force && previous && now - Date.parse(previous.at) < CENSUS_TTL_MS) return previous.state;
-    const processes = this.options?.processes ?? hostProcesses;
-    let result: CensusResult;
-    try { result = await processes.census(pending.witness, teamRunDirectory(run.workspace), this.config.teams?.commandPrefix); }
-    catch (error) { result = { ok: false, problem: error instanceof Error ? error.message : "The census failed." }; }
-    if (this.records.get(run.id) !== stored || stored.pending?.id !== pending.id || this.commands.has(run.id)) return undefined;
-    const count = (reasons: string[]) => result.ok ? result.findings.filter(finding => reasons.includes(finding.reason)).length : 0;
-    const recorded = count(["recorded-process", "recorded-session", "recorded-group"]), using = count(["working-directory", "open-file", "command-line"]);
-    const unreadable = count(["unreadable"]);
-    const recorder = this.recorderOf(stored, pending);
-    const incomplete = pending.recording && !recorder && pending.witness.boot === bootId();
-    const census: Omit<OperationCensus, "at" | "pendingId"> = !result.ok ? { state: "unknown", detail: result.problem.slice(0, 200) }
-      : recorded > 0 ? { state: "running", recorded, ...(using ? { using } : {}) }
-        : using > 0 ? { state: "in-use", using }
-          : unreadable > 0 ? { state: "unknown", detail: `${unreadable} process(es) of the accounts it inspects could not be inspected` }
-            : incomplete ? { state: "unknown", detail: "the host stopped while the operation was starting a command, so its record of the operation's processes may be incomplete" }
-              : recorder && recorder.inFlight > 0 ? { state: "unknown", detail: "a command of the operation is still starting" }
-                : { state: "ended" };
-    stored.census = { pendingId: pending.id, at: new Date(now).toISOString(), ...census };
-    if (previous?.state !== census.state || previous.recorded !== census.recorded || previous.using !== census.using || previous.detail !== census.detail) {
-      this.event(stored, operationCensusEvent(pending.kind, census));
+  private replaceCheck(stored: Stored, running: TeamRun["checks"][number], finished: TeamRun["checks"][number], observe?: () => void) {
+    return this.enqueue(stored.run.id, () => {
+      if (this.closed) return;
+      const index = stored.run.checks.indexOf(running);
+      if (index >= 0) stored.run.checks[index] = finished;
+      observe?.();
       this.save(stored);
-    }
-    return census.state;
+    });
   }
   private operation<T>(stored: Stored, kind: NonNullable<Stored["pending"]>["kind"], perform: (signal: AbortSignal) => Promise<T>, complete: (value: T) => void,
     sourceMember?: TeamMember, sourceWorkspace: "member" | "integration" = "member") {
@@ -1861,6 +1872,7 @@ export class TeamService {
         reason: error instanceof Error ? error.message : "A team workspace operation failed.", at: timestamp() };
       this.save(stored);
       this.block(stored, error);
+      this.fence.watch(stored);
     })).catch(() => {});
   }
   private block(stored: Stored, error: unknown, sourceMember?: TeamMember) {
@@ -2093,7 +2105,7 @@ export class TeamService {
         }
         const safePendingRecovery = Boolean(run.recovery?.status === "stopping" && stored.pending &&
           (recoverableOperationFailure(stored, stored.pending) || recoverableUnattributedResult(stored, stored.pending)));
-        if (all && (!stored.pending || safePendingRecovery || run.status === "blocked" || run.status === "cancelled")) { stored.halt = undefined; if (!["blocked", "cancelled"].includes(run.status)) run.reason = run.status === "paused" ? stored.ownerHalt?.reason : undefined; }
+        if (all && (!stored.pending || safePendingRecovery || stopFenced(stored) || run.status === "blocked" || run.status === "cancelled")) { stored.halt = undefined; if (!["blocked", "cancelled"].includes(run.status) && !commandStopReasons.has(run.reason ?? "")) run.reason = run.status === "paused" ? stored.ownerHalt?.reason : undefined; }
         this.save(stored); return;
       }
       if (await this.startAutomaticRecovery(stored, trackingReady)) return;
@@ -2580,7 +2592,7 @@ export class TeamService {
         ? role === "reviewer" ? run.verification?.setup : undefined
         : this.config.projects.find(project => project.id === run.projectId)!.team!.setup;
       if (setup) {
-        const setupCommand = this.replays.setupFor(run, this.config.teams?.commandPrefix); const result = await teamCommand(setup, cwd, signal, 600000, setupCommand.prefix, setupCommand.input);
+        const setupCommand = this.replays.setupFor(run, this.config.teams?.commandPrefix); const result = await teamOperationCommand(setup, cwd, signal, 600000, setupCommand.prefix, setupCommand.input);
         await this.noteLeftover(stored, result);
         if (result.exitCode !== 0 || result.interrupted) throw new TeamError(409, "team-setup-failed", "A member's configured setup command failed. Its isolated workspace was preserved.");
         await assertMemberReadOnly(cwd, member.baseCommit, this.prefixFor(run), signal, "setup");
@@ -3201,12 +3213,18 @@ export class TeamService {
         const baseCheck = { ...entry, startedAt: timestamp(), revision, round: run.round, headCommit: head }, runningCheck: TeamRun["checks"][number] = { ...baseCheck, status: "running", output: "" };
         await this.enqueue(stored.run.id, () => { if (!this.closed) { run.checks.push(runningCheck); this.save(stored); } });
         const scanner = new CheckOutputScanner(), metrics = metricObserver();
-        const result = await teamCommand(entry.command, verification.workspace, signal, (this.config.teams?.checkMinutes ?? 60) * 60000, this.config.teams?.commandPrefix, undefined, undefined, undefined, (chunk, stream) => { metrics.push(chunk, stream); scanner.push(chunk, stream); });
+        let result: CommandResult;
+        try {
+          result = await teamOperationCommand(entry.command, verification.workspace, signal, (this.config.teams?.checkMinutes ?? 60) * 60000, this.config.teams?.commandPrefix, undefined, (chunk, stream) => { metrics.push(chunk, stream); scanner.push(chunk, stream); });
+        } catch (error) {
+          if (error instanceof CommandStopUnconfirmed) await this.replaceCheck(stored, runningCheck, { ...baseCheck, status: "interrupted", finishedAt: timestamp(), ...(error.exitCode === undefined ? {} : { exitCode: error.exitCode }), output: error.output, scan: scanner.finish() });
+          throw error;
+        }
         const finishedCheck: TeamRun["checks"][number] = result.interrupted ? { ...baseCheck, status: "interrupted", finishedAt: timestamp(), exitCode: result.exitCode, output: result.output, scan: scanner.finish() }
           : result.exitCode === 0 ? { ...baseCheck, status: "passed", finishedAt: timestamp(), exitCode: 0, output: result.output }
           : { ...baseCheck, status: "failed", finishedAt: timestamp(), exitCode: result.exitCode, output: result.output, scan: scanner.finish() };
         results.push(finishedCheck);
-        await this.enqueue(stored.run.id, () => { if (!this.closed) { const i = run.checks.indexOf(runningCheck); if (i >= 0) run.checks[i] = finishedCheck; metrics.record(stored, finishedCheck); this.save(stored); } });
+        await this.replaceCheck(stored, runningCheck, finishedCheck, () => metrics.record(stored, finishedCheck));
         await this.noteLeftover(stored, result);
         if (!signal.aborted) await assertMemberReadOnly(verification.workspace, head, this.config.teams?.commandPrefix, signal, context);
         if (finishedCheck.status !== "passed") break;

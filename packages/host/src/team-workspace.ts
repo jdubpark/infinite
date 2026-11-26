@@ -12,7 +12,7 @@ import { hostEgressEnvironment } from "./egress.js";
 export class TeamError extends Error {
   constructor(readonly status: number, readonly code: string, message: string) { super(message); }
 }
-export interface CommandResult { exitCode: number | null; output: string; stdout: string; interrupted: boolean; truncated: boolean; leftover: boolean }
+export interface CommandResult { exitCode: number | null; output: string; stdout: string; interrupted: boolean; notStarted?: true; truncated: boolean; leftover: boolean }
 export function teamCommandEnvironment(extra?: Record<string, string>): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
   for (const name of ["PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"])
@@ -35,6 +35,17 @@ export interface CommandScope {
 export const commandScope = new AsyncLocalStorage<CommandScope>();
 export const EXIT_DRAIN_MS = 1_000;
 const EXIT_DRAIN_TURNS = 3;
+export const STOP_GRACE_MS = 5_000;
+export const STOP_SETTLE_MS = 10_000;
+export const COMMAND_STOP_UNCONFIRMED_REASON = "The host stopped a configured team command but cannot confirm that it ended, so it may still be running. The host starts nothing more for this run until a process census finds none of that operation's processes; Resume is accepted after that.";
+export class CommandStopUnconfirmed extends TeamError {
+  constructor(readonly output: string, readonly exitCode?: number | null) { super(409, "command-stop-unconfirmed", COMMAND_STOP_UNCONFIRMED_REASON); }
+}
+export async function teamOperationCommand(command: TeamCommand, cwd: string, signal: AbortSignal | undefined, timeoutMs: number, prefix?: TeamCommand, input?: string, onOutput?: (chunk: Buffer, stream: "stdout" | "stderr") => void): Promise<CommandResult> {
+  const result = await teamCommand(command, cwd, signal, timeoutMs, prefix, input, undefined, STOP_SETTLE_MS, onOutput);
+  if (prefix && result.interrupted && !result.notStarted) throw new CommandStopUnconfirmed(result.output, result.exitCode);
+  return result;
+}
 export function teamCommand(command: TeamCommand, cwd: string, signal?: AbortSignal, timeoutMs = 600000, prefix?: TeamCommand, input?: string, extraEnv?: Record<string, string>, forceSettleAfterMs?: number, onOutput?: (chunk: Buffer, stream: "stdout" | "stderr") => void): Promise<CommandResult> {
   const scope = commandScope.getStore(), ready = scope?.starting();
   const run = () => runTeamCommand(scope, command, cwd, signal, timeoutMs, prefix, input, extraEnv, forceSettleAfterMs, onOutput);
@@ -44,7 +55,7 @@ function runTeamCommand(scope: CommandScope | undefined, command: TeamCommand, c
   return new Promise((resolveResult, reject) => {
     if (signal?.aborted) {
       scope?.started(undefined);
-      resolveResult({ exitCode: null, output: "", stdout: "", interrupted: true, truncated: false, leftover: false });
+      resolveResult({ exitCode: null, output: "", stdout: "", interrupted: true, notStarted: true, truncated: false, leftover: false });
       return;
     }
     let child: ReturnType<typeof spawn>;
@@ -110,6 +121,17 @@ function runTeamCommand(scope: CommandScope | undefined, command: TeamCommand, c
       drainTimer = setTimeout(() => setImmediate(decideAtDrain, 1, chunks), EXIT_DRAIN_MS);
       drainTimer.unref();
     };
+    const leaderRuns = () => child.exitCode === null && child.signalCode === null;
+    const signalGroup = (name: NodeJS.Signals) => {
+      try {
+        if (child.pid && process.platform !== "win32") process.kill(-child.pid, name);
+        else child.kill(name);
+        return true;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "EPERM") capture(Buffer.from("\n[The host could not stop this command (EPERM); it was left to finish and its result is not used.]\n"));
+        return false;
+      }
+    };
     const stop = () => {
       if (stopRequested || settled) return;
       if (leaderExit) {
@@ -118,9 +140,12 @@ function runTeamCommand(scope: CommandScope | undefined, command: TeamCommand, c
       }
       stopRequested = true;
       interrupted = true;
-      try { if (child.pid && process.platform !== "win32") process.kill(-child.pid, "SIGKILL"); else child.kill("SIGKILL"); }
-      catch (error) {
-        if ((error as NodeJS.ErrnoException).code === "EPERM") capture(Buffer.from("\n[The host could not stop this command (EPERM); it was left to finish and its result is not used.]\n"));
+      if (!prefix) signalGroup("SIGKILL");
+      else if (signalGroup("SIGTERM")) {
+        const graceTimer = setTimeout(() => {
+          if (leaderRuns()) signalGroup("SIGKILL");
+        }, STOP_GRACE_MS);
+        graceTimer.unref();
       }
       if (forceSettleAfterMs !== undefined) {
         stopTimer = setTimeout(() => {
@@ -128,7 +153,7 @@ function runTeamCommand(scope: CommandScope | undefined, command: TeamCommand, c
           settled = true;
           finish();
           abandon();
-          reject(new TeamError(409, "command-stop-unconfirmed", "A configured team command did not close after the host tried to stop it."));
+          reject(new CommandStopUnconfirmed(output));
         }, forceSettleAfterMs);
         stopTimer.unref();
       }

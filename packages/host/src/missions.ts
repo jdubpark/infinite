@@ -4,6 +4,7 @@ import { isAbsolute, join, relative } from "node:path";
 import { writeSealed, unseal } from "./vault.js";
 import type { ConnectorSource } from "./mcp-types.js";
 import { TeamService, TeamError, providerInputReason } from "./teams.js";
+import { HALT_CENSUS_MS } from "./team-command-fence.js";
 import type { Manager } from "./manager.js";
 import type { Config } from "./types.js";
 import { DEFAULT_TEAM_RETENTION, hostClosedBlockedReason, inputSourceLabel, type BlockerEvidence, type CreateTeam, type NativeContinuation, type TeamAssignment, type TeamView } from "./team-types.js";
@@ -55,7 +56,7 @@ type Attempt = { memberId: string; sessionId: string; revision: number; prompt: 
   usageCursor?: number; contextTokens?: number };
 type RotationRule = "idle" | "size" | "age";
 type ChildOp = { kind: "answer" | "steer" | "pause" | "resume" | "cancel" | "parallelism"; subtaskId: string; teamId: string; requestId: string; revision?: number; decisionId?: string; text?: string; parallelism?: number; by?: "owner" | "coordinator" | "connector"; source?: ConnectorSource;
-  halt?: { token: string; reason?: string } };
+  halt?: { token: string; reason?: string }; waiting?: string };
 type Stored = {
   mission: Mission;
   fingerprint: string;
@@ -910,8 +911,9 @@ export class MissionService {
       if (op.revision !== team.revision && !(op.kind === "steer" && op.revision !== undefined)) { op.requestId = randomUUID(); op.revision = team.revision; this.save(stored); }
       try {
         if (op.kind === "answer") await this.teams.answer(op.teamId, op.decisionId!, { requestId: op.requestId, revision: op.revision, text: op.text! }, undefined, op.by ?? "owner", op.source);
-        else if (op.kind === "steer") team = await this.teams.steer(op.teamId, { requestId: op.requestId, revision: op.revision!, text: op.text! }, op.source ?? (op.by === "coordinator" ? "coordinator" : undefined));
+        else if (op.kind === "steer") team = await this.teams.steer(op.teamId, { requestId: op.requestId, revision: op.revision!, text: op.text! }, op.source ?? (op.by === "coordinator" ? "coordinator" : undefined), HALT_CENSUS_MS);
         else if (op.kind === "parallelism") team = await this.teams.setMissionParallelism(op.teamId, { requestId: op.requestId, revision: op.revision!, parallelism: op.parallelism! });
+        else if (op.kind === "resume") await this.teams.resume(op.teamId, { requestId: op.requestId, revision: op.revision }, op.source, HALT_CENSUS_MS);
         else await this.teams[op.kind](op.teamId, { requestId: op.requestId, revision: op.revision }, op.source);
       } catch (error) {
         if (this.closed) return;
@@ -919,6 +921,12 @@ export class MissionService {
         if (["members-stopping", "team-operation-running", "team-paused", "stale-team-revision"].includes(error.code)) {
           if (op.kind === "steer" && error.code === "stale-team-revision") op.revision = undefined;
           remaining.push(op); continue;
+        }
+        if (error.code === "team-command-running") {
+          if (op.waiting !== error.message) this.event(stored, `A ${op.kind} for subtask ${op.subtaskId} waits for its subteam. ${error.message}`);
+          op.waiting = error.message;
+          remaining.push(op);
+          continue;
         }
         if (op.kind === "steer") { steered.push(`The direction for subtask ${op.subtaskId} was not applied: ${error.message}`); continue; }
         this.event(stored, `A ${op.kind} for subtask ${op.subtaskId} was not applied: ${error.message}`);

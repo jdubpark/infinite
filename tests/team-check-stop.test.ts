@@ -10,6 +10,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { CENSUS_WRAPPER } from "../packages/host/src/process-census.js";
 import type { TeamCommand } from "../packages/host/src/team-types.js";
 import { COMMAND_STOP_UNCONFIRMED_REASON, STOP_SETTLE_MS } from "../packages/host/src/team-workspace.js";
+import { unseal } from "../packages/host/src/vault.js";
 import { waitFor } from "./helpers.js";
 import { fixture } from "./team-fixture.js";
 
@@ -29,6 +30,7 @@ const CHECK = [
   "else if (mode === 'ignores-term') { note('start'); process.on('SIGTERM', () => note('term')); untilRelease(); }",
   "else {",
   "  note('start');",
+  "  process.stdout.write('check output ' + mode + '\\n');",
   "  const holds = mode === 'holds-output';",
   "  spawn(process.execPath, [__filename, log, release, 'child'], { stdio: holds ? 'inherit' : 'ignore', detached: holds });",
   "  setInterval(() => {}, 1000);",
@@ -91,8 +93,8 @@ function harness(sudo: boolean): Harness {
     end: pid => { try { execFileSync("sudo", ["-n", "-u", SUDO_ACCOUNT, "--", "kill", "-KILL", String(pid)], { stdio: "ignore", timeout: 10_000 }); } catch { } } };
 }
 
-async function teamWithCheck(h: Harness, mode: string) {
-  const f = await fixture("lifecycle", undefined, { teams: { checkMinutes: 0.05, ...(h.prefix ? { commandPrefix: h.prefix } : {}) } });
+async function teamWithCheck(h: Harness, mode: string, checkMinutes = 0.05) {
+  const f = await fixture("lifecycle", undefined, { teams: { checkMinutes, ...(h.prefix ? { commandPrefix: h.prefix } : {}) } });
   f.host.config.projects[0]!.team!.checks = [{ command: process.execPath, args: [h.checkFile, h.checkLog, h.release, mode] }];
   await f.host.stopApi();
   writeFileSync(join(f.host.root, "config.json"), JSON.stringify(f.host.config));
@@ -191,4 +193,101 @@ test("under a sudo prefix, after the host ends in the middle of a stop, removal 
     await f.close();
     rmSync(h.shared, { recursive: true, force: true });
   }
+});
+
+const POSIX_CASE = { timeout: 150_000, skip: process.platform === "win32" && "process groups are POSIX" };
+const UNINSPECTABLE: TeamCommand = { command: "/usr/bin/env", args: [] };
+const STATED = "The owner stated that the processes of the run's check operation have ended. The host's process census could not tell (prefix-unsupported); the host accepts the statement in place of a census that finds none.";
+
+async function cleanUp(h: Harness, f: Awaited<ReturnType<typeof fixture>>) {
+  writeFileSync(h.release, "done");
+  for (const pid of pidsIn(h.checkLog)) if (alive(pid)) h.end(pid);
+  await f.close();
+  rmSync(h.shared, { recursive: true, force: true });
+}
+
+test("after a host restart that follows a stopped check, the run keeps its stop reason, a refused Resume keeps the operation, and Resume passes once the check's child ended", POSIX_CASE, async () => {
+  const h = harness(false);
+  const { f, id } = await teamWithCheck(h, "holds-output");
+  try {
+    await entry(h.checkLog, "start");
+    const child = await entry(h.checkLog, "child", undefined, 10_000);
+    const blocked = await waitFor(() => f.get(id), run => run.status === "blocked", 3_000 + STOP_SETTLE_MS + 20_000);
+    assert.equal(blocked.pendingOperation?.failureCode, "command-stop-unconfirmed");
+    await f.host.stopApi();
+    await f.host.start();
+    const restarted = await f.get(id);
+    assert.equal(restarted.reason, COMMAND_STOP_UNCONFIRMED_REASON, "the restart keeps the stop reason");
+    assert.equal(restarted.pendingOperation?.failureCode, "command-stop-unconfirmed");
+    const early = await f.host.fetchApi(`/teams/${id}/resume`, "owner", { requestId: randomUUID(), revision: restarted.revision });
+    assert.equal(early.body?.code, "team-command-running", JSON.stringify(early.body));
+    writeFileSync(h.release, "done");
+    await entry(h.checkLog, "end", child.pid, 10_000);
+    let answer: { status: number; body?: { code?: string } } | undefined;
+    for (let attempt = 0; attempt < 30; attempt++) {
+      answer = await f.host.fetchApi(`/teams/${id}/resume`, "owner", { requestId: randomUUID(), revision: (await f.get(id)).revision });
+      if (answer.status === 200) break;
+      assert.ok((await f.get(id)).pendingOperation, `a refused Resume keeps the stopped command's operation: ${JSON.stringify(answer.body)}`);
+      await delay(1_000);
+    }
+    assert.equal(answer?.status, 200, `Resume passes once the child ended: ${JSON.stringify(answer?.body)}`);
+  } finally { await cleanUp(h, f); }
+});
+
+test("a run paused during a check whose child holds the output answers its first Resume after the child ended", POSIX_CASE, async () => {
+  const h = harness(false);
+  const { f, id } = await teamWithCheck(h, "holds-output", 2);
+  try {
+    await entry(h.checkLog, "start");
+    const child = await entry(h.checkLog, "child", undefined, 10_000);
+    const paused = await f.host.fetchApi(`/teams/${id}/pause`, "owner", { requestId: randomUUID(), revision: (await f.get(id)).revision });
+    assert.equal(paused.body?.status, "paused", JSON.stringify(paused.body));
+    const failed = await waitFor(() => f.get(id), run => run.pendingOperation?.failureCode === "command-stop-unconfirmed", STOP_SETTLE_MS + 20_000);
+    assert.equal(failed.status, "paused");
+    const early = await f.host.fetchApi(`/teams/${id}/resume`, "owner", { requestId: randomUUID(), revision: failed.revision });
+    assert.equal(early.body?.code, "team-command-running", JSON.stringify(early.body));
+    writeFileSync(h.release, "done");
+    await entry(h.checkLog, "end", child.pid, 10_000);
+    await delay(3_000);
+    const first = await f.host.fetchApi(`/teams/${id}/resume`, "owner", { requestId: randomUUID(), revision: (await f.get(id)).revision });
+    assert.equal(first.status, 200, `the first Resume after the child ended passes: ${JSON.stringify(first.body)}`);
+    assert.equal(first.body?.pendingOperation, undefined);
+  } finally { await cleanUp(h, f); }
+});
+
+test("under a prefix the census cannot inspect, a stopped check's run names the owner's statement as the only way out; the owner's statement lifts the hold and Resume passes", POSIX_CASE, async () => {
+  const h = { ...harness(false), prefix: UNINSPECTABLE };
+  const { f, id } = await teamWithCheck(h, "leaves-child");
+  try {
+    await entry(h.checkLog, "start");
+    const blocked = await waitFor(() => f.get(id), run => run.status === "blocked" && /processes-ended/.test(run.reason ?? ""), 3_000 + STOP_SETTLE_MS + 20_000);
+    assert.match(blocked.reason ?? "", /only way out.*infinite team processes-ended/);
+    const refused = await f.host.fetchApi(`/teams/${id}/resume`, "owner", { requestId: randomUUID(), revision: blocked.revision });
+    assert.equal(refused.body?.code, "team-command-running", JSON.stringify(refused.body));
+    assert.equal((await f.host.fetchApi(`/teams/${id}/processes-ended`, "controller", { requestId: randomUUID() })).status, 403, "only the owner states that processes ended");
+    assert.equal((await f.host.fetchApi(`/teams/${id}/processes-ended`, "owner", { requestId: randomUUID(), revision: blocked.revision })).status, 400, "the statement takes only a request ID");
+    const statement = { requestId: randomUUID() };
+    const stated = await f.host.fetchApi(`/teams/${id}/processes-ended`, "owner", statement);
+    assert.equal(stated.status, 200, JSON.stringify(stated.body));
+    const replayed = await f.host.fetchApi(`/teams/${id}/processes-ended`, "owner", statement);
+    assert.equal(replayed.status, 200, JSON.stringify(replayed.body));
+    assert.equal((replayed.body as { events: { text: string }[] }).events.filter(event => event.text === STATED).length, 1);
+    await resumedOnceEnded(f, id);
+  } finally { await cleanUp(h, f); }
+});
+
+test("under a prefix, a check stopped at its time limit keeps the output it printed and its scan", POSIX_CASE, async () => {
+  const h = { ...harness(false), prefix: UNINSPECTABLE };
+  const { f, id } = await teamWithCheck(h, "leaves-child");
+  try {
+    await entry(h.checkLog, "start");
+    const blocked = await waitFor(() => f.get(id), run => run.status === "blocked", 3_000 + STOP_SETTLE_MS + 20_000);
+    const file = join(f.host.config.stateDir, "teams", `${id}.sealed`);
+    const stored = unseal<{ run: { checks: { status: string; output: string; scan?: { bytes: number } }[] } }>(readFileSync(f.host.config.keyFile), `team:${id}`, readFileSync(file, "utf8"));
+    const check = stored.run.checks.at(-1);
+    assert.equal(check?.status, "interrupted");
+    assert.match(check?.output ?? "", /check output leaves-child/, JSON.stringify(check));
+    assert.equal(blocked.checks.at(-1)?.output, check?.output, "the run view shows the kept output");
+    assert.ok((check?.scan?.bytes ?? 0) > 0, `the stopped check keeps the scan of its output: ${JSON.stringify(check?.scan)}`);
+  } finally { await cleanUp(h, f); }
 });

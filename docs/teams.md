@@ -2994,20 +2994,55 @@ ten-second limit when it does not.
 
 An operation that failed with `command-stop-unconfirmed` stays pending with its
 process record, whatever stopped the command: the time limit, a pause, a cancel,
-a steer, a block or a host stop. The run's reason says that the earlier command
-may still be running. Until the host looks and finds none of that operation's
-processes and none using the run directory, it starts nothing more for the run:
-no Git command, no further setup or check, no member, and no workspace removal.
-Resume and steering answer `team-command-running` (409) until then, and each
-request takes a fresh look. Once a look finds the operation ended, the host
-clears it, and a blocked run is resumable as after a check that reached its
-time limit. The run shows as resumable once a scheduled look has found the
-operation ended. The look supports no prefix, or a `sudo` prefix whose launcher
-has the `process-census` wrapper beside it; under any other prefix it cannot
-find the operation ended, and the run stays held until the owner cancels it.
-A process that survives the stop is held off in this way, not killed; ending it
-is follow-up INF-428. Other commands under the prefix, the Git commands among
-them, are stopped the same way but do not hold the run.
+a steer or a block. A host stop records no such failure: the host closes its
+team service before the stop settles, so after the restart the run is blocked
+with the reason for an operation that a restart interrupted, and its process
+record holds the run's directories in the same way. A restart after the failure
+was recorded keeps the failure, its reason and its process record.
+
+The run's reason says that the earlier command may still be running. Until the
+host looks and finds none of that operation's processes and none using the run
+directory, it starts nothing more for the run: no Git command, no further setup
+or check, no member, and no workspace removal. Resume and steering answer
+`team-command-running` (409) until then. Each of these requests takes a fresh
+look before it enters the run's queue; requests that arrive during a look share
+it, and the run's other requests are answered meanwhile. The host also looks
+once right after it records the failure, and the retention sweep looks every
+ten minutes. The run shows as resumable once a look has found the operation
+ended.
+
+The host clears the operation only in the step that accepts a request: a
+Resume, a steer, the owner's release of a halt, or a mission's release of its
+run. A refused request leaves the operation in place, and the next request
+looks again. A run paused during such a command accepts its first Resume after
+the command ended. A mission's release of a run whose command may still run is
+answered `team-operation-running`; the mission keeps its halt and retries, and
+a retry within 30 seconds reuses the last look.
+
+The look supports no prefix, or a `sudo` prefix whose launcher has the
+`process-census` wrapper beside it. Under any other prefix, the instance
+skeleton's root-owned launcher among them, the look cannot tell whether the
+command ended. The run's reason then says that the owner's statement is the
+only way out and names its command. After checking the host, the owner runs
+`infinite team processes-ended RUN_ID`, which sends
+`POST /api/teams/:id/processes-ended` with `{ "requestId": "<uuid>" }`. The
+route takes the owner role only, accepts no other field, and answers a repeated
+request ID with the run unchanged. The host looks first:
+
+- When the look finds the operation's processes, or processes using the run
+  directory, it answers `team-command-running` (409) and records nothing.
+- When the look finds none, it records nothing more, and Resume is accepted as
+  after any look that found the operation ended.
+- When the look cannot tell, the host records the statement on the pending
+  operation and an event that names the look's result. Resume, steering, a
+  halt release and workspace removal then treat the operation as ended.
+
+A run without a process record answers `team-no-process-record` (409). No client
+offers the statement yet; it is a CLI and API action only. Census support for
+the instance launcher is a follow-up. A process that survives the stop is held
+off in this way, not killed; ending it is follow-up INF-428. Other commands
+under the prefix, the Git commands among them, are stopped the same way but do
+not hold the run.
 
 Third, two Git runners outside the
 team command runner, the streamed patch and file reads and the team bundle

@@ -1996,7 +1996,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
   });
   app.get("/api/projects/:id/context", (req, res) => {
     if (!config.projects.some((p) => p.id === req.params.id)) return res.status(404).json({ error: "Unknown project" });
-    return res.json(manager.context(req.params.id));
+    return res.json(manager.projectContexts.context(req.params.id));
   });
   app.put("/api/projects/:id/context", requireRole(["owner"]), (req, res) => {
     if (!config.projects.some((p) => p.id === req.params.id))
@@ -2009,7 +2009,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
       .strict()
       .parse(req.body);
     return res.json(
-      manager.setContext(
+      manager.projectContexts.setContext(
         String(req.params.id),
         body.text,
         body.expectedVersion,

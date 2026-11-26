@@ -369,10 +369,6 @@ export class Manager {
   }
 
   metaRevision(id: string): string | undefined { return this.listedMeta.revision(id); }
-  context(projectId: string) { return this.projectContexts.context(projectId); }
-  setContext(projectId: string, text: string, expectedVersion: number) {
-    return this.projectContexts.setContext(projectId, text, expectedVersion);
-  }
   create(request: CreateSession, startedBy?: "owner"): Promise<Session & WorkerState> {
     if (request.continuation !== undefined)
       throw new ContentError("Native continuation is only available for managed coordinator team sessions", 400);

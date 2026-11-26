@@ -7,6 +7,7 @@ import type { TeamLineup } from "./team-types.js";
 
 export const ROUTING_ALGORITHM_VERSION = 1;
 export const POINTS_ALGORITHM_VERSION = 2;
+export const COST_HEADROOM_ALGORITHM_VERSION = 3;
 export const REWARD_VERSION = 1;
 
 export const ROUTING_DEFAULTS: RoutingKnobs = {
@@ -62,8 +63,8 @@ export function effectiveRouting(saved: TeamRouting | undefined, autonomy: Auton
   return { mode: "shadow", requested: mode === "auto" ? "auto" : "shadow", source: "saved", knobs, defaults };
 }
 
-export function algorithmVersionOf(knobs: Pick<RoutingKnobs, "points">): number {
-  return knobs.points.some(point => point !== "start") ? POINTS_ALGORITHM_VERSION : ROUTING_ALGORITHM_VERSION;
+export function algorithmVersionOf(_knobs: Pick<RoutingKnobs, "points">): number {
+  return COST_HEADROOM_ALGORITHM_VERSION;
 }
 
 export function policyDigest(effective: Extract<EffectiveRouting, { mode: "shadow" }>, mode: "shadow" | "auto" = "shadow"): string {

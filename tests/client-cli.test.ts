@@ -974,7 +974,7 @@ test("native cloud CLI preserves argv, enforces monitor mode, and reconnects wit
   const call = async (path: string, role: keyof typeof tokens, body?: unknown, cookie?: string) => fetch(config.origin + "/api" + path, { method: body === undefined ? "GET" : "POST", headers: { ...(cookie ? { Cookie: cookie, Origin: config.origin } : { Authorization: `Bearer ${tokens[role]}` }), "Content-Type": "application/json" }, body: body === undefined ? undefined : JSON.stringify(body) });
   try {
     await exec(process.execPath, [...cli, "pair", clientOrigin, "--token-file", tokenFile]);
-    app.manager.setContext("project", "Do not append me to native argv", 0);
+    app.manager.projectContexts.setContext("project", "Do not append me to native argv", 0);
     const nativeArgs = ["--model", "example/model", "--config", "literal=value", "--", "spaces, $HOME and `printf literal`", "line\nbreak"];
     const launched = await exec(process.execPath, [...cli, "--project", "project", "--cloud", "--detach", "codex", ...nativeArgs]);
     const sid = launched.stdout.trim(); assert.match(sid, /^[a-f0-9-]{36}$/);

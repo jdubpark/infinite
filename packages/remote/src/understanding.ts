@@ -13,6 +13,10 @@ export interface UnderstandingBrief {
   unknowns: string[];
   diagrams?: Diagram[];
 }
+export interface UnderstandingPinnedSource {
+  head: string | null;
+  repoIdentity: string;
+}
 export interface UnderstandingArtifact {
   id: string;
   sourceProjectId: string;
@@ -26,6 +30,7 @@ export interface UnderstandingArtifact {
   coverage: string[];
   brief: UnderstandingBrief;
   evidence: { source: string; line: number; text: string }[];
+  pinnedSources?: Record<string, UnderstandingPinnedSource>;
 }
 export type UnderstandingWorkKind = "mission" | "team" | "goal";
 export interface UnderstandingLink { kind: "pr" | "issue"; label: string; url: string }

@@ -18,8 +18,15 @@ const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-
 
 function artifactLines(artifact: UnderstandingArtifact): string[] {
   const lines = [`    Brief ${artifact.id} · ${artifact.sourceKind} ${artifact.sourceProjectId} · session ${artifact.sessionId}`,
-    `      generated ${artifact.generatedAt} · retained ${artifact.retainedAt} · head ${artifact.head ?? "unborn"} · base ${artifact.base ?? "unborn"}`,
-    `      ${artifact.brief.summary}`];
+    `      generated ${artifact.generatedAt} · retained ${artifact.retainedAt} · head ${artifact.head ?? "unborn"} · base ${artifact.base ?? "unborn"}`];
+  if (artifact.pinnedSources) {
+    const pinned = Object.entries(artifact.pinnedSources)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([projectId, source]) => `${projectId}@${source.head ?? "unborn"}`)
+      .join(", ");
+    lines.push(`      pinned ${pinned}`);
+  }
+  lines.push(`      ${artifact.brief.summary}`);
   for (const claim of artifact.brief.architecture) lines.push(`      Current: ${claim.text}${claim.citations.length ? ` [${claim.citations.map(c => `${c.source}:${c.line}`).join(", ")}]` : ""}`);
   for (const claim of artifact.brief.changes) lines.push(`      Change: ${claim.text}${claim.citations.length ? ` [${claim.citations.map(c => `${c.source}:${c.line}`).join(", ")}]` : ""}`);
   for (const claim of artifact.brief.checks) lines.push(`      Check: ${claim.text}${claim.citations.length ? ` [${claim.citations.map(c => `${c.source}:${c.line}`).join(", ")}]` : ""}`);

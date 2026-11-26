@@ -22,7 +22,7 @@ async function fixture() {
   const stateDir = join(root, "state"), runDir = join(root, "r");
   mkdirSync(runDir, { recursive: true });
   const key = Buffer.alloc(32, 7);
-  const config = { stateDir, runDir, enableDemo: true, agents: {} } as Config;
+  const config = { stateDir, runDir, enableDemo: true, agents: {}, projects: [{ id: "api", name: "API", path: fs.realpathSync(root) }] } as Config;
   return { root, stateDir, runDir, key, config, close: () => rmSync(root, { recursive: true, force: true }) };
 }
 type Fixture = Awaited<ReturnType<typeof fixture>>;

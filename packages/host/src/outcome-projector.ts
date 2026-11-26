@@ -1,9 +1,12 @@
 import { type ConfigComponents, configId, isRoutingComponent, profileIdentityKey } from "./config-identity.js";
+import type { UsageConfig } from "./config.js";
 import { CONFIGURATIONS_MODULE, epochAt } from "./configuration-store.js";
 import type { EventProjector } from "./evidence/outbox.js";
 import type { EvidenceStore } from "./evidence/store.js";
 import type { EvidenceDb, EvidenceTx, RunEvent } from "./evidence/types.js";
+import { applyOutcomeCost } from "./outcome-cost.js";
 import { integrationOf } from "./outcome-gauges.js";
+import { usageModule } from "./usage-store.js";
 import {
   BLOCK_DISPOSITIONS,
   type Disposition,
@@ -56,19 +59,28 @@ type RowRole = RowState["role"];
 type Data = Record<string, unknown>;
 type Facts = { projectId: string; goal?: OutcomePayload["goal"]; missionId?: string; gap: boolean; source: "production" | "replay"; experimentRef: string | null };
 type Features = { area: string; kind: string | null; risk: string; featureVersion: number; featureMap: string };
-type Ctx = { tx: EvidenceTx; store: EvidenceStore; event: RunEvent; log: (line: string) => void };
+type Ctx = { tx: EvidenceTx; store: EvidenceStore; event: RunEvent; log: (line: string) => void; prices?: UsageConfig["prices"]; usageReady: boolean };
 
-export function outcomeProjector(store: EvidenceStore, options?: { log?: (line: string) => void }): EventProjector {
+function saveWithCost(ctx: Ctx, row: OutcomeRow): void {
+  if (ctx.usageReady && row.disposition !== "open") {
+    try { applyOutcomeCost(ctx.tx, row, ctx.prices); } catch {}
+  }
+  saveOutcomeRow(ctx.tx, row);
+}
+
+export function outcomeProjector(store: EvidenceStore, options?: { log?: (line: string) => void; prices?: UsageConfig["prices"] }): EventProjector {
   const log = options?.log ?? ((line: string) => console.warn(line));
+  const prices = options?.prices;
   return {
     name: "outcomes",
     module: OUTCOMES_MODULE,
     kinds: OUTCOME_KINDS,
     project(tx, event) {
-      if (store.status().modules[CONFIGURATIONS_MODULE] !== "ready") {
+      const modules = store.status().modules;
+      if (modules[CONFIGURATIONS_MODULE] !== "ready") {
         throw new Error("The configurations module is unavailable.");
       }
-      apply({ tx, store, event, log });
+      apply({ tx, store, event, log, prices, usageReady: modules[usageModule.name] === "ready" });
       if (ATTEMPT_KINDS.has(event.kind)) refreshAttempts(tx, event.runId);
       tx.run(
         "INSERT INTO outcome_state (key, value) VALUES ('last_seq', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -225,7 +237,7 @@ function memberReported(ctx: Ctx): void {
       row.disposition = next;
       row.endedAt ??= event.at;
     }
-    saveOutcomeRow(tx, row);
+    saveWithCost(ctx, row);
     return;
   }
   const result = readMemberResult(tx, outcomeId(event.runId, memberId)) ?? sentinelResult(ctx, memberId, role);
@@ -250,7 +262,7 @@ function memberStopped(ctx: Ctx): void {
       row.disposition = next;
       row.endedAt = event.at;
     }
-    saveOutcomeRow(tx, row);
+    saveWithCost(ctx, row);
     return;
   }
   const result = readMemberResult(tx, outcomeId(event.runId, memberId)) ?? sentinelResult(ctx, memberId, role);
@@ -280,7 +292,7 @@ function taskIntegrated(ctx: Ctx): void {
   if (gauge) row.payload.integration = gauge;
   else delete row.payload.integration;
   if (str(data.commit) === undefined) row.flags = withFlag(row.flags, "empty-result");
-  saveOutcomeRow(tx, row);
+  saveWithCost(ctx, row);
   const summary = ensureSummary(tx, event);
   if (base !== undefined) summary.payload.currentBase = base;
   writeSummary(tx, summary);
@@ -295,7 +307,7 @@ function scoutCompleted(ctx: Ctx): void {
     row.disposition = "completed";
     row.endedAt = event.at;
   }
-  saveOutcomeRow(tx, row);
+  saveWithCost(ctx, row);
 }
 
 function taskEscalated(ctx: Ctx): void {
@@ -307,7 +319,7 @@ function taskEscalated(ctx: Ctx): void {
     row.disposition = "escalated";
     row.endedAt = event.at;
   }
-  saveOutcomeRow(tx, row);
+  saveWithCost(ctx, row);
 }
 
 function reviewRecorded(ctx: Ctx): void {
@@ -519,7 +531,7 @@ function runSettled(ctx: Ctx): void {
     if (!row.flags.includes("backfilled")) {
       row.acceptance = freezeAccepted(row.acceptance ?? null, row.payload.lastReview, status ?? "");
     }
-    saveOutcomeRow(tx, row);
+    saveWithCost(ctx, row);
   }
   const rows = runOutcomes(tx, event.runId);
   summary.payload.attempts = attemptsOf(rows);
@@ -573,7 +585,7 @@ function applyBlock(ctx: Ctx, memberId: string, code: string): void {
   if (!row || !replaces(row.disposition, next)) return;
   row.disposition = next;
   row.endedAt ??= ctx.event.at;
-  saveOutcomeRow(ctx.tx, row);
+  saveWithCost(ctx, row);
 }
 
 function ensureSummary(tx: EvidenceTx, event: RunEvent, created = false): RunSummaryRow {

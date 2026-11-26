@@ -13,7 +13,8 @@ import { createApp } from "../packages/host/src/server.js";
 import { TeamError, TeamService } from "../packages/host/src/teams.js";
 import { handleTeamClientCommand } from "../packages/host/src/team-cli.js";
 import { unseal } from "../packages/host/src/vault.js";
-import { DEFAULT_TEAM_RETENTION, type TeamRun, type TeamView, type TeamLineup } from "../packages/host/src/team-types.js";
+import { DEFAULT_TEAM_RETENTION, type TeamGoalContext, type TeamRun, type TeamView, type TeamLineup } from "../packages/host/src/team-types.js";
+import type { ProductGoal } from "../packages/host/src/goal-types.js";
 import type { Manager } from "../packages/host/src/manager.js";
 import type { Mission } from "../packages/host/src/mission-types.js";
 import type { Config } from "../packages/host/src/types.js";
@@ -685,4 +686,246 @@ test("a goal sweeps a cancelled cycle after retention and retries a failed run r
     assert.equal(view.cycles[0]?.status, "cancelled");
     assert.equal(view.cycles[0]?.reason, reason);
   } finally { goals.close(); teams.close(); fixture.close(); }
+});
+
+type GoalInternals = { records: Map<string, unknown> };
+
+function makeGoalContext(goalId: string, cycle: number, deadlineAt: string): TeamGoalContext {
+  return {
+    id: goalId, revision: 1, cycle, successCriteria: "Leftover runs can be cancelled cleanly.",
+    nonGoals: [], allowedPaths: ["."], evidence: [], previousWork: [], deadlineAt, maxMembers: 24, extendMinutes: 0, ceilingAt: deadlineAt,
+  };
+}
+
+function makeGoalRecord(goalId: string, overrides: Partial<ProductGoal>, extra: Record<string, unknown> = {}) {
+  const at = new Date().toISOString();
+  const deadlineAt = overrides.deadlineAt ?? new Date(Date.now() + 600_000).toISOString();
+  const goal: ProductGoal = {
+    id: goalId, projectId: "fixture", title: "Stopped goal", objective: "Exercise stopped goal leftover run cancellation",
+    successCriteria: "Leftover runs can be cancelled cleanly.", nonGoals: [], allowedPaths: ["."], evidence: [],
+    maxRuns: 2, maxMinutes: 60, maxTotalMinutes: 60, maxMembers: 24, parallelism: 4, revision: 1, status: "blocked",
+    createdAt: at, updatedAt: at, deadlineAt, ceilingAt: deadlineAt, lineup, autonomy: "supervised", activeTeamId: undefined,
+    cycles: [], memberCount: 0, steering: [], events: [], outcomes: [], ...overrides,
+  };
+  return { goal, fingerprint: "api-fixture", receipts: {}, ...extra };
+}
+
+async function withTeamApiHost(
+  t: { skip(message?: string): void },
+  run: (ctx: {
+    host: ReturnType<typeof createApp>;
+    config: Config;
+    key: Buffer;
+    fixture: ReturnType<typeof schedulerFixture>;
+    postTeamAction: (teamId: string, action: "pause" | "resume" | "cancel", revision: number) => Promise<{ status: number; body: any }>;
+  }) => Promise<void>,
+) {
+  const root = mkdtempSync(join(tmpdir(), "team-goal-cancel-api-")),
+    runDir = mkdtempSync(join(tmpdir(), "team-goal-cancel-run-")), fixture = schedulerFixture();
+  const workspace = join(root, "workspace");
+  mkdirSync(workspace, { recursive: true });
+  const key = randomBytes(32), token = randomBytes(32).toString("base64url");
+  const config: Config = {
+    port: 0, origin: "http://127.0.0.1", keyFile: join(root, "key"), stateDir: join(root, "state"), runDir,
+    environment: "local", enableDemo: true, maxSessions: 4, agents: {}, projects: [{ id: "fixture", name: "Fixture", path: workspace }],
+    tokens: [{ id: "owner", label: "Owner", role: "owner", hash: hashToken(token) }],
+    teams: { workspaceDir: join(root, "teams") },
+  };
+  writeFileSync(config.keyFile, key, { mode: 0o600 });
+  mkdirSync(join(config.stateDir, "desktop-uploads"), { recursive: true });
+  let host: ReturnType<typeof createApp> | undefined;
+  let listening = false;
+  try {
+    const probe = createServer();
+    try {
+      await new Promise<void>((resolve, reject) => {
+        probe.once("error", reject);
+        probe.listen(0, "127.0.0.1", resolve);
+      });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EPERM") { t.skip("The sandbox does not permit the loopback listener required by the HTTP route test."); return; }
+      throw error;
+    } finally { if (probe.listening) await new Promise<void>(resolve => probe.close(() => resolve())); }
+    host = createApp(config, key);
+    await new Promise<void>((resolve, reject) => {
+      const fail = (error: Error) => reject(error);
+      host!.server.once("error", fail);
+      host!.server.listen(0, "127.0.0.1", () => { listening = true; host!.server.removeListener("error", fail); resolve(); });
+    });
+    config.port = (host.server.address() as { port: number }).port;
+    await Promise.all([host.teams.close(), host.goals.close(), host.missions.close()]);
+    const postTeamAction = async (teamId: string, action: "pause" | "resume" | "cancel", revision: number) => {
+      const response = await fetch(`http://127.0.0.1:${config.port}/api/teams/${teamId}/${action}`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ requestId: randomUUID(), revision }),
+      });
+      return { status: response.status, body: await response.json() as any };
+    };
+    await run({ host, config, key, fixture, postTeamAction });
+  } finally {
+    if (host) {
+      await host.closeConnections();
+      if (listening) await new Promise<void>(resolve => host!.server.close(() => resolve()));
+    }
+    rmSync(root, { recursive: true, force: true }); rmSync(runDir, { recursive: true, force: true }); fixture.close();
+  }
+}
+
+test("POST /api/teams/:id/cancel updates stopped goal cycles for leftover blocked and paused runs", { timeout: 15000 }, async t => {
+  await withTeamApiHost(t, async ({ host, config, key, fixture, postTeamAction }) => {
+    const at = new Date().toISOString();
+    const deadlineAt = new Date(Date.now() + 600_000).toISOString();
+    const goalId = randomUUID();
+    const blockedRun = fixture.run;
+    blockedRun.status = "blocked";
+    blockedRun.reason = "The child stopped with a blocker.";
+    blockedRun.members = [];
+    blockedRun.goal = makeGoalContext(goalId, 1, deadlineAt);
+    const pausedRun: TeamRun = {
+      ...structuredClone(blockedRun),
+      id: randomUUID(),
+      revision: 1,
+      status: "paused",
+      reason: "The child stopped while paused.",
+      goal: makeGoalContext(goalId, 2, deadlineAt),
+      members: [],
+    };
+    const teamRecords = (host.teams as unknown as TeamInternals).records;
+    teamRecords.set(blockedRun.id, { run: blockedRun, fingerprint: "api-fixture-blocked", receipts: {}, prepared: true, root: config.teams!.workspaceDir });
+    teamRecords.set(pausedRun.id, { run: pausedRun, fingerprint: "api-fixture-paused", receipts: {}, prepared: true, root: config.teams!.workspaceDir });
+    const goalRecord = makeGoalRecord(goalId, {
+      status: "blocked",
+      activeTeamId: undefined,
+      deadlineAt,
+      ceilingAt: deadlineAt,
+      cycles: [
+        { teamId: blockedRun.id, cycle: 1, goalRevision: 1, status: "blocked", startedAt: at, memberCount: 0, autonomy: "supervised" },
+        { teamId: pausedRun.id, cycle: 2, goalRevision: 1, status: "paused", startedAt: at, memberCount: 0, autonomy: "supervised" },
+      ],
+    });
+    (host.goals as unknown as GoalInternals).records.set(goalId, goalRecord);
+
+    await t.test("keeps pause and resume refused and marks a cancelled blocked cycle on the stopped goal", async () => {
+      const pause = await postTeamAction(blockedRun.id, "pause", blockedRun.revision);
+      assert.equal(pause.status, 409);
+      assert.equal(pause.body.code, "goal-owned-team");
+      const resume = await postTeamAction(blockedRun.id, "resume", blockedRun.revision);
+      assert.equal(resume.status, 409);
+      assert.equal(resume.body.code, "goal-owned-team");
+
+      const cancelled = await postTeamAction(blockedRun.id, "cancel", blockedRun.revision);
+      assert.equal(cancelled.status, 200);
+      assert.equal(cancelled.body.status, "cancelled");
+      const goal = host.goals.get(goalId);
+      assert.equal(goal.status, "blocked");
+      assert.equal(goal.cycles[0]?.status, "cancelled");
+      const persisted = unseal<{ goal: ProductGoal }>(key, `goal:${goalId}`, readFileSync(join(config.stateDir, "goals", `${goalId}.sealed`), "utf8")).goal;
+      assert.equal(persisted.status, "blocked");
+      assert.equal(persisted.cycles[0]?.status, "cancelled");
+    });
+
+    await t.test("keeps pause and resume refused and cancels a stopped goal's leftover paused run", async () => {
+      const pause = await postTeamAction(pausedRun.id, "pause", pausedRun.revision);
+      assert.equal(pause.status, 409);
+      assert.equal(pause.body.code, "goal-owned-team");
+      const resume = await postTeamAction(pausedRun.id, "resume", pausedRun.revision);
+      assert.equal(resume.status, 409);
+      assert.equal(resume.body.code, "goal-owned-team");
+
+      const cancelled = await postTeamAction(pausedRun.id, "cancel", pausedRun.revision);
+      assert.equal(cancelled.status, 200);
+      assert.equal(cancelled.body.status, "cancelled");
+      const goal = host.goals.get(goalId);
+      assert.equal(goal.status, "blocked");
+      assert.equal(goal.cycles[1]?.status, "cancelled");
+      const persisted = unseal<{ goal: ProductGoal }>(key, `goal:${goalId}`, readFileSync(join(config.stateDir, "goals", `${goalId}.sealed`), "utf8")).goal;
+      assert.equal(persisted.status, "blocked");
+      assert.equal(persisted.cycles[1]?.status, "cancelled");
+    });
+
+    await t.test("goal cleanup removes the cancelled leftover run record after workspace removal", async () => {
+      blockedRun.workspaceRemovedAt = new Date().toISOString();
+      blockedRun.workspace = join(config.teams!.workspaceDir, "removed-blocked", "integration");
+      const internals = host.goals as unknown as { closed: boolean; step(stored: unknown): Promise<void> };
+      internals.closed = false;
+      try { await internals.step(goalRecord); } finally { internals.closed = true; }
+      assert.throws(() => host.teams.get(blockedRun.id), (error: unknown) => error instanceof TeamError && error.code === "team-not-found");
+      const goal = host.goals.get(goalId);
+      assert.equal(goal.status, "blocked");
+      assert.equal(goal.cycles[0]?.teamId, blockedRun.id);
+      assert.equal(goal.cycles[0]?.status, "cancelled");
+    });
+  });
+});
+
+test("POST /api/teams/:id/cancel refuses leftover run cancel when the stopped goal is extendable or has pending run operations", { timeout: 15000 }, async t => {
+  await withTeamApiHost(t, async ({ host, config, fixture, postTeamAction }) => {
+    const at = new Date().toISOString();
+    const defaultDeadlineAt = new Date(Date.now() + 600_000).toISOString();
+    const teamRecords = (host.teams as unknown as TeamInternals).records;
+    const goalRecords = (host.goals as unknown as GoalInternals).records;
+    const seedCase = (
+      goalOverrides: Partial<ProductGoal>,
+      extraGoalFields: (run: TeamRun) => Record<string, unknown> = () => ({}),
+      runStatus: TeamRun["status"] = "blocked",
+    ) => {
+      const goalId = randomUUID();
+      const deadlineAt = goalOverrides.deadlineAt ?? defaultDeadlineAt;
+      const run: TeamRun = {
+        ...structuredClone(fixture.run),
+        id: randomUUID(),
+        revision: 1,
+        status: runStatus,
+        reason: "The child stopped with a blocker.",
+        members: [],
+        goal: makeGoalContext(goalId, 1, deadlineAt),
+      };
+      teamRecords.set(run.id, { run, fingerprint: `api-fixture-${run.id}`, receipts: {}, prepared: true, root: config.teams!.workspaceDir });
+      goalRecords.set(goalId, makeGoalRecord(goalId, {
+        activeTeamId: undefined,
+        deadlineAt,
+        ceilingAt: deadlineAt,
+        cycles: [{ teamId: run.id, cycle: 1, goalRevision: 1, status: runStatus, startedAt: at, memberCount: 0, autonomy: "supervised" }],
+        ...goalOverrides,
+      }, extraGoalFields(run)));
+      return run;
+    };
+
+    await t.test("refuses cancel while a deadline-stopped goal can still be extended", async () => {
+      const run = seedCase({ status: "limit-reached", stopReason: "deadline", deadlineAt: new Date(Date.now() - 60_000).toISOString() });
+      const response = await postTeamAction(run.id, "cancel", run.revision);
+      assert.equal(response.status, 409);
+      assert.equal(response.body.code, "goal-owned-team");
+      assert.equal(host.teams.get(run.id).status, "blocked");
+    });
+
+    await t.test("refuses cancel while a stopped goal has a queued control for the run", async () => {
+      const run = seedCase({ status: "cancelled" }, item => ({
+        control: { action: "cancel", teamId: item.id, requestId: randomUUID(), revision: item.revision },
+      }));
+      const response = await postTeamAction(run.id, "cancel", run.revision);
+      assert.equal(response.status, 409);
+      assert.equal(response.body.code, "goal-owned-team");
+      assert.equal(host.teams.get(run.id).status, "blocked");
+    });
+
+    await t.test("refuses cancel while a stopped goal has a pending extensionIntent for the run", async () => {
+      const run = seedCase({ status: "cancelled" }, item => ({
+        extensionIntent: { requestId: randomUUID(), revision: 1, minutes: 30, fingerprint: "fp", teamId: item.id },
+      }));
+      const response = await postTeamAction(run.id, "cancel", run.revision);
+      assert.equal(response.status, 409);
+      assert.equal(response.body.code, "goal-owned-team");
+      assert.equal(host.teams.get(run.id).status, "blocked");
+    });
+
+    await t.test("refuses cancel for a stopped goal's ready-for-review cycle", async () => {
+      const run = seedCase({ status: "ready-for-review" }, () => ({}), "ready-for-review");
+      const response = await postTeamAction(run.id, "cancel", run.revision);
+      assert.equal(response.status, 409);
+      assert.equal(response.body.code, "goal-owned-team");
+      assert.equal(host.teams.get(run.id).status, "ready-for-review");
+    });
+  });
 });

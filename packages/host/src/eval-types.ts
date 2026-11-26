@@ -1,6 +1,8 @@
 import { z } from "zod";
+import type { EvalBudgetPeriod, EvalProvider } from "./eval-config.js";
 import type { TeamBrief, TeamGoalContext, TeamModelProfile } from "./team-types.js";
 import type { RoutineStatus } from "./routine-types.js";
+import type { ProviderSpendUnmeasurableReason } from "./usage.js";
 
 export const evalTaskIdSchema = z.string().regex(/^(captured|mined):[A-Za-z0-9:._-]{1,200}$/);
 
@@ -202,7 +204,17 @@ export type MiningStatus = { state: MiningState; visited: number | null; mined: 
 export type EvalJobReason = "owner" | "validation-stuck" | "configuration-changed" | "grader-processes-alive" | "limit-reached" | "done" | "expired"
   | "trial-voids" | "eval-processes-alive" | "identity-changed";
 export type EvalJobWait = "grader" | "window" | "host-load" | "halt" | "storage" | "bundle" | "mirror" | "another-job"
-  | "eval-identity" | "provider-limit" | "session-slots" | "daily-cap" | "grader-failed" | "eval-failed" | "bundle-missing";
+  | "eval-identity" | "spend-fuse" | "provider-limit" | "provider-budget" | "budget-unmeasurable" | "session-slots" | "daily-cap"
+  | "grader-failed" | "eval-failed" | "bundle-missing";
+export type EvalProviderBudgetStatus = {
+  provider: EvalProvider;
+  source: "project" | "host";
+  period: EvalBudgetPeriod;
+  limitUsd: number;
+  spentUsd: number | null;
+  state: "admitted" | "exceeded" | "unmeasurable";
+  reason?: ProviderSpendUnmeasurableReason;
+};
 export type ValidateJobView = {
   jobId: string; projectId: string | null; kind: "validate"; status: RoutineStatus;
   reason: EvalJobReason | null; waiting: EvalJobWait | null;
@@ -314,12 +326,13 @@ export type EvalSummary = {
   coverage: { days: number; validCaptured: number; accepted: number; share: number } | null;
   grader: { state: GraderState; version: number | null };
   evalIdentity: { state: EvalIdentityState; lastProbe?: { state: EvalIdentityState; at: string } | null };
-  trials: { today: number; dailyCap: number | null };
+  trials: { today: number; dailyCap: number | null; budgets?: EvalProviderBudgetStatus[] };
   jobs: EvalJobView[];
 };
 export type EvalRefusal = { status: 400 | 404 | 409 | 503; code: "invalid-eval-request" | "unknown-project" | "unknown-job" | "unknown-task"
   | "job-active" | "request-conflict" | "eval-config-incomplete" | "invalid-job-transition" | "task-not-active" | "evidence-unavailable"
-  | "profile-not-approved" | "too-few-tasks" | "subject-confirmed" | "report-not-ready" | "report-unreadable" | "no-report" };
+  | "profile-not-approved" | "too-few-tasks" | "subject-confirmed" | "report-not-ready" | "report-unreadable" | "no-report"
+  | "provider-budget-exceeded" | "provider-budget-unmeasurable" | "spend-fuse-open" };
 export interface EvalHostApi {
   summary(projectId: string): Promise<EvalSummary | EvalRefusal>;
   jobs(): EvalJobView[] | EvalRefusal;

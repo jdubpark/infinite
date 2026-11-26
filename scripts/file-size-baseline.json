@@ -8,7 +8,7 @@
     "packages/host/src/memory/store.ts": 2163,
     "packages/host/src/missions.ts": 1531,
     "packages/host/src/outcome-store.ts": 1266,
-    "packages/host/src/server.ts": 2159,
+    "packages/host/src/server.ts": 2161,
     "packages/host/src/team-cli.ts": 1224,
     "packages/host/src/teams.ts": 3260,
     "packages/host/src/understanding-work.ts": 1021,

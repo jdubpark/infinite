@@ -157,6 +157,8 @@ export function withDefaultAttention(
   };
 }
 export class Manager {
+  private contexts?: ProjectContexts;
+  get projectContexts() { return this.contexts ??= new ProjectContexts(this.config, this.key); }
   private readonly sessionQueues = new Map<string, Promise<unknown>>();
   private readonly conversationQueues = new Map<string, Promise<unknown>>();
   private readonly pendingCreates = new Set<string>();
@@ -205,8 +207,9 @@ export class Manager {
     readonly config: Config,
     readonly key: Buffer,
     hostProbe: HostLoadProbe = readHostLoad,
-    options?: { socketDir?: string },
+    options?: { socketDir?: string; projectContexts?: ProjectContexts },
   ) {
+    this.contexts = options?.projectContexts;
     assertRunnerDeployment(config);
     const configuredSocketDir = options?.socketDir ?? config.socketDir;
     this.socketDir = ensureSocketDir(configuredSocketDir ?? config.runDir, configuredSocketDir !== undefined ? "socketDir" : "runDir");
@@ -367,10 +370,6 @@ export class Manager {
   }
 
   metaRevision(id: string): string | undefined { return this.listedMeta.revision(id); }
-  context(projectId: string) { return new ProjectContexts(this.config, this.key).context(projectId); }
-  setContext(projectId: string, text: string, expectedVersion: number) {
-    return new ProjectContexts(this.config, this.key).setContext(projectId, text, expectedVersion);
-  }
   create(request: CreateSession, startedBy?: "owner"): Promise<Session & WorkerState> {
     if (request.continuation !== undefined)
       throw new ContentError("Native continuation is only available for managed coordinator team sessions", 400);
@@ -996,7 +995,7 @@ export class Manager {
       if (request.team?.role === "permission-coordinator") profile = permissionCoordinatorLaunch(request.provider, profile);
       if (request.team?.role === "mission-coordinator") profile = missionCoordinatorLaunch(parseMissionCoordinatorProvider(request.provider), profile);
       if (request.continuation) profile = withNativeContinuation(profile, request.continuation);
-      const context = withoutSharedContext(new ProjectContexts(this.config, this.key).snapshot(request.projectId), executionIdentity);
+      const context = withoutSharedContext(this.projectContexts.snapshot(request.projectId), executionIdentity);
       const session: Session = {
         id,
         ...(request.team ? { team: request.team } : {}),

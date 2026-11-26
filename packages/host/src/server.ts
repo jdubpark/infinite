@@ -23,7 +23,7 @@ import { CmuxSessions } from "./cmux/index.js";
 import { CmuxError } from "./cmux/client.js";
 import { ContentError, recordedMessages, sessionFile } from "./session-content.js";
 import { connectRemoteAccess } from "./remote-access.js";
-import { ProjectSync, ProjectSyncError, syncFailure } from "./project-sync.js";
+import { parseSyncGeneration, parseSyncPublisherId, ProjectSync, ProjectSyncError, syncFailure } from "./project-sync.js";
 import { ProjectSourceError, ProjectSourceService } from "./project-source.js";
 import { MirroredProjects } from "./mirrored-projects.js";
 import { RepoEnrollmentService, autonomyChangeSchema, repoEnrollmentRequestSchema } from "./repo-enrollment.js";
@@ -1957,36 +1957,36 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
     res.status(409).json({ error: "This project follows GitHub; laptop sync is off. Re-enroll with --source laptop to upload from this computer.", code: "source-github" });
     return true;
   };
-  const syncWriter = (req: express.Request, res: express.Response) => ({
-    deviceId: String(res.locals.deviceId),
-    publisherId: z.uuid().optional().parse(req.get("X-Infinite-Sync-Publisher")),
-  });
-  const syncGeneration = (req: express.Request) => z.uuid().optional().parse(req.get("X-Infinite-Sync-Generation"));
+  const syncWriter = (req: express.Request, res: express.Response) => ({ deviceId: String(res.locals.deviceId), publisherId: parseSyncPublisherId(req.get("X-Infinite-Sync-Publisher")) });
+  const syncLease = (req: express.Request, res: express.Response) => ({ writer: syncWriter(req, res), generation: parseSyncGeneration(req.get("X-Infinite-Sync-Generation")) });
   app.post("/api/projects/:id/sync/begin", requireRole(["owner"]), requireOwnerCli, async (req, res) => {
     const projectId = projectSchema.parse(req.params.id);
     if (refuseGithubSync(projectId, res)) return;
-    res.json(await projectSync.begin(projectId, syncWriter(req, res)));
+    res.json(await projectSync.begin(projectId, syncWriter(req, res), z.object({ expectEmpty: z.boolean().optional() }).strict().parse(req.body ?? {})));
   });
   app.post("/api/projects/:id/sync/has", requireRole(["owner"]), requireOwnerCli, async (req, res) => {
+    const { writer, generation } = syncLease(req, res);
     const body = z.object({ hashes: z.array(z.string().regex(/^[a-f0-9]{64}$/)).max(512) }).strict().parse(req.body);
-    res.json({ missing: await projectSync.missing(projectSchema.parse(req.params.id), body.hashes, syncWriter(req, res), syncGeneration(req)) });
+    res.json({ missing: await projectSync.missing(projectSchema.parse(req.params.id), body.hashes, writer, generation) });
   });
   app.put("/api/projects/:id/sync/blob/:hash", requireRole(["owner"]), requireOwnerCli, express.raw({ type: "application/octet-stream", limit: WORKSPACE_LIMITS.chunkBytes }), async (req, res) => {
+    const { writer, generation } = syncLease(req, res);
     if (!Buffer.isBuffer(req.body) || !req.body.length) return void res.status(400).json({ error: "Send the chunk as application/octet-stream" });
-    await projectSync.putBlob(projectSchema.parse(req.params.id), String(req.params.hash), req.body, syncWriter(req, res), syncGeneration(req));
+    await projectSync.putBlob(projectSchema.parse(req.params.id), String(req.params.hash), req.body, writer, generation);
     res.json({ stored: true });
   });
   app.put("/api/projects/:id/sync/blobs", requireRole(["owner"]), requireOwnerCli, express.raw({ type: "application/octet-stream", limit: WORKSPACE_LIMITS.batchBytes }), async (req, res) => {
+    const { writer, generation } = syncLease(req, res);
     if (!Buffer.isBuffer(req.body) || !req.body.length) return void res.status(400).json({ error: "Send the chunk batch as application/octet-stream" });
-    res.json({ stored: await projectSync.putBlobs(projectSchema.parse(req.params.id), req.body, syncWriter(req, res), syncGeneration(req)) });
+    res.json({ stored: await projectSync.putBlobs(projectSchema.parse(req.params.id), req.body, writer, generation) });
   });
   app.post("/api/projects/:id/sync/commit", requireRole(["owner"]), requireOwnerCli, express.json({ limit: WORKSPACE_LIMITS.manifestBytes + 64 * 1024 }), async (req, res) => {
     const projectId = projectSchema.parse(req.params.id);
     if (refuseGithubSync(projectId, res)) return;
+    const { writer, generation } = syncLease(req, res);
     const body = z.object({ generation: z.uuid(), manifest: z.unknown() }).strict().parse(req.body);
-    const headerGeneration = syncGeneration(req);
-    if (headerGeneration && headerGeneration !== body.generation) throw new ProjectSyncError("The sync generation does not match this request", "stale-generation");
-    res.json(await projectSync.commit(projectId, body.generation, body.manifest, () => projectRunning(projectId), syncWriter(req, res)));
+    if (generation !== body.generation) throw new ProjectSyncError("The sync generation does not match this request", "stale-generation");
+    res.json(await projectSync.commit(projectId, body.generation, body.manifest, () => projectRunning(projectId), writer));
   });
   app.post("/api/projects/:id/sync/apply", requireRole(["owner"]), async (req, res) => {
     const projectId = projectSchema.parse(req.params.id);

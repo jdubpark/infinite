@@ -202,20 +202,20 @@ test("sync routes receive a laptop tree, hold it while a session runs, and apply
     const missing = await host.fetchApi(`/projects/rehearsal/sync/blob/${absent}`);
     assert.equal(missing.status, 404);
     assert.equal(missing.body.code, "missing-content");
-    const mismatched = await putChunk(host, absent, Buffer.from("other bytes\n"));
+    const begun = (await host.fetchApi("/projects/rehearsal/sync/begin", "owner", {}, syncHeaders())).body.generation as string;
+    const mismatched = await putChunk(host, absent, Buffer.from("other bytes\n"), syncPublisher, begun);
     assert.equal(mismatched.status, 400);
     assert.equal((await mismatched.json()).code, "invalid-manifest");
-    assert.equal((await putChunk(host, absent, Buffer.alloc(1024 * 1024 + 1))).status, 413);
+    assert.equal((await putChunk(host, absent, Buffer.alloc(1024 * 1024 + 1), syncPublisher, begun)).status, 413);
     const oversize = Buffer.alloc(256 * 1024 + 1);
-    assert.equal((await putChunk(host, createHash("sha256").update(oversize).digest("hex"), oversize)).status, 413);
+    assert.equal((await putChunk(host, createHash("sha256").update(oversize).digest("hex"), oversize, syncPublisher, begun)).status, 413);
     const good = Buffer.from("batched\n"), goodHash = createHash("sha256").update(good).digest("hex");
-    const misnamed = await putBatch(host, encodeChunkBatch([{ hash: goodHash, bytes: good }, { hash: absent, bytes: Buffer.from("other\n") }]));
+    const misnamed = await putBatch(host, encodeChunkBatch([{ hash: goodHash, bytes: good }, { hash: absent, bytes: Buffer.from("other\n") }]), syncPublisher, begun);
     assert.deepEqual([misnamed.status, (await misnamed.json()).code], [400, "invalid-manifest"]);
-    assert.deepEqual((await host.fetchApi("/projects/rehearsal/sync/has", "owner", { hashes: [goodHash] })).body.missing, [goodHash], "a refused batch stores none of its chunks");
+    assert.deepEqual((await host.fetchApi("/projects/rehearsal/sync/has", "owner", { hashes: [goodHash] }, syncHeaders(begun))).body.missing, [goodHash], "a refused batch stores none of its chunks");
     const framed = encodeChunkBatch([{ hash: goodHash, bytes: good }]);
-    assert.equal((await putBatch(host, framed.subarray(0, framed.length - 1))).status, 400);
-    assert.equal((await putBatch(host, Buffer.alloc(2 * 1024 * 1024 + 1))).status, 413);
-    const begun = (await host.fetchApi("/projects/rehearsal/sync/begin", "owner", {}, syncHeaders())).body.generation;
+    assert.equal((await putBatch(host, framed.subarray(0, framed.length - 1), syncPublisher, begun)).status, 400);
+    assert.equal((await putBatch(host, Buffer.alloc(2 * 1024 * 1024 + 1), syncPublisher, begun)).status, 413);
     const atBound = await host.fetchApi("/projects/rehearsal/sync/commit", "owner", { generation: begun, manifest: "x".repeat(32 * 1024 * 1024 - 2) }, syncHeaders(begun));
     assert.deepEqual([atBound.status, atBound.body.code], [400, "invalid-manifest"]);
 
@@ -307,6 +307,75 @@ test("an active publisher lease resumes across API restart and another publisher
     assert.deepEqual([conflict.status, conflict.body.code], [409, "sync-in-progress"]);
     assert.ok(Number(conflict.headers.get("retry-after")) > 0, "the host tells another publisher when to retry");
   } finally { await host.stop(); }
+});
+
+test("sync upload routes reject missing or invalid publisher and generation headers with 400 while valid clients resume and commit", async () => {
+  const host = await inProcessHost();
+  const root = realpathSync(mkdtempSync("/tmp/inf-psync-headers-"));
+  const laptop = join(root, "laptop"); mkdirSync(laptop);
+  const storeDir = join(root, "store");
+  try {
+    const assertInvalidHeaders = (status: number, body: { code?: unknown; error?: unknown }, expectedHeader: string, context: string) => {
+      assert.deepEqual([status, body.code], [400, "invalid-sync-headers"], context);
+      assert.match(String(body.error), new RegExp(expectedHeader), context);
+    };
+
+    for (const [label, headers] of [["missing", {}], ["invalid", { "X-Infinite-Sync-Publisher": "not-a-uuid" }]] as const) {
+      const refused = await host.fetchApi("/projects/rehearsal/sync/begin", "owner", {}, headers);
+      assertInvalidHeaders(refused.status, refused.body, "X-Infinite-Sync-Publisher", `begin:${label}`);
+    }
+
+    const publisher = randomUUID();
+    const begun = await host.fetchApi("/projects/rehearsal/sync/begin", "owner", {}, { "X-Infinite-Sync-Publisher": publisher });
+    assert.equal(begun.status, 200);
+    const generation = begun.body.generation as string;
+    const chunk = Buffer.from("hello\n"), hash = createHash("sha256").update(chunk).digest("hex");
+    const batch = encodeChunkBatch([{ hash, bytes: chunk }]);
+    const badHeaderCases: [string, string | undefined, string | undefined, string][] = [
+      ["missing-both", undefined, undefined, "X-Infinite-Sync-Publisher"],
+      ["missing-publisher", undefined, generation, "X-Infinite-Sync-Publisher"],
+      ["invalid-publisher", "not-a-uuid", generation, "X-Infinite-Sync-Publisher"],
+      ["missing-generation", publisher, undefined, "X-Infinite-Sync-Generation"],
+      ["invalid-generation", publisher, "not-a-uuid", "X-Infinite-Sync-Generation"],
+    ];
+
+    for (const [label, publisherHeader, generationHeader, expectedHeader] of badHeaderCases) {
+      const headers: Record<string, string> = {
+        ...(publisherHeader ? { "X-Infinite-Sync-Publisher": publisherHeader } : {}),
+        ...(generationHeader ? { "X-Infinite-Sync-Generation": generationHeader } : {}),
+      };
+      const has = await host.fetchApi("/projects/rehearsal/sync/has", "owner", { hashes: [hash] }, headers);
+      assertInvalidHeaders(has.status, has.body, expectedHeader, `has:${label}`);
+      const single = await putChunk(host, hash, chunk, publisherHeader, generationHeader);
+      assertInvalidHeaders(single.status, await single.json(), expectedHeader, `blob:${label}`);
+      const grouped = await putBatch(host, batch, publisherHeader, generationHeader);
+      assertInvalidHeaders(grouped.status, await grouped.json(), expectedHeader, `blobs:${label}`);
+      const commit = await host.fetchApi("/projects/rehearsal/sync/commit", "owner", { generation, manifest: {} }, headers);
+      assertInvalidHeaders(commit.status, commit.body, expectedHeader, `commit:${label}`);
+    }
+
+    const mismatched = await host.fetchApi("/projects/rehearsal/sync/commit", "owner", { generation, manifest: {} }, {
+      "X-Infinite-Sync-Publisher": publisher, "X-Infinite-Sync-Generation": randomUUID(),
+    });
+    assert.deepEqual([mismatched.status, mismatched.body.code], [409, "stale-generation"]);
+
+    writeFileSync(join(laptop, "notes.md"), "verified\n");
+    const manifest = await captureWorkspace({ roots: [laptop], cwd: laptop, storeDir });
+    const resumed = await host.fetchApi("/projects/rehearsal/sync/begin", "owner", {}, { "X-Infinite-Sync-Publisher": publisher });
+    assert.deepEqual([resumed.status, resumed.body.generation], [200, generation], "the owning publisher resumes its active lease");
+    const validHeaders = { "X-Infinite-Sync-Publisher": publisher, "X-Infinite-Sync-Generation": generation };
+    const missing = await host.fetchApi("/projects/rehearsal/sync/has", "owner", { hashes: manifest.entries.flatMap(e => e.chunks ?? []) }, validHeaders);
+    assert.equal(missing.status, 200);
+    await uploadMissingChunks({ storeDir, hashes: manifest.entries.flatMap(e => e.chunks ?? []), transport: {
+      has: async hashes => (await host.fetchApi("/projects/rehearsal/sync/has", "owner", { hashes }, validHeaders)).body.missing,
+      putBatch: async body => { await ok(await putBatch(host, body, publisher, generation)); },
+      put: async (chunkHash, bytes) => { await ok(await putChunk(host, chunkHash, bytes, publisher, generation)); },
+    } });
+    const committed = await host.fetchApi("/projects/rehearsal/sync/commit", "owner", { generation, manifest }, validHeaders);
+    assert.equal(committed.status, 200);
+    assert.equal(committed.body.appliedManifest, manifest.id);
+    assert.equal(readFileSync(join(host.config.projects[0].path, "notes.md"), "utf8"), "verified\n");
+  } finally { await host.stop(); rmSync(root, { recursive: true, force: true }); }
 });
 
 test("session starts are refused while a sync holds the project, and an admitted start holds the next apply", { timeout: 60000 }, async () => {

@@ -53,20 +53,10 @@ export function createReportEnvelope(input: unknown, env: NodeJS.ProcessEnv = pr
   if (Buffer.byteLength(JSON.stringify(envelope)) > MAX_TEAM_REPORT_BYTES) throw new ReportError("Report exceeds 64 KiB.");
   return envelope;
 }
-function questionForOlderWorker(report: { kind: string }): Record<string, unknown> | undefined {
-  if (report.kind !== "question" || !("recommendation" in report)) return undefined;
-  return Object.fromEntries(Object.entries(report).filter(([key]) => key !== "recommendation"));
-}
 export async function submitTeamReport(input: unknown, env: NodeJS.ProcessEnv = process.env): Promise<TeamReportEnvelope> {
-  const { endpoint, token, binding } = hookCapability(env, "team-report");
-  let envelope = createReportEnvelope(input, env);
-  let response = await postTeamReport(endpoint, token, envelope);
-  const older = response.status === 400 ? questionForOlderWorker(envelope.report) : undefined;
-  if (older) {
-    await response.body?.cancel();
-    envelope = teamReportEnvelopeSchema.parse({ ...binding, report: older, requestId: reportIdentity({ ...binding, report: older }) });
-    response = await postTeamReport(endpoint, token, envelope);
-  }
+  const { endpoint, token } = hookCapability(env, "team-report");
+  const envelope = createReportEnvelope(input, env);
+  const response = await postTeamReport(endpoint, token, envelope);
   if (response.status >= 400 && response.status < 500) {
     const detail = (await response.text()).trim().slice(0, 2000);
     throw new ReportError(detail || `Report refused (${response.status}). Inspect this member's recorded report; do not bypass the refusal.`);
@@ -132,19 +122,15 @@ export function createMissionReportEnvelope(input: unknown, env: NodeJS.ProcessE
   return envelope;
 }
 export async function submitMissionReport(input: unknown, env: NodeJS.ProcessEnv = process.env): Promise<MissionReportEnvelope> {
-  const { endpoint, token, binding } = missionReportEnvironment(env);
-  let envelope = createMissionReportEnvelope(input, env);
-  const post = (body: MissionReportEnvelope) => fetch(endpoint, {
+  const { endpoint, token } = missionReportEnvironment(env);
+  const envelope = createMissionReportEnvelope(input, env);
+  const response = await fetch(endpoint, {
     method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-    body: JSON.stringify(body), signal: AbortSignal.timeout(10000), redirect: "error",
+    body: JSON.stringify(envelope), signal: AbortSignal.timeout(10000), redirect: "error",
   });
-  let response = await post(envelope);
-  const older = response.status === 400 ? questionForOlderWorker(envelope.report) : undefined;
-  if (older) {
-    await response.body?.cancel();
-    const content = { report: older, ...(envelope.note === undefined ? {} : { note: envelope.note }) };
-    envelope = missionReportEnvelopeSchema.parse({ ...binding, ...content, requestId: reportIdentity({ ...binding, ...content }) });
-    response = await post(envelope);
+  if (response.status >= 400 && response.status < 500) {
+    const detail = (await response.text()).trim().slice(0, 2000);
+    throw new ReportError(detail || `Report refused or unconfirmed (${response.status}). Stop and inspect this attempt's recorded report; do not bypass the refusal or submit a different report.`);
   }
   await response.body?.cancel();
   if (response.status !== 204)

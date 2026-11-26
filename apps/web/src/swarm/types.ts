@@ -1,4 +1,4 @@
-import type { Session, TeamModelProfile, UsageTotals } from "../api";
+import type { ProviderCapabilities, Session, TeamModelProfile, UsageTotals } from "../api";
 import type { MissionStatus } from "../mission-model";
 
 export type SwarmSession = Session;
@@ -18,7 +18,7 @@ export type SwarmTask = {
 };
 export type SwarmTeam = {
   id: string; projectId: string; provider: string; title: string; status: TeamStatus; revision: number;
-  createdAt: string; updatedAt: string; baseCommit: string; headCommit?: string; missionId?: string;
+  createdAt: string; updatedAt: string; lastActivityAt?: string; baseCommit: string; headCommit?: string; missionId?: string;
   goal?: { id: string; cycle: number };
   lineup?: { coordinator: { tier?: "light" | "strong" } };
   members: SwarmMember[]; tasks: SwarmTask[];
@@ -39,7 +39,13 @@ export type SwarmMission = {
   lineup?: { coordinator: TeamModelProfile };
   usage?: { total: UsageTotals; unmeasuredMembers?: number };
 };
-export type SwarmInput = { sessions: SwarmSession[]; teams: SwarmTeam[]; missions: SwarmMission[]; now: number };
+export type SwarmInput = {
+  sessions: SwarmSession[];
+  teams: SwarmTeam[];
+  missions: SwarmMission[];
+  providerCapabilities?: Record<string, ProviderCapabilities>;
+  now: number;
+};
 
 export const AGENT_STATES = ["needs-you", "in-review", "working", "waiting", "queued", "reported", "stopped", "fault"] as const;
 export type AgentState = typeof AGENT_STATES[number];

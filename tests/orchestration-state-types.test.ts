@@ -551,6 +551,7 @@ test("MissionFollowUp, BoardItem, MissionDecision, and MissionSubtask enforce in
     kind: "team",
     id: UUID2,
     title: "Fix tests",
+    groupId: "core",
     projectName: "Core",
     column: "review",
     status: "ready-for-review",
@@ -560,6 +561,8 @@ test("MissionFollowUp, BoardItem, MissionDecision, and MissionSubtask enforce in
   };
   assert.equal(boardItemSchema.safeParse(missionRow).success, true);
   assert.equal(boardItemSchema.safeParse(teamRow).success, true);
+  assert.equal(boardItemSchema.safeParse({ ...teamRow, groupId: undefined }).success, false);
+  assert.equal(boardItemSchema.safeParse({ ...teamRow, groupId: "" }).success, false);
   assert.equal(boardItemSchema.safeParse({ ...teamRow, stopReason: "deadline" }).success, false);
   assert.equal(boardItemSchema.safeParse({ ...teamRow, subtasks: { total: 1, running: 0, done: 1 } }).success, false);
 
@@ -568,6 +571,7 @@ test("MissionFollowUp, BoardItem, MissionDecision, and MissionSubtask enforce in
     kind: "goal",
     id: UUID,
     title: "Goal",
+    groupId: "core",
     projectName: "Core",
     column: "working",
     status: "running",
@@ -576,7 +580,19 @@ test("MissionFollowUp, BoardItem, MissionDecision, and MissionSubtask enforce in
     updatedAt: LATER,
     subtasks: { total: 1, running: 1, done: 0 },
   };
-  assert.ok(invalidGoalSubtasks);
+  // @ts-expect-error board items require canonical groupId
+  const missingGroupBoardItem: BoardItem = {
+    kind: "team",
+    id: UUID2,
+    title: "Missing group",
+    projectName: "Core",
+    column: "working",
+    status: "implementing",
+    detail: "Implementing",
+    createdAt: AT,
+    updatedAt: LATER,
+  };
+  assert.ok(invalidGoalSubtasks && missingGroupBoardItem);
 
   const openMissionDecision: OpenMissionDecision = {
     id: UUID,

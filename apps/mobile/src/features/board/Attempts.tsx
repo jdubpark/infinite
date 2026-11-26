@@ -6,7 +6,7 @@ import { StatusIcon } from "../../components/Icon";
 import { age } from "../../status";
 import { theme } from "../../theme";
 import { Section, t } from "../teams/parts";
-import { boardKind, boardStatusLabel } from "./model";
+import { boardKind, boardStatusLabel, subtaskProgressLabel } from "./model";
 
 export function Attempts({ attempts, current, machine, now }: { attempts: BoardItem[]; current: string; machine: string; now: number }) {
   const router = useRouter();
@@ -21,18 +21,20 @@ export function Attempts({ attempts, current, machine, now }: { attempts: BoardI
         const viewing = attempt.id === current;
         const number = attempt.attempt?.number ?? 0;
         const started = age(attempt.createdAt ?? attempt.updatedAt, now);
+        const progress = subtaskProgressLabel(attempt);
         return <Pressable key={`${attempt.kind}/${attempt.id}`} accessibilityRole="button" accessibilityState={{ selected: viewing, disabled: viewing }}
-          accessibilityLabel={`Attempt ${number}, ${boardStatusLabel(attempt)}${started ? `, started ${started} ago` : ""}${viewing ? ", viewing" : ""}`}
+          accessibilityLabel={`Attempt ${number}, ${boardStatusLabel(attempt)}${progress ? `, ${progress} subtasks` : ""}${started ? `, started ${started} ago` : ""}${viewing ? ", viewing" : ""}`}
           disabled={viewing} onPress={() => open(attempt)} style={({ pressed }) => [s.row, pressed && !viewing && s.pressed]}>
           <View style={s.icon}><StatusIcon kind={boardKind(attempt)} size={15} /></View>
           <View style={s.main}>
             <View style={s.line}>
               <Text style={s.number}>Attempt {number}</Text>
               <Text style={t.note}>{boardStatusLabel(attempt)}</Text>
+              {progress ? <Text style={s.progress}>{progress}</Text> : null}
               {started ? <Text style={t.note}>{started}</Text> : null}
               {viewing ? <Text style={s.viewing}>Viewing</Text> : null}
             </View>
-            <Text style={t.note} numberOfLines={1}>{attempt.detail}</Text>
+            {attempt.detail ? <Text style={t.note} numberOfLines={1}>{attempt.detail}</Text> : null}
           </View>
         </Pressable>;
       })}
@@ -48,5 +50,6 @@ const s = StyleSheet.create({
   main: { flex: 1, minWidth: 0, gap: 2 },
   line: { flexDirection: "row", alignItems: "center", flexWrap: "wrap", gap: 8 },
   number: { fontSize: 14, fontWeight: "600", color: theme.colors.ink },
+  progress: { fontSize: 12, color: theme.colors.mutedInk, fontVariant: ["tabular-nums"] },
   viewing: { fontSize: 12, fontWeight: "600", color: theme.colors.forest },
 });

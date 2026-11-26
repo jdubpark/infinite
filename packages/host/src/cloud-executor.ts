@@ -2,24 +2,10 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { realpath, stat } from "node:fs/promises";
 import { clearEgressEnvironment } from "./egress.js";
+import { supervisorArgs } from "./group-supervisor.js";
 
 const STARTUP_TIMEOUT = 15000;
 const STARTUP_ERROR = "The cloud executor did not become ready. No command was replayed.";
-
-const SUPERVISOR = `
-  const {spawn}=require('node:child_process');
-  const child=spawn(process.argv[1],process.argv.slice(2),{detached:true,stdio:['ignore','pipe','pipe']});
-  let stopping=false;
-  const kill=signal=>{if(child.pid)try{process.kill(-child.pid,signal)}catch{}};
-  const stop=()=>{if(stopping)return;stopping=true;kill('SIGTERM');setTimeout(()=>{kill('SIGKILL');process.exit(1)},2000)};
-  process.on('exit',()=>kill('SIGKILL'));
-  process.stdout.on('error',stop);process.stderr.on('error',stop);
-  child.stdout.pipe(process.stdout);child.stderr.pipe(process.stderr);
-  process.stdin.resume();process.stdin.on('end',stop);process.stdin.on('error',stop);
-  for(const signal of ['SIGINT','SIGTERM','SIGHUP'])process.on(signal,stop);
-  child.on('error',()=>process.exit(1));
-  child.on('exit',code=>{kill('SIGKILL');process.exit(code??1)});
-`;
 
 function endpoint(child: ChildProcess): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -63,9 +49,9 @@ export async function startCloudExecutor(options: { cwd: string; command?: strin
   const env: NodeJS.ProcessEnv = { ...process.env };
   clearEgressEnvironment(env);
   Object.assign(env, options.egress ?? {});
-  const child = spawn(process.execPath, ["-e", SUPERVISOR, options.command ?? "codex", ...(options.commandArgs ?? []), "exec-server",
+  const child = spawn(process.execPath, supervisorArgs(options.command ?? "codex", [...(options.commandArgs ?? []), "exec-server",
     "--listen", "ws://127.0.0.1:0", "--ws-auth", "capability-token",
-    "--ws-token-sha256", createHash("sha256").update(token).digest("hex")], {
+    "--ws-token-sha256", createHash("sha256").update(token).digest("hex")], { cwd, env }), {
     cwd, env, stdio: ["pipe", "pipe", "pipe"],
   });
   let closed = false, closing: Promise<void> | undefined;

@@ -1,10 +1,11 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Config } from "./types.js";
 import type { TeamCommand } from "./team-types.js";
 import { teamCommand, teamGitArgs } from "./team-workspace.js";
+import { spawnGroup, terminateGroup, watchLeader } from "./process-group.js";
 import { z } from "zod";
 
 export type RepositoryCodeMap = { areas: { id: string; files: number; symbols: number }[]; links: { source: string; target: string; weight: number }[]; truncated: { areas: boolean; links: boolean } };
@@ -59,6 +60,7 @@ const MAX_LANES = 128;
 const MAX_PENDING = 256;
 const MAX_LANE_WAITERS = 64;
 const MAX_OUTPUT = 1024 * 1024;
+const STOP_GRACE_MS = 2_000;
 const isHead = (value: string) => /^[a-f0-9]{40,64}$/i.test(value);
 const safeLane = (value: string) => /^[a-z0-9-]{1,80}$/.test(value);
 
@@ -247,19 +249,20 @@ export class RepositoryGraphs {
     return new Promise<{ stdout: string; error?: string }>(resolve => {
       if (this.lifecycle.kind === "closed") return resolve({ stdout: "", error: "Repository graph service is closed." });
       let stdout = "", failed = "", settled = false;
-      const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32", env: { PATH: process.env.PATH ?? "", LANG: "C.UTF-8" } });
+      const child = spawnGroup(command, args, { stdio: ["ignore", "pipe", "pipe"], env: { PATH: process.env.PATH ?? "", LANG: "C.UTF-8" } }, STOP_GRACE_MS);
       this.children.add(child);
+      const leader = watchLeader(child);
       const finish = (error?: string) => { if (settled) return; settled = true; clearTimeout(timeout); this.children.delete(child); resolve({ stdout, ...(error ? { error } : {}) }); };
-      const timeout = setTimeout(() => { kill(child); finish("Graph refresh timed out."); }, this.config.timeoutMs);
+      const timeout = setTimeout(() => { terminateGroup(child, STOP_GRACE_MS); finish("Graph refresh timed out."); }, this.config.timeoutMs);
       child.stdout?.setEncoding("utf8");
       child.stdout?.on("data", (chunk: string) => {
         if (settled) return;
-        if (Buffer.byteLength(stdout) + Buffer.byteLength(chunk) > MAX_OUTPUT) { kill(child); finish("Graph builder output exceeded the limit."); return; }
+        if (Buffer.byteLength(stdout) + Buffer.byteLength(chunk) > MAX_OUTPUT) { terminateGroup(child, STOP_GRACE_MS); finish("Graph builder output exceeded the limit."); return; }
         stdout += chunk;
       });
       child.stderr?.on("data", chunk => { failed += chunk.toString(); if (Buffer.byteLength(failed) > MAX_OUTPUT) failed = failed.slice(-MAX_OUTPUT); });
       child.once("error", error => finish(error.message.slice(0, 300)));
-      child.once("close", code => finish(code === 0 ? undefined : failed.trim().slice(-400) || `Graph builder exited with code ${code}.`));
+      child.once("close", code => finish(leader.leftover ? "Graph builder left a process holding its output." : code === 0 ? undefined : failed.trim().slice(-400) || `Graph builder exited with code ${code}.`));
     });
   }
 
@@ -378,13 +381,6 @@ export class RepositoryGraphs {
       for (const waiter of lane.waiters.splice(0)) { this.waiting--; this.settle(waiter, { status: "failed", requestedHead: waiter.head, reason: "Repository graph service closed before refresh completed." }); }
     }
     for (const probe of this.probes) probe.abort();
-    for (const child of this.children) kill(child);
+    for (const child of this.children) terminateGroup(child, STOP_GRACE_MS);
   }
-}
-
-function kill(child: ChildProcess) {
-  try {
-    if (child.pid && process.platform !== "win32") process.kill(-child.pid, "SIGTERM");
-    else child.kill("SIGTERM");
-  } catch {}
 }

@@ -18,7 +18,7 @@ function rig(options: { eval?: boolean } = {}) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "eval-session-")));
   const project = join(root, "project"), workspaceDir = join(root, "teams"), cwd = join(workspaceDir, "run");
   const stateDir = join(root, "state"), marks = join(root, "marks.log");
-  const runDir = mkdtempSync("/tmp/es-run-");
+  const runDir = join(root, "run"), socketDir = mkdtempSync(join(tmpdir(), "es-"));
   for (const dir of [project, cwd, stateDir]) mkdirSync(dir, { recursive: true });
   const key = randomBytes(32);
   const keyFile = join(root, "key");
@@ -27,7 +27,7 @@ function rig(options: { eval?: boolean } = {}) {
   writeFileSync(agent, "import { appendFileSync } from \"node:fs\";\nappendFileSync(process.argv[2], `${process.argv[3]}\\n`);\n");
   const profile = (label: string) => ({ command: process.execPath, args: [agent, marks, label] });
   const config = {
-    port: 0, origin: "http://127.0.0.1", keyFile, stateDir, runDir, environment: "local", enableDemo: false, maxSessions: 8,
+    port: 0, origin: "http://127.0.0.1", keyFile, stateDir, runDir, socketDir, environment: "local", enableDemo: false, maxSessions: 8,
     agents: { claude: profile("production") },
     projects: [{ id: "fixture", name: "Fixture", path: project }],
     teams: { workspaceDir },
@@ -50,7 +50,7 @@ function rig(options: { eval?: boolean } = {}) {
       await stopSessionWorkers(config);
       await new Promise(done => setTimeout(done, 1000));
       rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
-      rmSync(runDir, { recursive: true, force: true });
+      rmSync(socketDir, { recursive: true, force: true });
     },
   };
 }

@@ -393,3 +393,78 @@ test("an evaluator member is drawn with its code in the review stage", () => {
   assert.equal(agent?.role, "EV");
   assert.equal(agent?.stage, "review");
 });
+
+test("tool-input observability follows host providerCapabilities with safe legacy default", () => {
+  const capabilities = {
+    claude: { observesToolInputs: false },
+    "custom-hooks": { observesToolInputs: true },
+    opencode: { observesToolInputs: false },
+  };
+  const model = buildSwarm(input({
+    providerCapabilities: capabilities,
+    sessions: [
+      session("s-solo-custom", { provider: "custom-hooks", attention: attention("working") }),
+      session("s-solo-off", { provider: "claude", attention: attention("working") }),
+      session("s-coord", { provider: "custom-hooks", attention: attention("working") }),
+    ],
+    teams: [
+      team("run-caps", {
+        provider: "opencode",
+        members: [
+          member("m-custom", { provider: "custom-hooks" }),
+          member("m-claude-off", { provider: "claude" }),
+          member("m-opencode", { provider: "opencode" }),
+          member("m-unknown", { provider: "unlisted" }),
+        ],
+      }),
+    ],
+    missions: [
+      mission("m-1", { coordinator: { memberId: "c", sessionId: "s-coord", status: "running" } }),
+    ],
+  }));
+  assert.equal(findAgent(model, "m-custom")?.observable, true);
+  assert.equal(findAgent(model, "m-claude-off")?.observable, false);
+  assert.equal(findAgent(model, "m-opencode")?.observable, false);
+  assert.equal(findAgent(model, "m-unknown")?.observable, false);
+  assert.equal(findAgent(model, "s-solo-custom")?.observable, true);
+  assert.equal(findAgent(model, "s-solo-off")?.observable, false);
+  assert.equal(findAgent(model, "s-coord")?.observable, true);
+
+  const legacy = buildSwarm(input({
+    sessions: [session("s-legacy", { provider: "custom-hooks", attention: attention("working") })],
+    teams: [team("run-legacy", { members: [member("m-legacy", { provider: "opencode" })] })],
+  }));
+  assert.equal(findAgent(legacy, "s-legacy")?.observable, true);
+  assert.equal(findAgent(legacy, "m-legacy")?.observable, true);
+});
+
+test("unit lastActivityAt prefers authoritative host value and falls back cleanly for legacy payloads", () => {
+  const model = buildSwarm(input({
+    teams: [
+      team("host-recent", {
+        status: "ready-for-review",
+        createdAt: iso(90 * HOUR),
+        updatedAt: iso(1_000),
+        lastActivityAt: iso(6 * HOUR),
+        members: [member("m1", { status: "stopped", startedAt: iso(89 * HOUR), lastActivityAt: iso(88 * HOUR) })],
+      }),
+      team("host-old", {
+        status: "merged",
+        createdAt: iso(200 * HOUR),
+        updatedAt: iso(1_000),
+        lastActivityAt: iso(80 * HOUR),
+        members: [member("m2", { status: "stopped", lastActivityAt: iso(2 * HOUR) })],
+      }),
+      team("legacy-run", {
+        status: "merged",
+        createdAt: iso(30 * HOUR),
+        updatedAt: iso(1_000),
+        members: [member("m3", { status: "stopped", reportedAt: iso(12 * HOUR) })],
+      }),
+    ],
+  }));
+  assert.deepEqual(model.quiet.map(unit => unit.id), ["host-recent", "legacy-run"]);
+  assert.equal(model.quietOlder, 1);
+  assert.equal(findUnit(model, "host-recent")?.lastActivityAt, iso(6 * HOUR));
+  assert.equal(findUnit(model, "legacy-run")?.lastActivityAt, iso(12 * HOUR));
+});

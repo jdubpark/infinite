@@ -401,3 +401,63 @@ test("close stops the reads in flight", async () => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("patch reads distinguish empty diffs, missing refs, and repository errors", async () => {
+  const dir = makeRepo();
+  const nonRepo = mkdtempSync(join(tmpdir(), "eval-git-nonrepo-"));
+  try {
+    const from = commit(dir, writeFiles({ "a.txt": "one\n" }), "from");
+    const equalTree = commit(dir, () => {}, "equal tree");
+    const to = commit(dir, writeFiles({ "a.txt": "two\n" }), "to");
+    const missingSha = "0".repeat(40);
+    const git = captureGit(() => undefined);
+
+    assert.deepEqual(await git.patch(dir, from, equalTree), { state: "empty" });
+    assert.deepEqual(await git.patch(dir, missingSha, to), { state: "missing" });
+    assert.deepEqual(await git.patch(dir, from, missingSha), { state: "missing" });
+    assert.deepEqual(await git.patch(nonRepo, from, to), { state: "failed" });
+
+    assert.equal(await git.sameTree(dir, from, equalTree), "same");
+    assert.equal(await git.sameTree(dir, from, to), "different");
+    assert.equal(await git.sameTree(dir, missingSha, to), "missing");
+    assert.equal(await git.sameTree(dir, from, missingSha), "missing");
+    assert.equal(await git.sameTree(nonRepo, from, to), "failed");
+
+    const silentScript = join(dir, "silent.sh");
+    writeFileSync(silentScript, "#!/bin/sh\nexit 0\n");
+    const silent = captureGit(() => ({ command: "/bin/sh", args: [silentScript] }));
+    assert.deepEqual(await silent.patch(dir, from, to), { state: "empty" });
+    assert.equal(await silent.sameTree(dir, from, equalTree), "failed");
+
+    const noisyScript = join(dir, "noisy-stderr.sh");
+    writeFileSync(noisyScript, `#!/bin/sh\ni=0\nwhile [ "$i" -lt 120 ]; do\n  printf 'prefix-log-line-0123456789012345678901234567890123456789\\n' >&2\n  i=$((i + 1))\ndone\nshift\nexec git "$@"\n`);
+    const noisy = captureGit(() => ({ command: "/bin/sh", args: [noisyScript] }));
+    assert.deepEqual(await noisy.patch(dir, missingSha, to), { state: "missing" });
+    assert.equal(await noisy.sameTree(dir, missingSha, to), "missing");
+
+    const warnOnlyScript = join(dir, "warn-only.sh");
+    writeFileSync(warnOnlyScript, `#!/bin/sh\nprintf 'warning: path bad revision %s\\n' '${from}' >&2\nexit 128\n`);
+    const warnOnly = captureGit(() => ({ command: "/bin/sh", args: [warnOnlyScript] }));
+    assert.deepEqual(await warnOnly.patch(dir, from, to), { state: "failed" });
+
+    const warnBeforeFatalScript = join(dir, "warn-before-fatal.sh");
+    writeFileSync(warnBeforeFatalScript, `#!/bin/sh\nprintf 'warning: bad revision %s\\nfatal: not a git repository\\n' '${from}' >&2\nexit 128\n`);
+    const warnBeforeFatal = captureGit(() => ({ command: "/bin/sh", args: [warnBeforeFatalScript] }));
+    assert.deepEqual(await warnBeforeFatal.patch(dir, from, to), { state: "failed" });
+
+    const unrelatedFatalScript = join(dir, "unrelated-fatal.sh");
+    writeFileSync(unrelatedFatalScript, "#!/bin/sh\nprintf \"fatal: bad revision 'HEAD'\\n\" >&2\nexit 128\n");
+    const unrelatedFatal = captureGit(() => ({ command: "/bin/sh", args: [unrelatedFatalScript] }));
+    assert.deepEqual(await unrelatedFatal.patch(dir, from, to), { state: "failed" });
+    assert.equal(await unrelatedFatal.sameTree(dir, from, to), "failed");
+
+    const unattributedScript = join(dir, "unattributed-fatal.sh");
+    writeFileSync(unattributedScript, "#!/bin/sh\nprintf 'fatal: Needed a single revision\\n' >&2\nexit 128\n");
+    const unattributed = captureGit(() => ({ command: "/bin/sh", args: [unattributedScript] }));
+    assert.equal(await unattributed.sameTree(dir, from, to), "failed");
+    assert.deepEqual(await unattributed.patch(dir, from, to), { state: "failed" });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(nonRepo, { recursive: true, force: true });
+  }
+});

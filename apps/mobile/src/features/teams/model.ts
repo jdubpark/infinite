@@ -44,7 +44,7 @@ export type TeamRunAssessment = {
 export type TeamTask = {
   id: string; title: string; instructions: string; paths: string[]; dependsOn: string[];
   status: "pending" | "running" | "waiting" | "integrated" | "blocked";
-  memberId?: string; commit?: string; summary?: string; agentProfileId?: string;
+  memberId?: string; commit?: string; summary?: string; limitations?: string[]; agentProfileId?: string;
   criterionRefs?: TeamTaskCriterionRefs;
   escalation?: { toProfileId: string; reason: string };
   usage?: TaskUsage; ownerRating?: OwnerRating; rubric?: Rubric;

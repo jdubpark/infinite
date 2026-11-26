@@ -1,4 +1,5 @@
 import { join } from "node:path";
+import { anchorOf, earlierFor, readAnchor, type MainCheckAnchor } from "./main-check-anchors.js";
 import { defaultMainCheckPorts, type MainCheckHalt, type MainCheckHostLoad, type MainCheckPorts, type MainCheckTimer } from "./main-check-ports.js";
 import { accept, admit, candidate, checksDigest, emptyRecord, entryOf, finish, hostStart, isCommit, MAX_FAILURES, mainCheckRecordSchema, mainCheckRunnable, mainCheckSetting, noticeDue, observe, PROJECT_ID, retire, setWaiting, settle, viewOf, withWitness, type CheckSummary, type MainCheckCommand, type MainCheckErrorReason, type MainCheckInterruptReason, type MainCheckRecord, type MainCheckResult, type MainCheckView, type MainCheckWaiting, type Retiring } from "./main-check-state.js";
 import { extendWitness, recordCommand, type CensusResult, type ProcessWitness } from "./process-census.js";
@@ -11,6 +12,7 @@ import type { Config, Project } from "./types.js";
 
 export type { CheckSummary, MainCheckRecord, MainCheckResult, MainCheckView, MainCheckWaiting } from "./main-check-state.js";
 export type { MainCheckPorts } from "./main-check-ports.js";
+export type { HostProcesses } from "./process-census.js";
 
 export type MainCheckNotice = { projectId: string; label: string; notice: number; outcome: "passed" | "failed"; summary: CheckSummary };
 export type MainCheckOptions = {
@@ -29,6 +31,7 @@ const NOTICE_FLIGHT_MS = 60_000;
 const WITNESS_SAVE_MS = 200;
 const WITNESS_SAMPLES = [250, 1_000, 5_000];
 const WITNESS_SAMPLE_MS = 15_000;
+const GATE_PATH = "main-check-gate";
 
 type Slot = { record?: MainCheckRecord; unreadable?: true };
 type Step = { phase: "setup" | "verification"; command: TeamCommand };
@@ -37,7 +40,7 @@ type RunEnd =
   | { outcome: "passed" | "failed" }
   | { outcome: "interrupted"; reason: MainCheckInterruptReason }
   | { outcome: "error"; reason: MainCheckErrorReason };
-type Decision = { waiting?: MainCheckWaiting; head?: string };
+type Decision = { waiting?: MainCheckWaiting; head?: string; anchor?: MainCheckAnchor };
 type Active = {
   readonly projectId: string;
   readonly directory: string;
@@ -87,6 +90,7 @@ export class MainCheckService {
   private retirement = new Map<string, "processes" | "cleanup">();
   private readonly removals = new AbortController();
   private listed = false;
+  private swept = false;
   private phase: ServicePhase = { kind: "unstarted" };
 
   constructor(options: MainCheckOptions) {
@@ -293,12 +297,23 @@ export class MainCheckService {
   private async pass() {
     if (!this.listed) this.loadAll();
     for (const [projectId, slot] of [...this.slots]) if (slot.unreadable) this.load(projectId);
+    if (!this.swept) this.sweepAnchors();
     for (const projectId of [...this.slots.keys()]) this.recoverRunning(projectId);
     for (const active of [...this.unwritten]) this.writeFinish(active);
     for (const active of [...this.tails.values()]) if (active.finished && !this.unwritten.has(active) && active.inFlight === 0 && active.timers.save === undefined) this.closeTail(active);
     for (const [projectId, slot] of [...this.slots]) if (slot.record) this.commit(projectId, slot.record);
     await this.retireAll();
     if (this.phase.kind === "running") await this.admitOne();
+  }
+
+  private sweepAnchors() {
+    const slots = [...this.slots.values()];
+    if (!this.listed || slots.some(slot => slot.unreadable)) return;
+    const held = new Set(slots.flatMap(slot => [...(slot.record?.retiring ?? []), ...(slot.record?.running ? [slot.record.running] : [])].map(entry => entry.directory)));
+    try {
+      for (const directory of this.ports.anchors.list()) if (!held.has(directory)) this.ports.anchors.remove(directory);
+      this.swept = true;
+    } catch {}
   }
 
   private async retireAll() {
@@ -317,7 +332,7 @@ export class MainCheckService {
     const directory = join(entry.root, entry.directory);
     const prefix = this.config.teams?.commandPrefix;
     let result: CensusResult;
-    try { result = await this.ports.processes.census(entry.witness, directory, prefix); }
+    try { result = await this.ports.processes.census(entry.witness, directory, prefix, this.earlierOf(projectId, entry)); }
     catch (error) { result = { ok: false, problem: error instanceof Error ? error.message : "The census failed." }; }
     if (this.isStoppingOrClosed()) return "processes";
     const current = this.slots.get(projectId)?.record?.retiring?.find(item => item.directory === entry.directory);
@@ -326,8 +341,16 @@ export class MainCheckService {
     try { await commandScope.exit(() => this.ports.remove(directory, prefix, this.removals.signal, entry.root)); }
     catch { return "cleanup"; }
     const record = this.slots.get(projectId)?.record;
-    if (record) this.commit(projectId, retire(record, entry.directory));
+    if (record && this.commit(projectId, retire(record, entry.directory))) this.dropAnchor(entry.directory);
     return undefined;
+  }
+
+  private earlierOf(projectId: string, entry: Retiring) {
+    return earlierFor(entry.witness.boot, this.ports.bootId(), this.ports.platform, readAnchor(this.ports.anchors, projectId, entry.directory));
+  }
+
+  private dropAnchor(directory: string) {
+    try { this.ports.anchors.remove(directory); } catch {}
   }
 
   private removable(projectId: string, entry: Retiring, result: CensusResult): boolean {
@@ -347,7 +370,7 @@ export class MainCheckService {
       if (this.isStoppingOrClosed()) return;
       const decision = await this.gates(projectId);
       if (this.isStoppingOrClosed()) return;
-      if (decision.head !== undefined && this.admit(projectId, decision.head)) continue;
+      if (decision.head !== undefined && this.admit(projectId, decision.head, decision.anchor)) continue;
       const record = this.slots.get(projectId)?.record;
       if (record && record.waiting !== decision.waiting) this.commit(projectId, setWaiting(record, decision.waiting));
     }
@@ -362,13 +385,14 @@ export class MainCheckService {
     if (!pick) return { waiting: own };
     if ("waiting" in pick) return { waiting: own ?? pick.waiting };
     if (this.identityMissing()) return { waiting: "execution-identity" };
-    if (!(await this.censusWorks(project))) return { waiting: "census-unavailable" };
+    const gate = await this.gateCensus(project);
+    if (!gate) return { waiting: "census-unavailable" };
     if (this.halted(projectId)) return { waiting: "halt" };
     if (this.loadHeld()) return { waiting: "host-load" };
     if (await this.storageLow(project)) return { waiting: "storage" };
     const busy = this.hostBusy(projectId);
     if (busy) return { waiting: busy };
-    return { head: pick.head };
+    return { head: pick.head, anchor: await anchorOf(gate.boot, gate.result, pid => this.ports.processes.start(pid)) };
   }
 
   private pick(record: MainCheckRecord, digest: string) {
@@ -379,13 +403,14 @@ export class MainCheckService {
     return !this.config.teams?.commandPrefix && Object.values(this.config.agents).some(profile => profile !== undefined && /(^|\/)sudo$/.test(profile.command));
   }
 
-  private async censusWorks(project: Project) {
-    const witness: ProcessWitness = { boot: this.ports.bootId(), processes: [], sessions: [], groups: [] };
+  private async gateCensus(project: Project): Promise<{ boot: string; result: CensusResult } | undefined> {
+    const boot = this.ports.bootId();
+    const witness: ProcessWitness = { boot, processes: [], sessions: [], groups: [] };
     try {
-      const result = await this.ports.processes.census(witness, this.rootOf(project), this.config.teams?.commandPrefix);
-      return result.ok;
+      const result = await this.ports.processes.census(witness, join(this.rootOf(project), GATE_PATH), this.config.teams?.commandPrefix);
+      return result.ok ? { boot, result } : undefined;
     } catch {
-      return false;
+      return undefined;
     }
   }
 
@@ -417,7 +442,7 @@ export class MainCheckService {
 
   private rootOf(project: Project) { return project.teamworkDir ?? this.config.teams!.workspaceDir; }
 
-  private admit(projectId: string, head: string): boolean {
+  private admit(projectId: string, head: string, anchor?: MainCheckAnchor): boolean {
     const project = this.project(projectId);
     const record = this.slots.get(projectId)?.record;
     if (this.phase.kind !== "running" || !record || !this.enabled(project)) return false;
@@ -431,6 +456,7 @@ export class MainCheckService {
     const witness: ProcessWitness = { boot: this.ports.bootId(), processes: [], sessions: [], groups: [] };
     const root = this.rootOf(project);
     if (!this.commit(projectId, admit(record, { directory, root, witness, recording: true, head, checks: digest, startedAt }))) return false;
+    if (anchor) this.writeAnchor(projectId, directory, anchor);
     let resolveDone!: () => void;
     const done = new Promise<void>(resolve => { resolveDone = resolve; });
     const active: Active = {
@@ -442,6 +468,10 @@ export class MainCheckService {
     this.tails.set(entryKey(projectId, directory), active);
     this.launch(active, project.team);
     return true;
+  }
+
+  private writeAnchor(projectId: string, directory: string, anchor: MainCheckAnchor) {
+    try { this.ports.anchors.write(projectId, directory, anchor); } catch {}
   }
 
   private launch(active: Active, team: TeamProject) {
@@ -542,7 +572,7 @@ export class MainCheckService {
       this.unwritten.delete(active);
       return;
     }
-    const entry: Retiring = { directory: active.directory, root: active.root, witness: structuredClone(active.witness), ...(active.inFlight > 0 ? { recording: true as const } : {}) };
+    const entry: Retiring = { directory: active.directory, root: active.root, witness: structuredClone(active.witness) };
     if (!this.commit(active.projectId, finish(record, active.result!, entry, active.seenAt))) return;
     this.unwritten.delete(active);
     if (active.inFlight === 0) this.tails.delete(entryKey(active.projectId, active.directory));
@@ -585,7 +615,7 @@ export class MainCheckService {
 
   private saveEntry(active: Active): boolean {
     const record = this.slots.get(active.projectId)?.record;
-    const next = record && withWitness(record, active.directory, structuredClone(active.witness), active.inFlight > 0);
+    const next = record && withWitness(record, active.directory, structuredClone(active.witness), active.inFlight > 0 && !active.finished);
     return next !== undefined && this.commit(active.projectId, next);
   }
 

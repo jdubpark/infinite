@@ -398,13 +398,15 @@ export function TeamEvidenceSection({
               onOpenSession(authorMember.sessionId);
             }}
           /> : null}
-          {me?.role === "owner" && detailHead && detailHead.state !== "withdrawn" ? <Button
-            compact
-            destructive
-            title={withdrawing ? "Withdrawing…" : "Withdraw entry"}
-            disabled={withdrawing}
-            onPress={() => confirmWithdraw(detailHead)}
-          /> : null}
+          {me?.role === "owner" && detailHead && detailHead.state !== "withdrawn" ? (
+            connection.relay ? <Text style={t.note}>Direct host connection required to withdraw entries.</Text> : <Button
+              compact
+              destructive
+              title={withdrawing ? "Withdrawing…" : "Withdraw entry"}
+              disabled={withdrawing}
+              onPress={() => confirmWithdraw(detailHead)}
+            />
+          ) : null}
         </View>
       </ScrollView>
     </Sheet>

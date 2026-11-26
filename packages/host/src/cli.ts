@@ -5,6 +5,7 @@ import {
   writeFileSync,
   readFileSync,
   existsSync,
+  lstatSync,
   statSync,
   unlinkSync,
   openSync,
@@ -33,6 +34,37 @@ import { handleClientCommand } from "./client.js";
 import { handleMachineCommand } from "./machine-cli.js";
 import { handleLocalBehaviorCheckCommand } from "./understanding-cli.js";
 import { githubProxyDoctorLine } from "./github-grants.js";
+
+function claudeSettingsDoctorLine(settingsPath: string): string | undefined {
+  let raw: string;
+  try {
+    raw = readFileSync(settingsPath, "utf8");
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") {
+      try {
+        lstatSync(settingsPath);
+      } catch {
+        return undefined;
+      }
+    }
+    const safeCode = typeof code === "string" && /^[A-Z0-9_]{1,32}$/.test(code) ? ` (${code})` : "";
+    return `WARNING: ~/.claude/settings.json could not be read${safeCode}; allowedHttpHookUrls could not be verified.`;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return "WARNING: ~/.claude/settings.json contains invalid JSON; allowedHttpHookUrls could not be verified.";
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    return "WARNING: ~/.claude/settings.json does not contain a JSON object; allowedHttpHookUrls could not be verified.";
+  }
+  if ((parsed as Record<string, unknown>).allowedHttpHookUrls) {
+    return "WARNING: ~/.claude/settings.json defines allowedHttpHookUrls; add http://127.0.0.1:*/hook/claude or Infinite's Claude hooks will not run.";
+  }
+  return undefined;
+}
 
 const argv = process.argv.slice(2);
 if (!await handleLocalBehaviorCheckCommand(argv) && !await handleMachineCommand(argv) && !await handleClientCommand(argv)) {
@@ -216,7 +248,7 @@ async function attach(manager: Manager, sessionId: string) {
     try {
       while (queued.length > 0 && !inputFailed) {
         const chunk = queued[0]!;
-        await workerCall(manager.config.runDir, sessionId, {
+        await workerCall(manager.socketTarget, sessionId, {
           op: "raw",
           text: chunk.toString("utf8"),
           requestId: randomUUID(),
@@ -308,7 +340,7 @@ infinite mission progress ID [--after CURSOR] [--json]  Read child assignments a
 infinite board [--project ID]              Watch the owner board
 infinite team start [OBJECTIVE] [--prd FILE] Start a team in the bound project
 infinite team status [ID] [--logs]          Show teams, or one team's Brief
-infinite team watch ID [--logs]             Follow the summary; l logs, n/p agents, b summary
+infinite team watch ID [--logs | --board]   Follow the summary, board, or logs; b board, l logs, s summary
 infinite team steer ID TEXT                 Steer an active team
 infinite team answer ID QUESTION_ID TEXT    Answer a pending question
 infinite routine create --file FILE [--request-id UUID] [--json]
@@ -515,16 +547,8 @@ else if (command === "plan-fleet") {
       console.log(
         `Hook relay: ${existsSync(relay) ? relay : "MISSING (run npm run build)"}`,
       );
-      const userSettings = join(homedir(), ".claude", "settings.json");
-      if (existsSync(userSettings)) {
-        try {
-          const parsed = JSON.parse(readFileSync(userSettings, "utf8"));
-          if (parsed.allowedHttpHookUrls)
-            console.log(
-              "WARNING: ~/.claude/settings.json defines allowedHttpHookUrls; add http://127.0.0.1:*/hook/claude or Infinite's Claude hooks will not run.",
-            );
-        } catch {}
-      }
+      const userSettingsWarning = claudeSettingsDoctorLine(join(homedir(), ".claude", "settings.json"));
+      if (userSettingsWarning) console.log(userSettingsWarning);
       if (config.push?.enabled) {
         let mode = "missing";
         if (config.push.accessTokenFile) {

@@ -1,6 +1,6 @@
 import type { MainCheckPorts } from "../../packages/host/src/main-check-ports.js";
 import type { MainCheckRecord } from "../../packages/host/src/main-check-state.js";
-import type { CensusFinding, CensusResult, ProcessRow, ProcessTable, ProcessWitness } from "../../packages/host/src/process-census.js";
+import { excuseEarlier, type CensusFinding, type CensusResult, type EarlierProcesses, type ProcessRow, type ProcessTable, type ProcessWitness } from "../../packages/host/src/process-census.js";
 import type { VolumeUsage } from "../../packages/host/src/storage.js";
 import type { TeamCommand } from "../../packages/host/src/team-types.js";
 import { commandScope, EXIT_DRAIN_MS, TeamError, type CommandResult, type CommandScope } from "../../packages/host/src/team-workspace.js";
@@ -94,6 +94,7 @@ type Proc = {
   start: string;
   run: string;
   hidden: boolean;
+  uninspectable: boolean;
   killable: boolean;
   forever: boolean;
   exitCode: number | null;
@@ -122,6 +123,9 @@ export interface WorldHooks {
 }
 
 const GIT_MS: readonly [number, number] = [20, 250];
+const ESCAPE_CHANCE = 0.15;
+const ESCAPER_MS: readonly [number, number] = [1_000, 180_000];
+const ARRIVAL_MS: readonly [number, number] = [20_000, 120_000];
 const FAILURE_OUTPUT = "✖ the suite failed: expected 1, received 2\n    at check (src/check.ts:12:3)\n";
 const inside = (path: string, directory: string) => path === directory || path.startsWith(`${directory}/`);
 
@@ -158,10 +162,18 @@ export class World {
   readonly records = new Map<string, string>();
   readonly runs = new Map<string, WorldRun>();
   readonly processes = new Map<number, Proc>();
+  readonly anchors = new Map<string, { projectId: string; text: string }>();
   private boots = 1;
   private nextPid = 2000;
+  private reused = 0;
+  private arrivals = true;
+  private readonly freed: number[] = [];
 
-  constructor(readonly clock: Clock, private readonly r: Rand, private readonly counts: Counts, private readonly hooks: WorldHooks) {}
+  constructor(readonly clock: Clock, private readonly r: Rand, private readonly counts: Counts, private readonly hooks: WorldHooks, private readonly ambient?: Rand) {
+    if (!ambient) return;
+    this.residents();
+    this.arrive();
+  }
 
   ports(life: Life): MainCheckPorts {
     return {
@@ -183,13 +195,29 @@ export class World {
       processes: {
         table: async () => this.table(),
         start: async pid => this.processes.get(pid)?.start,
-        census: async (witness, directory) => this.census(witness, directory),
+        census: async (witness, directory, _prefix, earlier) => this.census(witness, directory, earlier),
+      },
+      anchors: {
+        list: () => [...this.anchors.keys()],
+        read: (projectId, directory) => {
+          const stored = this.anchors.get(directory);
+          if (stored === undefined) return undefined;
+          if (stored.projectId !== projectId) throw new Error("The anchor was sealed for another project.");
+          return JSON.parse(stored.text) as unknown;
+        },
+        write: (projectId, directory, anchor) => {
+          this.anchors.set(directory, { projectId, text: JSON.stringify(anchor) });
+        },
+        remove: directory => {
+          this.anchors.delete(directory);
+        },
       },
       remove: async runDirectory => this.remove(runDirectory),
       halt: { check: input => this.haltCheck(input.projectId) },
       hostLoad: { held: () => this.held() },
       storage: async root => this.storage(root),
       bootId: () => this.boot,
+      platform: "linux",
       randomHex: length => hex(this.r, length),
       uuid: () => uuid(this.r),
     };
@@ -198,7 +226,7 @@ export class World {
   private spawn(run: WorldRun, killable: boolean, forever: boolean): Proc {
     const pid = this.nextPid;
     this.nextPid += 1;
-    const proc: Proc = { pid, ppid: 1, pgid: pid, sid: pid, start: `${this.boot}:${pid}`, run: run.path, hidden: this.r.chance(0.35), killable, forever, exitCode: null, children: [] };
+    const proc: Proc = { pid, ppid: 1, pgid: pid, sid: pid, start: `${this.boot}:${pid}`, run: run.path, hidden: this.r.chance(0.35), uninspectable: false, killable, forever, exitCode: null, children: [] };
     this.processes.set(pid, proc);
     return proc;
   }
@@ -211,8 +239,62 @@ export class World {
     parent.children.push(child);
   }
 
+  hide(run = "", reuse?: number): number {
+    const pid = reuse !== undefined && !this.processes.has(reuse) ? reuse : this.nextPid;
+    if (pid === this.nextPid) this.nextPid += 1;
+    else this.reused += 1;
+    const start = pid === reuse ? `${this.boot}:${pid}:${this.reused}` : `${this.boot}:${pid}`;
+    this.processes.set(pid, { pid, ppid: 1, pgid: pid, sid: pid, start, run, hidden: true, uninspectable: true, killable: false, forever: false, exitCode: null, children: [] });
+    return pid;
+  }
+
+  end(pid: number) {
+    const proc = this.processes.get(pid);
+    if (proc) this.exit(proc, 0);
+  }
+
+  stopArrivals() {
+    this.arrivals = false;
+  }
+
+  private residents() {
+    for (let count = this.ambient!.int(0, 3); count > 0; count -= 1) this.ambientProcess();
+  }
+
+  private arrive() {
+    this.clock.set(undefined, () => {
+      if (!this.arrivals) return;
+      this.ambientProcess();
+      this.arrive();
+    }, this.ambient!.int(...ARRIVAL_MS));
+  }
+
+  private ambientProcess() {
+    const a = this.ambient!;
+    const pid = this.hide();
+    const proc = this.processes.get(pid)!;
+    bump(this.counts, "ambient:started");
+    this.clock.set(undefined, () => {
+      if (this.processes.get(pid) !== proc) return;
+      this.exit(proc, 0);
+      this.freed.push(pid);
+    }, a.chance(0.7) ? a.int(1_000, 20_000) : a.int(60_000, 1_200_000));
+  }
+
+  private escape(run: WorldRun) {
+    const a = this.ambient;
+    if (!a || !a.chance(ESCAPE_CHANCE)) return;
+    const reuse = a.chance(0.6) ? this.freed.pop() : undefined;
+    const pid = this.hide(run.path, reuse);
+    const proc = this.processes.get(pid)!;
+    bump(this.counts, reuse === pid ? "escaper:reused-pid" : "escaper:new-pid");
+    this.clock.set(undefined, () => {
+      if (this.processes.get(pid) === proc) this.exit(proc, 0);
+    }, a.int(...ESCAPER_MS));
+  }
+
   private exit(proc: Proc, code: number | null) {
-    if (!this.processes.has(proc.pid)) return;
+    if (this.processes.get(proc.pid) !== proc) return;
     this.processes.delete(proc.pid);
     proc.exitCode = code;
     for (const child of proc.children) {
@@ -241,6 +323,7 @@ export class World {
     this.boots += 1;
     this.boot = `boot-${this.boots}`;
     for (const proc of [...this.processes.values()]) this.exit(proc, null);
+    if (this.ambient && this.arrivals) this.residents();
   }
 
   private table(): ProcessTable {
@@ -392,6 +475,7 @@ export class World {
     this.hooks.command(run, command, timeoutMs, forceSettleAfterMs);
     const behavior = this.behaviorOf(run, run.commandIndex);
     run.commandIndex += 1;
+    if (!life.stopped && behavior.end !== "unavailable") this.escape(run);
     return this.command(life, run, behavior, signal, timeoutMs ?? 600_000, forceSettleAfterMs, onOutput, at => this.hooks.limit(run, at));
   }
 
@@ -404,7 +488,7 @@ export class World {
     if (run.copyHead !== base || run.dirty) throw new TeamError(409, "verification-changed-files", "The verification workspace is not read-only.");
   }
 
-  private census(witness: ProcessWitness, directory: string): CensusResult {
+  private async census(witness: ProcessWitness, directory: string, earlier?: EarlierProcesses): Promise<CensusResult> {
     const mode = this.faults.census;
     const roll = mode === "flaky" ? this.r.int(0, 4) : -1;
     const kind = this.runs.has(directory) ? "run" : "root";
@@ -415,10 +499,13 @@ export class World {
       for (const proc of this.processes.values()) {
         const recorded = witness.boot === this.boot && (witness.processes.some(item => item.pid === proc.pid && item.start === proc.start) || witness.groups.includes(proc.pgid) || witness.sessions.includes(proc.sid));
         if (recorded) findings.push({ pid: proc.pid, reason: "recorded-group" });
+        else if (proc.uninspectable) findings.push({ pid: proc.pid, reason: "unreadable" });
         else if (!proc.hidden && inside(proc.run, directory)) findings.push({ pid: proc.pid, reason: "working-directory" });
       }
       if (mode === "finds" || roll === 1) findings.push({ pid: 1, reason: "open-file" });
-      result = { ok: true, findings };
+      const kept = await excuseEarlier(findings, earlier, async pid => this.processes.get(pid)?.start);
+      if (kept.length < findings.length) bump(this.counts, `census:${kind}:excused${earlier === "all" ? ":after-boot" : ""}`);
+      result = { ok: true, findings: kept };
     }
     bump(this.counts, `census:${kind}:${!result.ok ? "fail" : result.findings.length > 0 ? "finds" : "clean"}`);
     this.hooks.census(directory, witness, result);

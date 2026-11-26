@@ -1,6 +1,7 @@
 import { isAbsolute, normalize, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { WebSocket } from "ws";
+import { replyDeadline } from "./deadline.js";
 import { NATIVE_MAX_BUFFERED, NATIVE_MAX_MESSAGE } from "./native-transport.js";
 
 export interface CodexExecutor {
@@ -114,10 +115,10 @@ export async function connectCodexEnvironments(options: {
   const call = (method: string, params: unknown): Promise<unknown> => new Promise((resolve, reject) => {
     if (closed || socket.readyState !== WebSocket.OPEN) { reject(new CodexEnvironmentError("unavailable", "The internal provider connection is unavailable")); return; }
     const id = ++nextId;
-    const timer = setTimeout(() => {
-      pending.delete(id);
+    const timer = replyDeadline(15000, () => {
+      if (!pending.delete(id)) return;
       reject(new CodexEnvironmentError("uncertain", "The provider acknowledgement timed out; keep execution held and reconcile before continuing"));
-    }, 15000);
+    });
     pending.set(id, { resolve, reject, timer });
     const text = JSON.stringify({ id, method, params });
     if (socket.bufferedAmount + Buffer.byteLength(text) > NATIVE_MAX_BUFFERED) { socket.terminate(); lost(); return; }

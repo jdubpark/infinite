@@ -20,7 +20,7 @@ const gitOutput = (cwd: string, ...args: string[]) => execFileSync("git", args, 
 const slackLink = (thread: IntakeThread) => `https://example.slack.com/archives/${thread.channelId}/p${thread.threadTs.replace(".", "")}`;
 
 async function intakeHost(withSlack: boolean, options: {
-  direct?: boolean; answerQuestions?: boolean; requestChannelIds?: string[]; ownerOnlyInJoinedChannels?: boolean;
+  direct?: boolean; answerQuestions?: boolean; requestChannelIds?: string[]; ownerOnlyInJoinedChannels?: boolean; multiRepo?: boolean;
 } = {}) {
   const { direct, answerQuestions, requestChannelIds, ownerOnlyInJoinedChannels } = options;
   const root = realpathSync(mkdtempSync("/tmp/inf-intake-e2e-"));
@@ -51,13 +51,13 @@ async function intakeHost(withSlack: boolean, options: {
         linearAgentUserId: AGENT, bindByMention: false, endpoint: slack.endpoint, ...(direct ? { directRequests: true } : {}),
         ...(answerQuestions ? { answerQuestions: true } : {}), ...(requestChannelIds ? { requestChannelIds } : {}),
         ...(ownerOnlyInJoinedChannels ? { ownerOnlyInJoinedChannels } : {}),
-        organizationScope: { workspaces: workspacePins.filter(pin => pin.projectId === "api") } } } : {}),
+        organizationScope: { workspaces: options.multiRepo ? workspacePins : workspacePins.filter(pin => pin.projectId === "api") } } } : {}),
       mission: { groupId: "api", maxSubtasks: 8, maxMinutes: 30 },
       maxActive: 3,
       requireSlackThread: slack !== undefined,
     };
   } });
-  return {
+  const world = {
     host, linear, slack, receipts,
     close: async () => {
       await host.stop();
@@ -69,6 +69,20 @@ async function intakeHost(withSlack: boolean, options: {
       assert.deepEqual(left, [], "no session of this host outlives its stop");
     },
   };
+  try {
+    if (slack) {
+      const group = options.multiRepo
+        ? await host.fetchApi("/project-groups", "owner", { requestId: randomUUID(), name: "Shop", repos: repos.map(repo => repo.id) })
+        : await host.fetchApi("/project-groups/api", "owner");
+      assert.equal(group.status, 200, JSON.stringify(group.body));
+      host.config.intake!.mission.groupId = group.body.id;
+      assert.equal((await host.fetchApi("/intake/workspace-scope", "owner")).body.state, "verified");
+    }
+    return world;
+  } catch (error) {
+    await world.close();
+    throw error;
+  }
 }
 
 test("a Slack-filed answer-only issue is acknowledged and reported in its thread", { timeout: 150 * 1000 }, async () => {
@@ -101,14 +115,10 @@ test("a Slack-filed answer-only issue is acknowledged and reported in its thread
 });
 
 test("a question reaches the thread and the owner's tagged reply answers it", { timeout: 210 * 1000 }, async () => {
-  const world = await intakeHost(true);
+  const world = await intakeHost(true, { multiRepo: true });
   const { host, linear, slack, receipts } = world;
   try {
     writeFileSync(join(receipts, "release-dispatch"), "go", { mode: 0o600 });
-    const group = await host.fetchApi("/project-groups", "owner", { requestId: randomUUID(), name: "Shop", repos: ["api", "web"] });
-    assert.equal(group.status, 200, JSON.stringify(group.body));
-    host.config.intake!.mission.groupId = group.body.id;
-    host.config.intake!.slack!.organizationScope.workspaces = workspacePins;
 
     slack!.seedThread(BINDING, [{ user: OWNER, text: `<@${AGENT}> file this: which response format should the endpoint use?` }]);
     const issue = linear.file({ attachmentUrls: [slackLink(BINDING)] });
@@ -168,7 +178,7 @@ test("without a Slack block intake still starts missions and comments in Linear"
 });
 
 test("a teammate proposes work and checks its progress while the owner runs the swarm from the thread", { timeout: 210_000 }, async () => {
-  const world = await intakeHost(true, { direct: true, answerQuestions: true, requestChannelIds: [BINDING.channelId] });
+  const world = await intakeHost(true, { multiRepo: true, direct: true, answerQuestions: true, requestChannelIds: [BINDING.channelId] });
   const { host, linear, receipts } = world, slack = world.slack!;
   const teammate = "U22222222";
   const proposal = "Exports need to include empty rows.";
@@ -182,10 +192,6 @@ test("a teammate proposes work and checks its progress while the owner runs the 
     await waitFor(async () => slack.acks().includes(id), Boolean, 5000);
   };
   try {
-    const group = await host.fetchApi("/project-groups", "owner", { requestId: randomUUID(), name: "Shop", repos: ["api", "web"] });
-    assert.equal(group.status, 200);
-    host.config.intake!.mission.groupId = group.body.id;
-    host.config.intake!.slack!.organizationScope.workspaces = workspacePins;
     writeFileSync(join(receipts, "release-dispatch"), "go");
     writeFileSync(join(receipts, "release-web-question"), "go");
     await waitFor(async () => (await host.fetchApi("/intake")).body.slack?.connected, Boolean, 30_000);

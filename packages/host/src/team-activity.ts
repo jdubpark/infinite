@@ -67,12 +67,18 @@ function normalizeMember(member: TeamMember) {
   return { ...rest, ...(pendingLimit ? { pendingLimit: true } : {}) };
 }
 
-function normalizeLinear(linear: TeamRun["linear"]) {
+function normalizeLinear(linear: TeamRun["linear"], status: TeamRun["status"]) {
   if (!linear) return undefined;
-  if (linear.status === "synced" || (linear.status === "pending" && linear.issue)) {
+  if (status !== "blocked" && (linear.status === "synced" || (linear.status === "pending" && linear.issue))) {
     return { status: "synced" as const, issue: linear.issue };
   }
   const { checkedAt: _checkedAt, retryAt: _retryAt, ...rest } = linear;
+  return rest;
+}
+
+function normalizeCensus(census: Stored["census"]) {
+  if (!census) return undefined;
+  const { at: _at, ...rest } = census;
   return rest;
 }
 
@@ -86,6 +92,7 @@ function stateDigests(stored: Stored): { runState: string; activity: string } {
   const normalizedMembers = members.map(normalizeMember);
   const {
     run: _run,
+    census,
     receipts: _receipts,
     retention: _retention,
     outbox: _outbox,
@@ -101,10 +108,11 @@ function stateDigests(stored: Stored): { runState: string; activity: string } {
   } = stored;
   const runState = digest({
     ...storedRest,
+    ...(census ? { census: normalizeCensus(census) } : {}),
     run: {
       ...runRest,
       members: normalizedMembers,
-      ...(linear ? { linear: normalizeLinear(linear) } : {}),
+      ...(linear ? { linear: normalizeLinear(linear, stored.run.status) } : {}),
     },
   });
   const activity = digest({ ...runRest, members: normalizedMembers });
@@ -134,9 +142,11 @@ export class TeamSaveTracker {
     const previousLastActivityAt = stored.run.lastActivityAt;
     if (runStateChanged || activityChanged) {
       const at = now();
-      if (runStateChanged) stored.run.updatedAt = at;
       if (activityChanged) {
         stored.run.lastActivityAt = latestIso([stored.run.lastActivityAt, ...runActivityTimestamps(stored.run), at], at);
+      }
+      if (runStateChanged) {
+        stored.run.updatedAt = latestIso([previousUpdatedAt, stored.run.lastActivityAt, at], at);
       }
     }
     try {

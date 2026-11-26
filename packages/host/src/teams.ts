@@ -613,7 +613,7 @@ export class TeamService {
     this.objectiveTests.mark(stored);
     const wrote = this.activity.commit(stored, () => writeSealed(join(this.directory, `${stored.run.id}.sealed`), this.key, `team:${stored.run.id}`, stored), timestamp, this.records);
     if (this.options?.events && (wrote || stored.outbox?.length)) this.flushOutbox(stored);
-    if (wrote || this.entryBacklog.has(stored.run.id)) this.mirrorEntries(stored.run);
+    if (wrote || this.entryBacklog.has(stored.run.id) && this.options?.entries?.retryable()) this.mirrorEntries(stored.run);
   }
   private mirrorEntries(run: TeamRun) {
     const entries = this.options?.entries;

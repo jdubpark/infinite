@@ -1,16 +1,17 @@
-import test from "node:test";
+import test, { type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { initialAttention } from "@infinite/attention";
 import type { LinearService } from "../packages/host/src/linear.js";
 import type { LinearIssueView, LinearTrackingView } from "../packages/host/src/linear-types.js";
 import { unavailableState } from "../packages/host/src/session-listing.js";
-import { TeamSaveTracker } from "../packages/host/src/team-activity.js";
+import { TeamSaveTracker, type TeamSaveSnapshot } from "../packages/host/src/team-activity.js";
 import type { TeamRun } from "../packages/host/src/team-types.js";
 import type { Stored, TeamService } from "../packages/host/src/teams.js";
 import { schedulerFixture } from "./fixtures/team-scheduler.js";
 
 type Internal = {
+  activity: { snapshots: Map<string, TeamSaveSnapshot>; commit: TeamSaveTracker["commit"] };
   save(stored: Stored): void;
   event(stored: Stored, text: string): void;
   record(id: string): Stored;
@@ -21,8 +22,8 @@ const internal = (teams: TeamService) => teams as unknown as Internal;
 function sampleIssue(overrides: Partial<LinearIssueView> = {}): LinearIssueView {
   return {
     id: "11111111-1111-4111-8111-111111111111",
-    identifier: "INF-446",
-    url: "https://linear.app/example/issue/INF-446",
+    identifier: "EXAMPLE-1",
+    url: "https://linear.app/example/issue/EXAMPLE-1",
     title: "Persist authoritative lastActivityAt",
     description: "Keep settled timestamps stable.",
     state: { name: "In Progress", type: "started" },
@@ -343,9 +344,164 @@ test("legacy records derive activity ignoring churned updatedAt and failed post-
   }
 });
 
-test("seeded randomized durable-state simulator preserves timestamp and persistence invariants across polls, failures, and restarts", async t => {
-  const seed = Number(process.env.TEAM_ACTIVITY_SEED ?? 0x5eed446);
-  t.diagnostic(`seed=${seed}`);
+test("blocked Linear continuable transitions bump updatedAt while unchanged census re-checks and backward clock steps stay monotonic", async t => {
+  const f = schedulerFixture();
+  const blockedAt = "2026-10-18T02:00:00.000Z";
+  t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-10-18T06:00:00.000Z") });
+  try {
+    const issue = sampleIssue();
+    let tracking: LinearTrackingView = { status: "synced", issue, checkedAt: blockedAt };
+    f.run.status = "blocked";
+    f.run.parallelismCeiling = 4;
+    f.run.parallelism = 4;
+    f.run.blockCode = "repair-limit";
+    f.run.reason = "The team exhausted its correction rounds.";
+    f.run.headCommit = f.run.baseCommit;
+    f.run.createdAt = "2026-10-18T00:00:00.000Z";
+    f.run.updatedAt = blockedAt;
+    f.run.lastActivityAt = blockedAt;
+    f.run.linearTracking = true;
+    f.run.linear = structuredClone(tracking);
+    f.run.members[0]!.status = "stopped";
+    f.run.members[0]!.startedAt = "2026-10-18T00:10:00.000Z";
+    f.run.members[0]!.lastActivityAt = "2026-10-18T01:55:00.000Z";
+    f.writeTeam();
+
+    const linear = {
+      updateTeam: () => structuredClone(tracking),
+      getTeam: () => structuredClone(tracking),
+      confirmTeam: async () => undefined,
+    } as unknown as LinearService;
+
+    const teams = f.openTeam({ linear });
+    const scheduler = internal(teams);
+    const stored = scheduler.record(f.run.id);
+
+    assert.equal(teams.get(f.run.id).continuable, true);
+    assert.equal(teams.get(f.run.id).updatedAt, blockedAt);
+    assert.equal(teams.get(f.run.id).lastActivityAt, blockedAt);
+
+    t.mock.timers.tick(35_000);
+    const pendingAt = new Date().toISOString();
+    tracking = {
+      status: "pending",
+      reason: "Waiting for Linear to confirm current requirements and execution evidence.",
+      checkedAt: blockedAt,
+      issue,
+    };
+    await scheduler.step(stored);
+    assert.equal(teams.get(f.run.id).continuable, false);
+    assert.equal(teams.get(f.run.id).updatedAt, pendingAt);
+    assert.equal(teams.get(f.run.id).lastActivityAt, blockedAt);
+
+    t.mock.timers.tick(5_000);
+    const resyncedAt = new Date().toISOString();
+    tracking = { status: "synced", issue, checkedAt: resyncedAt };
+    await scheduler.step(stored);
+    assert.equal(teams.get(f.run.id).continuable, true);
+    assert.equal(teams.get(f.run.id).updatedAt, resyncedAt);
+    assert.equal(teams.get(f.run.id).lastActivityAt, blockedAt);
+
+    t.mock.timers.tick(10_000);
+    tracking = { status: "synced", issue, checkedAt: new Date().toISOString() };
+    await scheduler.step(stored);
+    assert.equal(teams.get(f.run.id).updatedAt, resyncedAt);
+    assert.equal(teams.get(f.run.id).lastActivityAt, blockedAt);
+
+    const pendingId = randomUUID();
+    stored.run.status = "paused";
+    stored.pending = { id: pendingId, kind: "check", revision: 1 };
+    stored.census = { pendingId, at: "2026-10-18T06:01:00.000Z", state: "ended" };
+    scheduler.save(stored);
+    const pausedAt = teams.get(f.run.id).updatedAt;
+    const pausedActivity = teams.get(f.run.id).lastActivityAt;
+
+    t.mock.timers.tick(600_000);
+    const recheckedAt = new Date().toISOString();
+    stored.census = { pendingId, at: recheckedAt, state: "ended" };
+    scheduler.save(stored);
+    assert.equal(teams.get(f.run.id).updatedAt, pausedAt);
+    assert.equal(teams.get(f.run.id).lastActivityAt, pausedActivity);
+    assert.equal(teams.get(f.run.id).pendingOperation?.processesCheckedAt, recheckedAt);
+    assert.equal(f.readRecord<Stored>("team", f.run.id).census?.at, recheckedAt);
+
+    t.mock.timers.tick(60_000);
+    const changedCensusAt = new Date().toISOString();
+    stored.census = { pendingId, at: changedCensusAt, state: "in-use", using: 1 };
+    scheduler.save(stored);
+    assert.equal(teams.get(f.run.id).updatedAt, changedCensusAt);
+    assert.equal(teams.get(f.run.id).lastActivityAt, pausedActivity);
+
+    const tracker = new TeamSaveTracker();
+    const record: Stored = structuredClone(stored);
+    record.run.updatedAt = "2026-10-18T10:00:00.000Z";
+    record.run.lastActivityAt = "2026-10-18T10:00:00.000Z";
+    tracker.seed(record);
+
+    record.run.events.push({ at: "2026-10-18T09:50:00.000Z", text: "Activity during backward clock step." });
+    assert.equal(tracker.commit(record, () => {}, () => "2026-10-18T09:50:00.000Z"), true);
+    assert.equal(record.run.lastActivityAt, "2026-10-18T10:00:00.000Z");
+    assert.equal(record.run.updatedAt, "2026-10-18T10:00:00.000Z");
+
+    record.run.members[0]!.lastActivityAt = "2026-10-18T10:05:00.000Z";
+    assert.equal(tracker.commit(record, () => {}, () => "2026-10-18T09:55:00.000Z"), true);
+    assert.equal(record.run.lastActivityAt, "2026-10-18T10:05:00.000Z");
+    assert.equal(record.run.updatedAt, "2026-10-18T10:05:00.000Z");
+
+    record.run.linear = { status: "synced", issue: sampleIssue({ title: "Updated during backward clock" }), checkedAt: "2026-10-18T09:56:00.000Z" };
+    assert.equal(tracker.commit(record, () => {}, () => "2026-10-18T09:56:00.000Z"), true);
+    assert.equal(record.run.updatedAt, "2026-10-18T10:05:00.000Z");
+    assert.equal(record.run.lastActivityAt, "2026-10-18T10:05:00.000Z");
+  } finally {
+    t.mock.timers.reset();
+    f.close();
+  }
+});
+
+type ActivityMutant =
+  | "skip-persisted-invalidation-on-write-error"
+  | "bump-last-activity-on-linear-freshness"
+  | "overwrite-member-last-activity-on-unavailable";
+
+function applyActivityMutant(teams: TeamService, mutant: ActivityMutant | undefined) {
+  if (!mutant) return;
+  const scheduler = internal(teams);
+  const tracker = scheduler.activity;
+  if (mutant === "skip-persisted-invalidation-on-write-error") {
+    const original = tracker.commit.bind(tracker);
+    tracker.commit = (stored, write, now, records) => {
+      const prior = tracker.snapshots.get(stored.run.id);
+      try {
+        return original(stored, write, now, records);
+      } catch (error) {
+        if (prior) tracker.snapshots.set(stored.run.id, prior);
+        throw error;
+      }
+    };
+  } else if (mutant === "bump-last-activity-on-linear-freshness") {
+    const original = tracker.commit.bind(tracker);
+    tracker.commit = (stored, write, now, records) => {
+      const prior = tracker.snapshots.get(stored.run.id);
+      const wrote = original(stored, write, now, records);
+      if (wrote && prior && stored.run.linear?.status === "pending") {
+        stored.run.lastActivityAt = now();
+        write();
+      }
+      return wrote;
+    };
+  } else if (mutant === "overwrite-member-last-activity-on-unavailable") {
+    const originalStep = scheduler.step.bind(scheduler);
+    scheduler.step = async stored => {
+      await originalStep(stored);
+      if (stored.run.members[0]?.status === "unavailable") {
+        stored.run.members[0].lastActivityAt = new Date().toISOString();
+        scheduler.save(stored);
+      }
+    };
+  }
+}
+
+async function runActivitySimulator(t: TestContext, seed: number, mutant?: ActivityMutant) {
   const rng = mulberry32(seed);
   const pick = <T>(items: readonly T[]): T => items[Math.floor(rng() * items.length)]!;
 
@@ -384,7 +540,13 @@ test("seeded randomized durable-state simulator preserves timestamp and persiste
         confirmTeam: async () => undefined,
       } as unknown as LinearService;
 
-      let teams = f.openTeam({ linear });
+      const openService = () => {
+        const opened = f.openTeam({ linear });
+        applyActivityMutant(opened, mutant);
+        return opened;
+      };
+
+      let teams = openService();
       let scheduler = internal(teams);
       let stored = scheduler.record(f.run.id);
 
@@ -526,7 +688,7 @@ test("seeded randomized durable-state simulator preserves timestamp and persiste
           expectedLastActivityAt = retryAt;
         } else if (op === "restart") {
           teams.close();
-          teams = f.openTeam({ linear });
+          teams = openService();
           scheduler = internal(teams);
           stored = scheduler.record(f.run.id);
           t.mock.timers.tick(5_000);
@@ -557,7 +719,7 @@ test("seeded randomized durable-state simulator preserves timestamp and persiste
         assert.equal(steered.updatedAt, steerAt, steerCtx);
         assert.equal(steered.lastActivityAt, steerAt, steerCtx);
         teams.close();
-        teams = f.openTeam({ linear });
+        teams = openService();
         scheduler = internal(teams);
         stored = scheduler.record(f.run.id);
         t.mock.timers.tick(15_000);
@@ -574,4 +736,23 @@ test("seeded randomized durable-state simulator preserves timestamp and persiste
       f.close();
     }
   }
+}
+
+test("seeded randomized durable-state simulator preserves timestamp and persistence invariants across polls, failures, and restarts", async t => {
+  const seed = Number(process.env.TEAM_ACTIVITY_SEED ?? 0x5eed446);
+  t.diagnostic(`seed=${seed}`);
+  await runActivitySimulator(t, seed);
 });
+
+const ACTIVITY_MUTANTS: readonly { name: ActivityMutant; expectedOp: RegExp }[] = [
+  { name: "skip-persisted-invalidation-on-write-error", expectedOp: /op=failed-write-rollback/ },
+  { name: "bump-last-activity-on-linear-freshness", expectedOp: /op=linear-freshness/ },
+  { name: "overwrite-member-last-activity-on-unavailable", expectedOp: /op=unavailable-poll/ },
+];
+
+for (const mutant of ACTIVITY_MUTANTS) {
+  test(`activity simulator rejects broken mutant: ${mutant.name}`, async t => {
+    const seed = Number(process.env.TEAM_ACTIVITY_SEED ?? 0x5eed446);
+    await assert.rejects(() => runActivitySimulator(t, seed, mutant.name), mutant.expectedOp);
+  });
+}

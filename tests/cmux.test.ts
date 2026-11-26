@@ -9,6 +9,8 @@ import { join } from "node:path";
 import type express from "express";
 import { spawn as ptySpawn } from "node-pty";
 import { CmuxSessions } from "../packages/host/src/cmux/index.js";
+import { ProjectContexts } from "../packages/host/src/project-context.js";
+import { intakeConfigSchema } from "../packages/host/src/intake-types.js";
 import { sendSessionList } from "../packages/host/src/session-list.js";
 import { createApp } from "../packages/host/src/server.js";
 import { hashToken } from "../packages/host/src/config.js";
@@ -75,7 +77,7 @@ async function fixture(t: TestContext, starting = false) {
   };
   const key = randomBytes(32);
   const provider = ptySpawn(process.execPath, ["-e", "process.stdout.write('ready\\n');setInterval(()=>{},1000)"], { cols: 80, rows: 24, cwd, env: process.env });
-  let sessions: CmuxSessions | undefined;
+  let sessions: CmuxSessions | undefined, projectContexts: ProjectContexts | undefined;
   let providerExited = false;
   const exited = new Promise<void>((resolve) => provider.onExit(() => { providerExited = true; resolve(); }));
   t.after(async () => {
@@ -112,7 +114,8 @@ async function fixture(t: TestContext, starting = false) {
   writeHooks();
   sessions = new CmuxSessions(config, key);
   const mutations = () => existsSync(join(root, "mutations.jsonl")) ? readFileSync(join(root, "mutations.jsonl"), "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line)) : [];
-  const restart = async () => { await sessions!.close(); sessions = new CmuxSessions(config, key); return sessions; };
+  const restart = async () => { await sessions!.close(); sessions = new CmuxSessions(config, key, projectContexts); return sessions; };
+  const useProjectContexts = async (contexts: ProjectContexts) => { projectContexts = contexts; return restart(); };
   let row = (await sessions.list()).find(row => row.nativeSession?.id === nativeId);
   if (!row) row = (await sessions.list()).find(row => row.nativeSession?.id === nativeId);
   const trace = existsSync(join(root, "calls.jsonl")) ? readFileSync(join(root, "calls.jsonl"), "utf8").trim().split("\n").slice(-12).join("; ") : "no fixture CLI started";
@@ -122,8 +125,33 @@ async function fixture(t: TestContext, starting = false) {
     const lease = await sessions!.call<ControlLease>(id, { op: "control", action: "claim", actor, takeover });
     return { actor, leaseId: lease.id };
   };
-  return { root, cwd, hooksDir, config, key, provider, transcript, nativeId, hooks, writeHooks, setState, id, claim, mutations, restart, get sessions() { return sessions!; } };
+  return { root, cwd, hooksDir, config, key, provider, transcript, nativeId, hooks, writeHooks, setState, id, claim, mutations, restart, useProjectContexts, get sessions() { return sessions!; } };
 }
+
+test("cmux launch uses the shared verified project context and rejects a revoked source binding", { timeout: 20000 }, async (t) => {
+  const f = await fixture(t);
+  f.config.projects[0]!.source = { mode: "github", repository: "example/original", baseBranch: "main" };
+  f.config.intake = intakeConfigSchema.parse({
+    linear: { teamIds: [randomUUID()], creatorId: randomUUID(), label: "work" }, mission: { groupId: "workspace" },
+    slack: { teamId: "T000", ownerUserId: "U000", appTokenFile: join(f.root, "app"), botTokenFile: join(f.root, "bot"),
+      organizationScope: { workspaces: [{ projectId: "project", path: f.cwd, repository: "example/original" }] } },
+  });
+  let current = new Map([["project", { companyId: "company-original", repositoryId: "remote:github.com/example/original" }]]);
+  const contexts = new ProjectContexts(f.config, f.key, () => current);
+  const marker = "cmux verified owner note";
+  contexts.setContext("project", marker, 0);
+  await f.useProjectContexts(contexts);
+
+  const request = { requestId: randomUUID(), provider: "claude", projectId: "project", title: "Context launch", prompt: "Inspect the code" } as const;
+  const launched = await f.sessions.create(request);
+  assert.equal(launched.context, marker);
+  const workerLaunch = f.mutations().find(row => row.method === "workspace.create");
+  assert.match(workerLaunch?.params.initial_input, new RegExp(marker), "the authorized note reaches the cmux worker input");
+
+  current = new Map([["project", { companyId: "company-original", repositoryId: "remote:github.com/example/replacement" }]]);
+  await assert.rejects(f.sessions.create({ ...request, requestId: randomUUID() }), /matching repository binding/);
+  assert.equal(f.mutations().filter(row => row.method === "workspace.create").length, 1, "a revoked note never reaches a second worker launch");
+});
 
 test("cmux discovery keeps native identities and paginates transcripts without claiming task completion", { timeout: 15000 }, async (t) => {
   const f = await fixture(t, true);

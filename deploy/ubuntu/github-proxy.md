@@ -21,7 +21,7 @@ and any grant format other than the current one (`v2`).
 
 | Session | Repository | Operations | Push refs |
 | --- | --- | --- | --- |
-| Session the owner started (the owner-only create and resume routes, `infinite new`) | the project's GitHub repository | fetch, push, pr, merge | `refs/heads/*` |
+| Session the owner started (the owner-only create and resume routes, including the paired native CLI) | the project's GitHub repository | fetch, push, pr, merge | `refs/heads/*` |
 | Any other session outside a team | the project's GitHub repository | fetch | none |
 | Team delivery member | the run's delivery repository | fetch, push, pr (+ merge when delivery mode is `merge`) | the run's head branch only |
 | Other team members | the run's repository | fetch | none |

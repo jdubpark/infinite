@@ -28,7 +28,7 @@ import { parseDeployment } from "./deployment.js";
 import { planFleet } from "./fleet.js";
 import { CEILING_TARGETS, checkCeiling, nodeCeilingFs, shippedCeilingTemplate, type CeilingProvider } from "./ceilings.js";
 import { egressDoctorLine, installHostEgress } from "./egress.js";
-import type { Config, Provider, Role } from "./types.js";
+import type { Config, Role } from "./types.js";
 
 import { handleClientCommand } from "./client.js";
 import { handleMachineCommand } from "./machine-cli.js";
@@ -375,7 +375,6 @@ infinite init --deployment-mode single-tenant --origin https://HOST
 infinite serve --config FILE          Start the API; workers survive API exit
 infinite doctor --config FILE         Check configured CLI binaries
 infinite list --config FILE           List sessions on this host
-infinite new --provider codex --title "Task" --prompt "..."
 infinite attach SESSION_ID --config FILE
 infinite plan-fleet FILE               Print a secret-free development VM plan
 infinite init --deployment-mode tenant-development --tenant-id UUID --origin https://HOST
@@ -395,6 +394,8 @@ else if (command === "plan-fleet") {
   if (!values.local && !values.origin?.startsWith("https://"))
     throw new Error("init requires --origin https://your-host.tailnet.ts.net");
   initialize();
+} else if (command === "new") {
+  throw new Error("Host-local session creation is retired. Pair an owner laptop with `infinite pair https://HOST --token-file FILE`, then launch with `infinite --project ID --title \"Task\" codex`.");
 } else {
   if (dev && !existsSync(configFile)) initialize();
   const { config, key } = readConfig(configFile);
@@ -494,21 +495,7 @@ else if (command === "plan-fleet") {
         console.log(
           `${session.id}  ${session.provider.padEnd(8)}  ${session.status.padEnd(12)}  ${session.title}`,
         );
-    else if (command === "new") {
-      const provider = values.provider as Provider;
-      if (!config.agents[provider])
-        throw new Error("Choose a configured --provider");
-      const generatedTitle = !values.title?.trim();
-      const session = await manager.create({
-        requestId: randomUUID(),
-        provider,
-        projectId: values.project ?? config.projects[0].id,
-        title: values.title?.trim() || `${provider} session`,
-        ...(generatedTitle ? { generatedTitle: true as const } : {}),
-        prompt: values.prompt ?? "",
-      }, "owner");
-      console.log(`${session.id}  ${session.status}`);
-    } else if (command === "attach") await attach(manager, positionals[1]);
+    else if (command === "attach") await attach(manager, positionals[1]);
     else if (command === "doctor") {
       for (const [provider, profile] of Object.entries(config.agents)) {
         if (provider === "demo" || !profile) continue;

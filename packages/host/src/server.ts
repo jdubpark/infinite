@@ -218,7 +218,8 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
     projectSync.applying(projectId) || projectSource.refreshing(projectId) || await projectRunning(projectId, true) });
   validateLinearConfig(config);
   validateMcpConfig(config);
-  const manager = new Manager(config, key);
+  let intakeAudience: ReturnType<typeof createIntakeAudienceGuard> | undefined;
+  const manager = new Manager(config, key, undefined, { projectContexts: new ProjectContexts(config, key, () => intakeAudience?.workspaceBindings()) });
   const projectSync = new ProjectSync(config, key);
   const desktopFiles = new DesktopFiles(config);
   const startsInFlight = new Map<string, number>();
@@ -407,7 +408,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
     sessionTitle: sessionId => { try { return manager.meta(sessionId).session.title; } catch { return undefined; } },
   });
   const projectSchema = z.string().regex(/^[a-z0-9-]{1,80}$/);
-  const cmux = config.cmux?.enabled ? new CmuxSessions(config, key) : undefined;
+  const cmux = config.cmux?.enabled ? new CmuxSessions(config, key, manager.projectContexts) : undefined;
   const handoffs: HandoffService = new HandoffService(config, key, manager, teams, startInProject, async (sessionId, projectId) => {
     const sourcePath = realpathSync(manager.meta(sessionId).session.cwd);
     for (const project of config.projects) {
@@ -426,7 +427,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
   const assertNoHandoff = (projectId: string) => {
     if (handoffs.activeForProject(projectId)) throw new TeamError(409, "handoff-in-progress", "This project is transferring a task to a team. Wait for its checkpoint to finish.");
   };
-  const intakeAudience = createIntakeAudienceGuard({ config, groups: projectGroups, sourceAppliedHead: projectId => projectSource.status(projectId).appliedHead });
+  intakeAudience = createIntakeAudienceGuard({ config, groups: projectGroups, sourceAppliedHead: projectId => projectSource.status(projectId).appliedHead });
   const createMission = createIntakeMissionCreator({ config, missions, groups: projectGroups, audience: intakeAudience, assertNoHandoff });
   const intakeStore = config.intake ? new IntakeStore(config, key) : undefined;
   const intakeSlackClient = config.intake?.slack ? new SlackClient({ botTokenFile: config.intake.slack.botTokenFile, appTokenFile: config.intake.slack.appTokenFile, endpoint: config.intake.slack.endpoint, teamId: config.intake.slack.teamId, organizationScope: config.intake.slack.organizationScope, workspaceAllowed: intakeAudience.workspacesAllowed }) : undefined;
@@ -1999,17 +2000,15 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
   app.get("/api/projects/:id/sync/blob/:hash", requireRole(["owner"]), requireOwnerCli, async (req, res) => {
     res.json({ base64: await projectSync.readBlob(projectSchema.parse(req.params.id), String(req.params.hash)) });
   });
-  const projectContexts = new ProjectContexts(config, key);
   app.get("/api/projects/:id/context-links", (req, res) => {
-    return res.json(projectContexts.listLinks(String(req.params.id)));
+    return res.json(manager.projectContexts.listLinks(String(req.params.id)));
   });
   app.put("/api/projects/:id/context-links", requireRole(["owner"]), (req, res) => {
-    return res.json(projectContexts.setLinks(String(req.params.id), contextLinksRequest.parse(req.body)));
+    return res.json(manager.projectContexts.setLinks(String(req.params.id), contextLinksRequest.parse(req.body)));
   });
   app.get("/api/projects/:id/context", (req, res) => {
-    if (!config.projects.some((p) => p.id === req.params.id))
-      return res.status(404).json({ error: "Unknown project" });
-    return res.json(manager.context(req.params.id));
+    if (!config.projects.some((p) => p.id === req.params.id)) return res.status(404).json({ error: "Unknown project" });
+    return res.json(manager.projectContexts.context(req.params.id));
   });
   app.put("/api/projects/:id/context", requireRole(["owner"]), (req, res) => {
     if (!config.projects.some((p) => p.id === req.params.id))
@@ -2022,7 +2021,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
       .strict()
       .parse(req.body);
     return res.json(
-      manager.setContext(
+      manager.projectContexts.setContext(
         String(req.params.id),
         body.text,
         body.expectedVersion,

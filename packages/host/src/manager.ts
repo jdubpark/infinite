@@ -157,6 +157,7 @@ export function withDefaultAttention(
   };
 }
 export class Manager {
+  readonly projectContexts: ProjectContexts;
   private readonly sessionQueues = new Map<string, Promise<unknown>>();
   private readonly conversationQueues = new Map<string, Promise<unknown>>();
   private readonly pendingCreates = new Set<string>();
@@ -205,8 +206,9 @@ export class Manager {
     readonly config: Config,
     readonly key: Buffer,
     hostProbe: HostLoadProbe = readHostLoad,
-    options?: { socketDir?: string },
+    options?: { socketDir?: string; projectContexts?: ProjectContexts },
   ) {
+    this.projectContexts = options?.projectContexts ?? new ProjectContexts(config, key);
     assertRunnerDeployment(config);
     const configuredSocketDir = options?.socketDir ?? config.socketDir;
     this.socketDir = ensureSocketDir(configuredSocketDir ?? config.runDir, configuredSocketDir !== undefined ? "socketDir" : "runDir");
@@ -367,9 +369,9 @@ export class Manager {
   }
 
   metaRevision(id: string): string | undefined { return this.listedMeta.revision(id); }
-  context(projectId: string) { return new ProjectContexts(this.config, this.key).context(projectId); }
+  context(projectId: string) { return this.projectContexts.context(projectId); }
   setContext(projectId: string, text: string, expectedVersion: number) {
-    return new ProjectContexts(this.config, this.key).setContext(projectId, text, expectedVersion);
+    return this.projectContexts.setContext(projectId, text, expectedVersion);
   }
   create(request: CreateSession, startedBy?: "owner"): Promise<Session & WorkerState> {
     if (request.continuation !== undefined)
@@ -996,7 +998,7 @@ export class Manager {
       if (request.team?.role === "permission-coordinator") profile = permissionCoordinatorLaunch(request.provider, profile);
       if (request.team?.role === "mission-coordinator") profile = missionCoordinatorLaunch(parseMissionCoordinatorProvider(request.provider), profile);
       if (request.continuation) profile = withNativeContinuation(profile, request.continuation);
-      const context = withoutSharedContext(new ProjectContexts(this.config, this.key).snapshot(request.projectId), executionIdentity);
+      const context = withoutSharedContext(this.projectContexts.snapshot(request.projectId), executionIdentity);
       const session: Session = {
         id,
         ...(request.team ? { team: request.team } : {}),

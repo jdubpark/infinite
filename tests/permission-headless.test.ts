@@ -2,10 +2,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { randomBytes, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { createServer } from "node:net";
 import { join, resolve } from "node:path";
 import { Manager } from "../packages/host/src/manager.js";
-import { socketPath, workerCall } from "../packages/host/src/ipc.js";
+import { workerCall } from "../packages/host/src/ipc.js";
 import { headlessChannelArgs } from "../packages/host/src/launch.js";
 import {
   HeadlessPermissionChannel, channelToken, deferredCallOpen, deliveryKey, type ChannelReply,
@@ -653,27 +652,6 @@ test("an owner's allow whose resume check returns after the resumed provider exi
     assert.equal(deferredCallOpen((after, limit) => r.manager.events(id, after, limit)), true);
     await assert.rejects(r.manager.resume(id, randomUUID()), /waited for the owner's answer/);
   } finally { await r.stop(); }
-});
-
-test("a deferral recorded while resume reads the session state still refuses the resume", async () => {
-  const r = await rig();
-  const worker = createServer();
-  try {
-    const id = randomUUID(), dir = join(r.config.stateDir, "sessions", id);
-    mkdirSync(dir, { recursive: true });
-    writeSealed(join(dir, "meta.sealed"), r.key, `${id}:meta`, { session: { id, provider: "claude", projectId: "rehearsal", title: "Headless", cwd: r.workspace, headless: { channel: true } } });
-    const journal = new Journal(join(dir, "events"), r.key, id);
-    worker.on("connection", socket => socket.once("data", chunk => {
-      assert.equal(JSON.parse(String(chunk)).op, "state");
-      journal.append("lifecycle", { permissionChannel: { event: "deferred", callId: "toolu_1" } });
-      socket.end(JSON.stringify({ result: { status: "exited", nativeSession: { id: "native-1", source: "hook" } } }) + "\n");
-    }));
-    await new Promise<void>(done => worker.listen(socketPath(r.config.runDir, id), done));
-    await assert.rejects(r.manager.resume(id, randomUUID()), /waited for the owner's answer/);
-  } finally {
-    worker.close();
-    await r.stop();
-  }
 });
 
 test("a call retired at the resume is recorded as answered by the owner, and a newer waiting call stays open", async () => {

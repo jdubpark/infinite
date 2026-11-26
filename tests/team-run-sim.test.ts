@@ -37,7 +37,7 @@ const FLOORS: Readonly<Record<string, number>> = {
   "ack:pause": 31, "ack:resume": 28, "ack:cancel": 8, "ack:steer": 34, "ack:revoke": 16, "ack:answer": 3, "ack:continue": 2,
   "retry:pause": 8, "retry:resume": 9, "retry:cancel": 4, "retry:steer": 10, "retry:revoke": 5, "retry:answer": 1, "retry:continue": 1,
   "refused:request-conflict": 20, "refused:stale-team-revision": 18, "refused:team-cancelled": 29, "refused:members-stopping": 8,
-  "pass:ended-halt": 49, "restart": 26, "intermediate:revoke:1": 4,
+  "pass:ended-halt": 49, "restart": 26, "intermediate:revoke:1": 4, "withdrawn:steer": 1,
 };
 
 test("team run requests keep their invariants across host stops", async t => {

@@ -1191,7 +1191,7 @@ export class TeamService {
       if (!receipt) return this.view(stored);
       if (stored.run.pullRequest && !pullRequestBranch(stored.run)) await this.reviewFeedback.resolveLegacyPullRequestBranch(stored);
       this.commands.get(id)?.abort();
-      await this.invalidatePermissionDecisions(stored, "The team revision changed before the permission request could be answered.");
+      await this.invalidatePermissionDecisions(stored, "A steer started before the permission request could be answered.");
       this.recordReceipt(stored, body.requestId, receipt);
       if (stored.run.recovery && stored.run.recovery.status !== "exhausted") {
         stored.run.recovery.status = "exhausted";

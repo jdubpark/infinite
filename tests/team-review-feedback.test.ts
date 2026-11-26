@@ -1,12 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import type { Prompt } from "@infinite/attention";
 import type { Blackboard } from "../packages/host/src/evidence/blackboard.js";
 import type { FuseGate } from "../packages/host/src/fuse/types.js";
 import { PULL_REQUEST_BRANCH_FIELDS, PULL_REQUEST_FIELDS, type ReviewIntake, reviewRequestId } from "../packages/host/src/review-feedback.js";
 import type { TeamReviewFeedback } from "../packages/host/src/team-review-feedback.js";
+import { permissionAuthorityHash, permissionEvidenceHash } from "../packages/host/src/team-permissions.js";
 import type { TeamRun } from "../packages/host/src/team-types.js";
 import { MissionReview, type MissionReviewRecord, type ReviewForwardOp } from "../packages/host/src/mission-review.js";
 import type { Mission, MissionSubtask } from "../packages/host/src/mission-types.js";
@@ -68,6 +70,18 @@ function hostStop(f: Fixture, stopAt: number) {
     return true;
   } };
   return { entries: entries as unknown as Blackboard, arm: () => { armed = true; }, stopped: () => restore !== undefined, restart: () => restore?.() };
+}
+
+function approvedDecision(f: Fixture) {
+  const member = f.run.members[0]!, permissions = { mode: "coordinator" as const, scope: "Approve one-time runs of accepted checks.", maxDecisions: 3 };
+  const prompt: Prompt = { id: 1, kind: "permission", source: "screen", hash: "a".repeat(64), pinned: true, acceptsText: false,
+    title: "Would you like to run the following command?", detail: "Environment: local\n$ npm run check",
+    options: [{ index: 0, label: "Yes, proceed (y)", role: "accept" }, { index: 1, label: "No (esc)", role: "reject" }] };
+  f.run.permissions = permissions;
+  f.run.permissionDecisions = [{ id: randomUUID(), revision: 1, targetMemberId: member.memberId, targetSessionId: member.sessionId, targetCwd: member.cwd,
+    policyHash: createHash("sha256").update(JSON.stringify(permissions)).digest("hex"), promptId: prompt.id, promptHash: prompt.hash!,
+    evidenceHash: permissionEvidenceHash(prompt), prompt, option: 0, authorityHash: permissionAuthorityHash(permissions, []),
+    expiresAt: new Date(Date.now() + 5 * 60000).toISOString(), answerRequestId: randomUUID(), coordinatorMemberId: randomUUID(), status: "approved" }];
 }
 
 test("one changes-requested review by the owner starts exactly one follow-up, and a repeat of that review starts none", async () => {
@@ -337,6 +351,40 @@ test("whichever record write a review's steer stops after, the restarted host st
   }
   assert.equal(stops, 3, "the intent, the steer and the acknowledgement; the steer's earlier save of an unchanged record writes nothing");
 });
+
+for (const superseded of [false, true]) {
+  test(superseded ? "a review that GitHub supersedes while the host is stopped between its steer's permission withdrawal and the steer's write starts nothing, and the decision stays withdrawn with a true reason"
+    : "a host stop between a review steer's permission withdrawal and the steer's write leaves the decision withdrawn, and the restarted host steers exactly once", async () => {
+    const f = schedulerFixture();
+    try {
+      approvedDecision(f);
+      const gh = delivered(f), changes = gh.review("PRR_1", owner, "CHANGES_REQUESTED"), withdrawn = [["stale", "A steer started before the permission request could be answered."]];
+      const decisions = (saved: Saved) => saved.run.permissionDecisions?.map(decision => [decision.status, decision.reason]);
+      gh.show([changes]);
+      const stop = hostStop(f, 2), first = poller(f.openTeam({ entries: stop.entries }));
+      await first.start();
+      stop.arm();
+      await first.poll();
+      assert.ok(stop.stopped(), "the review's intent and its steer's permission withdrawal are two record writes");
+      stop.restart();
+      const left = f.readRecord<Saved>("team", f.run.id);
+      assert.deepEqual([left.run.revision, left.reviewIntake?.intents.map(intent => intent.state), left.receipts[reviewRequestId(f.run.id, "PRR_1")]], [1, ["pending"], undefined],
+        "the host stopped after the withdrawal and before the steer's own write");
+      assert.deepEqual(decisions(left), withdrawn);
+      if (superseded) gh.show([changes, gh.review("PRR_2", owner, "APPROVED", "Looks good.", new Date(Date.now() + 120_000).toISOString())]);
+      const reads = gh.commands().length, second = poller(f.openTeam());
+      await second.start();
+      assert.equal(gh.commands().length - reads, 1, "the restarted host reads GitHub once before it acts on an intent without a receipt");
+      await second.poll();
+      const saved = f.readRecord<Saved>("team", f.run.id);
+      assert.equal(saved.run.revision, superseded ? 1 : 2, superseded ? "a superseded review starts nothing" : "the restarted host steers exactly once");
+      assert.deepEqual(saved.run.steering.map(item => item.text), superseded ? [] : [requested]);
+      assert.deepEqual(saved.reviewIntake?.intents.map(intent => intent.state), [superseded ? "superseded" : "applied"]);
+      assert.deepEqual(decisions(saved), withdrawn, "the host does not restore the withdrawn decision, and its reason does not say the revision changed");
+      assert.equal(f.permissionAnswers(), 0, "no provider answer is sent for the withdrawn decision");
+    } finally { f.close(); }
+  });
+}
 
 test("a review that GitHub supersedes while the owner's halt holds it starts nothing", async () => {
   const f = schedulerFixture();

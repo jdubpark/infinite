@@ -1,4 +1,4 @@
-import { ACTIVE_MEMBER_STATUSES, type TeamAssignment, type TeamMember, type TeamPermissionDecision, type TeamRun } from "./team-types.js";
+import { ACTIVE_MEMBER_STATUSES, decisionAnswerLabel, type TeamDecision, type TeamAssignment, type TeamMember, type TeamPermissionDecision, type TeamRun } from "./team-types.js";
 import { createHash } from "node:crypto";
 import { lstatSync } from "node:fs";
 import { basename, dirname } from "node:path";
@@ -7,6 +7,30 @@ import type { Manager } from "./manager.js";
 import { accountSettingPrompt, type Prompt } from "@infinite/attention";
 import { isCollapsedPermissionPrompt, oneShotPermissionOption } from "./team-permissions.js";
 import type { Stored } from "./teams.js";
+import { activeStageForRole } from "./stall-recovery.js";
+
+export function answerFeedback(member: TeamMember, decision: TeamDecision) {
+  return [member.contextFeedback ?? member.prompt, `${decisionAnswerLabel(decision)} answered: ${decision.answer}`].filter(Boolean).join("\n\n");
+}
+
+export function hasQueuedAnswer(stored: Stored) {
+  const { run } = stored;
+  return run.members.some(member => {
+    if (member.revision !== run.revision || member.status !== "queued" || activeStageForRole(member.role) !== run.status) return false;
+    const link = stored.ledgerReplaces?.[member.memberId];
+    if (link) return link.cause === "answer";
+    return run.decisions.some(decision => {
+      if (decision.revision !== run.revision || !decision.answer) return false;
+      const prior = run.members.find(candidate => candidate.memberId === decision.memberId);
+      return prior?.status === "stopped" && prior.role === member.role && prior.taskId === member.taskId &&
+        prior.cwd === member.cwd && prior.baseCommit === member.baseCommit && member.contextFeedback === answerFeedback(prior, decision);
+    });
+  });
+}
+
+export function heldStage(stored: Stored) {
+  return stored.run.status === "paused" && stored.ownerHalt?.waiting ? stored.ownerHalt.resumeStage ?? "needs-input" : undefined;
+}
 
 export type TeamKernel = {
   readonly records: Map<string, Stored>;

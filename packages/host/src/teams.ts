@@ -58,7 +58,7 @@ import { HOST_LOAD_REASON_PREFIX, LaunchHeldError } from "./host-load.js";
 import { permissionEvidenceHash } from "./team-permissions.js";
 import { storageShortfall, volumeUsage, type VolumeUsage } from "./storage.js";
 import type { PermissionAgentServices } from "./permission-agent-types.js";
-import { activeMember, activeTeamRun, assignment, automaticRecoveryLimit, boundedRecoveryText, commitId, coordinatorPermissionPrompt, deliveredAtRevision, digest, filesystemEntryExists, livePermissionRecoveryStatuses, permissionCoordinatorDecision, permissionRequestCount, recoveriesUsed, teamRunDirectory, terminalPermissionCoordinator, timestamp } from "./team-kernel.js";
+import { activeMember, activeTeamRun, answerFeedback, hasQueuedAnswer, heldStage, assignment, automaticRecoveryLimit, boundedRecoveryText, commitId, coordinatorPermissionPrompt, deliveredAtRevision, digest, filesystemEntryExists, livePermissionRecoveryStatuses, permissionCoordinatorDecision, permissionRequestCount, recoveriesUsed, teamRunDirectory, terminalPermissionCoordinator, timestamp } from "./team-kernel.js";
 import type { PermissionHost } from "./team-permission-agent.js";
 import { TeamPermissionReview } from "./team-permission-review.js";
 import { teamRetentionState, TeamRetention, type RetentionHost } from "./team-retention.js";
@@ -137,7 +137,7 @@ export type Stored = {
   pending?: PendingOperation;
   verificationRecovery?: { pendingId: string; pendingKind: "check"; revision: number; headCommit: string; failure: "setup-changed-files" | "verification-changed-files" | "legacy-completed-check" };
   halt?: "pause" | "cancel" | "steer" | "block";
-  ownerHalt?: { haltId?: string; reason: string; waiting?: true };
+  ownerHalt?: { haltId?: string; reason: string; waiting?: true; resumeStage?: TeamRun["status"] };
   unfencedAnswers?: string[];
   answersMarked?: true;
   deliveryAttempt?: { memberId: string; revision: number; headCommit: string };
@@ -157,7 +157,7 @@ const receiptDigest = <T extends object>(value: T & { source?: SteeringSource | 
   return digest({ ...body, ...(by && by !== "coordinator" ? { by } : {}),
     ...(typeof source === "object" ? { source: { kind: source.kind, id: source.id } } : {}) });
 };
-const heldWaiting = (stored: Stored) => stored.run.status === "paused" && stored.ownerHalt?.waiting === true;
+const heldWaiting = (stored: Stored) => heldStage(stored) !== undefined;
 const holdsWorkerSlot = (member: TeamMember, revision: number) => member.revision === revision &&
   (member.role === "scout" || member.role === "implementer") &&
   (!isDeferredWorkerMember(member) && ["queued", "running", "unavailable"].includes(member.status) || member.status === "reported" && !member.exitConfirmedAt);
@@ -713,7 +713,7 @@ export class TeamService {
   }
   private linkReplacement(stored: Stored, next: TeamMember, previous: TeamMember, cause: ReplacementCause): void {
     if (previous.goalCriteriaPlan) next.goalCriteriaPlan = previous.goalCriteriaPlan;
-    if (!this.options?.events) return;
+    if (!this.options?.events && cause !== "answer") return;
     (stored.ledgerReplaces ??= {})[next.memberId] = { memberId: previous.memberId, cause };
   }
   private memberStopped(stored: Stored, member: TeamMember, reason: MemberStopReason, detail?: MemberStopDetail): void {
@@ -1494,7 +1494,7 @@ export class TeamService {
       const verificationRecovery = action === "resume" && validVerificationRecovery(stored) ? stored.verificationRecovery : undefined;
       if (action === "resume") { const refusal = this.resumeRefusal(stored, verificationRecovery); if (refusal) throw refusal; }
       if (action === "resume" && verificationRecovery) return this.resumeVerificationRecovery(stored, body, verificationRecovery);
-      const inPlace = heldWaiting(stored);
+      const inPlace = heldStage(stored);
       const receipt = this.admit(stored, action, body);
       if (!receipt) return this.view(stored);
       const record = () => this.recordReceipt(stored, body.requestId, receipt);
@@ -1525,11 +1525,11 @@ export class TeamService {
     if (stored.halt) return new TeamError(409, "members-stopping", "Wait for the team's active members to stop before resuming.");
     return undefined;
   }
-  private async resumeRun(stored: Stored, inPlace = false, record?: () => void) {
+  private async resumeRun(stored: Stored, inPlace?: TeamRun["status"], record?: () => void) {
     const run = stored.run;
     if (!inPlace) await this.invalidatePermissionDecisions(stored, "A resume started before the permission request could be answered.");
     record?.();
-    if (inPlace) { run.status = "needs-input"; run.reason = undefined; return; }
+    if (inPlace) { run.status = inPlace; run.reason = undefined; return; }
     run.revision++; run.tasks = []; run.review = undefined; run.round = 0; stored.checkHead = undefined;
     this.emit(stored, "run.revision-advanced", [run.revision], {}, { cause: "resume", fromRevision: run.revision - 1, baseChanged: false });
     run.brief = undefined; run.noChange = undefined;
@@ -1553,13 +1553,13 @@ export class TeamService {
   private waitsWithNothingInFlight(stored: Stored) {
     const run = stored.run;
     const unlaunched = (member: TeamMember) => { try { return member.status === "queued" && !this.hasLaunch(member); } catch { return false; } };
-    return run.status === "needs-input" && !stored.halt && !stored.pending && !this.commands.has(run.id) &&
+    return (run.status === "needs-input" || hasQueuedAnswer(stored)) && !stored.halt && !stored.pending && !this.commands.has(run.id) &&
       !run.members.some(member => activeMember(member) && member.role !== "permission-coordinator" && !unlaunched(member));
   }
   private async haltStop(stored: Stored, mark: { haltId: string; reason: string }) {
     const run = stored.run;
     if (this.waitsWithNothingInFlight(stored)) {
-      run.status = "paused"; run.reason = mark.reason; stored.ownerHalt = { ...mark, waiting: true };
+      stored.ownerHalt = { ...mark, waiting: true, resumeStage: run.status }; run.status = "paused"; run.reason = mark.reason;
       this.event(stored, `Team paused where it waits for input: ${mark.reason} Its questions stay open; an answer is kept until it resumes.`);
       await this.invalidatePermissionDecisions(stored, "The team was paused before the permission request could be answered.");
     } else {
@@ -1568,11 +1568,11 @@ export class TeamService {
     this.save(stored);
   }
   private releasedMark(stored: Stored, reason: string): NonNullable<Stored["ownerHalt"]> {
-    return { reason, ...(stored.ownerHalt?.waiting ? { waiting: true as const } : {}) };
+    return { reason, ...(stored.ownerHalt?.waiting ? { waiting: true as const, resumeStage: stored.ownerHalt.resumeStage } : {}) };
   }
   private async haltResumeRun(stored: Stored) {
     this.fence.lift(stored);
-    const inPlace = heldWaiting(stored);
+    const inPlace = heldStage(stored);
     await this.resumeRun(stored, inPlace);
     stored.ownerHalt = undefined;
     this.event(stored, inPlace ? "Team resumed where it waited for input: the owner released the halt." : "Team resumed with a fresh plan: the owner released the halt.");
@@ -2286,7 +2286,7 @@ export class TeamService {
         if ((prior.role === "scout" || prior.role === "implementer") && run.members.filter(member => holdsWorkerSlot(member, run.revision)).length >= run.parallelism) continue;
         const answeredBy = decisionAnswerLabel(decision);
         const next = this.newMember(run, prior.role, prior.cwd, prior.baseCommit, prior.taskId, appendBuiltPrompt(builtPromptForMember(stored, prior), `${answeredBy} answered: ${decision.answer}`), prior.modelProfile);
-        next.contextFeedback = [prior.contextFeedback ?? prior.prompt, `${answeredBy} answered: ${decision.answer}`].filter(Boolean).join("\n\n");
+        next.contextFeedback = answerFeedback(prior, decision);
         next.provider = next.modelProfile?.provider ?? prior.provider ?? run.provider;
         prior.status = "stopped"; run.members.push(next);
         this.linkReplacement(stored, next, prior, "answer");

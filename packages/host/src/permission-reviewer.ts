@@ -11,6 +11,7 @@ import type { AgentProfile, Provider } from "./types.js";
 import { sudoShape } from "./sudo-profile.js";
 import { hostEgressEnvironment } from "./egress.js";
 import { usageFromRunLine } from "./opencode-usage.js";
+import { openCodeModelArg, readOpenCodeVersion, type OpenCodeMajor } from "./opencode-version.js";
 import type { UsageTokens } from "./usage.js";
 
 export type PermissionTierName = "light" | "strong";
@@ -247,7 +248,14 @@ export function claudeReviewerArgs(turn: Pick<PermissionTurn, "profile" | "syste
   ];
 }
 
-export function openCodeReviewerConfig(system: string): string {
+export function openCodeReviewerConfig(system: string, major: OpenCodeMajor = 1): string {
+  if (major === 2) {
+    return JSON.stringify({
+      update: "disable",
+      share: "disabled",
+      agents: { [REVIEW_AGENT]: { mode: "primary", description: "Permission review", system, permissions: OPENCODE_2_DENY_ALL } },
+    });
+  }
   return JSON.stringify({
     autoupdate: false,
     share: "disabled",
@@ -255,11 +263,34 @@ export function openCodeReviewerConfig(system: string): string {
   });
 }
 
-export function openCodeReviewerArgs(turn: Pick<PermissionTurn, "profile" | "prompt">): string[] {
+const OPENCODE_2_DENY_ALL = [
+  { action: "*", resource: "*", effect: "deny" },
+  { action: "execute", resource: "*", effect: "deny" },
+];
+
+export function openCodeReviewerArgs(turn: Pick<PermissionTurn, "profile" | "prompt">, major: OpenCodeMajor = 1): string[] {
   const profile = turn.profile;
   if (profile.provider !== "opencode") throw new Error("An OpenCode reviewer needs an OpenCode profile.");
+  if (major === 2) return ["run", "--standalone", "--format", "json", "--agent", REVIEW_AGENT, "--model", openCodeModelArg(profile.model, profile.variant, 2), "--", turn.prompt];
   return ["--pure", "run", "--format", "json", "--agent", REVIEW_AGENT, "--model", profile.model,
     ...(profile.variant ? ["--variant", profile.variant] : []), "--", turn.prompt];
+}
+
+export function openCodeAgentsDenyEverything(stdout: string): boolean {
+  const start = stdout.search(/^\[/m);
+  if (start < 0) return false;
+  try {
+    const agents = JSON.parse(stdout.slice(start)) as { id?: unknown; permissions?: unknown }[];
+    const agent = agents.find(item => item.id === REVIEW_AGENT);
+    if (!agent || !Array.isArray(agent.permissions)) return false;
+    const rules = agent.permissions as { action?: unknown; resource?: unknown; effect?: unknown }[];
+    const denied = (action: string) => {
+      const rule = [...rules].reverse().find(item => item.action === "*" || item.action === action);
+      return rule?.resource === "*" && rule.effect === "deny";
+    };
+    return rules.some(rule => rule.action === "execute" && rule.resource === "*" && rule.effect === "deny")
+      && ["*", "execute", "read", "edit", "bash", "webfetch", "task", "question"].every(denied);
+  } catch { return false; }
 }
 
 const OPENCODE_ENV = {
@@ -283,14 +314,16 @@ export function createCliTurnLauncher(options: CliTurnLauncherOptions): Permissi
   const verified = new Map<string, Promise<boolean>>();
   const launchOf = (profile: TeamModelProfile) => reviewerCommand(profile.provider, options.agents[profile.provider]);
 
-  const openCodeToolsOff = (launch: { command: string; prefix: string[] }, env: NodeJS.ProcessEnv, cwd: string): Promise<boolean> => {
-    const key = JSON.stringify(launch);
+  const openCodeToolsOff = (launch: { command: string; prefix: string[] }, major: OpenCodeMajor, env: NodeJS.ProcessEnv, cwd: string): Promise<boolean> => {
+    const key = JSON.stringify([launch, major]);
     const cached = verified.get(key);
     if (cached) return cached;
-    const check = run(launch.command, [...launch.prefix, "--pure", "debug", "agent", REVIEW_AGENT], {
-      env: { ...env, OPENCODE_CONFIG_CONTENT: openCodeReviewerConfig("Verification.") }, cwd, timeoutMs: 60_000, maxOutput: 1024 * 1024,
+    const args = major === 2 ? ["debug", "agents", "--standalone"] : ["--pure", "debug", "agent", REVIEW_AGENT];
+    const check = run(launch.command, [...launch.prefix, ...args], {
+      env: { ...env, OPENCODE_CONFIG_CONTENT: openCodeReviewerConfig("Verification.", major) }, cwd, timeoutMs: 60_000, maxOutput: 1024 * 1024,
     }).then(result => {
       if (result.code !== 0) return false;
+      if (major === 2) return openCodeAgentsDenyEverything(result.stdout);
       const start = result.stdout.indexOf("{");
       try {
         const agent = JSON.parse(result.stdout.slice(start)) as { tools?: Record<string, unknown> };
@@ -319,11 +352,12 @@ export function createCliTurnLauncher(options: CliTurnLauncherOptions): Permissi
       try {
         chmodSync(cwd, 0o755);
         const env = { ...(options.env ?? reviewerEnvironment()) };
-        if (turn.profile.provider === "opencode" && !(await openCodeToolsOff(launch, { ...env, ...OPENCODE_ENV }, cwd))) return { ok: false, failure: "tools-offered" };
+        const major = turn.profile.provider === "opencode" ? (await readOpenCodeVersion(launch)).major : 1;
+        if (turn.profile.provider === "opencode" && !(await openCodeToolsOff(launch, major, { ...env, ...OPENCODE_ENV }, cwd))) return { ok: false, failure: "tools-offered" };
         if (await held()) return { ok: false, failure: "held" };
         const startedAt = now().toISOString();
-        const args = turn.profile.provider === "claude" ? claudeReviewerArgs(turn) : openCodeReviewerArgs(turn);
-        const childEnv = turn.profile.provider === "opencode" ? { ...env, ...OPENCODE_ENV, OPENCODE_CONFIG_CONTENT: openCodeReviewerConfig(turn.system) } : env;
+        const args = turn.profile.provider === "claude" ? claudeReviewerArgs(turn) : openCodeReviewerArgs(turn, major);
+        const childEnv = turn.profile.provider === "opencode" ? { ...env, ...OPENCODE_ENV, OPENCODE_CONFIG_CONTENT: openCodeReviewerConfig(turn.system, major) } : env;
         const parser = turn.profile.provider === "claude" ? claudeParser() : openCodeParser(turn.profile.model);
         const result = await run(launch.command, [...launch.prefix, ...args], {
           env: childEnv, cwd, timeoutMs: turn.timeoutMs, signal: turn.signal, maxOutput,

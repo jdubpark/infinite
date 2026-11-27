@@ -30,13 +30,33 @@ export function usageFromRunLine(line: unknown, model: string, now = new Date())
     providerId: slash < 0 ? model : model.slice(0, slash), modelId: slash < 0 ? model : model.slice(slash + 1) });
 }
 
+type ToolPart = { id?: unknown; partID?: unknown; tool?: unknown; callID?: unknown; state?: { status?: unknown; metadata?: { toolCalls?: unknown } } };
+
 export function toolFromRunLine(line: unknown): { tool: string; toolUseId?: string; ok: boolean } | undefined {
-  const event = line as { type?: unknown; part?: { tool?: unknown; callID?: unknown; state?: { status?: unknown } } } | null;
+  const event = line as { type?: unknown; part?: ToolPart } | null;
   if (event?.type !== "tool_use") return undefined;
   const tool = text(event.part?.tool)?.slice(0, 100);
   if (!tool) return undefined;
-  const toolUseId = text(event.part?.callID)?.slice(0, 200);
+  const toolUseId = text(event.part?.callID ?? (event.part?.partID === undefined ? undefined : event.part.id))?.slice(0, 200);
   return { tool, ...(toolUseId ? { toolUseId } : {}), ok: event.part?.state?.status !== "error" };
+}
+
+const MAX_NESTED = 200;
+
+export function nestedToolsFromRunLine(line: unknown): { tool: string; toolUseId?: string; ok: boolean }[] {
+  const event = line as { type?: unknown; part?: ToolPart } | null;
+  const parent = toolFromRunLine(event);
+  if (!parent || parent.tool !== "execute") return [];
+  const calls = event?.part?.state?.metadata?.toolCalls;
+  if (!Array.isArray(calls)) return [];
+  const nested: { tool: string; toolUseId?: string; ok: boolean }[] = [];
+  for (const [index, call] of calls.slice(0, MAX_NESTED).entries()) {
+    const entry = call as { tool?: unknown; status?: unknown } | null;
+    const tool = text(entry?.tool)?.slice(0, 100);
+    if (!tool || (entry?.status !== "completed" && entry?.status !== "error")) continue;
+    nested.push({ tool, ...(parent.toolUseId ? { toolUseId: `${parent.toolUseId}#${index}` } : {}), ok: entry.status === "completed" });
+  }
+  return nested;
 }
 
 export class JsonLineAssembler {

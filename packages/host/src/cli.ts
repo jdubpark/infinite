@@ -12,6 +12,8 @@ import {
   closeSync,
 } from "node:fs";
 import { resolve, join, dirname } from "node:path";
+import { describeOpenCodeRead, readOpenCodeVersion } from "./opencode-version.js";
+import { reviewerCommand } from "./permission-reviewer.js";
 import { homedir } from "node:os";
 import { randomBytes, randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
@@ -514,6 +516,7 @@ else if (command === "plan-fleet") {
             `${provider}: unavailable; install and authenticate on this host${hooks}${codeMode}`,
           );
         }
+        if (provider === "opencode") console.log(`opencode launch: ${describeOpenCodeRead(await readOpenCodeVersion(reviewerCommand("opencode", profile)))}`);
       }
       for (const provider of ["claude", "codex"] as const satisfies readonly CeilingProvider[]) {
         const profile = config.agents[provider];

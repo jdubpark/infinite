@@ -62,7 +62,7 @@ import { SignalIndex } from "./signal-index.js";
 import { CODEX_ENVIRONMENT_STATE_FILE, nativeCodexObserverArgs, prepareCodexWorkerExecution, startNativeCodex } from "./native-codex.js";
 import { startNativeOpenCode, validateNativeOpenCodeArgs } from "./native-opencode.js";
 import { createExecutorTunnel, type ExecutorTunnel } from "./executor-tunnel.js";
-import { JsonLineAssembler, toolFromRunLine, usageFromRunLine } from "./opencode-usage.js";
+import { JsonLineAssembler, nestedToolsFromRunLine, toolFromRunLine, usageFromRunLine } from "./opencode-usage.js";
 import { createHybridWorkspace } from "./hybrid-workspace.js";
 import { WorkerLimitWatch, WorkerScreenActivity } from "./worker-screen-activity.js";
 import { normalizeWorkerControlRequest, resolveBootstrapExecutionIdentity, teamAnswerWorkerRequestSchema, workerControlRequestSchema, workerWorkspaceExportRequestSchema,
@@ -1580,6 +1580,10 @@ server.listen(workerSocket, async () => {
           if (tool) {
             record({ kind: "tool-start", tool: tool.tool, ...(tool.toolUseId ? { toolUseId: tool.toolUseId } : {}), input: {}, quiet: true }, "protocol");
             record({ kind: "tool-end", ...tool }, "protocol");
+          }
+          for (const nested of nestedToolsFromRunLine(event)) {
+            record({ kind: "tool-start", tool: nested.tool, ...(nested.toolUseId ? { toolUseId: nested.toolUseId } : {}), input: {}, quiet: true }, "protocol");
+            record({ kind: "tool-end", ...nested }, "protocol");
           }
         }
         snapshots.observe(data);

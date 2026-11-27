@@ -248,6 +248,8 @@ The third command also checks the live branch tip before and after execution. St
 
 Infinite's normal tests include a fresh non-Node repository that starts a real digest-pinned container, reads the current working files through a bind mount and checks a deliberate failing assertion. To repeat just that qualification on an enrolled Infinite guest, run `infinite-check --runner VERIFY_LINUX -- node --import tsx --test --test-name-pattern 'fresh non-Node project' tests/cloud-check.test.ts` from the Infinite checkout. Qualify each application's own suite from its own repository.
 
+A cloud controller can also run the declared check for an enrolled branch or pull request and publish a status on its exact commit. It can recover current heads over outbound HTTPS while the workstation is asleep. A required check uses the receipt from the owning workspace. [Cloud revision controller](docs/cloud-revision-controller.md)
+
 ### Isolating workspaces that contain several repositories
 
 Provision a dedicated VM, Docker engine, disk, SSH identity and package caches for each workspace. Keep private networks and other workspaces' guests inaccessible from that VM. On each VM create a regular root-owned `/etc/infinite-check-workspace` file containing the workspace ID, writable only by root. The workstation requires confirmation of that ID over the authenticated SSH connection before sending any checkout bytes. A paired run checks that the guests and Docker engines have distinct identities. Where the test network requires an HTTP egress proxy, put its credential-free endpoint in a root-owned `/etc/infinite-check-proxy` file. The worker configures package clients and Docker builds within the disposable job home.

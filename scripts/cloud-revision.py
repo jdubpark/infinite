@@ -40,6 +40,16 @@ def private_file(path: Path) -> bytes:
     return path.read_bytes().strip()
 
 
+def launcher_digest(launcher: Path) -> str:
+    # These are the installed inputs that decide what runs on the guest.
+    inputs = [launcher, launcher.parent.parent / ".nvmrc", launcher.parent.parent / "package.json"]
+    runtime = launcher.parent / "cloud-check"
+    inputs.extend(runtime / name for name in ("bootstrap.py", "worker.py", "project.py", "workspace_policy.py",
+                                               "npm-shell.sh", "linux-runner.json"))
+    hashes = [hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None for path in inputs]
+    return canonical_digest(hashes)
+
+
 def load_config(path: Path) -> dict:
     raw = json.loads(private_file(path))
     required = {"repository", "origin", "workspace", "snapshotRoot", "runner", "refs", "mode", "command", "profileSha256", "context", "stateDirectory", "launcher", "webhookSecretFile", "githubTokenFile"}
@@ -77,7 +87,7 @@ def load_config(path: Path) -> dict:
     launcher = Path(raw["launcher"]).resolve(strict=True)
     if not launcher.is_file() or not os.access(launcher, os.X_OK):
         raise RevisionError("launcher must name the installed executable")
-    raw["launcherSha256"] = hashlib.sha256(launcher.read_bytes()).hexdigest()
+    raw["launcherSha256"] = launcher_digest(launcher)
     installed_profile = launcher.parent / "cloud-check/linux-runner.json"
     try:
         profile_value = json.loads(installed_profile.read_text(encoding="utf-8"))
@@ -303,6 +313,22 @@ def verifier_env(config: dict) -> dict:
     return keep
 
 
+def record_output(stream, job_path: Path, job: dict) -> bytes:
+    stream.flush()
+    stream.seek(0)
+    checksum = hashlib.sha256()
+    for block in iter(lambda: stream.read(65536), b""):
+        checksum.update(block)
+    job["outputSha256"] = checksum.hexdigest()
+    job["outputBytes"] = stream.tell()
+    stream.seek(max(0, job["outputBytes"] - 1024 * 1024))
+    tail = stream.read()
+    with tempfile.NamedTemporaryFile(dir=job_path.parent, delete=False) as private_log:
+        private_log.write(tail)
+    os.replace(private_log.name, job_path.with_suffix(".log"))
+    return tail
+
+
 def run_job(config: dict, state: Path, job_path: Path, api: str) -> None:
     worker_lock_path = job_path.with_suffix(".worker.lock")
     queue_lock_path = job_path.with_suffix(".queue.lock")
@@ -340,7 +366,7 @@ def run_job(config: dict, state: Path, job_path: Path, api: str) -> None:
             job["startedAt"] = int(time.time())
             atomic_json(job_path, job)
         try:
-            if hashlib.sha256(Path(config["launcher"]).read_bytes()).hexdigest() != config["launcherSha256"]:
+            if launcher_digest(Path(config["launcher"])) != config["launcherSha256"]:
                 raise RevisionError("installed launcher changed after enrollment")
             snapshot = prepare_snapshot(config, state, sha)
             check, mode = check_argv(config)
@@ -350,13 +376,9 @@ def run_job(config: dict, state: Path, job_path: Path, api: str) -> None:
             receipt_dir = effective_state_home() / config["workspace"] / "cloud-check/receipts"
             prior_receipts = {path.name for path in receipt_dir.iterdir()} if receipt_dir.is_dir() else set()
             try:
-                with tempfile.TemporaryFile(dir=state) as output:
+                with tempfile.NamedTemporaryFile(dir=state, prefix=job_path.stem + ".active-") as output:
                     completed = subprocess.run(launcher_args, cwd=snapshot, env=verifier_env(config), stdout=output, stderr=subprocess.STDOUT, check=False, timeout=24 * 60 * 60)
-                    output.flush()
-                    output.seek(0)
-                    output_bytes = output.read(16 * 1024 * 1024 + 1)
-                    if len(output_bytes) > 16 * 1024 * 1024:
-                        raise RevisionError("cloud launcher output exceeded 16 MiB")
+                    output_bytes = record_output(output, job_path, job)
             finally:
                 shutil.rmtree(snapshot, ignore_errors=True)
             exit_code = completed.returncode
@@ -367,14 +389,13 @@ def run_job(config: dict, state: Path, job_path: Path, api: str) -> None:
             record = verify_receipt(config, sha, exit_code, output_bytes, check, mode, prior_receipts)
             job["result"] = "success" if exit_code == 0 else "failure"
             job["description"] = "Cloud verification passed" if exit_code == 0 else "Cloud verification failed"
-            job["outputSha256"] = hashlib.sha256(output_bytes).hexdigest()
             job["receiptSha256"] = hashlib.sha256(json.dumps(record, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         except Exception as error:
             job["result"] = "error"
             job["runner"] = config["runner"]
             job["profileSha256"] = config["profileSha256"]
             job["description"] = "Cloud verification could not complete"
-            job["error"] = type(error).__name__
+            job["error"] = f"{type(error).__name__}: {str(error)[:500]}"
         job["completedAt"] = int(time.time())
         with queue_lock_path.open("a+b") as queue_lock:
             fcntl.flock(queue_lock, fcntl.LOCK_EX)

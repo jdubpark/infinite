@@ -253,6 +253,10 @@ export type GoalVerdictView = {
   detail: "available" | "expired";
 };
 
+export type MetricPoint = { cycle: number; run: string; revision: number; head: string; value: number; at: string };
+export type MetricSeries = { command: string; label?: string; name: string; configured: boolean; points: MetricPoint[] };
+export type GoalMetricsView = { series: MetricSeries[]; omittedSeries: number; omittedValues: number; dropped: number };
+
 export type RepairLoopCause = "review" | "check" | "delivery";
 export type RepairLoopOutcome = "resolved" | "blocked" | "cancelled" | "superseded" | "unresolved" | "in-progress";
 export type RepairEventCoverage = "complete" | "incomplete";

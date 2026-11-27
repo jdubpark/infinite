@@ -3065,7 +3065,17 @@ block or a host stop) ends the command in one of two ways. Without a command
 prefix the host kills the command's process group at once. Under a command
 prefix the host sends SIGTERM to the process group, and SIGKILL five seconds
 later if that process still runs, because a prefix such as `sudo` passes on the
-signals it can catch and cannot pass on SIGKILL. A command whose stop comes
+signals it can catch and cannot pass on SIGKILL. Under a prefix, setup and
+check commands and the main check's commands run behind a small shell anchor,
+which the prefix starts in place of the command. The anchor gives the command
+its input and exits with the command's status. On SIGTERM, SIGHUP, SIGINT or
+SIGQUIT it sends SIGTERM to its own process group, which holds the command and
+the processes the command started, and SIGKILL to that group five seconds
+later. So a process that ignores SIGTERM still ends about five seconds after
+the stop, unless it moved to a process group or session of its own. Other
+prefixed commands, such as Git and workspace removal, run without the anchor.
+Without a prefix there is no anchor: the group SIGKILL already ends every
+process in the group. A command whose stop comes
 before its start, for example while it waits for its turn to start, is never
 started: it returns as interrupted, with no output. Once that process has exited, the host sends
 no signal to anything the command started: the group may be empty by then, and
@@ -3101,7 +3111,10 @@ Second, under a command prefix that runs the command as another account, the
 stop reaches only part of the command. Measured with sudo 1.9.15p5 started
 without a terminal, with and without `use_pty`: `sudo` passes the SIGTERM to the
 command's first process only, the processes that process started get no signal,
-and a SIGKILL ends `sudo` while the command keeps running. Neither a delivered
+and a SIGKILL ends `sudo` while the command keeps running. For setup and check
+commands that first process is the anchor, so the stop reaches the processes in
+the anchor's group as described above, and a process outside that group gets no
+signal. Neither a delivered
 signal nor closed output shows that such a command ended. A setup or check
 command stopped under a prefix therefore fails its operation with
 `command-stop-unconfirmed` in every case: when its output closes, and at the
@@ -3122,7 +3135,10 @@ or check, no member, and no workspace removal. Resume and steering answer
 `team-command-running` (409) until then. Each of these requests takes a fresh
 look before it enters the run's queue; requests that arrive during a look share
 it, and the run's other requests are answered meanwhile. The host also looks
-once right after it records the failure, and the retention sweep looks every
+once after it records the failure: at once without a command prefix, and under
+a prefix seven seconds later, which is at least two seconds after the anchor's
+SIGKILL, so that the look does not find the anchor's group still ending. The
+retention sweep looks every
 ten minutes. The run shows as resumable once a look has found the operation
 ended.
 
@@ -3960,7 +3976,7 @@ Limits of this first slice, stated in full:
 - If the host's API process ends before it has recorded the end of the check, for example when it crashes or is killed, in the short window while a command of the check is starting, the run directory is not removed until the host boots again, and no main check on the host starts until then: that project waits on `processes` and the others on `another-check`. An orderly stop records the end of a running check first. Once the end is recorded, the record holds the process id of every command the check started, even while the host still reads a command's start time, and the copy is removed once a census finds nothing of the run, without a reboot. Earlier versions also held the copy until the next boot when the host stopped after recording the end, while it still read a command's start time. A copy held that way at the upgrade still waits for the host to boot again. The record does not say whether the end of the check or a host start after a crash marked such a copy, and only a host start can leave a command's process id out of the record.
 - Preparing the copy has no time limit of its own. It ends by the Git helpers' own limits, a halt, or a host stop.
 - Two different heads observed with the same stamp are ordered by their results' order in the record. Fetches of one mirror are serial, so their stamps differ in practice.
-- The host may not signal a command that the command prefix runs as another account. A halt, a time limit or a host stop reaches it only as far as the prefix passes the SIGTERM on: `sudo` passes it to the command's first process, not to the processes that process started. The check is recorded as an error ten seconds later, the command runs on, and no main check on the host starts until the command has ended: that project waits on `processes` and the others on `another-check`. A team's checks have the same limit.
+- The host may not signal a command that the command prefix runs as another account. A halt, a time limit or a host stop reaches it only as far as the prefix passes the SIGTERM on: `sudo` passes it to the command's first process only. That process is the anchor described under the team command runner: it sends SIGTERM to its process group and SIGKILL five seconds later, so a process outside that group gets no signal. When the check's output is still open ten seconds after the stop, the check is recorded as an error, the command runs on, and no main check on the host starts until the command has ended: that project waits on `processes` and the others on `another-check`. A team's checks have the same limit.
 - The host learns that a command's process has exited when its event loop next runs. A stop that the host handles before it has learned of the exit is a stop of a running command, and it signals the command's process group.
 - The census cannot inspect some processes of the host's account and of the account that runs commands; on Linux a login session has such processes (its service manager and its SSH processes). When it admits a check, the host takes a census of a path under the team root that no copy uses (`main-check-gate`), and records each process that census cannot inspect by its id and start time, at most 256 of them, in a sealed anchor of that copy (`main-check-anchors/` in the host state directory). A process that names the team root in its arguments is recorded like any other. If `main-check-gate` under the team root is a symbolic link or another project's folder, a process the census cannot inspect that names that folder in its arguments is not recorded and holds the copy until it ends; this can delay a removal, never cause an early one. When it retires the copy, it disregards a process it cannot inspect only if the copy's anchor names the same id with the same start time, on the boot the check started in. Every other process it cannot inspect keeps the copy from being removed for as long as that process runs, whether or not a check started it: one that started after the admission, one past the first 256, one that received the id of an anchored process, and all of them when the anchor is missing or cannot be read. No main check on the host starts meanwhile: that project waits on `processes` and the others on `another-check`. A host that runs under a login account therefore also waits on a login session that starts while a copy waits; run the host under an account of its own, as the Ubuntu deployment does. A process that the account only started and that runs as another account, such as a `sudo` process, is not one of them. The anchor is deleted after the record no longer names the copy; after a host start, once every main-check record can be read, the host deletes every anchor that no record names.
 - An anchor is not an inspection. A process of the account that runs commands that was alive and could not be inspected before the admission enters the anchor without any tampering, for example a process that a team run's checks left behind, and the census never examines it while it stays that way: if it uses the copy, the copy is removed while it runs. A process that cannot be inspected and starts after the admission holds the copy until it ends, at every pass, so such processes that keep arriving during the wait extend it. On a machine where other login sessions of the account start at any time, such as a shared test runner, a copy can therefore wait for as long as each new session lasts.

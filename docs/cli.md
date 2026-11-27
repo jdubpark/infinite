@@ -234,10 +234,12 @@ watch prints again only when the visible text changes. `--logs` starts in the
 review log, `--board` starts in the blackboard entry view, and
 `infinite team status TEAM_ID --logs` prints the current revision's logs once.
 `team processes-ended` states, as the owner, that the processes of a stopped
-setup or check command have ended, for a run whose process census cannot tell;
-see [Goals and agent teams](teams.md). `team delete` removes a settled
-cancelled, merged, or no-change run and its workspace. Repeating the command after removal prints `already removed` and
-exits successfully. `--json` prints the final team record. See [Goals and agent teams](teams.md) for the
+setup or check command, or the processes an earlier command left behind, have
+ended, for a run whose process census cannot tell; see
+[Goals and agent teams](teams.md). `team delete` removes a settled cancelled,
+merged, or no-change run and its workspace. Repeating the command after removal
+prints `already removed` and exits successfully. `--json` prints the final team
+record. See [Goals and agent teams](teams.md) for the
 full key list.
 
 `repo init` takes these source and delivery options:

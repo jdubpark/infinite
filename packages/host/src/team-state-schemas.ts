@@ -392,6 +392,9 @@ export type TeamPendingOperation = {
   kind: "prepare" | "member" | "result" | "check";
   revision: number;
 } & TeamPendingOperationFailure & TeamPendingOperationSource & TeamPendingOperationCensus;
+export type TeamLeftoverProcesses =
+  | { since: string; state: "unchecked"; checkedAt?: never }
+  | { since: string; state: "running" | "in-use" | "unknown"; checkedAt: string };
 export function buildTeamPendingOperation(input: {
   id: string;
   kind: TeamPendingOperation["kind"];

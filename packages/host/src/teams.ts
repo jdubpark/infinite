@@ -9,6 +9,7 @@ import { dirname, join, relative, resolve } from "node:path";
 import { type Config, type Session, isEvalSession } from "./types.js";
 import { TeamStopRefused, type Manager } from "./manager.js";
 import { extendWitness, hostProcesses, newWitness, recordCommand, type HostProcesses, type ProcessWitness } from "./process-census.js";
+import { leftoverView, notedLeftover, settledLeftover, type StoredLeftover } from "./team-leftover.js";
 import type { WorkerError } from "./ipc.js";
 import { writeSealed, unseal } from "./vault.js";
 import { accountSettingPrompt, PROVIDER_NAMES, recoveryTurnEnd, type AttentionState, type Prompt, type SignalData } from "@infinite/attention";
@@ -52,7 +53,7 @@ import type { ProjectSourceService } from "./project-source.js";
 import type { RepositoryGraphs, RepositoryGraphResult } from "./repository-graphs.js";
 import { LEGACY_READ_ONLY_ROLE_CHANGED_FILES_REASON, TeamError, assertMemberReadOnly, assertMemberScope, assertTeamPath, captureDeliveryBaseline, captureMemberResult, ensureDefaultTeamRoot, ensureHostDirectory, integrateMemberResult, prepareMemberScratch, prepareMemberWorkspace, prepareRecoveryWorkspaceFromSource, prepareTeamWorkspace, prepareTeamWorkspaceFromMirror, prepareVerificationWorkspace, commandScope, type CommandResult, type CommandScope, CommandStopUnconfirmed, teamOperationCommand, teamCommand, teamHead, teamWorkspacePath, teamGitArgs, validateTeamPlan, writeTeamContext } from "./team-workspace.js";
 import { assertTeamworkPath } from "./repo-enrollment.js";
-import { CommandFence, HALT_CENSUS_MS, commandStopReasons, ownerStatementEvent, stopFenceLifted, stopFenced, type OwnerStatement, type TakenCensus } from "./team-command-fence.js";
+import { CommandFence, HALT_CENSUS_MS, commandStopReasons, stopFenceLifted, stopFenced, type OwnerStatement, type TakenCensus } from "./team-command-fence.js";
 import { HOST_LOAD_REASON_PREFIX, LaunchHeldError } from "./host-load.js";
 import { permissionEvidenceHash } from "./team-permissions.js";
 import { storageShortfall, volumeUsage, type VolumeUsage } from "./storage.js";
@@ -127,6 +128,7 @@ export type Stored = {
   deliveryReviewApproval?: DeliveryReviewApproval;
   retention?: RetentionState;
   census?: OperationCensus;
+  leftover?: StoredLeftover;
   outbox?: OutboxEvent[];
   ledgerStatus?: TeamRun["status"];
   permissionTaskEnded?: true;
@@ -168,7 +170,7 @@ const clock = (iso: string) => `${iso.slice(11, 16)} UTC`;
 export const memberTimeLimitReason = "An agent exceeded its one-hour runtime limit. Its workspace was preserved.";
 export const memberStallReason = MEMBER_STALL_REASON;
 export const checkTimeoutReason = "A configured check ran past the team check time limit (teams.checkMinutes) and was stopped. No correction round was used; the integrated work was preserved.";
-export const commandLeftoverEvent = "A configured command exited while a process it started still held its output. The host judged the command by its exit code and neither waited for that process nor stopped it.";
+export const commandLeftoverEvent = "A configured command exited while a process it started still held its output. The host judged the command by its exit code and neither waited for that process nor stopped it. It keeps this run's directories until a process census finds none of that command's processes.";
 export const repeatedCheckFailureReason = "The same required verification command failed again against an unchanged integration commit. No further identical repair was attempted; inspect the check output and continue with owner direction.";
 const repairLimitReason = "The team exhausted its two correction rounds. Review the check and agent evidence before continuing manually.";
 const promptTooLargeReason = "The accumulated team requirements exceed the prompt limit. Start a new team with consolidated requirements.";
@@ -597,7 +599,7 @@ export class TeamService {
     const workers = { limit: run.parallelism, max, running: members.filter(member => holdsWorkerSlot(member, run.revision)).length, ready };
     const providerLimits = this.limits.active(this.currentDate());
     const waitReasons = describeTeamWaitReasons({ ...safeRun, members: withUsage.members }, providerLimits, this.currentDate().getTime());
-    return { ...safeRun, ...(this.publisher.isPublicationPending(stored) ? { publishing: true } : {}), ...(stored.pending ? { pendingOperation: buildTeamPendingOperation({ id: stored.pending.id, kind: stored.pending.kind, revision: stored.pending.revision, failure: stored.pending.failure, source: stored.pending.source, census: stored.census?.pendingId === stored.pending.id ? stored.census : undefined }) } : {}), tasks: safeRun.tasks.map(task => {
+    return { ...safeRun, ...(this.publisher.isPublicationPending(stored) ? { publishing: true } : {}), ...(stored.pending ? { pendingOperation: buildTeamPendingOperation({ id: stored.pending.id, kind: stored.pending.kind, revision: stored.pending.revision, failure: stored.pending.failure, source: stored.pending.source, census: stored.census?.pendingId === stored.pending.id ? stored.census : undefined }) } : {}), ...(stored.leftover ? { leftoverProcesses: leftoverView(stored.leftover) } : {}), tasks: safeRun.tasks.map(task => {
       const revision = task.revision ?? safeRun.revision;
       const attempts = withUsage.members.filter(member => member.taskId === task.id && member.revision === revision);
       const usage = attempts.flatMap(member => member.usage?.messages ? [member.usage] : []);
@@ -752,7 +754,13 @@ export class TeamService {
   }
   private event(stored: Stored, text: string) { runEvent(stored.run, text); }
   private async noteLeftover(stored: Stored, result: CommandResult) {
-    if (result.leftover) await this.enqueue(stored.run.id, () => { if (!this.closed) { this.event(stored, commandLeftoverEvent); this.save(stored); } });
+    if (!result.leftover) return;
+    await this.enqueue(stored.run.id, () => {
+      if (this.closed) return;
+      stored.leftover = notedLeftover(stored.leftover, stored.pending?.witness, stored.pending?.id, timestamp());
+      this.event(stored, commandLeftoverEvent);
+      this.save(stored);
+    });
   }
   list(): TeamView[] { return [...this.records.values()].filter(stored => !stored.run.replay).map(record => this.view(record)).sort((a, b) => b.createdAt.localeCompare(a.createdAt)); }
   listItems(): TeamListItem[] { return this.list().map(teamListItem); }
@@ -872,7 +880,7 @@ export class TeamService {
       publicationTarget: stored => service.publicationTarget(stored),
       needsPublication: stored => service.needsPublication(stored),
       startPublication: stored => service.startPublication(stored),
-      refreshOperationCensus: (stored, force) => service.fence.refresh(stored, force),
+      refreshOperationCensus: (stored, force, withLeftover) => service.fence.refresh(stored, force, withLeftover),
       get fence() { return service.fence; },
       closeStaleBlockedRun: (stored, hours) => service.closeStaleBlockedRun(stored, hours),
       onBackgroundTask: () => service.diag.idle.bump(),
@@ -1427,20 +1435,17 @@ export class TeamService {
   processesEnded(id: string, input: TeamProcessesEnded) {
     const body = teamProcessesEndedSchema.parse(input), fingerprint = receiptDigest({ operation: "processes-ended", ...body });
     const replayed = this.records.get(id)?.receipts[body.requestId] === fingerprint;
-    return (replayed ? Promise.resolve(undefined) : this.fence.take(id, true)).then(taken => this.enqueue(id, async () => {
+    return (replayed ? Promise.resolve(undefined) : this.fence.take(id, true, true)).then(taken => this.enqueue(id, async () => {
       const stored = this.record(id), pending = stored.pending, prior = stored.receipts[body.requestId];
       if (prior) {
         if (prior !== fingerprint) throw new TeamError(409, "request-conflict", "This request ID belongs to a different team action.");
         return this.view(stored);
       }
-      if (!pending?.witness) throw new TeamError(409, "team-no-process-record", "This run holds no record of an operation's processes for the owner to state as ended.");
+      if (!pending?.witness && !stored.leftover) throw new TeamError(409, "team-no-process-record", "This run holds no record of an operation's processes, or of processes an earlier command left behind, for the owner to state as ended.");
       const state = taken && this.fence.apply(stored, taken);
       if (state === undefined) throw new TeamError(409, "team-operation-running", "The run's operation is running, or changed during the host's census. Retry the statement after it settles.");
-      if (state === "running" || state === "in-use") throw new TeamError(409, "team-command-running", "The host still sees processes of this run's operation, or processes using its directory, so it does not accept the statement. Retry after they have exited.");
-      if (state === "unknown") {
-        pending.processesEnded = { requestId: body.requestId, at: timestamp(), detail: stored.census?.detail ?? "" };
-        this.event(stored, ownerStatementEvent(pending.kind, pending.processesEnded.detail));
-      }
+      if (state === "running" || state === "in-use") throw this.fence.busy(stored);
+      if (state === "unknown") this.fence.state(stored, body.requestId);
       stored.receipts[body.requestId] = fingerprint;
       this.save(stored);
       this.trackBlocked(stored);
@@ -1855,6 +1860,7 @@ export class TeamService {
     void commandScope.run(this.commandRecorder(stored, pending.id), () => perform(controller.signal)).then(value => this.enqueue(stored.run.id, () => {
       if (this.closed || stored.pending?.id !== pending.id) return;
       this.commands.delete(stored.run.id);
+      stored.leftover = settledLeftover(stored.leftover, pending);
       try { this.assertBudget(stored.run); } catch (error) { this.block(stored, error); return; }
       if (stored.run.stopReason) { this.block(stored, new TeamError(409, "goal-budget-exhausted", "The goal exhausted its execution budget.")); return; }
       const held = ["paused", "cancelled", "blocked"].includes(stored.run.status) ? stored.run.status : undefined;
@@ -1866,6 +1872,7 @@ export class TeamService {
       if (this.closed || stored.pending?.id !== pending.id) return;
       this.commands.get(stored.run.id)?.abort();
       this.commands.delete(stored.run.id);
+      stored.leftover = settledLeftover(stored.leftover, pending);
       const failed = stored.pending, recorder = this.recorderOf(stored, failed);
       if (recorder?.spawning === 0 && (process.platform !== "win32" || recorder.inFlight === 0)) delete failed.recording;
       failed.failure = { code: error instanceof TeamError ? error.code : "workspace-operation-failed",

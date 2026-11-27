@@ -38,6 +38,7 @@ import {
   type TeamCheck,
   type TeamCommand,
   type TeamDecision,
+  type TeamLeftoverProcesses,
   type TeamMemberSavedWork,
   type TeamPendingOperation,
   type TeamPermissionAgentDecision,
@@ -788,6 +789,7 @@ export interface TeamWaitReason {
 export type TeamView = Omit<TeamRun, "members" | "permissionDecisions" | "permissionRecovery"> & {
   lastActivityAt: string;
   pendingOperation?: TeamPendingOperation;
+  leftoverProcesses?: TeamLeftoverProcesses;
   publishing?: boolean;
   members: Omit<TeamMember, "prompt" | "contextFeedback" | "nativeSessionId" | "continuation" | "turns" | "pendingFeedback" | "goalCriteriaPlan">[];
   permissionDecisions?: Omit<TeamPermissionDecision, "prompt" | "coordinatorSessionId">[];

@@ -97,6 +97,19 @@ export function extendWitness(witness: ProcessWitness, table: ProcessTable): boo
   }
   return changed;
 }
+export function mergeWitness(base: ProcessWitness, extra: ProcessWitness): ProcessWitness {
+  if (base.boot !== extra.boot) return structuredClone(extra.boot === bootId() ? extra : base);
+  const merged = structuredClone(base);
+  for (const recorded of extra.processes) {
+    if (merged.processes.some(known => known.pid === recorded.pid && known.start === recorded.start)) continue;
+    if (merged.processes.length >= WITNESS_LIMIT) markOverflow(merged);
+    else merged.processes.push({ pid: recorded.pid, start: recorded.start });
+  }
+  for (const session of extra.sessions) addUnique(merged, merged.sessions, session);
+  for (const group of extra.groups) addUnique(merged, merged.groups, group);
+  if (extra.overflow) markOverflow(merged);
+  return merged;
+}
 export function witnessFindings(witness: ProcessWitness, table: ProcessTable): CensusFinding[] {
   if (table.boot !== witness.boot) return [];
   const findings: CensusFinding[] = [];

@@ -1,0 +1,16 @@
+{
+  "repository": "OWNER/REPOSITORY",
+  "origin": "git@github.com:OWNER/REPOSITORY.git",
+  "workspace": "WORKSPACE_ID",
+  "snapshotRoot": "/srv/infinite/workspaces/REPOSITORY",
+  "runner": "RUNNER_ALIAS",
+  "refs": ["refs/heads/main"],
+  "mode": "npm",
+  "command": ["npm", "run", "check"],
+  "profileSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "context": "infinite/cloud-check",
+  "stateDirectory": "/var/lib/infinite-revision/REPOSITORY",
+  "launcher": "/usr/local/bin/infinite-check",
+  "webhookSecretFile": "/etc/infinite/cloud-revision/webhook-secret",
+  "githubTokenFile": "/etc/infinite/cloud-revision/status-token"
+}

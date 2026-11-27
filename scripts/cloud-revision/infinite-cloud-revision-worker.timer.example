@@ -1,0 +1,11 @@
+[Unit]
+Description=Retry queued Infinite cloud revision checks
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=30s
+Persistent=true
+Unit=infinite-cloud-revision-worker.service
+
+[Install]
+WantedBy=timers.target

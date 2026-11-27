@@ -1,7 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import {
-  answerGate, createQueueState, formatAnswer, kindLabel, moveQueue, orderedChoices, queueEntryLabel, reconcileQueue,
+  answerGate, answerSend, apiPath, controlStep, createQueueState, decisionForPath, hideCompleted, formatAnswer, kindLabel, moveQueue, orderedChoices, queueEntryLabel, reconcileQueue,
   removeAnswered, settleAnsweredKeys, toggleChoice, visibleDecisions, QUEUE_SCREEN_POLL_MS, type QueueDecision,
 } from "../apps/mobile/src/features/queue/model.ts";
 
@@ -18,8 +19,36 @@ const session = (terminalOnly?: true, team?: { id: string; title: string; role: 
 });
 const stamp = "2026-11-27T10:00:00.000Z";
 
-test("the screen polls no faster than the web queue page", () => {
+test("the screen polls no faster than the web queue page, and the hook uses that interval", () => {
   assert.ok(QUEUE_SCREEN_POLL_MS >= 1800);
+  const hook = readFileSync(new URL("../apps/mobile/src/features/queue/useDecisionQueue.ts", import.meta.url), "utf8");
+  assert.match(hook, /usePoll\(async \(\): Promise<Read> => \{[\s\S]*?\}, QUEUE_SCREEN_POLL_MS, \[connection\]\)/);
+  const session = readFileSync(new URL("../apps/mobile/src/features/queue/QueueSessionAnswer.tsx", import.meta.url), "utf8");
+  assert.match(session, /\}, QUEUE_SESSION_POLL_MS, \[connection, id\]\)/);
+});
+
+test("a team or mission answer sends the trimmed text to the host path with the decision's revision, and nothing for blank text", () => {
+  const decision = team("1", stamp) as Extract<QueueDecision, { kind: "team" }>;
+  assert.deepEqual(answerSend(decision, "  b \n"), { path: "/teams/t/decisions/1/answer", label: "Answer", revision: 3, fields: { text: "b" } });
+  assert.equal(answerSend(decision, "   "), undefined);
+  assert.equal(apiPath("/api/missions/m/answer/9"), "/missions/m/answer/9");
+  assert.equal(apiPath("/missions/m"), "/missions/m");
+  const decisions = [team("1", stamp), mission("2")];
+  assert.equal(decisionForPath(decisions, "/missions/m/answer/2")?.key, "mission:m:2");
+  assert.equal(decisionForPath(decisions, "/missions/m/answer/3"), undefined);
+});
+
+test("a decision whose answer completed while the screen was closed stays hidden when it is read again", () => {
+  const done = (key: string) => key === "k2";
+  assert.deepEqual([...hideCompleted(new Map(), 7, ["k1", "k2"], done)], [["k2", 7]]);
+  assert.deepEqual([...hideCompleted(new Map([["k1", 9]]), 7, ["k1"], () => false)], [["k1", 9]]);
+});
+
+test("answering an input-control session needs an explicit take-control step and never takes over silently", () => {
+  assert.deepEqual(controlStep({ requiresControl: false, hasLease: false }), { kind: "none" });
+  assert.deepEqual(controlStep({ requiresControl: true, hasLease: false }), { kind: "take", takeover: false });
+  assert.deepEqual(controlStep({ requiresControl: true, hasLease: false, holderLabel: "Laptop" }), { kind: "take", takeover: true });
+  assert.deepEqual(controlStep({ requiresControl: true, hasLease: true }), { kind: "ready" });
 });
 
 test("the recommended answer comes first except in approval mode", () => {

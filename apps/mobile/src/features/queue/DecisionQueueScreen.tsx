@@ -11,23 +11,23 @@ import { theme } from "../../theme";
 import { runRequests } from "../../store/requests";
 import { useRunRequest } from "../teams/useRunRequest";
 import { t } from "../teams/parts";
-import { answerGate, createQueueState, kindLabel, moveQueue, reconcileQueue, removeAnswered, toggleChoice, type QueueDecision } from "./model";
+import { answerGate, answerSend, createQueueState, decisionForPath, kindLabel, moveQueue, queueRequestKey, QUEUE_ME_POLL_MS, reconcileQueue, removeAnswered, SWAP_GUARD_MS, toggleChoice, type QueueDecision } from "./model";
 import { QueueChoices } from "./QueueChoices";
 import { QueueSessionAnswer } from "./QueueSessionAnswer";
 import { useDecisionQueue } from "./useDecisionQueue";
 
-const requestKey = (machine: string, key: string) => `queue/${machine}/${key}`;
-const apiPath = (answerPath: string) => answerPath.startsWith("/api/") ? answerPath.slice(4) : answerPath;
 
 export function DecisionQueueScreen({ connection }: { connection: Connection }) {
   const router = useRouter();
   const machine = connectionKey(connection);
   const feed = useDecisionQueue(connection);
-  const me = usePoll(() => api<Me>(connection, "/me"), 30000, [connection]);
+  const me = usePoll(() => api<Me>(connection, "/me"), QUEUE_ME_POLL_MS, [connection]);
   const [state, setState] = useState(() => createQueueState());
   const [sessionSending, setSessionSending] = useState(false);
   const known = useRef<string[]>([]);
-  const now = useClock(30000);
+  const [recorded, setRecorded] = useState("");
+  const [armedKey, setArmedKey] = useState<string>();
+  const now = useClock(QUEUE_ME_POLL_MS);
   const [seenDecisions, setSeenDecisions] = useState<QueueDecision[] | null>(null);
   if (feed.decisions !== seenDecisions) {
     setSeenDecisions(feed.decisions);
@@ -40,19 +40,28 @@ export function DecisionQueueScreen({ connection }: { connection: Connection }) 
   useEffect(() => {
     if (!feed.decisions) return;
     const listed = new Set(feed.decisions.map(decision => decision.key));
-    for (const key of known.current) if (!listed.has(key)) runRequests.clear(requestKey(machine, key));
+    for (const key of known.current) if (!listed.has(key)) runRequests.clear(queueRequestKey(machine, key));
     known.current = [...listed];
   }, [feed.decisions, machine]);
 
   const { confirmAnswered, refresh } = feed;
+  const activeKey = active?.key;
+  const swapped = state.activeLeft;
+  useEffect(() => {
+    if (!swapped || !activeKey) return;
+    const timer = setTimeout(() => setArmedKey(activeKey), SWAP_GUARD_MS);
+    return () => clearTimeout(timer);
+  }, [swapped, activeKey]);
   const settle = useCallback((key: string) => {
+    setRecorded("Answer recorded.");
+    setTimeout(() => setRecorded(""), 5000);
     confirmAnswered(key);
     setState(previous => removeAnswered(previous, key));
     refresh();
   }, [confirmAnswered, refresh]);
-  const run = useRunRequest<{ id: string; revision: number }>(connection, requestKey(machine, active?.key ?? ""), {
+  const run = useRunRequest<{ id: string; revision: number }>(connection, queueRequestKey(machine, active?.key ?? ""), {
     accepted: (_result, request) => {
-      const answered = state.decisions.find(decision => apiPath(decision.answerPath) === request.path);
+      const answered = decisionForPath(state.decisions, request.path);
       if (answered) settle(answered.key);
     },
     refused: feed.refresh,
@@ -61,7 +70,7 @@ export function DecisionQueueScreen({ connection }: { connection: Connection }) 
   const promptAnswers = me.data?.capabilities?.answer !== false;
   const permitted = role !== undefined && role !== "viewer" && promptAnswers;
   const gate = active && me.data ? answerGate({ decision: active, role, promptAnswers, online: feed.online }) : undefined;
-  const canAnswer = gate?.kind === "answer";
+  const canAnswer = gate?.kind === "answer" && (!swapped || armedKey === activeKey);
   const navigationLocked = run.busy || sessionSending;
   const index = active ? state.decisions.findIndex(decision => decision.key === active.key) : -1;
   const waited = active && now ? age(active.since, now).replace(/^now$/, "under a minute") : "";
@@ -69,7 +78,8 @@ export function DecisionQueueScreen({ connection }: { connection: Connection }) 
   const openSession = (id: string) => router.push({ pathname: "/session/[id]", params: { id, machine } });
   const projectName = (id?: string) => id ? projects?.find(project => project.id === id)?.name ?? id : "";
   const sendText = (decision: Exclude<QueueDecision, { kind: "session" }>, text: string) => {
-    if (decision.key === active?.key && canAnswer && text.trim()) run.send(apiPath(decision.answerPath), "Answer", decision.revision, { text: text.trim() });
+    const send = answerSend(decision, text);
+    if (decision.key === active?.key && canAnswer && send) run.send(send.path, send.label, send.revision, send.fields);
   };
 
   return <View style={s.fill}>
@@ -79,6 +89,7 @@ export function DecisionQueueScreen({ connection }: { connection: Connection }) 
       refreshControl={<RefreshControl refreshing={feed.refreshing} onRefresh={feed.refresh} tintColor={theme.colors.forest} colors={[theme.colors.forest]} />}>
       <Text style={s.title} accessibilityRole="header">Decisions</Text>
       <Text style={t.note}>One at a time, oldest first. Nothing is sent until you choose an answer.</Text>
+      {recorded ? <Text style={t.note} accessibilityRole="alert" accessibilityLiveRegion="polite">{recorded}</Text> : null}
       {feed.unavailable ? <Text style={t.body} accessibilityRole="alert">This host has no decision queue. Update it to answer decisions here.</Text>
         : !feed.decisions ? <Text style={t.note} accessibilityRole="alert">{feed.loading ? "Reading decisions…" : "The decision queue could not be read. Pull down to try again."}</Text>
         : !active ? <Text style={s.empty}>No decisions wait on you.</Text>

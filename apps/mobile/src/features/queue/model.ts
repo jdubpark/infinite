@@ -17,6 +17,9 @@ export type QueueDecision =
 export type DecisionQueue = { decisions: QueueDecision[] };
 
 export const QUEUE_SCREEN_POLL_MS = 2000;
+export const QUEUE_SESSION_POLL_MS = 2000;
+export const QUEUE_ME_POLL_MS = 30000;
+export const SWAP_GUARD_MS = 400;
 export const QUEUE_COUNT_POLL_MS = 10000;
 export const ANSWERED_RESTORE_READ = 5;
 
@@ -27,7 +30,8 @@ export function createQueueState(decisions: readonly QueueDecision[] = []): Queu
 }
 
 function selectionShape(decision: QueueDecision | undefined): string {
-  if (!decision || decision.kind === "session") return decision ? JSON.stringify([decision.prompt.id, decision.terminalOnly]) : "";
+  if (!decision) return "";
+  if (decision.kind === "session") return JSON.stringify([decision.prompt.id, decision.terminalOnly, decision.prompt.options.map(option => [option.index, option.label, option.role])]);
   return JSON.stringify([decision.revision, decision.decision.answerMode, decision.decision.options, decision.decision.recommendation?.answers]);
 }
 
@@ -114,4 +118,37 @@ export function queueEntryLabel(count: number | undefined): string {
 export function kindLabel(decision: QueueDecision): string {
   if (decision.kind === "session") return decision.origin.team ? "Member approval" : "Session prompt";
   return decision.kind === "team" ? "Team decision" : "Mission decision";
+}
+
+export const queueRequestKey = (machine: string, key: string) => `queue/${machine}/${key}`;
+export const apiPath = (answerPath: string) => answerPath.startsWith("/api/") ? answerPath.slice(4) : answerPath;
+
+export type QueueAnswerSend = { path: string; label: string; revision: number; fields: { text: string } };
+
+export function answerSend(decision: Exclude<QueueDecision, { kind: "session" }>, text: string): QueueAnswerSend | undefined {
+  const trimmed = text.trim();
+  return trimmed ? { path: apiPath(decision.answerPath), label: "Answer", revision: decision.revision, fields: { text: trimmed } } : undefined;
+}
+
+export function decisionForPath(decisions: readonly QueueDecision[], path: string): QueueDecision | undefined {
+  return decisions.find(decision => apiPath(decision.answerPath) === path);
+}
+
+export function hideCompleted(
+  hidden: ReadonlyMap<string, number>,
+  read: number,
+  listed: readonly string[],
+  completed: (key: string) => boolean,
+): Map<string, number> {
+  const next = settleAnsweredKeys(hidden, read, new Set(listed));
+  for (const key of listed) if (!next.has(key) && completed(key)) next.set(key, read);
+  return next;
+}
+
+export type ControlStep = { kind: "none" } | { kind: "take"; takeover: boolean } | { kind: "ready" };
+
+export function controlStep(input: { requiresControl: boolean; hasLease: boolean; holderLabel?: string }): ControlStep {
+  if (!input.requiresControl) return { kind: "none" };
+  if (input.hasLease) return { kind: "ready" };
+  return { kind: "take", takeover: input.holderLabel !== undefined };
 }

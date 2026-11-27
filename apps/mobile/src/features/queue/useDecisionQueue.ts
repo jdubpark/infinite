@@ -1,7 +1,9 @@
 import { useMemo, useRef, useState } from "react";
-import { api, ApiError, type Connection } from "../../api/client";
+import { useIsFocused } from "expo-router";
+import { api, ApiError, connectionKey, type Connection } from "../../api/client";
 import { usePoll } from "../../api/usePoll";
-import { QUEUE_COUNT_POLL_MS, QUEUE_SCREEN_POLL_MS, settleAnsweredKeys, visibleDecisions, type DecisionQueue } from "./model";
+import { runRequests } from "../../store/requests";
+import { hideCompleted, QUEUE_COUNT_POLL_MS, QUEUE_SCREEN_POLL_MS, queueRequestKey, visibleDecisions, type DecisionQueue } from "./model";
 
 type Read = { queue: DecisionQueue | null; read: number };
 
@@ -15,31 +17,37 @@ async function readQueue(connection: Connection): Promise<DecisionQueue | null> 
 }
 
 export function useDecisionQueue(connection: Connection) {
+  const machine = connectionKey(connection);
   const readNumber = useRef(0);
-  const answered = useRef(new Map<string, number>());
+  const focused = useIsFocused();
   const [hidden, setHidden] = useState<ReadonlyMap<string, number>>(() => new Map());
-  const publish = (next: Map<string, number>) => {
-    answered.current = next;
-    setHidden(next);
-  };
+  const [settledFor, setSettledFor] = useState<Read | null>(null);
+  const [blurredAt, setBlurredAt] = useState<{ data: Read | null } | null>(null);
   const poll = usePoll(async (): Promise<Read> => {
     const read = ++readNumber.current;
-    const queue = await readQueue(connection);
-    if (queue) {
-      const settled = settleAnsweredKeys(answered.current, read, new Set(queue.decisions.map(decision => decision.key)));
-      if (settled.size !== answered.current.size) publish(settled);
-    }
-    return { queue, read };
+    return { queue: await readQueue(connection), read };
   }, QUEUE_SCREEN_POLL_MS, [connection]);
+  if (poll.data !== settledFor) {
+    setSettledFor(poll.data);
+    if (poll.data?.queue) {
+      const { read, queue } = poll.data;
+      const next = hideCompleted(hidden, read, queue.decisions.map(decision => decision.key), key => runRequests.read(queueRequestKey(machine, key)).result !== undefined);
+      if (next.size !== hidden.size || [...next].some(([key, value]) => hidden.get(key) !== value)) setHidden(next);
+    }
+  }
+  if (!focused && !blurredAt) setBlurredAt({ data: poll.data });
+  if (focused && blurredAt && poll.data !== blurredAt.data) setBlurredAt(null);
+  const current = focused && !blurredAt;
   const confirmAnswered = (key: string) => {
-    publish(new Map(answered.current).set(key, readNumber.current + 1));
+    const first = readNumber.current + 1;
+    setHidden(previous => new Map(previous).set(key, first));
   };
   const source = poll.data?.queue ?? null;
   const decisions = useMemo(() => source ? visibleDecisions(source, hidden) : null, [source, hidden]);
   return {
     decisions,
     unavailable: poll.data !== null && poll.data.queue === null,
-    online: poll.online,
+    online: poll.online && current,
     stale: poll.stale,
     loading: poll.loading,
     refreshing: poll.refreshing,

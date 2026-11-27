@@ -41,8 +41,21 @@ async function rig(withCli = true) {
     await waitFor(() => Promise.resolve(output), text => text.includes("Live session connected") || text.includes("Interactive"), 30000);
     await waitFor(size, value => value?.cols === 110 && value.rows === 30, 30000);
   }
+  const t0 = Date.now(), marks: string[] = [];
+  const mark = (label: string) => { marks.push(`${Date.now() - t0}ms ${label}`); };
+  const lines = () => existsSync(log) ? readFileSync(log, "utf8").split("\n").filter(Boolean) : [];
+  const report = async (error: unknown) => {
+    const session = (await host.fetchApi(`/sessions/${sid}`).catch(() => undefined))?.body as Record<string, unknown> | undefined;
+    const state = Object.fromEntries(Object.entries(session ?? {}).filter(([key]) => /terminalSize|control|lease|online|interactive/i.test(key)));
+    const screen = output.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07/g, "").slice(-4096);
+    const drained = lines().map(line => `${Number(line.split(" ")[1]) - t0}ms drain`);
+    process.stderr.write(`resize-retry diagnostics (${error instanceof Error ? error.message : String(error)})\nsteps:\n${marks.join("\n")}\ndrains:\n${drained.join("\n")}\nsession: ${JSON.stringify(state)}\nscreen tail:\n${screen}\n`);
+  };
+  const resize = (cols: number, rows: number) => { mark(`resize ${cols}x${rows}`); pty?.resize(cols, rows); };
+  const gateOn = () => { mark("gate written"); writeFileSync(gate, ""); };
+  const gateOff = () => { mark("gate removed"); rmSync(gate); };
   return {
-    host, sid, pty: pty!, size, gate, drains: () => existsSync(log) ? readFileSync(log, "utf8").split("\n").filter(Boolean).length : 0,
+    host, sid, pty: pty!, size, gate, mark, report, resize, gateOn, gateOff, drains: () => lines().length,
     stop: async () => { try { pty?.kill(); } catch {} await host.stop(); rmSync(scratch, { recursive: true, force: true }); },
   };
 }
@@ -50,31 +63,31 @@ async function rig(withCli = true) {
 test("after a refused resize the CLI reaches the session's size again without another window resize", { timeout: 90_000 }, async () => {
   const r = await rig();
   try {
-    writeFileSync(r.gate, "");
-    r.pty.resize(90, 25);
+    r.gateOn();
+    r.resize(90, 25);
     await waitFor(async () => r.drains(), count => count >= 1, 20_000);
     assert.deepEqual(await r.size(), { cols: 110, rows: 30 }, "the refused resize left the session at the old size");
-    rmSync(r.gate);
+    r.gateOff();
     await waitFor(r.size, value => value?.cols === 90 && value.rows === 25, 20_000);
     assert.ok(r.drains() >= 1);
-  } finally { await r.stop(); }
+  } catch (error) { await r.report(error); throw error; } finally { await r.stop(); }
 });
 
 test("a persistently refused resize is retried a bounded number of times and a newer resize supersedes the pending retry", { timeout: 90_000 }, async () => {
   const r = await rig();
   try {
-    writeFileSync(r.gate, "");
-    r.pty.resize(90, 25);
+    r.gateOn();
+    r.resize(90, 25);
     await waitFor(async () => r.drains(), count => count >= 1 + RETRIES, 40_000);
     await new Promise(resolve => setTimeout(resolve, 5000));
     assert.equal(r.drains(), 1 + RETRIES, "one send and three retries, then no more");
     assert.deepEqual(await r.size(), { cols: 110, rows: 30 });
     const before = r.drains();
-    r.pty.resize(100, 28);
+    r.resize(100, 28);
     await waitFor(async () => r.drains(), count => count > before, 20_000);
-    rmSync(r.gate);
+    r.gateOff();
     await waitFor(r.size, value => value?.cols === 100 && value.rows === 28, 20_000);
-  } finally { await r.stop(); }
+  } catch (error) { await r.report(error); throw error; } finally { await r.stop(); }
 });
 
 test("a refused resize arrives as a resizeRefusal frame on an open duplex stream and as a 503 over HTTP", { timeout: 60_000 }, async () => {
@@ -86,7 +99,8 @@ test("a refused resize arrives as a resizeRefusal frame on an open duplex stream
     const reading = (async () => { try { for await (const page of connection.pages()) frames.push(page as Record<string, unknown>); } catch {} })();
     await waitFor(async () => frames.length, count => count > 0, 20_000);
     await connection.control("claim", true);
-    writeFileSync(r.gate, "");
+    r.gateOn();
+    r.mark("resize 90x25");
     connection.resize(90, 25);
     const refused = await waitFor(async () => frames.find(frame => frame.resizeRefusal), Boolean, 20_000) as { resizeRefusal: { code: string; error: string } };
     assert.equal(refused.resizeRefusal.code, "resize-refused");
@@ -98,20 +112,20 @@ test("a refused resize arrives as a resizeRefusal frame on an open duplex stream
     assert.equal(response.status, 503);
     assert.equal(response.body.code, "resize-refused");
     abort.abort(); await reading;
-  } finally { abort.abort(); await r.stop(); }
+  } catch (error) { await r.report(error); throw error; } finally { abort.abort(); await r.stop(); }
 });
 
 test("a newer resize cancels the pending retry of a refused one and restarts the bounded retries", { timeout: 120_000 }, async () => {
   const r = await rig();
   try {
-    writeFileSync(r.gate, "");
-    r.pty.resize(90, 25);
+    r.gateOn();
+    r.resize(90, 25);
     while (r.drains() < 3) await new Promise(resolve => setTimeout(resolve, 10));
     await new Promise(resolve => setTimeout(resolve, 1500));
-    r.pty.resize(100, 28);
+    r.resize(100, 28);
     await waitFor(async () => r.drains(), count => count >= 7, 60_000);
     await new Promise(resolve => setTimeout(resolve, 6000));
     assert.equal(r.drains(), 7, "three drains before the newer resize, the newer send, then three retries: the stale retry did not fire");
     assert.deepEqual(await r.size(), { cols: 110, rows: 30 });
-  } finally { await r.stop(); }
+  } catch (error) { await r.report(error); throw error; } finally { await r.stop(); }
 });

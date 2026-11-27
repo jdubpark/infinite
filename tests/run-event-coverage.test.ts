@@ -10,7 +10,7 @@ import { teamReportSchema, type TeamReport } from "../packages/host/src/team-typ
 import { schedulerFixture } from "./fixtures/team-scheduler.js";
 
 const spec = readFileSync(fileURLToPath(new URL("../docs/superpowers/specs/2026-11-12-outcome-ledger-design.md", import.meta.url)), "utf8");
-const teamsSource = ["teams.ts", "team-retention.ts", "team-recovery.ts"]
+const teamsSource = ["teams.ts", "team-retention.ts", "team-recovery.ts", "team-consumer.ts"]
   .map(file => readFileSync(fileURLToPath(new URL(`../packages/host/src/${file}`, import.meta.url)), "utf8")).join("\n");
 
 const LITERAL_KIND = /^"[a-z.-]+"$/;

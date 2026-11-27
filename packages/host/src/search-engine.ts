@@ -260,12 +260,12 @@ function settle(ctx: Ctx): void {
 
 function widen(ctx: Ctx, arming: boolean): void {
   const { s, view } = ctx;
-  if (s.pending !== undefined) return;
   const rest = s.holdUntil ?? plus(view.now, allowanceMinutes(view.policy, false));
   if (pastDeadline(view.deadline, rest)) {
     if (!arming) end(ctx, "abandoned", "deadline");
     return;
   }
+  if (s.pending !== undefined) return;
   const profileIds = pickChallengers(s, view);
   if (profileIds.length > 0) {
     s.launches = (s.launches ?? 0) + 1;

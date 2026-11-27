@@ -365,7 +365,8 @@ session (`/api/teams/:id/context`, `/api/sessions/:id/context`)—carry
 directory names, repository-relative file paths, and counts, which is the
 class of data the file listing and session events already serve, and no source
 text. A team view also carries `leftoverProcesses` while a run records a
-process that an earlier command left holding its output: a state (`unchecked`,
+process that an earlier command left holding its output, or a process of an
+earlier operation that was still alive when that operation ended: a state (`unchecked`,
 `running`, `in-use` or `unknown`) and two times, with no process ids, paths or
 census details. Run removal and the owner's statement that a run's processes
 ended (`processes-ended`) are not on the allowlist. `GET /api/decision-queue` is admitted as a read; global API

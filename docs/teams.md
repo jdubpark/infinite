@@ -511,9 +511,12 @@ up to 2,000 IDs with the oldest dropped. Replaying one returns `team-deleted`;
 start another run with a new request ID.
 
 A run whose command exited while a process it started still held its output
-(see the leader rule under checks) keeps a record of that command's processes:
-the ids, groups and sessions its operation recorded, whether the operation then
-succeeded or failed. Later operations of the run, a passing check among them,
+(see the leader rule under checks), or whose operation ended while a process of
+the operation was still alive (see the settle look under checks), keeps a record
+of that command's processes: the ids, groups and sessions its operation
+recorded, whether the operation then succeeded or failed. In the second case the
+record holds only the processes, groups and sessions that still had a live
+member when the operation ended. Later operations of the run, a passing check among them,
 do not clear the record. While it stands, nothing removes the run's directories:
 not retention of a merged, no-change, ready-for-review, cancelled or blocked
 run, and not the owner's removal. Until the run is cancelled, merged,
@@ -3094,8 +3097,19 @@ finds none of that command's processes." That process keeps running, in the
 verification copy for a check, until it ends. The run keeps the record of that
 command's processes, whether the operation succeeded or failed, and no removal
 of the run's directories proceeds until a look finds none of them or, when a
-look cannot tell, the owner states that they ended (see retention above). A process that a command leaves behind without holding its
-output is not noted and holds nothing. Most Git reads
+look cannot tell, the owner states that they ended (see retention above).
+
+A process that a command leaves behind without holding its output is found by
+the settle look. When an operation of a run ends, the host reads the process
+table. If a process, group or session the operation recorded still has a live
+member, the host reads the table again 250 ms later and keeps what is still
+alive in the run's process record, then writes one fixed event line: "N
+process(es) that a command of this run started still run after the command
+ended. The host keeps this run's directories until a census finds none." A
+removal then waits as described under retention. When nothing is alive at the
+first read, the host waits for nothing and keeps no record. The look misses a
+process that left its group and session, since the host records no id for it
+unless a sample caught it earlier. Most Git reads
 refuse a result whose output stayed open past that second, as they refuse any
 incomplete read; the few that decide by Git's exit code alone read only output
 that is complete when Git exits. A stop that arrives within the second ends the

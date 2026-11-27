@@ -2,6 +2,7 @@ import type { Attention, AttentionState } from "@infinite/attention";
 import { memberLimit, type TeamMember, type TeamPermissionDecision, type TeamRun, type TeamStatus } from "./team-types.js";
 
 export const MEMBER_STALL_REASON = "An agent showed no activity twice on the same assignment. Its workspace was preserved.";
+export const STOP_REFUSED_REASON = "An agent could not be stopped. Release its input control or inspect its terminal before integration.";
 
 const ACTIVE_STALL_RUN_STATUSES = new Set<TeamRun["status"]>([
   "planning",
@@ -131,12 +132,13 @@ export interface StallRecoveryInput {
   stallWindowMs: number;
   journalDrained: boolean;
   hasDeliveryAttempt: boolean;
+  controlHeld?: boolean;
   nowMs: number;
   phase: "detect" | "replace";
 }
 
 export function evaluateStallRecovery(input: StallRecoveryInput): StallRecoveryDecision {
-  const { run, member, attentionState, activePrompt, quietForMs, stallWindowMs, journalDrained, hasDeliveryAttempt, nowMs, phase } = input;
+  const { run, member, attentionState, activePrompt, quietForMs, stallWindowMs, journalDrained, hasDeliveryAttempt, controlHeld, nowMs, phase } = input;
 
   if (run.members.some(item => item !== member && item.stalledSourceMemberId === member.memberId)) {
     return { action: "suppress-duplicate", guard: "duplicate-suppression", reason: "replacement-already-exists" };
@@ -245,6 +247,9 @@ export function evaluateStallRecovery(input: StallRecoveryInput): StallRecoveryD
   if (phase === "detect") {
     if (run.replay) {
       return { action: "end-replay", reason: "stalled" };
+    }
+    if (controlHeld) {
+      return { action: "none", guard: "eligible-cause", reason: "waiting-on-control" };
     }
     return { action: "initiate-stop" };
   }

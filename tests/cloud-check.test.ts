@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -19,6 +19,33 @@ function bindFixtureRunner(home: string, root: string, origin?: string) {
   mkdirSync(directory, { recursive: true, mode: 0o700 });
   const originHashes = origin ? [createHash("sha256").update(origin).digest("hex")] : [];
   writeFileSync(join(directory, scope + ".json"), JSON.stringify({ roots: [root], originHashes, runners: ["fixture-runner"] }), { mode: 0o600 });
+}
+
+const fixtureSshScript = String.raw`#!/usr/bin/env python3
+import os, shlex, sys
+args = sys.argv[1:]
+alias, command = args[-2], args[-1]
+guest_home = "GUEST_HOME_" + alias.replace("-", "_")
+if guest_home in os.environ:
+    os.environ["HOME"] = os.environ[guest_home]
+if os.environ.get("FIXTURE_ANDROID_HOME"):
+    os.environ["ANDROID_HOME"] = os.environ["FIXTURE_ANDROID_HOME"]
+if os.environ.get("MUTATE_SOURCE"):
+    from pathlib import Path
+    Path(os.environ["MUTATE_SOURCE"]).write_text("changed\n")
+parts = shlex.split(command)
+if len(parts) >= 4 and parts[0] == "python3" and parts[1] == "-c":
+    # Aliases are distinct test-owned guest namespaces on this single host.
+    needle = 'name = "\\0infinite-check-capacity-" + hashlib.sha256(expected.encode("ascii")).hexdigest()'
+    replacement = f'name = "\\0infinite-check-capacity-" + hashlib.sha256((expected + ":" + {alias!r}).encode("ascii")).hexdigest()'
+    if parts[2].count(needle) != 1:
+        raise SystemExit("test transport could not isolate the embedded guest reservation")
+    parts[2] = parts[2].replace(needle, replacement)
+os.execvpe(parts[0], parts, os.environ)
+`;
+
+function installFixtureSsh(bin: string) {
+  writeFileSync(join(bin, "ssh"), fixtureSshScript, { mode: 0o755 });
 }
 
 test("a test host recovers if its first listener address is taken during startup", async (t) => {
@@ -62,7 +89,7 @@ test("cloud dispatch preserves Git layers, worktree bytes, cwd, argv and the che
   const sub = join(repo, "nested");
   mkdirSync(sub, { recursive: true });
   mkdirSync(bin);
-  const env = { ...process.env, HOME: dir, XDG_CONFIG_HOME: join(dir, ".config"), GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: join(dir, "private-gitconfig"), PATH: `${bin}:${process.env.PATH}` };
+  const env = { ...process.env, HOME: dir, XDG_CONFIG_HOME: join(dir, ".config"), GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: join(dir, "private-gitconfig"), PATH: `${bin}:${process.env.PATH}`, FIXTURE_ANDROID_HOME: "/opt/fixture-sdk" };
   const git = (...args: string[]) => execFileSync("git", args, { cwd: repo, env, encoding: "utf8" });
   const launch = (...args: string[]) => spawnSync("python3", [client, "--runner", "fixture-runner", "--", ...args], { cwd: sub, env, encoding: "utf8" });
   git("init", "-q", "--template=");
@@ -94,7 +121,7 @@ test("cloud dispatch preserves Git layers, worktree bytes, cwd, argv and the che
   assert.equal(existsSync(join(sub, "unintended")), false);
   bindFixtureRunner(dir, repo);
   execFileSync("python3", [client, "--enroll", "fixture-runner"], { cwd: repo, env });
-  writeFileSync(join(bin, "ssh"), '#!/bin/sh\nfor command do :; done\nexport ANDROID_HOME=/opt/fixture-sdk\nexec sh -c "$command"\n', { mode: 0o755 });
+  installFixtureSsh(bin);
   const linked = join(dir, "linked");
   git("worktree", "add", "-q", "--detach", linked, "HEAD");
   const linkedResult = spawnSync("python3", [client, "--runner", "fixture-runner", "--project-command", "--", "git", "rev-parse", "HEAD"], { cwd: linked, env, encoding: "utf8" });
@@ -161,6 +188,7 @@ test("portable project enrollment follows the exact Git origin", (t) => {
     GIT_CONFIG_NOSYSTEM: "1",
     GIT_CONFIG_GLOBAL: globalConfig,
     PATH: `${join(dir, "bin")}:${process.env.PATH}`,
+    FIXTURE_ANDROID_HOME: "/opt/fixture-sdk",
   };
   mkdirSync(env.HOME, { recursive: true });
   mkdirSync(join(dir, "bin"));
@@ -188,7 +216,7 @@ test("portable project enrollment follows the exact Git origin", (t) => {
   bindFixtureRunner(env.HOME, source, primary);
   const enrolled = run(source, "--enroll", "fixture-runner");
   assert.equal(enrolled.status, 0, enrolled.stdout + enrolled.stderr);
-  writeFileSync(join(dir, "bin", "ssh"), '#!/bin/sh\nfor command do :; done\nexport ANDROID_HOME=/opt/fixture-sdk\nexec sh -c "$command"\n', { mode: 0o755 });
+  installFixtureSsh(join(dir, "bin"));
 
   if (existsSync("/etc/infinite-check-workspace")) {
     assert.match(run(clone, "--runner", "fixture-runner", "--project-command", "--", "true").stderr, /directory enrollment/);
@@ -241,7 +269,7 @@ test("a passing cloud project command is rejected when its source changes in fli
   git("commit", "-qm", "fixture");
   bindFixtureRunner(env.HOME, repo);
   execFileSync("python3", [client, "--enroll", "fixture-runner"], { cwd: repo, env });
-  writeFileSync(join(bin, "ssh"), '#!/bin/sh\nfor command do :; done\nprintf "changed\\n" > "$MUTATE_SOURCE"\nexec sh -c "$command"\n', { mode: 0o755 });
+  installFixtureSsh(bin);
 
   const proof = "require('node:assert/strict').equal(require('node:fs').readFileSync('tracked', 'utf8'), 'before\\n'); console.log('cloud command passed')";
   const result = spawnSync("python3", [client, "--runner", "fixture-runner", "--project-command", "--", "node", "-e", proof], { cwd: repo, env, encoding: "utf8" });
@@ -344,6 +372,97 @@ test("nested npm cannot reuse a cloud job from a different repository", (t) => {
   assert.equal(existsSync(proof), false);
 });
 
+test("implicit dispatch rotates on a real busy reservation, waits cancelably, and releases after disconnect", { timeout: 60000 }, async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "cloud-capacity-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const repo = join(dir, "repo");
+  const bin = join(dir, "bin");
+  const config = join(dir, "config", "infinite", "cloud-check", "workspaces.d");
+  const guestBusy = join(dir, "guest-busy");
+  const guestFree = join(dir, "guest-free");
+  const started = join(dir, "started");
+  const disconnectedPid = join(dir, "detached-pid");
+  mkdirSync(repo, { recursive: true }); mkdirSync(bin); mkdirSync(config, { recursive: true });
+  for (const home of [guestBusy, guestFree]) mkdirSync(home, { recursive: true, mode: 0o700 });
+  const env = {
+    ...process.env, HOME: dir, XDG_CONFIG_HOME: join(dir, "config"),
+    GIT_CONFIG_GLOBAL: join(dir, "gitconfig"), GIT_CONFIG_NOSYSTEM: "1",
+    PATH: `${bin}:${process.env.PATH}`, GUEST_HOME_runner_busy: guestBusy,
+    GUEST_HOME_runner_free: guestFree,
+  };
+  const git = (...args: string[]) => execFileSync("git", args, { cwd: repo, env, encoding: "utf8" });
+  git("init", "-q", "--template=");
+  git("config", "user.name", "Fixture");
+  git("config", "user.email", "fixture@example.invalid");
+  writeFileSync(join(repo, "tracked"), "fixture\n");
+  git("add", "."); git("commit", "-qm", "fixture");
+  const origin = "https://example.invalid/capacity-fixture.git";
+  git("remote", "add", "origin", origin);
+  const marker = "/etc/infinite-check-workspace";
+  if (existsSync(marker)) {
+    const scope = readFileSync(marker, "utf8").trim();
+    writeFileSync(join(config, scope + ".json"), JSON.stringify({
+      roots: [repo], originHashes: [createHash("sha256").update(origin).digest("hex")],
+      runners: ["runner-busy", "runner-free"],
+    }), { mode: 0o600 });
+  } else {
+    execFileSync("python3", [client, "--enroll", "runner-busy", "--enroll", "runner-free"], { cwd: repo, env });
+  }
+  installFixtureSsh(bin);
+
+  const hold = spawn("python3", [client, "--runner", "runner-busy", "--project-command", "--", "node", "-e",
+    `require('node:fs').writeFileSync(process.argv[1], 'started'); setTimeout(() => console.log('held guest released'), 60000)`, started],
+  { cwd: repo, env, stdio: ["ignore", "pipe", "pipe"] });
+  t.after(() => { if (hold.exitCode === null) hold.kill("SIGTERM"); });
+  const holdClosed = new Promise<number | null>(resolve => hold.once("close", code => resolve(code)));
+  let holdOutput = "";
+  hold.stdout.setEncoding("utf8").on("data", chunk => { holdOutput += chunk; });
+  hold.stderr.setEncoding("utf8").on("data", chunk => { holdOutput += chunk; });
+  const waitFor = async (predicate: () => boolean, message: string) => {
+    const deadline = Date.now() + 10000;
+    while (!predicate() && Date.now() < deadline) await delay(50);
+    assert.ok(predicate(), message);
+  };
+  await waitFor(() => existsSync(started), "first command did not start on runner-busy");
+
+  const waiting = spawn("python3", [client, "--runner", "runner-busy", "--project-command", "--", "true"], { cwd: repo, env, stdio: ["ignore", "pipe", "pipe"] });
+  t.after(() => { if (waiting.exitCode === null) waiting.kill("SIGTERM"); });
+  const waitingClosed = new Promise<number | null>(resolve => waiting.once("close", code => resolve(code)));
+  let waitOutput = "";
+  waiting.stdout.setEncoding("utf8").on("data", chunk => { waitOutput += chunk; });
+  waiting.stderr.setEncoding("utf8").on("data", chunk => { waitOutput += chunk; });
+  await waitFor(() => waitOutput.includes("Runner runner-busy is busy; checkout not sent"), "explicit busy runner did not enter capacity wait");
+  waiting.kill("SIGINT");
+  const waitingExit = await waitingClosed;
+  assert.equal(waitingExit, 130, waitOutput);
+
+  const rotated = spawnSync("python3", [client, "--project-command", "--", "node", "-e", "console.log('free guest ran'); process.exit(19)"], { cwd: repo, env, encoding: "utf8", timeout: 25000 });
+  assert.equal(rotated.status, 19, rotated.stdout + rotated.stderr);
+  const hasStandingRunner = existsSync("/etc/infinite-cloud-runner") ||
+    (process.platform === "linux" && existsSync("/etc/infinite") && existsSync("/etc/systemd/system/infinite.service"));
+  if (hasStandingRunner) assert.match(rotated.stderr, /Runner standing is busy; checkout not sent/);
+  assert.match(rotated.stderr, /Runner runner-busy is busy; checkout not sent/);
+  assert.match(rotated.stdout, /RUNNER runner-free exit=19/);
+  assert.match(rotated.stdout, /free guest ran/);
+  hold.kill("SIGINT");
+  const holdExit = await holdClosed;
+  assert.equal(holdExit, 130, holdOutput);
+
+  const disconnect = spawn("python3", [client, "--runner", "runner-free", "--project-command", "--", "node", "-e",
+    `const {spawn}=require('node:child_process'); const fs=require('node:fs'); const child=spawn('sleep',['60'],{detached:true,stdio:'ignore'}); child.unref(); fs.writeFileSync(process.argv[1], String(child.pid)); setInterval(()=>{},1000)`, disconnectedPid],
+  { cwd: repo, env, stdio: ["ignore", "pipe", "pipe"] });
+  t.after(() => { if (disconnect.exitCode === null) disconnect.kill("SIGTERM"); });
+  const disconnectClosed = new Promise<number | null>(resolve => disconnect.once("close", code => resolve(code)));
+  await waitFor(() => existsSync(disconnectedPid), "disconnect command did not start its child");
+  const pid = Number(readFileSync(disconnectedPid, "utf8"));
+  disconnect.kill("SIGTERM");
+  await disconnectClosed;
+  await waitFor(() => {
+    try { return readFileSync(`/proc/${pid}/stat`, "utf8").split(" ")[2] === "Z"; }
+    catch { return true; }
+  }, "contained child survived controller disconnect");
+});
+
 test("a fresh non-Node project runs pinned Compose against its working checkout", (t) => {
   const dir = mkdtempSync(join(tmpdir(), "portable-compose-"));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
@@ -374,7 +493,7 @@ test("a fresh non-Node project runs pinned Compose against its working checkout"
   writeFileSync(join(repo, "expected"), "working");
   bindFixtureRunner(dir, repo);
   execFileSync("python3", [client, "--enroll", "fixture-runner"], { cwd: repo, env });
-  writeFileSync(join(bin, "ssh"), '#!/bin/sh\nfor command do :; done\nexec sh -c "$command"\n', { mode: 0o755 });
+  installFixtureSsh(bin);
   const passed = run();
   assert.equal(passed.status, 0, passed.stdout + passed.stderr);
   assert.match(passed.stdout, /^fixture-result=working$/m);

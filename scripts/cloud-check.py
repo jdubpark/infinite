@@ -463,8 +463,10 @@ def outer_archive(payload: dict[str, bytes]) -> bytes:
 
 
 
-READY_LINE = b"INFINITE-CHECK-READY-v2\n"
+READY_LINE = b"INFINITE-CHECK-READY-v3\n"
+BUSY_LINE = b"INFINITE-CHECK-BUSY-v1\n"
 HANDSHAKE_TIMEOUT_SECONDS = 120
+CAPACITY_WAIT_SECONDS = 600
 
 
 def stop_process_group(process: subprocess.Popen[bytes]) -> None:
@@ -484,7 +486,7 @@ def stop_process_group(process: subprocess.Popen[bytes]) -> None:
         process.wait()
 
 
-def dispatch(transport_argv: list[str], archive: bytes, envelope: str, receipt: dict) -> int:
+def dispatch(transport_argv: list[str], archive: bytes, envelope: str, receipt: dict) -> int | None:
     process = subprocess.Popen(
         transport_argv,
         stdin=subprocess.PIPE,
@@ -527,6 +529,11 @@ def dispatch(transport_argv: list[str], archive: bytes, envelope: str, receipt: 
                 return 2
         line, separator, trailing = bytes(prefix).partition(b"\n")
         line += separator
+        if line == BUSY_LINE and not trailing:
+            process.stdin.close()
+            stop_process_group(process)
+            process.wait()
+            return None
         if line != READY_LINE:
             sys.stdout.buffer.write(line)
             sys.stdout.buffer.flush()
@@ -580,6 +587,31 @@ def dispatch(transport_argv: list[str], archive: bytes, envelope: str, receipt: 
         except (BrokenPipeError, OSError):
             pass
         raise
+
+
+def dispatch_with_capacity(candidates: list[tuple[str, list[str]]], archive: bytes,
+                           envelope: str, *, wait_seconds: int = CAPACITY_WAIT_SECONDS) -> tuple[str, int, dict]:
+    """Dispatch once to the first guest that tagged itself as holding capacity.
+
+    Retries are permitted only after the guest's exact BUSY line, which is
+    emitted before it accepts any archive bytes. Every other transport outcome
+    is final because command start may be ambiguous.
+    """
+    if not candidates:
+        raise RuntimeError("no eligible runner remains for this dispatch")
+    deadline = time.monotonic() + wait_seconds
+    while True:
+        for alias, transport in candidates:
+            print(f"Dispatch to {alias} (archive SHA-256 {hashlib.sha256(archive).hexdigest()})", file=sys.stderr, flush=True)
+            receipt = {}
+            code = dispatch(transport, archive, envelope, receipt)
+            if code is not None:
+                return alias, code, receipt
+            print(f"Runner {alias} is busy; checkout not sent", file=sys.stderr, flush=True)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("workspace runner pool remained busy until the capacity wait expired")
+        time.sleep(min(1.0, remaining))
 
 
 def config_values(root: Path, *scope: str, key: str) -> list[str]:
@@ -824,24 +856,32 @@ def main() -> int:
             if on_runner and event in {"build", "desktop:build", "dev", "web", "start", "android", "ios", "export:android", "export:ios"}:
                 run_standing_build(root, args.npm_script, event, argv)
             argv = ["npm", "run", event, "--", *argv]
+
+        remote_command = "python3 -c " + shlex.quote(bootstrap) + " " + shlex.quote(expected_workspace)
+        options = ["BatchMode=yes", "ConnectTimeout=90", "ServerAliveInterval=30", "ServerAliveCountMax=3",
+                   "StrictHostKeyChecking=yes", "ForwardAgent=no", "ForwardX11=no", "ClearAllForwardings=yes",
+                   "PermitLocalCommand=no", "RequestTTY=no", "RemoteCommand=none", "ControlPath=none"]
+        ssh = ["ssh", "-T", *(item for option in options for item in ("-o", option))]
+        transport_for = lambda alias: (alias, [*ssh, alias, remote_command])
         if on_runner:
-            transports = [("standing", [sys.executable, "-c", bootstrap, expected_workspace])]
+            candidates = None if scope is not None else list(dict.fromkeys([*trusted_saved, *legacy_aliases(root)]))
+            eligible = policy.allowed_aliases(scope, candidates)
+            candidate_groups = [[("standing", [sys.executable, "-c", bootstrap, expected_workspace]),
+                                 *(transport_for(alias) for alias in eligible)]]
         else:
             candidates = None if scope is not None else list(dict.fromkeys([*trusted_saved, *legacy_aliases(root)]))
             eligible = policy.allowed_aliases(scope, candidates, args.runner)
             if not eligible:
                 raise RuntimeError("no approved cloud-check SSH aliases are configured")
-            targets = [eligible[0]]
+            second_target = None
             if args.also_on:
-                if args.also_on == targets[0]:
-                    raise RuntimeError("--also-on must name a distinct enrolled SSH alias")
-                targets.extend(policy.allowed_aliases(scope, candidates, args.also_on))
-            remote_command = "python3 -c " + shlex.quote(bootstrap) + " " + shlex.quote(expected_workspace)
-            options = ["BatchMode=yes", "ConnectTimeout=90", "ServerAliveInterval=30", "ServerAliveCountMax=3",
-                       "StrictHostKeyChecking=yes", "ForwardAgent=no", "ForwardX11=no", "ClearAllForwardings=yes",
-                       "PermitLocalCommand=no", "RequestTTY=no", "RemoteCommand=none", "ControlPath=none"]
-            ssh = ["ssh", "-T", *(item for option in options for item in ("-o", option))]
-            transports = [(alias, [*ssh, alias, remote_command]) for alias in targets]
+                second_target = policy.allowed_aliases(scope, candidates, args.also_on)[0]
+                eligible = [alias for alias in eligible if alias != second_target]
+                if not eligible:
+                    raise RuntimeError("--also-on requires a distinct first enrolled SSH alias")
+            candidate_groups = [[transport_for(alias) for alias in eligible]]
+            if second_target is not None:
+                candidate_groups.append([transport_for(second_target)])
 
         payload = capture(root, cwd, argv, worker, project, mode)
         if origin_url(root) != origin or common_dir_hash(root) != common_hash:
@@ -855,10 +895,8 @@ def main() -> int:
         envelope = hashlib.sha256(payload["snapshot.json"]).hexdigest()
         digest = hashlib.sha256(archive).hexdigest()
         results = []
-        for alias, transport in transports:
-            print(f"Dispatch to {alias} (archive SHA-256 {digest})", file=sys.stderr, flush=True)
-            receipt = {}
-            code = dispatch(transport, archive, envelope, receipt)
+        for candidates in candidate_groups:
+            alias, code, receipt = dispatch_with_capacity(candidates, archive, envelope)
             results.append({"runner": alias, "exit": code, "receipt": receipt})
             print(f"RUNNER {alias} exit={code}", flush=True)
 

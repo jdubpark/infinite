@@ -1,4 +1,6 @@
 import ctypes
+import errno
+import hashlib
 import os
 import pathlib
 import re
@@ -6,6 +8,7 @@ import secrets
 import select
 import shutil
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -16,6 +19,9 @@ import time
 os.umask(0o022)
 allowed = {"worker.py", "project.py", "npm-shell.sh", "toolchain.json", "snapshot.json", "source.pack", "working-tree.tar"}
 interrupted = 0
+capacity_socket = None
+BUSY_LINE = "INFINITE-CHECK-BUSY-v1"
+READY_LINE = "INFINITE-CHECK-READY-v3"
 def admit_workspace():
     if len(sys.argv) != 2:
         raise RuntimeError("missing workspace selection")
@@ -35,7 +41,19 @@ def admit_workspace():
             label = expected.encode("ascii")
             if expected == "-" or marker.read(66) not in (label, label + b"\n"):
                 raise RuntimeError("runner does not belong to the selected workspace")
-    print("INFINITE-CHECK-READY-v2", flush=True)
+
+def reserve_capacity(expected):
+    """Hold a guest-wide, kernel-released reservation for this workspace."""
+    name = "\0infinite-check-capacity-" + hashlib.sha256(expected.encode("ascii")).hexdigest()
+    reservation = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        reservation.bind(name)
+    except OSError as error:
+        reservation.close()
+        if error.errno == errno.EADDRINUSE:
+            return None
+        raise
+    return reservation
 
 def on_signal(number, _frame):
     global interrupted
@@ -173,6 +191,13 @@ def launch_systemd(base, env, token, systemd):
     return child.returncode, False
 try:
     admit_workspace()
+    capacity_socket = reserve_capacity(sys.argv[1])
+    if capacity_socket is None:
+        print(BUSY_LINE, flush=True)
+        raise SystemExit(75)
+    if interrupted:
+        raise SystemExit(128 + interrupted)
+    print(READY_LINE, flush=True)
     header = sys.stdin.buffer.read(8)
     if len(header) != 8:
         raise EOFError("missing verification frame")
@@ -225,3 +250,6 @@ try:
 except (EOFError, OSError, RuntimeError, tarfile.TarError, subprocess.SubprocessError) as error:
     sys.stderr.write("remote bootstrap: " + str(error) + "\n")
     raise SystemExit(2)
+finally:
+    if capacity_socket is not None:
+        capacity_socket.close()

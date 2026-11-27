@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
-import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -20,13 +21,16 @@ test("outbound reconciliation recovers current trusted heads after an outage and
   const secret = join(root, "webhook");
   const launcher = join(root, "trusted-launcher");
   await writeFile(launcher, "#!/bin/sh\nexit 99\n", { mode: 0o700 });
+  const profile = '{"test":true}';
+  await mkdir(join(root, "cloud-check"));
+  await writeFile(join(root, "cloud-check/linux-runner.json"), profile);
   await writeFile(secret, "fixture-webhook", { mode: 0o600 });
   const repo = "example/project";
   const branch = "release/current";
   const ref = "refs/heads/" + branch;
   const enrolled = { repository: repo, origin: "https://example.invalid/project.git", refs: [ref],
     workspace: "sample", runner: "guest", mode: "command", command: ["make", "test"], context: "cloud/check",
-    launcher, profileSha256: "0".repeat(64), stateDirectory: state, snapshotRoot: root,
+    launcher, profileSha256: createHash("sha256").update(profile).digest("hex"), stateDirectory: state, snapshotRoot: root,
     webhookSecretFile: secret, githubTokenFile: join(root, "missing-token") };
   await writeFile(config, JSON.stringify(enrolled), { mode: 0o600 });
 

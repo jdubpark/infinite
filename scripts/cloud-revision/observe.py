@@ -57,7 +57,6 @@ def reconcile(controller, config, state, api):
             if (ref not in config["refs"] or (base.get("repo") or {}).get("full_name") != repo
                     or source.get("full_name") != repo or source.get("fork") is True):
                 continue
-            # Use only the identities needed by the normal event validation and queue.
             accepted = {key: {"ref": side["ref"], "repo": {"full_name": repo}}
                         for key, side in (("base", base), ("head", head))}
             accepted["head"]["sha"] = head["sha"]

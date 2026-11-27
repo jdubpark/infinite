@@ -41,7 +41,6 @@ def private_file(path: Path) -> bytes:
 
 
 def launcher_digest(launcher: Path) -> str:
-    # These are the installed inputs that decide what runs on the guest.
     inputs = [launcher, launcher.parent.parent / ".nvmrc", launcher.parent.parent / "package.json"]
     runtime = launcher.parent / "cloud-check"
     inputs.extend(runtime / name for name in ("bootstrap.py", "worker.py", "project.py", "workspace_policy.py",

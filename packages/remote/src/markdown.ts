@@ -7,7 +7,6 @@ const DEFAULT_MAX_NODES = 4000;
 const DEFAULT_MAX_BYTES = 256 * 1024;
 const MAX_DEPTH = 32;
 
-/** Bounded CommonMark-subset parser producing rich nodes. Never throws. */
 export function parseMarkdown(text: string, options: Options = {}): { nodes: RichNode[]; truncated: boolean } {
   try {
     const safeOptions = options && typeof options === "object" ? options : {};

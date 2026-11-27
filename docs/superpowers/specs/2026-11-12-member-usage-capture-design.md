@@ -6,7 +6,7 @@ Date: 2026-11-12. Status: design for review. Part of `2026-11-12-self-improving-
 
 The host knows what an attempt cost only when its member ran on OpenCode. Claude Code and Codex members show `Unmeasured`. The outcome ledger, the router, and the learning budget need a cost for every attempt.
 
-This design records token usage for the Claude Code and Codex sessions that the host runs, turns provider limit observations into durable limit events, and adds a list-price equivalent to every usage record.
+This design records token usage for the Claude Code and Codex sessions that the host runs, turns provider limit observations into durable limit events, and adds a list-price equivalent to every usage record. Codex sessions stay at coverage `none` with reason `hooks-off` until Codex capture has a route that needs no hook-trust bypass (owner decision 2).
 
 It amends two earlier non-goals. The 2026-10-17 usage ledger design excluded cost for Claude Code and Codex. The 2026-10-19 cost and effectiveness design said: "Capturing Claude Code or Codex token usage. They remain unmeasured." Both end here. The rule that Spent holds only metered money stays.
 
@@ -292,8 +292,17 @@ Fixtures come from synthetic sessions against a scratch repository. A script rep
 ## Owner decisions
 
 1. **Visibility.** The 2026-10-19 design made an API-price value for subscription use a non-goal (INF-71). This design shows Claude and Codex tokens everywhere and their list-price equivalent only in the Models tab and the CLI.
-2. **Codex hooks.** Codex capture needs `attention.hooks.codex` on the deployment. The default is off.
-3. **Final drain wrapper.** One more root-owned wrapper lets the host read the rest of a stopped member's transcript. Without it those sessions lose the rows written after the last hook.
+2. **Codex hooks. Decided 2026-11-13 as "on", then withdrawn the same day on the evidence of spike S2.** Codex hooks stay off, in code (`DEFAULT_HOOKS`) and on the execution host, while they need `--dangerously-bypass-hook-trust`. On codex-cli 0.167.2 the flag is not limited to the hooks the host injects: untrusted hooks committed in the working directory also run, outside the command sandbox and with network access. A Codex member on a repository checkout would therefore run any hook that the repository commits, unreviewed. Until capture has a route that needs no bypass flag, Codex sessions keep coverage `none` with reason `hooks-off`. Two candidate routes are open work, not designs:
+   - Read the transcript from the `notify` route with hooks off. Codex's `notify` fires without the flag, and the relay can resolve the rollout from its thread id. It needs one verification that a notify reply can start the transcript stream.
+   - Host-recorded trust for the host's own hooks only. The trust key and hash format for hooks set by session flags are unknown.
+
+   Update (INF-213): the first route is built. A Codex session with a hook listener gets the turn-end `notify` setting with hooks off, and the worker reads its rollout. A team member and a session under a handoff policy have a listener. An ordinary Codex session has none while Codex hooks are off, so it gets no `notify` and keeps `none` / `hooks-off`. With hooks off, the notice journals no attention signal; the host uses it only to find and read the session record. Three limits remain:
+   - A Codex session that ends before its first turn completes still reports `none` / `hooks-off`.
+   - With hooks off, no hook marks the start of a turn, so a notice proves only that some turn ended. The host reads the turn boundary from the session record after the provider exits: a `task_started` row starts a turn, and a `task_complete` row that names the same turn ends it. Coverage can be `complete` only when that final read reached the end of the record and the record's last turn has its end row. A turn that was cut short, an aborted turn (`turn_aborted`), an end row that names another turn or none, a context or request-usage row outside any turn, and a record that starts no turn all leave a turn open. Coverage is then `partial` with reason `stopped-mid-turn`, unless an earlier rule already applies (no usage rows, a dropped row, or a final read that was skipped or incomplete). The rule assumes serial turns, where a start row replaces the open turn. In 761 session records written by Codex 0.167.0 to 0.170.0, no turn starts while another is open, and no context or request-usage row follows an end row with no turn open. Five context rows precede the first start row of their record, and the start row that follows names their turn. A later version that renames the start or end row would report `partial` for a record it wrote alone. For a record that mixes both forms, the host sees the unannounced turn only once that turn writes a context or usage row.
+   - The second route (host-recorded trust for the host's own hooks) is not built. Per-event Codex signals still need it or the bypass flag.
+
+   The choice between the two routes is closed. Turning Codex hooks on stays the owner's decision and stays off.
+3. **Final drain wrapper. Decided 2026-11-13: added.** The Ubuntu template gains the root-owned wrapper and its line in `deploy/ubuntu/infinite.sudoers`.
 4. **Retention.** Usage rows hold no text and are kept without limit in the first version.
 
 ## Left to the builder

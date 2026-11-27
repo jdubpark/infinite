@@ -1,12 +1,16 @@
 import { randomUUID } from "node:crypto";
-import type { ControlLease, Event, Receipt, TerminalSnapshot, WorkerState } from "./types.js";
+import { replyDeadline } from "./deadline.js";
+import type { ControlLease, Event, Receipt, TerminalOpen, TerminalSnapshot, WorkerState } from "./types.js";
 
 export type TerminalPage = {
+  open?: TerminalOpen;
   events?: Event[]; cursor?: number; more?: boolean;
-  state?: Pick<WorkerState, "status" | "exitCode" | "control" | "capabilities" | "runtime" | "nativeSession">;
+  cols?: number; rows?: number;
+  state?: Pick<WorkerState, "status" | "pid" | "exitCode" | "outputTailIncomplete" | "control" | "capabilities" | "runtime" | "nativeSession" | "terminalSize">;
   snapshot?: TerminalSnapshot; receipt?: Receipt; error?: string;
   requestId?: string; control?: ControlLease | null;
   refusal?: { requestId?: string; code: string; error?: string };
+  resizeRefusal?: { requestId?: string; code: string; error?: string };
 };
 export class TerminalAccessError extends Error {}
 export class TerminalControlError extends Error {
@@ -15,6 +19,7 @@ export class TerminalControlError extends Error {
   }
 }
 
+export type TerminalControlAction = "claim" | "renew" | "release";
 type ConnectionOptions = { snapshot?: boolean; control?: boolean; clientId?: string };
 export function terminalConnection(origin: string, token: string, sessionId: string, after: number, signal: AbortSignal, options: ConnectionOptions = {}) {
   const url = new URL(`/api/sessions/${sessionId}/terminal?after=${after}`, origin);
@@ -64,7 +69,6 @@ export function terminalConnection(origin: string, token: string, sessionId: str
         const input = id ? pending.get(id) : undefined, control = id ? controls.get(id) : undefined;
         if (input) { pending.delete(id!); clearTimeout(input.timer); pendingBytes -= input.size; input.reject(refusal); return; }
         if (control) { controls.delete(id!); clearTimeout(control.timer); control.reject(refusal); return; }
-        // Resize has no receipt; deliver its refusal to the attachment loop.
       }
       const size = Buffer.byteLength(event.data);
       if (bytes + size > 8 * 1024 * 1024) throw new Error("Terminal output buffer limit reached");
@@ -83,26 +87,33 @@ export function terminalConnection(origin: string, token: string, sessionId: str
     const size = Buffer.byteLength(text);
     if (pendingBytes + size > 256 * 1024 || pending.size >= 128 || socket.bufferedAmount > 256 * 1024) return Promise.reject(new Error("Input buffer limit reached"));
     return new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => fail(new Error("Terminal acknowledgement timed out")), 15000);
+      const timer = replyDeadline(15000, () => { if (pending.has(requestId)) fail(new Error("Terminal acknowledgement timed out")); });
       timer.unref();
       pending.set(requestId, { timer, size, resolve, reject }); pendingBytes += size;
       try { send({ op, requestId, text, ...(op === "input" ? { submit: false } : {}), ...(lease ? { leaseId: lease.id } : {}) }); }
       catch (error) { pending.delete(requestId); clearTimeout(timer); pendingBytes -= size; reject(error); }
     });
   };
+  function control(action: "claim", takeover?: boolean): Promise<ControlLease | null>;
+  function control(action: TerminalControlAction, takeover?: false): Promise<ControlLease | null>;
+  function control(action: TerminalControlAction, takeover = false): Promise<ControlLease | null> {
+    const requestId = randomUUID();
+    if (controls.size >= 4) return Promise.reject(new Error("A control request is already pending"));
+    return new Promise((resolve, reject) => {
+      const timer = replyDeadline(15000, () => { if (controls.has(requestId)) fail(new Error("Terminal acknowledgement timed out")); });
+      timer.unref();
+      controls.set(requestId, { timer, resolve, reject });
+      try {
+        send(action === "claim"
+          ? { op: "control", requestId, action, ...(lease ? { leaseId: lease.id } : {}), ...(takeover ? { takeover: true } : {}) }
+          : { op: "control", requestId, action, ...(lease ? { leaseId: lease.id } : {}) });
+      }
+      catch (error) { controls.delete(requestId); clearTimeout(timer); reject(error); }
+    });
+  }
   return {
     get lease() { return lease; },
-    control(action: "claim" | "renew" | "release", takeover = false): Promise<ControlLease | null> {
-      const requestId = randomUUID();
-      if (controls.size >= 4) return Promise.reject(new Error("A control request is already pending"));
-      return new Promise((resolve, reject) => {
-        const timer = setTimeout(() => fail(new Error("Terminal acknowledgement timed out")), 15000);
-        timer.unref();
-        controls.set(requestId, { timer, resolve, reject });
-        try { send({ op: "control", requestId, action, ...(lease ? { leaseId: lease.id } : {}), ...(takeover ? { takeover: true } : {}) }); }
-        catch (error) { controls.delete(requestId); clearTimeout(timer); reject(error); }
-      });
-    },
+    control,
     async *pages(): AsyncGenerator<TerminalPage> {
       try {
         while (!ended || queue.length) {

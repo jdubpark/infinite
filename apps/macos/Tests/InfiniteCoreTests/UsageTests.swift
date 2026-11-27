@@ -1,8 +1,6 @@
 import XCTest
 @testable import InfiniteCore
 
-/// The cost views decode the host's usage contract as `usage-api.ts` defines it. A missing balance,
-/// a subscription without metered spend, and nulls in the scorecard must all decode, never crash.
 final class UsageTests: XCTestCase {
     private func decode<T: Decodable>(_ type: T.Type, _ json: String) throws -> T {
         try JSONDecoder().decode(T.self, from: Data(json.utf8))
@@ -22,9 +20,11 @@ final class UsageTests: XCTestCase {
         XCTAssertEqual(overview.month.previous.unpriced, 2)
         XCTAssertEqual(overview.withPlansUsd, 412.84, accuracy: 0.0001)
         XCTAssertEqual(overview.accounts.map(\.id), ["deepseek", "meta", "claude", "codex"])
+        XCTAssertEqual(overview.accounts[0].billing, .metered(month: Money(usd: 8.12, unpriced: 0)))
         XCTAssertEqual(overview.accounts[0].balance?.amount, 12.5)
         XCTAssertNil(overview.accounts[1].balance)
         XCTAssertNil(overview.accounts[2].month)
+        XCTAssertEqual(overview.accounts[2].billing, .subscription(planUsd: 200, source: .owner))
         XCTAssertEqual(overview.accounts[2].planUsd, 200)
         XCTAssertNil(overview.accounts[3].planUsd)
         XCTAssertFalse(overview.accounts[2].metered)
@@ -33,10 +33,12 @@ final class UsageTests: XCTestCase {
         XCTAssertNil(overview.accounts[3].planSource)
         XCTAssertFalse(overview.accounts[3].planSetByOwner)
         let config = try decode(AccountView.self, #"{"id":"claude","kind":"subscription","planUsd":200,"planSource":"config"}"#)
+        XCTAssertEqual(config.billing, .subscription(planUsd: 200, source: .config))
         XCTAssertFalse(config.planSetByOwner)
+        let roundTripped = try decode(AccountView.self, String(decoding: try JSONEncoder().encode(overview.accounts[2]), as: UTF8.self))
+        XCTAssertEqual(roundTripped, overview.accounts[2])
     }
 
-    /// The fee editor refuses what `PUT /api/usage/accounts/:id/plan` refuses, before the request leaves the Mac.
     func testPlanFeeParsesTheHostsRange() throws {
         XCTAssertEqual(try PlanFee.parse("200"), 200)
         XCTAssertEqual(try PlanFee.parse(" $19.99 "), 19.99)
@@ -51,7 +53,6 @@ final class UsageTests: XCTestCase {
         XCTAssertThrowsError(try PlanFee.parse("100001")) { XCTAssertEqual(($0 as? DesktopError)?.message, "The fee must be at most $100K a month.") }
     }
 
-    /// The desktop client receives `JSON` values; the typed contract comes from re-encoding them.
     func testContractDecodesFromTheClientJSONValue() throws {
         let value = try JSON.parse(Data("""
         {"tz":"Europe/Berlin","accounts":["deepseek","meta"],"days":[{"date":"2026-10-18","usd":1.5,"byAccount":{"deepseek":1,"meta":0.5}},{"date":"2026-10-19","usd":0,"byAccount":{}}]}
@@ -63,7 +64,6 @@ final class UsageTests: XCTestCase {
         XCTAssertEqual(daily.maxUsd, 1.5)
     }
 
-    /// `byKind` carries dollars, not counts: a fractional value must decode, and counts come from the rows.
     func testProjectDecodesTeamsWithoutAGoal() throws {
         let project = try decode(ProjectUsage.self, """
         {"id":"p1","name":"Infinite","total":{"usd":41.2,"unpriced":3},
@@ -91,7 +91,21 @@ final class UsageTests: XCTestCase {
         XCTAssertNil(list.projects[1].unmeasured)
     }
 
-    /// Nothing measured is "—", a partly measured figure is a floor, and only a fully priced figure is exact.
+    func testProjectCostPathKeepsHyphensAndStillEscapesOtherCharacters() {
+        XCTAssertEqual(RemoteClient.usageProjectPath("storefront-api", tz: "UTC"), "/usage/projects/storefront-api?tz=UTC")
+        XCTAssertEqual(RemoteClient.usageProjectPath("storefront-api~1", tz: "UTC"), "/usage/projects/storefront-api~1?tz=UTC")
+        XCTAssertEqual(RemoteClient.usageProjectPath("a/b", tz: "UTC"), "/usage/projects/a%2Fb?tz=UTC")
+    }
+
+    func testPathSegmentFollowsRFC3986UnreservedAndEncodesAccountPlanPaths() {
+        XCTAssertEqual(RemoteClient.pathSegment("alpha-1_2.3~4"), "alpha-1_2.3~4")
+        XCTAssertEqual(RemoteClient.pathSegment("a b/c?d#e%f"), "a%20b%2Fc%3Fd%23e%25f")
+        XCTAssertEqual(RemoteClient.pathSegment("acct:work+1"), "acct%3Awork%2B1")
+        XCTAssertEqual(RemoteClient.pathSegment("caf\u{00E9}"), "caf%C3%A9")
+        XCTAssertEqual(RemoteClient.accountPlanPath("claude~work"), "/usage/accounts/claude~work/plan")
+        XCTAssertEqual(RemoteClient.accountPlanPath("org/team a?b#c%20caf\u{00E9}"), "/usage/accounts/org%2Fteam%20a%3Fb%23c%2520caf%C3%A9/plan")
+    }
+
     func testUnmeasuredWorkNeverShowsAsZero() {
         XCTAssertEqual(Money(usd: 0, unpriced: 0).display(unmeasured: 3), .absent)
         XCTAssertEqual(Money(usd: 0, unpriced: 2).display(), .absent)
@@ -104,7 +118,6 @@ final class UsageTests: XCTestCase {
         XCTAssertEqual(Money(usd: 0, unpriced: 2).label, "—")
     }
 
-    /// The host's month window starts at 00:00 UTC; a zone west of it must not relabel October as September.
     func testMonthIsNamedInUTC() {
         let english = Locale(identifier: "en_US_POSIX")
         XCTAssertEqual(UsageFormat.monthName("2026-10-01T00:00:00.000Z", locale: english), "October")

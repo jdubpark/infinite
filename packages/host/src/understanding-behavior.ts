@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import {
   existsSync, lstatSync, readFileSync, readdirSync, realpathSync, statSync,
 } from "node:fs";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { isAbsolute, join, resolve, sep } from "node:path";
 import { z } from "zod";
 import type {
   BehaviorCheckResult, BehaviorDefinition, BehaviorList, BehaviorRun, BehaviorSuite,
@@ -104,7 +104,6 @@ export class BehaviorError extends Error {
   constructor(readonly statusCode: 400 | 404 | 409 | 429 | 503, message: string) { super(message); this.name = "BehaviorError"; }
 }
 
-/** Encrypted, bounded behavior definitions and real finite-state checker receipts. */
 export class UnderstandingBehaviorService {
   private readonly directory: string;
   private readonly files = new Map<string, string>();
@@ -437,10 +436,8 @@ export class UnderstandingBehaviorService {
         result.message = "The checker output exceeded the workspace storage limit. No result was retained; the admission remains consumed.";
         this.commit(active.workspaceId, next);
       }
-      // A completion is retained, but a source, plan, identity, or definition change makes it stale immediately.
       this.assess(active.workspaceId, nextBehavior);
     } catch {
-      // The durable running receipt remains intact; startup recovery will preserve it as interrupted.
     } finally {
       if (this.active?.runId === active.runId) this.active = undefined;
     }
@@ -456,7 +453,7 @@ export class UnderstandingBehaviorService {
     nextRun.state = "interrupted";
     nextRun.finishedAt = new Date().toISOString();
     nextRun.message = message;
-    try { this.commit(active.workspaceId, next); } catch { /* Leave the durable running receipt for restart recovery. */ }
+    try { this.commit(active.workspaceId, next); } catch {}
   }
 
   private dailyLimit(workspaceId: string) {
@@ -492,7 +489,6 @@ export class UnderstandingBehaviorService {
       stateSchema.parse(state);
       const scope = `${STORE_SCOPE}:${workspaceId}`;
       const raw = seal(this.sources.key, scope, state);
-      // Every mutation preserves space to finish admitted runs even when their output cannot fit.
       const running = state.behaviors.reduce((count, behavior) => count + behavior.runs.filter(run => run.state === "running").length, 0);
       if (Buffer.byteLength(raw) + running * RUN_COMPLETION_RESERVE_BYTES > MAX_STORE_BYTES)
         throw new BehaviorError(409, "This workspace has reached its behavior storage limit.");

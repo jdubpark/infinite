@@ -16,7 +16,6 @@ const CHANGE: Record<ChangeKind, { label: string; ink: string; surface: string }
 
 const FILE_LETTER: Record<FileChangeKind, string> = { added: "A", modified: "M", removed: "D", renamed: "R" };
 
-/** One card per component touched by the work, with its files one tap away. */
 export function Components({ items, onOpenComponent }: { items: ComponentChange[]; onOpenComponent?: (componentId: string) => void }) {
   return <View style={styles.stack}>
     {items.map((item, index) => <ComponentCard key={`${item.repositoryId}/${item.path}/${index}`} item={item} onOpenComponent={onOpenComponent} />)}

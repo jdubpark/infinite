@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import type { Prompt } from "@infinite/attention";
-import { detectPrompt, dialogCommand, oneShotPermissionOption } from "@infinite/attention";
+import { detectPrompt, dialogCommand, hasTruncatedEvidence, oneShotPermissionOption, truncateInput } from "@infinite/attention";
 
 const dialog: Prompt = {
   id: 7,
@@ -41,7 +41,6 @@ test("one-shot review fails closed without complete and bounded evidence", () =>
   assert.equal(oneShotPermissionOption({ ...dialog, hash: undefined }), undefined);
   assert.equal(oneShotPermissionOption({ ...dialog, pinned: false }), undefined);
   assert.equal(oneShotPermissionOption({ ...dialog, pinned: undefined }), undefined);
-  // A second `$ ` line, from the transcript above the title or written into the reason, hides which one is the command.
   const twoCommands = { ...dialog, detail: `$ npm test\n${dialog.detail}` };
   assert.equal(dialogCommand(twoCommands), undefined);
   assert.equal(oneShotPermissionOption(twoCommands), undefined);
@@ -71,8 +70,17 @@ test("one-shot review fails closed without complete and bounded evidence", () =>
   assert.equal(oneShotPermissionOption(persistentYes), undefined);
 });
 
-// The Codex 0.163 command dialog as the host's terminal rendered it on a live run: the bottom of
-// the screen, under the transcript, with its key hint on the last row.
+test("hook evidence cannot delegate the Code Mode account setting", () => {
+  const hookPrompt: Prompt = {
+    ...dialog,
+    title: "Code Mode (experimental)",
+    source: "hook",
+    tool: { name: "Bash", input: { command: "npm run check" }, inputComplete: true },
+  };
+  assert.equal(oneShotPermissionOption(hookPrompt), undefined);
+  assert.equal(oneShotPermissionOption({ ...hookPrompt, title: "Would you like to run this command?" }), 0);
+});
+
 const codexDialog = [
   "• Running npm run check",
   "",
@@ -95,7 +103,6 @@ const codexDialog = [
 ];
 const codexComposer = ["", "• Working (12s • esc to interrupt)", "", "› Ask Codex to do anything", "", "  ? for shortcuts"];
 
-/** The prompt the worker opens for a detected block, as `screenDecision` builds it. */
 function screenPromptOf(lines: string[]): Prompt | undefined {
   const detected = detectPrompt(lines, "codex");
   if (!detected) return undefined;
@@ -111,12 +118,10 @@ test("the live Codex dialog layout is pinned and keeps its command spacing", () 
 });
 
 test("dialog text printed in the transcript is never delegable", () => {
-  // Agent output scrolls above Codex's own input area, so a copied dialog is followed by it.
   const printed = screenPromptOf([...codexDialog, ...codexComposer])!;
   assert.equal(printed.title, "Would you like to run the following command?");
   assert.equal(printed.pinned, false);
   assert.equal(oneShotPermissionOption(printed), undefined);
-  // A printed dialog above a real yes/no prompt is still not the active dialog.
   const aboveYesNo = screenPromptOf([...codexDialog, "", "Overwrite the lockfile? [Y/n]"])!;
   assert.equal(aboveYesNo.pinned, false);
   assert.equal(oneShotPermissionOption(aboveYesNo), undefined);
@@ -145,7 +150,6 @@ test("a Codex reason phrased as a question does not displace the dialog title", 
   const prompt = screenPromptOf(questionReasonDialog)!;
   assert.equal(prompt.title, "Would you like to run the following command?");
   assert.equal(prompt.kind, "permission");
-  // The header starts at the title: the transcript line above it is not part of the dialog.
   assert.doesNotMatch(prompt.detail ?? "", /• Running/);
   assert.match(prompt.detail ?? "", /inspection route\?/);
   assert.equal(prompt.pinned, true);
@@ -194,4 +198,55 @@ test("a dialog whose detail runs past the parser's cap is marked truncated and n
   assert.match(prompt.detail ?? "", /… \[\+\d+ chars\]$/);
   assert.equal(dialogCommand(prompt), undefined, "a cut command is not a complete command");
   assert.equal(oneShotPermissionOption(prompt), undefined);
+});
+
+test("array truncation detection accepts untruncated 50-item arrays and rejects truncated top-level and nested arrays", () => {
+  const hookPrompt = (input: Record<string, unknown>): Prompt => ({
+    ...dialog,
+    source: "hook",
+    tool: { name: "MultiEdit", input: JSON.parse(JSON.stringify(input)) as Record<string, unknown>, inputComplete: true },
+  });
+
+  const exact50 = truncateInput({ edits: Array.from({ length: 50 }, (_, i) => ({ old_string: String(i), new_string: "x" })) });
+  assert.equal(hasTruncatedEvidence(exact50), false);
+  assert.equal(oneShotPermissionOption(hookPrompt(exact50)), 0);
+
+  const truncated51 = truncateInput({ edits: Array.from({ length: 51 }, (_, i) => ({ old_string: String(i), new_string: "x" })) });
+  assert.equal(hasTruncatedEvidence(truncated51), true);
+  assert.equal(oneShotPermissionOption(hookPrompt(truncated51)), undefined);
+
+  const nestedExact = truncateInput({
+    batch: { groups: [{ items: Array.from({ length: 50 }, (_, i) => i) }] },
+    matrix: [Array.from({ length: 50 }, (_, i) => i)],
+  });
+  assert.equal(hasTruncatedEvidence(nestedExact), false);
+  assert.equal(oneShotPermissionOption(hookPrompt(nestedExact)), 0);
+
+  const nestedObjectTruncated = truncateInput({
+    batch: { groups: [{ items: Array.from({ length: 51 }, (_, i) => i) }] },
+  });
+  assert.equal(hasTruncatedEvidence(nestedObjectTruncated), true);
+  assert.equal(oneShotPermissionOption(hookPrompt(nestedObjectTruncated)), undefined);
+
+  const nestedArrayTruncated = truncateInput({
+    matrix: [[Array.from({ length: 51 }, (_, i) => i)]],
+  });
+  assert.equal(hasTruncatedEvidence(nestedArrayTruncated), true);
+  assert.equal(oneShotPermissionOption(hookPrompt(nestedArrayTruncated)), undefined);
+
+  const collapsed = truncateInput({
+    items: Array.from({ length: 51 }, () => ({ a: "x".repeat(200), b: "y".repeat(200) })),
+  });
+  assert.equal(hasTruncatedEvidence(collapsed), true);
+  assert.equal(oneShotPermissionOption(hookPrompt(collapsed)), undefined);
+  assert.equal(hasTruncatedEvidence({ nested: { note: "abc … [+5 chars]" } }), true);
+  assert.equal(hasTruncatedEvidence({ nested: "[truncated]" }), true);
+
+  const markerLikeObject = { metadata: { "[truncated]": true, omitted: 1 } };
+  assert.equal(hasTruncatedEvidence(markerLikeObject), false);
+  assert.equal(oneShotPermissionOption(hookPrompt(markerLikeObject)), 0);
+
+  const shortArrayWithMarkerObject = { items: [{ "[truncated]": true, omitted: 1 }] };
+  assert.equal(hasTruncatedEvidence(shortArrayWithMarkerObject), false);
+  assert.equal(oneShotPermissionOption(hookPrompt(shortArrayWithMarkerObject)), 0);
 });

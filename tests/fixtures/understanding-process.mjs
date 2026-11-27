@@ -1,10 +1,6 @@
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 
-// Stands in for the Jevcode engine: answers `context` and `brief` for the runtime tests.
-// Mode "brief-fail" makes only the `brief` subcommand exit 1.
-// UNDERSTANDING_FIXTURE_BRIEF_SLEEP_MS makes `brief` wait that long first, so the host's deadline stops it.
-// Modes "brief-stderr" and "context-stderr" write one line to stderr and make that subcommand exit 1.
 const args = process.argv.slice(2);
 const mode = args[0];
 const subcommand = args.find(arg => arg === "context" || arg === "brief");

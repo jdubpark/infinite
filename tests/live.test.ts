@@ -143,6 +143,25 @@ test("unchanged refetch notifications retry failed REST loads without resending 
   } finally { feed.close(); t.mock.timers.reset(); }
 });
 
+test("an unchanged inline session list is sent again once a minute, so a phone's ages keep moving", async t => {
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  let now = 0;
+  t.mock.method(Date, "now", () => now);
+  const feed = new LiveFeed({
+    sessions: async () => ({ sessions: [{ id: "exited", attention: { since: "2026-11-20T00:00:00.000Z" } }] }),
+    teams: () => ({ teams: [] }), session: async () => ({}), events: async () => ({ events: [], cursor: 0, more: false }),
+  });
+  const sent: { at: number; update: unknown }[] = [];
+  try {
+    feed.subscribe(["sessions", "teams"], 0, update => sent.push({ at: now, update }));
+    await flush();
+    for (let tick = 0; tick < 81; tick++) { now += 750; t.mock.timers.tick(750); await flush(); }
+    assert.deepEqual(sent.map(row => [row.at, (row.update as { topic: string }).topic]), [[0, "sessions"], [0, "teams"], [60_000, "sessions"]],
+      "one re-send of the session list at a minute, none sooner, and none for other topics");
+    assert.deepEqual(sent[2]!.update, sent[0]!.update, "the re-send is the same inline list");
+  } finally { feed.close(); t.mock.timers.reset(); }
+});
+
 const buffers = new WeakMap<ReadableStreamDefaultReader<Uint8Array>, string>();
 async function readSse(reader: ReadableStreamDefaultReader<Uint8Array>) {
   let text = buffers.get(reader) ?? "";
@@ -306,6 +325,47 @@ test("HTTP live streams stop after cookie logout or paired-token revocation", { 
     await expectClosed(deviceReader);
   } finally {
     await Promise.all(readers.map(reader => reader.cancel().catch(() => {})));
+    await host.stop();
+  }
+});
+
+test("disabled browser sessions reject login, ignore existing cookies, and keep bearer SSE", { timeout: 15000 }, async () => {
+  const host = await inProcessHost();
+  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+  try {
+    const login = await fetch(`${host.origin}/api/login`, { method: "POST", headers: { Origin: host.config.origin, "Content-Type": "application/json" }, body: JSON.stringify({ token: host.tokens.owner }) });
+    assert.equal(login.status, 200);
+    const cookie = login.headers.get("set-cookie")!.split(";")[0];
+
+    host.config.browserSessions = false;
+    for (const path of ["/api/login", "/api/login/", "/API/LOGIN/"]) {
+      const blockedLogin = await fetch(host.origin + path, { method: "POST", headers: { Origin: host.config.origin, "Content-Type": "application/json" }, body: "not-json" });
+      assert.equal(blockedLogin.status, 403, `${path} is blocked before parsing the invalid body`);
+      assert.deepEqual(await blockedLogin.json(), { code: "browser-sessions-disabled", error: "Browser sign-in is disabled on this instance" });
+      assert.equal(blockedLogin.headers.get("set-cookie"), null);
+    }
+
+    assert.equal((await fetch(`${host.origin}/api/me`, { headers: { Cookie: cookie } })).status, 401, "a still-live server cookie is ignored when browser sessions are disabled");
+    assert.equal((await fetch(`${host.origin}/api/me`, { headers: { Cookie: cookie, Authorization: "Bearer invalid" } })).status, 401, "an invalid bearer cannot fall back to a browser cookie");
+    assert.equal((await fetch(`${host.origin}/api/me`, { headers: { Authorization: `Bearer ${host.tokens.owner}` } })).status, 200);
+
+    const page = await fetch(host.origin);
+    assert.equal(page.status, 503);
+    assert.match(page.headers.get("content-type")!, /text\/html/);
+    const html = await page.text();
+    assert.match(html, /Browser sign-in is disabled/);
+    assert.match(html, /Do not enter a device key here/);
+    assert.doesNotMatch(html, /<script|<form|type=\"password\"/i);
+
+    const stream = await fetch(`${host.origin}/api/events?topics=sessions`, { headers: { Authorization: `Bearer ${host.tokens.owner}` } });
+    assert.equal(stream.status, 200);
+    reader = stream.body!.getReader();
+    assert.match(new TextDecoder().decode((await reader.read()).value), /: connected/);
+    const logout = await fetch(`${host.origin}/api/logout`, { method: "POST", headers: { Origin: host.config.origin, Cookie: cookie, Authorization: `Bearer ${host.tokens.owner}` } });
+    assert.equal(logout.status, 200);
+    assert.equal(logout.headers.get("set-cookie"), null, "disabled browser sessions do not set or clear cookies");
+  } finally {
+    await reader?.cancel().catch(() => {});
     await host.stop();
   }
 });

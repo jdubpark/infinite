@@ -7,7 +7,7 @@ import { join, relative, sep } from "node:path";
 import type { Prompt } from "@infinite/attention";
 import { claimControl, waitFor } from "./helpers.js";
 import { fixture, git, limitLineup } from "./team-fixture.js";
-import { DEFAULT_PERMISSION_LIMIT, DEFAULT_PERMISSION_SCOPE, LEGACY_DEFAULT_PERMISSION_SCOPES, currentPermissions, type TeamLineup } from "../packages/host/src/team-types.js";
+import { DEFAULT_PERMISSION_LIMIT, DEFAULT_PERMISSION_SCOPE, LEGACY_DEFAULT_PERMISSION_SCOPES, currentPermissions, type TeamLineup, type TeamPermissionDecision } from "../packages/host/src/team-types.js";
 import { isCollapsedPermissionPrompt, permissionEvidenceHash, refusedBeforeSend } from "../packages/host/src/team-permissions.js";
 import { permissionEvidenceDigest } from "../packages/host/src/team-permission-evidence.js";
 import { ContentError } from "../packages/host/src/session-content.js";
@@ -45,7 +45,6 @@ test("only a preflight or named worker refusal counts as an answer that sent not
   assert.equal(refusedBeforeSend(new ContentError("The assigned team member has no running managed terminal")), true);
   for (const code of ["prompt-changed", "control-busy", "control-lost"])
     assert.equal(refusedBeforeSend(Object.assign(new Error(code), { code })), true, code);
-  // A socket error can follow a delivered key, like a lost acknowledgement.
   for (const code of ["ECONNRESET", "EPIPE", undefined])
     assert.equal(refusedBeforeSend(Object.assign(new Error("Worker connection failed"), { code })), false, String(code));
 });
@@ -143,7 +142,7 @@ test("a lost expansion acknowledgement is sealed uncertain and a fresh Manager n
         const ledger = unseal<{ requests: Record<string, { receipt: Receipt }> }>(key, `${sessionId}:team-permission-expansions`,
           readFileSync(join(stateDir, "sessions", sessionId, "team-permission-expansions.sealed"), "utf8"));
         intentWasDurable = ledger.requests[request.requestId]?.receipt.state === "uncertain";
-        socket.destroy(); // The worker accepted the one-key request; its acknowledgement is lost.
+        socket.destroy();
       } else socket.end(JSON.stringify({ error: "unexpected request" }) + "\n");
     });
   });
@@ -385,7 +384,6 @@ test("a Codex permission review preserves a large objective and complete request
     assert.ok(existsSync(feedback.targetScratchDirectory), "the host-assigned temporary directory exists for the reviewed target");
     const scratchRelativeToTarget = relative(target.cwd, feedback.targetScratchDirectory);
     assert.ok(scratchRelativeToTarget.startsWith(`..${sep}`), "the target scratch directory stays outside its Git checkout");
-    // While the coordinator reviews, the run does not tell the person to answer the prompt.
     await waitFor(() => f.get(reviewing.id), run => run.reason === "The permission coordinator is reviewing a provider request.", 10000);
     writeFileSync(join(f.receipts, `${reviewing.id}.judge-release`), "release", { mode: 0o600 });
 
@@ -533,7 +531,6 @@ test("a Codex command redrawn while the answer is in progress receives no Enter"
     const reviewing = await waitFor(() => f.get(created.body.id), run =>
       run.permissionDecisions?.some(decision => decision.status === "reviewing") && existsSync(join(f.receipts, `${run.id}.judge-ready`)), 60000);
     writeFileSync(join(f.receipts, `${reviewing.id}.judge-release`), "release", { mode: 0o600 });
-    // Arrow keys reached the dialog before it changed, so the host cannot say nothing was sent.
     const uncertain = await waitFor(() => f.get(reviewing.id), run => !["pending", "reviewing", "approved", "answering"].includes(run.permissionDecisions?.[0]?.status ?? "pending"), 30000);
     assert.equal(uncertain.permissionDecisions[0].status, "uncertain", JSON.stringify(uncertain.permissionDecisions[0]));
     assert.equal(uncertain.permissionDecisions[0].receipt?.state, "uncertain");
@@ -652,7 +649,7 @@ test("an explicit escalation or a foreign decision report never answers the targ
       const session = await f.host.fetchApi(`/sessions/${target.sessionId}`);
       assert.equal(session.body.attention?.state, "needs-you");
       if (scenario === "permissions-escalate") {
-        await new Promise(resolve => setTimeout(resolve, 1800)); // Let several 500 ms TeamService passes observe the held prompt.
+        await new Promise(resolve => setTimeout(resolve, 1800));
         const stillEscalated = await f.get(reviewing.id);
         assert.equal(stillEscalated.permissionDecisions?.length, 1,
           "a terminal escalation for this exact prompt cannot launch another ordinary review on later ticks");
@@ -766,7 +763,6 @@ test("an owner answer supersedes a late permission report when the obsolete revi
     const targetSession = await waitFor(() => f.host.fetchApi(`/sessions/${target.sessionId}`),
       result => result.body?.attention?.state === "needs-you" && result.body?.attention?.prompt?.kind === "permission", 15000);
 
-    // Keep the report-only reviewer from stopping immediately after its target becomes obsolete.
     reviewerControl = await claimControl(f.host, coordinator.sessionId, "controller");
     const ownerAnswer = await f.host.fetchApi(`/sessions/${target.sessionId}/answer`, "owner", {
       requestId: randomUUID(), promptId: targetSession.body.attention.prompt.id, option: 0,
@@ -774,8 +770,6 @@ test("an owner answer supersedes a late permission report when the obsolete revi
     assert.equal(ownerAnswer.status, 200, JSON.stringify(ownerAnswer.body));
     await waitFor(() => f.host.fetchApi(`/sessions/${target.sessionId}`), result => !result.body?.attention?.prompt, 15000);
 
-    // If the stale report reaches the ordinary result validator, this violates the reviewer's
-    // read-only workspace check. It must be ignored because the owner's answer already won.
     writeFileSync(join(coordinator.cwd, "late-review-write.txt"), "outside the reviewer assignment\n");
     writeFileSync(join(f.receipts, `${reviewing.id}.judge-release`), "release", { mode: 0o600 });
     const lateReport = await waitFor(() => f.get(reviewing.id), run =>
@@ -794,10 +788,6 @@ test("an owner answer supersedes a late permission report when the obsolete revi
     assert.equal(finished.permissionDecisions?.[0]?.receipt, undefined, "a late reviewer report cannot deliver a second answer");
     assert.deepEqual(finished.tasks.map(task => task.status), ["integrated", "integrated"]);
 
-    // Reproduce a legacy host record that stopped during a generic result operation after
-    // the permission coordinator and an implementation sibling had both reported. Without
-    // operation provenance, restart must retain both reports and ask the PM to reconcile
-    // them instead of either accepting one or leaving the same run wedged.
     await f.host.stopApi();
     const stateFile = join(f.host.config.stateDir, "teams", `${finished.id}.sealed`);
     const key = readFileSync(f.host.config.keyFile);
@@ -859,9 +849,6 @@ test("an unavailable reviewer with a terminal decision does not fence a later pe
     const targetPrompt = await waitFor(() => f.host.fetchApi(`/sessions/${target.sessionId}`), result =>
       result.body?.attention?.state === "needs-you" && result.body?.attention?.prompt?.kind === "permission", 15000);
 
-    // Model a new prompt after the first review became terminal, while retaining the old
-    // report-only member as unavailable. The current prompt identity remains independently
-    // validated by maybeStartPermissionReview before its new coordinator can answer it.
     const service = await f.openTeamService({ start: false });
     const internal = service as unknown as {
       records: Map<string, { run: typeof reviewing }>;
@@ -931,7 +918,8 @@ test(`a ${action} with an unresolved verification operation stays in force after
   const f = await fixture("lifecycle");
   try {
     const created = await f.host.fetchApi("/teams", "owner", f.create());
-    const checking = await waitFor(() => f.get(created.body.id), run => run.status === "verifying" && run.checks.some(check => check.status === "running"), 30000);
+    const checking = await waitFor(() => f.get(created.body.id), run => run.status === "verifying" && run.checks.some(check => check.status === "running") &&
+      existsSync(join(f.receipts, "check-ready.json")), 30000);
     const result = await f.host.fetchApi(`/teams/${checking.id}/${action}`, "owner", { requestId: randomUUID(), revision: checking.revision });
     assert.equal(result.status, 200);
     await f.host.stopApi();
@@ -943,4 +931,70 @@ test(`a ${action} with an unresolved verification operation stays in force after
     assert.equal(recovered.recovery, undefined);
     assert.equal((await f.host.fetchApi("/teams")).body.teams.find((team: { id: string }) => team.id === checking.id).status, recovered.status);
   } finally { await f.close(); }
+});
+
+test("answerTeamPermission delivers explicit sourceCoordinatorMemberId while observing live mutations on reused decisions", { timeout: 20_000 }, async () => {
+  mkdirSync(".local", { recursive: true, mode: 0o700 });
+  const root = mkdtempSync(join(".local", "ta-"));
+  const stateDir = join(root, "state"), runDir = join(root, "r"), sessionId = randomUUID();
+  mkdirSync(runDir);
+  const key = Buffer.alloc(32, 23);
+  const team = { runId: randomUUID(), memberId: randomUUID(), revision: 1, role: "implementer" as const, taskId: "task-reuse" };
+  const cwd = realpathSync(root), runtime = { id: randomUUID(), location: "cloud" as const, transport: "pty" as const };
+  const session = { id: sessionId, team, provider: "codex" as const, title: "Reuse", projectId: "fixture", cwd, createdAt: new Date().toISOString(), status: "running" as const, contextVersion: 0, context: "", initialPrompt: "", runtime } as Session;
+  const config = { stateDir, runDir, enableDemo: true, agents: { codex: { command: process.execPath, args: [] } } } as Config;
+  const prompt: Prompt = { id: 4, kind: "permission", source: "screen", hash: "b".repeat(64), pinned: true, acceptsText: false, title: "Would you like to run the following command?", detail: "Environment: local\n$ npm run check", options: [{ index: 0, label: "Yes, proceed (y)", role: "accept" }, { index: 1, label: "No (esc)", role: "reject" }] };
+  const liveState = { status: "running", seq: 11, screen: "", runtime, control: null, attention: { state: "needs-you", prompt } } as WorkerState;
+  mkdirSync(join(stateDir, "sessions", sessionId), { recursive: true });
+  writeSealed(join(stateDir, "sessions", sessionId, "meta.sealed"), key, `${sessionId}:meta`, { session, fingerprint: "fixture" });
+  let control: ControlLease | null = null, onClaim: (() => void) | undefined;
+  const delivered: Extract<WorkerRequest, { op: "team-answer" }>[] = [];
+  const server = createServer(socket => {
+    let data = "";
+    socket.on("data", chunk => {
+      data += chunk.toString();
+      const end = data.indexOf("\n");
+      if (end < 0) return;
+      const request = JSON.parse(data.slice(0, end)) as WorkerRequest;
+      if (request.op === "state") socket.end(JSON.stringify({ result: { ...liveState, control } }) + "\n");
+      else if (request.op === "control" && request.action === "claim") { control = { id: randomUUID(), label: request.actor.label, expiresAt: Date.now() + 60_000 }; onClaim?.(); socket.end(JSON.stringify({ result: control }) + "\n"); }
+      else if (request.op === "control" && request.action === "release") { control = null; socket.end(JSON.stringify({ result: null }) + "\n"); }
+      else if (request.op === "team-answer") { delivered.push(request); socket.end(JSON.stringify({ result: { requestId: request.requestId, state: "delivered", result: "closed", seq: 12 } }) + "\n"); }
+      else socket.end(JSON.stringify({ error: "unexpected request" }) + "\n");
+    });
+  });
+  await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(socketPath(runDir, sessionId), resolve); });
+  try {
+    const manager = new Manager(config, key), sourceCoordinatorId = randomUUID();
+    const makeDecision = (overrides: Partial<TeamPermissionDecision> = {}): TeamPermissionDecision => ({
+      id: randomUUID(), revision: 1, policyHash: "a".repeat(64), targetMemberId: team.memberId, targetSessionId: sessionId, targetCwd: cwd,
+      promptId: prompt.id, promptHash: prompt.hash!, evidenceHash: permissionEvidenceHash(prompt), prompt, option: 0,
+      expiresAt: new Date(Date.now() + 60_000).toISOString(), answerRequestId: randomUUID(), status: "answering", ...overrides,
+    });
+    const reused = makeDecision({ reusedFromDecisionId: randomUUID() });
+    const receipt = await manager.answerTeamPermission(sessionId, reused.answerRequestId, team, reused, () => true, sourceCoordinatorId);
+    assert.equal(receipt.state, "delivered");
+    assert.equal(receipt.result, "closed");
+    assert.equal(delivered.length, 1);
+    assert.equal(delivered[0]?.coordinatorMemberId, sourceCoordinatorId);
+    assert.equal(reused.coordinatorMemberId, undefined);
+    assert.equal(control, null);
+
+    const invalidated = makeDecision({ reusedFromDecisionId: randomUUID() });
+    onClaim = () => { invalidated.status = "uncertain"; };
+    await assert.rejects(manager.answerTeamPermission(sessionId, invalidated.answerRequestId, team, invalidated, () => true, sourceCoordinatorId), /invalidated before the answer/);
+    onClaim = undefined;
+    assert.equal(delivered.length, 1);
+    assert.equal(control, null);
+
+    const unattributed = makeDecision();
+    await assert.rejects(manager.answerTeamPermission(sessionId, unattributed.answerRequestId, team, unattributed, () => true, sourceCoordinatorId), /incomplete, expired, or not a one-shot approval/);
+    const missingSource = makeDecision({ reusedFromDecisionId: randomUUID() });
+    await assert.rejects(manager.answerTeamPermission(sessionId, missingSource.answerRequestId, team, missingSource, () => true), /incomplete, expired, or not a one-shot approval/);
+    const conflicting = makeDecision({ coordinatorMemberId: randomUUID() });
+    await assert.rejects(manager.answerTeamPermission(sessionId, conflicting.answerRequestId, team, conflicting, () => true, sourceCoordinatorId), /incomplete, expired, or not a one-shot approval/);
+  } finally {
+    if (server.listening) await new Promise<void>(resolve => server.close(() => resolve()));
+    rmSync(root, { recursive: true, force: true });
+  }
 });

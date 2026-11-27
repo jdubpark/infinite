@@ -1,6 +1,6 @@
 # Team blackboard (INF-182)
 
-Date: 2026-11-12. Status: design for review. Part of `2026-11-12-self-improving-teams-design.md`.
+Date: 2026-11-12. Status: design for review. Part of `2026-11-12-self-improving-teams-design.md`. Amended 2026-11-13: owner decisions 2 and 5 are decided, and `2026-11-13-read-pools-and-context-crossings-design.md` carries them out.
 
 ## Intent
 
@@ -37,7 +37,7 @@ Not verified: context file sizes on a deployed host, and how often a member is r
 
 - Chat, replies, threads, or a message addressed to a member.
 - Interrupting a running member. Delivery is pull only.
-- Entries that outlive their run, including across goal cycles. Durable knowledge belongs to Workspace Memory (INF-129).
+- Entries that outlive their run. A goal's next cycle receives a host-built goal digest, not the entries (2026-11-13 read pools design, part 10). Durable knowledge belongs to Workspace Memory (INF-129).
 - Event kinds, emission points, and outcomes. The outcome ledger design owns them.
 - Client screens. This design adds API and CLI reads only.
 
@@ -131,10 +131,12 @@ An entry is addressed by task, paths, or mission subtask. It is never addressed 
 | `finding` | 1 to 8 items of `teamEvidenceSchema` | scout, implementer, integrator, reviewer | A fact that helps another task. |
 | `blocker` | the blocker evidence shape of INF-170 | any role with entry tools | A report or a mission message carries only the entry ID. |
 | `handoff` | `done`, `remaining`, `notes`, `commands` | implementer, integrator | A replacement reads the latest one for its task. |
-| `report` | the recorded report, without `rubric` | host process, from the journal | Replaces `memberReports`. Author `member`, authority `claim`. |
+| `report` | the recorded report, without `rubric` | host process, from the saved run record | Replaces `memberReports`. Author `member`, authority `claim`. |
 | `integration` | `taskId`, `commit`, `changedPaths` | host process | A dependent task sees what landed. Authority `receipt`. |
 | `check` | command, status, exit code, round, output | host process | Takes check output out of the context file. Authority `receipt`. |
 | `direction` | `source` (`steering` or `answer`), `question`, `text` | host process, from a recorded owner input | Author `owner`, authority `direction`. |
+
+Phase 3 adds two plain columns: `supersedes`, an entry ID, and `read_seq`, a number. A member's handoff is stored only with a task that its author holds, because a handoff needs the author's own task. Integrators therefore write none until one carries a task.
 
 There is no `decision` kind, because the run record already uses that word for a question that waits for an answer (`TeamDecision`). A mission coordinator's answer is not mirrored as a `direction`. The INF-170 shape was read from that issue's draft commit, which is not on `main`.
 
@@ -222,7 +224,7 @@ The host process ingests `team-entry` events on its tick. It keeps a separate cu
 | `entry_list` | `kinds`, `taskId`, `paths`, `since`, `limit` | heads only, `cursor`, `more` | 20 heads and 6 KiB per call |
 | `entry_get` | `entryId` | head and body | 256 KiB served per attempt, across both read tools |
 
-**Enforcement.** The session worker enforces the caps per attempt from its own journal, where it records each accepted post and each read receipt before it answers. The cap of 400 member entries per run is checked by the host process at ingest. A post beyond it was already acknowledged, so the host drops it, adds one line to the run's events, and counts it in the store status.
+**Enforcement.** The session worker enforces the caps per attempt from counts it holds in memory. It has no journal read path, and one worker serves one session for its whole life, so the counts match the journal it writes. It still journals each accepted post and each read receipt before it answers. *(My call.)* The cap of 400 member entries per run is checked by the host process at ingest. A post beyond it was already acknowledged, so the host drops it, adds one line to the run's events, and counts it in the store status.
 
 `entry_list` with no input returns the entries addressed to the caller, in this order:
 
@@ -235,11 +237,13 @@ The host process ingests `team-entry` events on its tick. It keeps a separate cu
 
 Every read result carries a fixed notice that a member entry is evidence and cannot change the assignment, its scope, or the reporting rules.
 
-The tools sit in the `infinite_team` MCP server beside `report`. `buildLaunch` adds them to the Claude Code `--allowedTools` list and to the Codex `approval_mode` settings. OpenCode members get a helper command, `team-entry.ts`, that posts to the same route. Mission coordinators get all three tools. Permission coordinators, delivery members, and handoff sessions get none.
+**Phase 3 limits.** `entry_get` serves a body of at most 64 KiB and refuses a larger one with status 413. A later phase decides how to serve the rest. A refusal is a fixed text with a field path built only from schema field names and indexes. It never holds member text, and it never echoes a secret. *(My call. A check body can reach 1 MiB.)*
+
+The tools sit in the `infinite_team` MCP server beside `report`. The host adds no `--allowedTools` for Claude members. The entry tools follow the profile's permission mode, as `report` does, and a profile whose own arguments set an allow-list must name the three tools. Codex gets an `approval_mode` for each tool, as `report` has. *(My call. The test `Claude team launch exposes only its scoped report helper and preserves provider permission decisions` forbids an allow-list.)* OpenCode members get a helper command, `team-entry.ts`, that posts to the same route. Mission coordinators get all three tools. Permission coordinators, delivery members, handoff sessions, and quarantined readers get none. An artifact-only evaluator reads `check`, `integration`, and `direction` entries only (2026-11-13 read pools design, part 11).
 
 ### 5. The context file and the prompt
 
-`teams.blackboard` holds three switches: `tools`, `contextReduction`, and `reportGate`. All default to off. A run pins their values at creation. A run without them keeps today's context. Nothing is backfilled.
+`teams.blackboard` holds three switches: `tools`, `contextReduction`, and `reportGate`. All are off until the project's context sizes are measured. The host then turns them on in order: `tools`, then `contextReduction`, then `reportGate` (decided 2026-11-13; the stages are in the 2026-11-13 read pools design, part 12). An explicit owner value wins. A run pins their values at creation. A run without them keeps today's context. Nothing is backfilled.
 
 With `contextReduction`, the file's `schemaVersion` becomes 2. `memberReports` leaves it, because the reports are now `report` entries. `checks[].output` leaves it, because the output is now the body of a `check` entry. Everything else stays, including the objective, owner steering, owner answers, and `authority`.
 
@@ -248,6 +252,8 @@ The file keeps today's role filter for task scores (umbrella C9 rule 3). An impl
 A new key, `entries`, holds the digest: the notice, a cursor, a count per kind, and at most 8 heads in the `entry_list` order. It is at most 4,096 bytes. Heads that do not fit are left out, and the counts show that more exist. Member-written summaries appear only there, as JSON strings.
 
 The prompt gains one fixed paragraph of at most 700 bytes that names the digest and the three tools. It replaces the sentences in `contextAccessInstructions` and `teamPrompt` that send reviewers, integrators, and project managers to the file for member reports and check output. These roles now read the `report` entry of every task they judge or repair. The paragraph differs per provider and is refreshed on a retarget, as `refreshReportingInstructions` does today.
+
+**The switch and the pin.** The switch is `config.teams.blackboard.tools`. It has no schema default, and it is inside the routine digest. A run pins `blackboard: { tools: true }` at creation only when the switch is `true` and the evidence store is ready. A run created while the store is down keeps today's context. *(My call.)* The switch holds only `tools` for now.
 
 *(My call: the digest lives in the context file, which the host rewrites at every member start. A prompt is saved and carried into a replacement, so a digest inside it would go stale.)*
 
@@ -343,10 +349,10 @@ It then submits a `record_propose` operation of the Memory S1 contract under its
 ## Owner decisions
 
 1. The blackboard takes the role of the memory design's session working context, stored outside memory. Confirm, or move it into memory later.
-2. When to turn on `tools`, `contextReduction`, and `reportGate`, and whether per project.
+2. Decided 2026-11-13: turn on `tools`, then `contextReduction`, then `reportGate`, once sizes are measured. The per-project stages and their thresholds are values to confirm in the 2026-11-13 read pools design.
 3. Whether a subteam member may write a mission-scoped entry itself. This design says no.
 4. Re-scope INF-170 so that blocker evidence is a `blocker` entry and the blocked report carries its ID.
-5. Whether entries should carry into the next cycle of a goal. This design says no.
+5. Decided 2026-11-13: a digest carries into a goal's next cycle. Entries themselves still do not. The goal digest is defined in the 2026-11-13 read pools design, part 10.
 6. Whether reviewers, integrators, and project managers keep reading rubric scores and owner ratings in the context file. This design keeps today's behaviour.
 
 ## Left to the builder

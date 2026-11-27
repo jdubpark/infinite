@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -77,7 +77,10 @@ test("subscription plan updates are owner-only, validated, and reset to config",
 test("the encrypted channel carries the phone cost screen and owner plan edits", { timeout: 60000 }, async () => {
   const host = await startHost({ config: {
     machine: { id: randomUUID(), label: "Test machine" }, remote: { enabled: true },
-    usage: { prices: {}, budgets: {}, accounts: { claude: { kind: "subscription", match: [], planUsd: 20 } } },
+    usage: { prices: {}, budgets: {}, accounts: {
+      claude: { kind: "subscription", match: [], planUsd: 20 },
+      "claude+work@example.com": { kind: "subscription", match: [], planUsd: 25 },
+    } },
   } });
   const owner = createRemoteClient({ url: host.origin, token: host.tokens.owner });
   try {
@@ -86,11 +89,18 @@ test("the encrypted channel carries the phone cost screen and owner plan edits",
     const result = await owner.request<{ accounts: { id: string; planUsd?: number; planSource?: string }[] }>("/usage/accounts/claude/plan", { method: "PUT", body: { planUsd: 9.99 } });
     assert.equal(result.accounts.find(account => account.id === "claude")?.planUsd, 9.99);
     assert.equal(result.accounts.find(account => account.id === "claude")?.planSource, "owner");
-    await assert.rejects(owner.request("/usage/accounts/cl%61ude/plan", { method: "PUT", body: { planUsd: 1 } }), "encoded route segments stay refused");
+    const encoded = await owner.request<{ accounts: { id: string; planUsd?: number; planSource?: string }[] }>(
+      `/usage/accounts/${encodeURIComponent("claude+work@example.com")}/plan`,
+      { method: "PUT", body: { planUsd: 14.5 } },
+    );
+    assert.equal(encoded.accounts.find(account => account.id === "claude+work@example.com")?.planUsd, 14.5);
+    assert.equal(encoded.accounts.find(account => account.id === "claude+work@example.com")?.planSource, "owner");
+    for (const denied of ["/usage/accounts/claude/%70lan", "/usage/accounts/%2e%2e/plan", "/usage/accounts/a%2fb/plan", "/usage/accounts/%252e%252e/plan"]) {
+      await assert.rejects(owner.request(denied, { method: "PUT", body: { planUsd: 1 } }), `${denied} stays refused`);
+    }
   } finally { owner.close(); await host.stop(); }
 });
 
-/** Runs `infinite evidence ...` against the host as its owner and returns stdout. */
 function evidenceCli(host: { origin: string; tokens: { owner: string } }, root: string) {
   const clientFile = join(root, "client.json");
   writeFileSync(clientFile, JSON.stringify({ origin: host.origin, token: host.tokens.owner, projectId: "rehearsal" }), { mode: 0o600 });
@@ -127,6 +137,29 @@ test("the status route and command report the store", { timeout: 60000 }, async 
   }
 });
 
+test("usage routes answer 503 and change nothing while the ledger is unavailable", { timeout: 90000 }, async () => {
+  const host = await startHost({ config: { usage: { prices: {}, budgets: {}, accounts: {
+    claude: { kind: "subscription", match: ["anthropic/*"], planUsd: 20 },
+  } } } });
+  try {
+    await host.stopApi();
+    const location = join(host.config.stateDir, "evidence");
+    rmSync(location, { recursive: true, force: true });
+    writeFileSync(location, "not a directory");
+    const plan = join(host.config.stateDir, "usage-plans.sealed");
+    const before = existsSync(plan) ? readFileSync(plan) : undefined;
+    await host.start();
+    assert.equal((await host.fetchApi("/usage/models")).status, 503);
+    const put = await host.fetchApi("/usage/accounts/claude/plan", "owner", { planUsd: 12 }, {}, "PUT");
+    assert.equal(put.status, 503);
+    assert.deepEqual(put.body, { error: "The usage ledger is unavailable" });
+    assert.deepEqual(existsSync(plan) ? readFileSync(plan) : undefined, before, "a refused plan override writes nothing");
+    const refresh = await host.fetchApi("/usage/balances/refresh", "owner", {});
+    assert.equal(refresh.status, 503);
+    assert.deepEqual(refresh.body, { error: "The usage ledger is unavailable" });
+  } finally { await host.stop(); }
+});
+
 test("a host with an unusable evidence location still serves and reports the store unavailable", { timeout: 90000 }, async () => {
   const host = await startHost();
   const root = mkdtempSync(join(tmpdir(), "infinite-evidence-cli-"));
@@ -136,7 +169,10 @@ test("a host with an unusable evidence location still serves and reports the sto
     rmSync(location, { recursive: true, force: true });
     writeFileSync(location, "not a directory");
     await host.start();
-    assert.equal((await host.fetchApi("/usage")).status, 200);
+    const usage = await host.fetchApi("/usage");
+    assert.equal(usage.status, 503);
+    assert.deepEqual(usage.body, { error: "The usage ledger is unavailable" });
+    assert.equal((await host.fetchApi("/sessions")).status, 200);
     const status = await host.fetchApi("/evidence/status");
     assert.equal(status.status, 200);
     assert.equal(status.body.state, "unavailable");
@@ -150,4 +186,27 @@ test("a host with an unusable evidence location still serves and reports the sto
     rmSync(root, { recursive: true, force: true });
     await host.stop();
   }
+});
+
+test("the ledger reads answer 503 when the store is unavailable", { timeout: 90000 }, async () => {
+  const host = await startHost();
+  try {
+    await host.stopApi();
+    const location = join(host.config.stateDir, "evidence");
+    rmSync(location, { recursive: true, force: true });
+    writeFileSync(location, "not a directory");
+    await host.start();
+
+    const models = await host.fetchApi("/usage/models");
+    assert.equal(models.status, 503, JSON.stringify(models.body));
+    assert.deepEqual(models.body, { error: "The usage ledger is unavailable" });
+    assert.equal((await host.fetchApi("/usage/models?role=reviewer")).status, 503);
+    assert.equal((await host.fetchApi("/usage")).status, 503);
+
+    const cells = await host.fetchApi("/outcomes");
+    assert.equal(cells.status, 503, JSON.stringify(cells.body));
+    assert.equal(cells.body.code, "evidence-unavailable");
+
+    assert.equal((await host.fetchApi("/teams")).status, 200, "the rest of the host still serves");
+  } finally { await host.stop(); }
 });

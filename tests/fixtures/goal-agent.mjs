@@ -22,6 +22,11 @@ record();
 process.stdin.resume();
 
 async function report(value) {
+  if (value.kind === "plan" && prompt.includes("Task criterion references for this goal plan:")) {
+    const context = JSON.parse(readFileSync(join(".git", "infinite-team-context.json"), "utf8"));
+    const criterionRefs = { objectiveVersion: context.authority.goal.record.version, criteria: ["c0"] };
+    value = { ...value, tasks: value.tasks.map(task => ({ ...task, criterionRefs })) };
+  }
   const response = await fetch(`${process.env.INFINITE_HOOK_URL}/team-report`, {
     method: "POST",
     headers: { Authorization: `Bearer ${process.env.INFINITE_HOOK_TOKEN}`, "Content-Type": "application/json" },
@@ -125,9 +130,18 @@ async function main() {
   } else if (assignment.role === "reviewer") {
     if (!Number.isInteger(progress.completed) || progress.completed < 1 || progress.draft)
       throw new Error("The reviewed implementation is incomplete");
-    // The UI scenario deliberately omits inspection evidence. The host must
-    // reject this approval even though the configured code check passed.
-    await report({ kind: "review", verdict: "approved", summary: "Verified the progress data and configured check results" });
+    await report({ kind: "review", verdict: "approved", summary: "Verified the progress data and configured check results",
+      acceptance: [{ criterion: 1, verdict: "verified", evidence: "The configured check read the completed field." }] });
+  } else if (assignment.role === "evaluator") {
+    const file = join(receipts, `verdict-${progress.completed}.json`);
+    if (existsSync(file)) {
+      await report(JSON.parse(readFileSync(file, "utf8")));
+      return;
+    }
+    const context = JSON.parse(readFileSync(join(".git", "infinite-team-context.json"), "utf8"));
+    const changed = context.changedPaths?.paths?.[0];
+    await report({ kind: "verdict", result: "met",
+      criteria: (context.record?.criteria ?? []).map(item => ({ id: item.id, state: "met", evidence: changed ? [`file:${changed}`] : [] })) });
   } else throw new Error(`Unexpected fixture role: ${assignment.role}`);
 }
 

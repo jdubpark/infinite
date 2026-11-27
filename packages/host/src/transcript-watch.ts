@@ -1,81 +1,52 @@
-// The transcript watch owns everything the worker needs to capture a session's usage and chat
-// from its provider transcript: the byte reader, the usage reader, the drains, the end evidence,
-// the subagent transcripts, and the facts that stay true once a transcript is replaced. The worker
-// journals what it returns.
 import { TranscriptTail, type TranscriptMessage, type TranscriptProvider } from "./transcript.js";
 import { UsageTail, usageCoverage, type SecondaryState, type UsageCoverage, type UsageCoverageReason } from "./transcript-usage.js";
 import { MAX_SECONDARY_FILES, SECONDARY_ID, SECONDARY_NAME, type SecondaryListing, type SecondaryRequest } from "./transcript-secondary.js";
 import type { UsageRecord } from "./usage.js";
 
-/** How the final drain after the provider exited ended: it never ran, it reached the end, or it did not. */
 export type FinalDrainState = "complete" | "incomplete" | "skipped";
 
-/** The coverage of one session, journaled by the worker when the provider exits. */
 export interface CoverageRecord {
   coverage: UsageCoverage;
   reason?: UsageCoverageReason;
   records: number;
   provider: string;
-  /** Present only when `finish` was told a drain was owed and a primary transcript was open. */
   finalDrain?: FinalDrainState;
 }
 
-/**
- * Whether a hook closes a turn with nothing left running: the `SessionEnd` event, or a `turn-end` signal that
- * did not fail and has no background task. A background subagent keeps writing usage after its turn ends, and a
- * failed turn end carries no task count, so neither proves that every row was read.
- */
 export function closesTurn(signals: readonly { kind: string; backgroundTasks?: number; failed?: boolean }[], event: string): boolean {
   if (event === "SessionEnd") return true;
   return signals.some(signal => signal.kind === "turn-end" && signal.failed !== true && (signal.backgroundTasks ?? 0) === 0);
 }
 
 export interface WatchOptions {
-  /** The session's provider. `opencode` never reaches the watch; its usage comes from run output. */
   provider: string;
-  /** The model the launch asked for. Used only when a row names no model. */
   requestedModel?: string;
-  /** Journals one usage record. A throw is recorded as a failed write and never reaches chat. */
   onUsage: (record: UsageRecord) => void;
 }
 
-/** The facts of one provider hook that the watch needs. The worker reads them from the payload. */
 export interface WatchHook {
-  /** The hook came from a subagent, whose usage the primary transcript does not hold. */
   subagent: boolean;
-  /** The hook closes a turn: a turn-end signal, or the end of the session. */
   turnEnd: boolean;
-  /** The hook names a primary transcript file. Absent when the hook names none. */
   transcript?: { path: string; provider: TranscriptProvider };
-  /** The hook is the provider's `SessionEnd`. */
   sessionEnd?: boolean;
+  endOnly?: boolean;
 }
 
-/** A secondary transcript the watch reads, with its own end evidence for one drain. */
 interface Reader {
   name: string;
-  /** The identity of the file the watch first read under this name. */
   id: string;
   tail: TranscriptTail;
   usage: UsageTail;
-  /** The largest size any listing gave for the file. The reader must reach it before it is complete. */
   required: number;
-  /** The file was replaced or shortened. Its bytes are never read again. */
   broken: boolean;
   evidence?: { drain: number; offset: number };
 }
 
-/** The secondary listing that came with the primary end mark of one drain. */
 interface Listing {
   drain: number;
   names: Set<string>;
 }
 
-/**
- * The transcript being read now, with its byte reader, its usage reader, and its secondary facts. Secondary
- * facts belong to one transcript. `cut` is sticky: once a listing shows files the watch cannot hold, the
- * transcript's secondaries are never complete.
- */
 interface Current {
   path: string;
   provider: TranscriptProvider;
@@ -84,17 +55,13 @@ interface Current {
   readers: Map<string, Reader>;
   listing?: Listing;
   cut: boolean;
-  /** A subagent hook arrived while this transcript was the primary. */
   subagentHook: boolean;
-  /** A listing of this transcript reported a file, or was invalid. Sticky. */
   listedAny: boolean;
 }
 
 const RANK: Record<SecondaryState, number> = { none: 0, complete: 1, missing: 2 };
-/** The worse of two secondary states: `missing` is worse than `complete`, which is worse than `none`. */
 const worse = (a: SecondaryState, b: SecondaryState): SecondaryState => (RANK[a] >= RANK[b] ? a : b);
 
-/** Runs `action`, and returns `fallback` when it throws. The watch never throws to its caller. */
 function guard<T>(fallback: T, action: () => T): T {
   try {
     return action();
@@ -103,7 +70,6 @@ function guard<T>(fallback: T, action: () => T): T {
   }
 }
 
-/** The listing value of a primary end mark, when it is well formed. Undefined for any other value. */
 function parseListing(value: unknown): SecondaryListing | undefined {
   const listing = value as { files?: unknown; total?: unknown } | null;
   if (!listing || typeof listing !== "object" || !Array.isArray(listing.files) || listing.files.length > MAX_SECONDARY_FILES) return undefined;
@@ -121,32 +87,20 @@ function parseListing(value: unknown): SecondaryListing | undefined {
   return { files, total: listing.total as number };
 }
 
-/**
- * One session's transcript watch. A drain starts at each hook that names the transcript. The drain
- * is complete only when a post names it and reaches the end of the file with nothing pending.
- */
 export class TranscriptWatch {
   private readonly options: WatchOptions;
   private current: Current | undefined;
   private drainSeq = 0;
-  /** The id of the drain the last transcript hook started. */
   private drain: number | undefined;
-  /** The last provider hook: whether it closed a turn, and which drain it started. */
   private last: { turnEnd: boolean; drain: number | undefined } | undefined;
-  /** The end evidence for `drain`: the offset at which its end mark arrived. */
+  private endOnly = false;
   private evidence: { drain: number; offset: number } | undefined;
-  /** A subagent hook that arrived before any transcript was open. It counts for the first transcript that opens. */
   private pendingSubagent = false;
   private writeFailed = false;
-  /** The host asked the provider to stop. Sticky. */
   private stopped = false;
-  /** The provider exited and the watch closed. Sticky. */
   private closed = false;
-  /** The id of the final drain, once one started. */
   private finalDrain: number | undefined;
-  /** The reply that started the final drain. A later start repeats it from the current cursor. */
   private finalStart: { path: string; after: number; drain: number; secondaries?: true } | undefined;
-  /** What replaced transcripts held. Each fact stays sticky. `secondary` is the worst state of them all. */
   private readonly retired: { rows: number; records: number; dropped: boolean; gap: boolean; midTurn: boolean; secondary: SecondaryState; mismatch: boolean; childThreads: boolean } = {
     rows: 0, records: 0, dropped: false, gap: false, midTurn: false, secondary: "none", mismatch: false, childThreads: false,
   };
@@ -155,35 +109,24 @@ export class TranscriptWatch {
     this.options = options;
   }
 
-  /** A primary transcript is open, so a final drain has a file to read. */
   get reading(): boolean {
     return this.current !== undefined && !this.closed;
   }
 
-  /** The host asked the provider to stop. Idempotent. */
   stopRequested(): void {
     this.stopped = true;
   }
 
-  /**
-   * Every provider hook. Returns what the relay must send when the hook names a transcript. After the final drain
-   * starts, a hook changes nothing: the provider has exited, so no late hook can describe a turn.
-   */
   hook(input: WatchHook): { path: string; after: number; drain: number; secondaries?: true } | undefined {
     return guard(undefined, () => {
       if (this.closed || this.finalDrain !== undefined) return undefined;
-      // After a stop request, the provider's SessionEnd proves the process is ending, not that the turn ended: it keeps the turn boundary of the hook before it.
       const turnEnd = input.sessionEnd === true && this.stopped ? (this.last?.turnEnd ?? false) : input.turnEnd;
-      return this.receiveHook({ ...input, turnEnd });
+      const started = this.receiveHook({ ...input, turnEnd });
+      this.endOnly = input.endOnly === true && turnEnd;
+      return started;
     });
   }
 
-  /**
-   * Starts the final drain on the current transcript, once per session. It takes the turn boundary of the last
-   * provider hook. A later call while the watch is open returns the same drain, from the current cursor, and resets
-   * nothing: any process of the agent's account may post to the drain route first, and the worker's relay must still
-   * get the transcript. Undefined when no primary transcript is open, or after the watch closed.
-   */
   drainFinal(): { path: string; after: number; drain: number; secondaries?: true } | undefined {
     return guard(undefined, () => {
       const current = this.current;
@@ -200,18 +143,10 @@ export class TranscriptWatch {
     });
   }
 
-  /**
-   * One post to the transcript route: a chunk or an end mark, for the primary or a secondary. Undefined
-   * when the post is not for the current transcript, or the watch closed. `secondaries` lists the files the worker wants.
-   */
   post(body: unknown): { messages: TranscriptMessage[]; after: number; secondaries?: SecondaryRequest[] } | undefined {
     return guard(undefined, () => (this.closed ? undefined : this.receivePost(body)));
   }
 
-  /**
-   * The provider exited. Journals the last usage records, and returns the coverage of the session. With `finalDrain`
-   * true a drain was owed: the record states how it ended, and the watch closes.
-   */
   finish(hooks: boolean, finalDrain = false): CoverageRecord {
     if (finalDrain) this.closed = true;
     return guard<CoverageRecord>({ coverage: "partial", reason: "row-dropped", records: 0, provider: this.options.provider }, () => this.coverage(hooks, finalDrain));
@@ -222,7 +157,6 @@ export class TranscriptWatch {
       if (this.current) this.current.subagentHook = true;
       else this.pendingSubagent = true;
     }
-    // A subagent hook can drain the primary the watch already reads. It never opens or replaces one.
     const transcript = input.subagent && input.transcript?.path !== this.current?.path ? undefined : input.transcript;
     if (!transcript) {
       this.last = { turnEnd: input.turnEnd, drain: undefined };
@@ -233,7 +167,6 @@ export class TranscriptWatch {
     this.drainSeq += 1;
     this.drain = this.drainSeq;
     this.last = { turnEnd: input.turnEnd, drain: this.drain };
-    // Only a Claude transcript has subagent files, so only its hooks ask for the listing.
     return {
       path,
       after: current.tail.offset,
@@ -247,10 +180,8 @@ export class TranscriptWatch {
     const b = body as Record<string, unknown>;
     if (!current || b.path !== current.path) return undefined;
     if (typeof b.secondary === "string") return this.receiveSecondary(current, b.secondary, b);
-    // A chunk from elsewhere than the cursor is not applied; the reply tells the relay where to resume.
     const applied = b.offset === current.tail.offset;
     if (typeof b.text === "string") {
-      // A chunk never creates end evidence, whatever flags it carries. Only a text-less mark does.
       const messages = applied ? current.tail.ingest(b.text) : [];
       return { messages, after: current.tail.offset };
     }
@@ -263,7 +194,6 @@ export class TranscriptWatch {
     return { messages: [], after: current.tail.offset, ...(wanted.length > 0 ? { secondaries: wanted } : {}) };
   }
 
-  /** A post for one secondary transcript. Its chat messages are discarded; only its usage is kept. */
   private receiveSecondary(current: Current, name: string, b: Record<string, unknown>) {
     const reader = current.readers.get(name);
     if (!reader || reader.broken) return undefined;
@@ -277,10 +207,6 @@ export class TranscriptWatch {
     return { messages: [], after: reader.tail.offset };
   }
 
-  /**
-   * Accepts the listing of the current drain. A file the watch cannot hold becomes a cut listing. Returns the
-   * files that have grown past the watch's offset, in listing order, with the byte each starts at.
-   */
   private acceptListing(current: Current, value: unknown): SecondaryRequest[] {
     const drain = this.drain as number;
     const parsed = parseListing(value);
@@ -304,9 +230,6 @@ export class TranscriptWatch {
         reader = this.openReader(current, file.name, file.id);
       }
       names.add(file.name);
-      // A file under a name the watch read before, with another identity, or smaller than a size a listing gave
-      // or than the bytes already read, was replaced or shortened. Its cursor belongs to bytes that no longer
-      // exist, so it is never read again.
       if (reader.broken || file.id !== reader.id || file.size < Math.max(reader.required, reader.tail.offset)) {
         reader.broken = true;
         current.cut = true;
@@ -314,10 +237,8 @@ export class TranscriptWatch {
       }
       reader.required = Math.max(reader.required, file.size);
       const offset = reader.tail.offset;
-      // The listing comes from the relay's fresh size check. A file with nothing new needs no stream.
       if (file.size === offset && !reader.tail.pending) reader.evidence = { drain, offset };
       else if (file.size > offset) {
-        // Bytes are unread: the evidence of an earlier listing in this drain no longer holds.
         reader.evidence = undefined;
         wanted.push({ name: file.name, after: offset });
       }
@@ -334,12 +255,15 @@ export class TranscriptWatch {
     return reader;
   }
 
-  /** Records end evidence only for the drain the last transcript hook started. */
   private mark(drain: unknown, offset: number) {
-    if (this.drain !== undefined && drain === this.drain) this.evidence = { drain: this.drain, offset };
+    if (this.drain === undefined || drain !== this.drain) return;
+    this.evidence = { drain: this.drain, offset };
   }
 
-  /** The drain of the last transcript hook reached the end of `current`, and nothing is pending. */
+  private endStands(current: Current | undefined, finalDrain: FinalDrainState | undefined): boolean {
+    return !this.endOnly || (finalDrain === "complete" && current !== undefined && current.usage.lastTurnEnded());
+  }
+
   private complete(current: Current): boolean {
     const evidence = this.evidence;
     return evidence !== undefined
@@ -350,10 +274,6 @@ export class TranscriptWatch {
       && !current.tail.pending;
   }
 
-  /**
-   * The listing of the current drain names every secondary reader, each one reached its end in this drain
-   * at its required size, and the transcript is not cut. Evaluated while the drain it names is still current.
-   */
   private secondariesComplete(current: Current): boolean {
     const listing = current.listing;
     if (current.cut || !listing || this.drain === undefined || listing.drain !== this.drain || this.last?.drain !== this.drain) return false;
@@ -365,22 +285,16 @@ export class TranscriptWatch {
     return true;
   }
 
-  /**
-   * The secondary state of one transcript. `none` when it saw no subagent hook, has no reader, and no listing of
-   * it reported a file or was invalid. `complete` when it has a reader and its secondaries are complete.
-   */
   private stateOf(current: Current): SecondaryState {
     if (!current.subagentHook && current.readers.size === 0 && !current.listedAny) return "none";
     return current.readers.size > 0 && this.secondariesComplete(current) ? "complete" : "missing";
   }
 
-  /** The secondary state of the session: the worst of the current transcript and every replaced one. */
   private sessionSecondary(current: Current | undefined): SecondaryState {
     const now: SecondaryState = current ? this.stateOf(current) : this.pendingSubagent ? "missing" : "none";
     return worse(this.retired.secondary, now);
   }
 
-  /** Retires the current transcript, then opens the next one with no evidence and no secondary facts. */
   private switchTo(next: { path: string; provider: TranscriptProvider }): Current {
     if (this.current) this.retire(this.current);
     this.evidence = undefined;
@@ -391,19 +305,15 @@ export class TranscriptWatch {
     return this.current;
   }
 
-  /** Journals the usage the old transcript and its secondaries still held, and keeps its facts. */
   private retire(old: Current) {
     const complete = this.complete(old);
-    // The state is read while the drain it names is still the current one.
     this.retired.secondary = worse(this.retired.secondary, this.stateOf(old));
     this.retireUsage(old.usage, old.tail);
     for (const reader of old.readers.values()) this.retireUsage(reader.usage, reader.tail);
-    this.retired.gap = this.retired.gap || !complete;
-    // A transcript that ended its drain outside a turn boundary leaves the session mid-turn, even if a later one ends a turn.
+    this.retired.gap = this.retired.gap || !complete || this.endOnly;
     this.retired.midTurn = this.retired.midTurn || (complete && !(this.last?.turnEnd ?? false));
   }
 
-  /** Finishes one usage reader: its records are journaled, and its counts and faults join the retired facts. */
   private retireUsage(usage: UsageTail, tail: TranscriptTail) {
     const records = usage.finish();
     this.retired.rows += usage.rowCount();
@@ -414,7 +324,6 @@ export class TranscriptWatch {
     this.emit(records);
   }
 
-  /** Writes each record through the caller's journal. A failed write is kept as a fact, never thrown. */
   private emit(records: UsageRecord[]) {
     for (const record of records) {
       try {
@@ -425,11 +334,9 @@ export class TranscriptWatch {
     }
   }
 
-  /** The coverage of the session, from the current transcript and every retired fact. */
   private coverage(hooks: boolean, finalDrain: boolean): CoverageRecord {
     const current = this.current;
     if (current) this.emit(current.usage.finish());
-    // The final drain is the last drain. It is complete when it is the current drain and the primary transcript reached its end.
     const finalState: FinalDrainState | undefined = finalDrain && current
       ? (this.finalDrain === undefined ? "skipped" : this.drain === this.finalDrain && this.complete(current) ? "complete" : "incomplete")
       : undefined;
@@ -449,7 +356,7 @@ export class TranscriptWatch {
         || readers.some(reader => reader.tail.dropped || reader.tail.discarded > 0 || reader.usage.rejectedCount() > 0),
       lastDrain: {
         complete: current !== undefined && this.complete(current) && !this.retired.gap,
-        turnEnd: (this.last?.turnEnd ?? false) && !this.retired.midTurn,
+        turnEnd: (this.last?.turnEnd ?? false) && !this.retired.midTurn && this.endStands(current, finalState),
       },
       finalDrain: finalState,
       secondary: this.sessionSecondary(current),

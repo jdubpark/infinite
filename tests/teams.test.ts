@@ -7,6 +7,7 @@ import { createInterface } from "node:readline";
 import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
+import { tmpdir } from "node:os";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { createRemoteClient, type RemoteClient } from "@infinite/remote";
 import { claimControl, startHost, waitFor, type Host } from "./helpers.js";
@@ -21,7 +22,6 @@ import { collectPermissionEvidence } from "../packages/host/src/team-permission-
 import { reportErrorMessage, submitTeamReport } from "../packages/host/src/team-report-client.js";
 import { LEGACY_READ_ONLY_ROLE_CHANGED_FILES_REASON } from "../packages/host/src/team-workspace.js";
 
-// The shared fallback lineup used by delivery and permission tests; the limit tests below define their own.
 import { git, limitLineup as fallbackLineup, mixedLineup, fixture } from "./team-fixture.js";
 import { schedulerFixture } from "./fixtures/team-scheduler.js";
 import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
@@ -43,6 +43,35 @@ test("team session creation refuses native continuation for other providers or r
     error instanceof Error && error.message.includes("only supported for Claude Code") && (error as Error & { status?: number }).status === 400);
   assert.throws(() => manager.createTeamSession({ ...request, provider: "claude" }, { ...assignment, role: "implementer" }, "workspace"), error =>
     error instanceof Error && error.message.includes("only supported for permission or mission coordinators") && (error as Error & { status?: number }).status === 400);
+});
+
+test("team session creation checks its header fields", async () => {
+  const manager = Object.create(Manager.prototype) as Manager;
+  const root = mkdtempSync(join(tmpdir(), "infinite-header-"));
+  try {
+    const cwd = join(root, "member");
+    mkdirSync(cwd);
+    Object.defineProperty(manager, "config", { value: { teams: { workspaceDir: root } } });
+    Object.defineProperty(manager, "sessionQueues", { value: new Map() }); Object.defineProperty(manager, "pendingCreates", { value: new Set() }); Object.defineProperty(manager, "createAdmission", { value: Promise.resolve(), writable: true });
+    const seen: unknown[] = [];
+    Object.defineProperty(manager, "createOnce", { value: async (request: unknown) => { seen.push(request); return request; } });
+    const request = { requestId: randomUUID(), provider: "claude" as const, projectId: "project", title: "Member", prompt: "Work" };
+    const assignment = { runId: randomUUID(), memberId: randomUUID(), revision: 1, role: "implementer" as const };
+    const header = await manager.createTeamSession(request, assignment, cwd, undefined, root, false, { purpose: "gate", configId: "a".repeat(64) }) as unknown as Record<string, unknown>;
+    assert.equal(header.purpose, "gate");
+    assert.equal(header.configId, "a".repeat(64));
+    const plain = await manager.createTeamSession(request, assignment, cwd, undefined, root, false, {}) as unknown as Record<string, unknown>;
+    assert.equal("purpose" in plain, false);
+    assert.equal("configId" in plain, false);
+    assert.equal("purpose" in (seen[1] as object), false);
+    const refused = (error: unknown) =>
+      error instanceof Error && (error as Error & { status?: number }).status === 400;
+    assert.throws(() => manager.createTeamSession(request, assignment, cwd, undefined, root, false, { purpose: "learning" as never }), refused);
+    assert.throws(() => manager.createTeamSession(request, assignment, cwd, undefined, root, false, { configId: "abc" }), refused);
+    assert.throws(() => manager.createTeamSession(request, assignment, cwd, undefined, root, false, { configId: "A".repeat(64) }), refused);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 function permissionWorkspaceEvidenceHash(prompt: Prompt, cwd: string, changedPaths: string[]) {
@@ -254,7 +283,7 @@ test("a GitHub mission continuation fetches a new ancestor mirror head without m
     git(f.source, "clone", "--bare", f.source, mirror);
     const parentId = randomUUID(), branch = "infinite/team-parent-test";
     const parentWorkspace = join(f.host.config.teams!.workspaceDir, parentId, "integration");
-    mkdirSync(join(f.host.config.teams!.workspaceDir, parentId), { recursive: true });
+    mkdirSync(join(f.host.config.teams!.workspaceDir, parentId), { recursive: true, mode: 0o700 });
     git(f.source, "clone", "--no-local", "--no-hardlinks", "--", mirror, parentWorkspace);
     git(parentWorkspace, "remote", "remove", "origin");
     git(parentWorkspace, "checkout", "-b", branch, f.base);
@@ -300,7 +329,6 @@ test("team runs use readable names and exact root permissions under a strict uma
   const previousUmask = process.umask(0o077);
   let f: Awaited<ReturnType<typeof fixture>> | undefined;
   try {
-    // The API subprocess inherits this umask, including after enrollment restarts it.
     f = await fixture("success", undefined, { teams: { workspaceDir,
       commandPrefix: { command: process.execPath, args: [resolve("tests/fixtures/team-agent.mjs"), "--command-prefix", root] },
     } });
@@ -944,17 +972,71 @@ test("a team builds concurrently in isolated copies and produces checked, review
     assert.ok(workers.every(worker => worker.cwd !== f.source && worker.finishedAt));
     assert.ok(Math.max(...workers.map(worker => worker.startedAt)) < Math.min(...workers.map(worker => worker.finishedAt)), "The implementers must actually overlap");
     assert.equal((await viewer.request<{ teams: TeamView[] }>("/teams")).teams.filter(run => run.id === id).length, 1);
+    const record = await f.host.fetchApi(`/teams/${id}/record`, "viewer");
+    assert.equal(record.status, 200, JSON.stringify(record.body));
+    assert.equal(record.body.owner.kind, "run");
+    assert.equal(record.body.record.criteria[0].statementOf, "objective");
+    assert.equal(record.body.record.statement.objective, request.objective);
+    assert.equal(record.body.log[0].op, "record.created"); assert.equal(record.body.log[0].actor, "host");
+    const missing = await f.host.fetchApi(`/teams/${randomUUID()}/record`, "viewer");
+    assert.equal(missing.status, 404); assert.equal(missing.body.code, "team-not-found");
     const commands = readFileSync(join(f.receipts, "commands.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
     assert.ok(commands.some(command => command.cwd === f.source && command.command === "git"), "Source Git inspection must use the configured execution identity");
     for (const worker of workers)
       assert.ok(commands.some(command => command.cwd === worker.cwd && command.command === "git" && command.args.includes("add")), "Git must not stage agent-controlled files as the API identity");
-    const checkCommands = commands.filter(command => command.command === process.execPath && command.args.includes("check.mjs"));
+    const checkCommands = commands.filter(command => [process.execPath, "sh"].includes(command.command) && command.args.includes("check.mjs"));
     assert.ok(checkCommands.length > 0, "Configured checks must use the execution identity");
     for (const command of checkCommands) {
       assert.ok(command.cwd.startsWith(join(dirname(finished.workspace), "verification") + "/"), "Configured checks must run in a separate verification copy");
       assert.equal(git(command.cwd, "rev-parse", "HEAD"), finished.headCommit, "The checked commit must match the reviewed integration commit");
     }
   } finally { owner.close(); viewer.close(); await f.close(); }
+});
+
+test("a full run stores its events in order", { timeout: 120000 }, async () => {
+  const f = await fixture();
+  let store: EvidenceStore | undefined, apiStopped = false;
+  try {
+    const request = f.create();
+    const created = await f.host.fetchApi("/teams", "owner", request);
+    assert.equal(created.status, 200, JSON.stringify(created.body));
+    const finished = await f.settled(created.body.id);
+    assert.equal(finished.status, "ready-for-review", JSON.stringify(finished));
+    await f.host.stopApi();
+    apiStopped = true;
+    store = new EvidenceStore({ databasePath: evidenceDatabasePath(f.host.config.stateDir), vaultKey: readFileSync(f.host.config.keyFile) });
+    const events: { seq: number; kind: string; memberId?: string; data: Record<string, unknown> }[] = [];
+    for (let after = 0; ;) {
+      const page = store.events({ runId: finished.id, after, limit: 500 });
+      events.push(...page.events);
+      if (!page.more) break;
+      after = page.cursor;
+    }
+    const kinds = (kind: string) => events.filter(event => event.kind === kind);
+    for (const kind of ["run.created", "run.prepared", "plan.accepted", "check.finished", "review.recorded", "run.settled"])
+      assert.equal(kinds(kind).length, 1, kind);
+    assert.equal(kinds("task.planned").length, 2);
+    assert.equal(kinds("task.integrated").length, 2);
+    for (const kind of ["member.stopped", "repair.started", "ledger.gap"]) assert.equal(kinds(kind).length, 0, kind);
+    assert.equal(kinds("check.finished")[0]!.data.passed, true);
+    assert.equal(kinds("review.recorded")[0]!.data.verdict, "approved");
+    assert.equal(kinds("run.settled")[0]!.data.status, "ready-for-review");
+    for (const member of finished.members) {
+      const started = events.filter(event => event.kind === "member.started" && event.memberId === member.memberId);
+      const reported = events.filter(event => event.kind === "member.reported" && event.memberId === member.memberId);
+      assert.equal(started.length, 1, `one member.started for ${member.role}`);
+      assert.equal(reported.length, 1, `one member.reported for ${member.role}`);
+      assert.ok(started[0]!.seq < reported[0]!.seq, `${member.role} starts before it reports`);
+    }
+    const stages = [["run.created"], ["run.prepared"], ["plan.accepted"], ["task.planned"], ["task.integrated"], ["check.finished"], ["review.recorded"], ["run.settled"]];
+    const seqs = stages.map(([kind]) => kinds(kind!).map(event => event.seq));
+    for (let i = 1; i < seqs.length; i++)
+      assert.ok(Math.max(...seqs[i - 1]!) < Math.min(...seqs[i]!), `${stages[i - 1]![0]} precedes ${stages[i]![0]}`);
+  } finally {
+    store?.close();
+    if (apiStopped) await f.host.start();
+    await f.close();
+  }
 });
 
 test("changeIndex parses name-status and numstat -z records with statuses, counts, and binary nulls", () => {
@@ -996,7 +1078,6 @@ test("review rubrics drop self-grading, integration records docs/tests, and owne
     assert.equal(taskB.rubric?.reviewerProfileId, reviewerProfile.id);
     assert.equal(taskA.diffStat?.docs, true);
     assert.equal(taskA.diffStat?.tests, true);
-    // The fixture's implementers write a.txt and b.txt; task a also writes docs/x.md and tests/y.test.ts.
     assert.deepEqual(finished.changes?.files.map(file => `${file.path}:${file.status}`).sort(), ["a.txt:added", "b.txt:added", "docs/x.md:added", "tests/y.test.ts:added"]);
     assert.equal(finished.changes?.headCommit, finished.headCommit);
     assert.equal(finished.changes?.truncated, false);
@@ -1037,6 +1118,28 @@ test("legacy create capacity is ignored and ready work uses the PM-selected limi
     for (const [, delta] of moments) { running += delta; maximum = Math.max(maximum, running); }
     assert.ok(maximum <= 4, `Observed ${maximum} overlapping implementers`);
     assert.ok(maximum >= 2, "Independent ready work uses the capacity selected by the PM");
+  } finally { await f.close(); }
+});
+
+test("a full run projects its outcomes", { timeout: 120000 }, async () => {
+  const f = await fixture();
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
+    const run = await f.settled(created.body.id);
+    assert.equal(run.status, "ready-for-review", JSON.stringify(run));
+    const view = await waitFor(() => f.host.fetchApi(`/outcomes/runs/${run.id}`, "owner"), response => response.status === 200 && response.body.rows.length === 2, 30000);
+    assert.equal(view.body.summary.status, "ready-for-review", JSON.stringify(view.body));
+    for (const served of [view.body.summary, ...view.body.rows, ...view.body.members])
+      for (const name of ["projectRef", "taskRef", "areaRef"]) assert.equal(Object.hasOwn(served, name), false, name);
+    assert.equal(view.body.rows[0].payload.projectId, run.projectId);
+    for (const row of view.body.rows)
+      assert.deepEqual([row.integrated, row.accepted, row.firstPass, row.held, row.disposition], [1, 1, 1, null, "integrated"], JSON.stringify(row));
+    const roles = view.body.members.map((member: { role: string }) => member.role);
+    assert.ok(roles.includes("project-manager"), JSON.stringify(roles));
+    assert.ok(roles.includes("reviewer"), JSON.stringify(roles));
+    assert.equal((await f.host.fetchApi(`/outcomes/runs/${run.id}`, "viewer")).status, 200);
+    assert.equal((await f.host.fetchApi(`/outcomes/runs/${randomUUID()}`, "owner")).status, 404);
   } finally { await f.close(); }
 });
 
@@ -1088,8 +1191,10 @@ test("mixed teams pin real worker launches across configuration changes, restart
     const decision = waiting.decisions[0];
     const original = waiting.members.find(member => member.memberId === decision.memberId)!;
     assert.equal(original.role, "project-manager", "The owner question is routed through the PM after worker diagnosis");
+    assert.equal(decision.recommendation, undefined, "A question from a member started before recommendations were required still becomes a decision");
     assert.equal(waiting.recovery?.source.code, "agent-question");
     assert.equal(waiting.recovery?.source.reportKind, "question");
+    assert.match(waiting.recovery?.source.reason ?? "", /owner decision: .* The asking agent recommends: Compact\. Reason: The first file already uses it\.$/, "The PM's recovery reads the worker's recommendation");
     const sourceMember = waiting.members.find(member => member.memberId === waiting.recovery?.source.memberId)!;
     assert.equal(sourceMember.taskId, "b");
     assert.deepEqual(sourceMember.modelProfile, mixedLineup.implementers[1]);
@@ -1155,7 +1260,7 @@ test("mixed teams pin real worker launches across configuration changes, restart
           }
         }
         assert.equal(settings.get("command"), process.execPath);
-        assert.deepEqual(settings.get("env_vars"), ["INFINITE_HOOK_URL", "INFINITE_HOOK_TOKEN", "INFINITE_TEAM_ASSIGNMENT", "INFINITE_MISSION_ASSIGNMENT", "INFINITE_PROJECT_ID"]);
+        assert.deepEqual(settings.get("env_vars"), ["INFINITE_HOOK_URL", "INFINITE_HOOK_TOKEN", "INFINITE_TEAM_ASSIGNMENT", "INFINITE_PROJECT_ID"]);
         assert.equal(settings.get("tools.report.approval_mode"), "approve");
         assert.match(worker.prompt ?? "", /report tool of the infinite_team MCP server/);
       } else {
@@ -1167,7 +1272,6 @@ test("mixed teams pin real worker launches across configuration changes, restart
       const session = await f.host.fetchApi(`/sessions/${member.sessionId}`);
       assert.equal(session.status, 200);
       assert.equal(session.body.provider, expected.provider);
-      // A trusted root covers each member's own clone: the exact folder, never a parent.
       assert.equal(session.body.workspaceTrusted, true);
       assert.equal(worker.trustedWorkspace, worker.cwd);
       const override = args.indexOf(`projects={${JSON.stringify(worker.cwd)}={trust_level="trusted"}}`);
@@ -1212,6 +1316,26 @@ test("mixed plans reject absent, unknown, and fixed-role model selections before
   } finally { await f.close(); }
 });
 
+test("a selected team decision mode is persisted by the service across API restart", { timeout: 60000 }, async () => {
+  const f = await fixture("mcp");
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
+    const running = await waitFor(() => f.get(created.body.id), run => run.members.some(member => member.status === "running") && existsSync(join(f.receipts, "mcp-capability.json")), 30000);
+    const capability = JSON.parse(readFileSync(join(f.receipts, "mcp-capability.json"), "utf8"));
+    const report = { requestId: randomUUID(), runId: capability.assignment.runId, memberId: capability.assignment.memberId, revision: capability.assignment.revision,
+      report: { kind: "question", question: "May this operation proceed?", options: ["Approve once", "Deny"], answerMode: "approval" } };
+    const submitted = await fetch(`${capability.url}/team-report`, { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${capability.token}` }, body: JSON.stringify(report) });
+    assert.equal(submitted.status, 204);
+    const waiting = await waitFor(() => f.get(running.id), run => run.decisions.length === 1 && run.status === "needs-input", 30000);
+    assert.equal(waiting.decisions[0].answerMode, "approval");
+
+    await f.host.stopApi(); await f.host.start();
+    const recovered = await f.get(waiting.id);
+    assert.equal(recovered.decisions[0].answerMode, "approval", "The selected mode is part of the durable decision record");
+  } finally { await f.close(); }
+});
+
 test("questions and steering survive API restart with durable retries and stale revision refusals", { timeout: 120000 }, async () => {
   const f = await fixture("question");
   let controller: RemoteClient | undefined;
@@ -1221,10 +1345,13 @@ test("questions and steering survive API restart with durable retries and stale 
     assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
     const waiting = await waitFor(() => f.get(created.body.id), run => run.decisions.length === 1 && run.status === "needs-input", 30000);
     const decision = waiting.decisions[0];
+    assert.equal(decision.answerMode, undefined, "Legacy two-option questions remain ordinary choices after service persistence");
+    assert.deepEqual(decision.recommendation, { answers: ["Compact"], reason: "Both files share one short label." }, "The decision carries the asking member's recommendation");
     await f.host.stopApi(); await f.host.start();
     const recovered = await f.get(waiting.id);
     assert.equal(recovered.decisions[0].id, decision.id);
     assert.equal(recovered.decisions[0].question, decision.question);
+    assert.equal(recovered.decisions[0].answerMode, undefined, "Absent mode remains absent after restart");
     assert.equal(recovered.decisions[0].answer, undefined);
     assert.equal(recovered.members.length, waiting.members.length, "Restart must not duplicate the waiting child");
     const answer = { requestId: randomUUID(), revision: recovered.revision, text: "Compact" };
@@ -1233,6 +1360,7 @@ test("questions and steering survive API restart with durable retries and stale 
     controller = createRemoteClient({ url: f.host.origin, token: f.host.tokens.controller });
     const answered = await controller.request<TeamView>(answerPath, { body: answer });
     assert.equal(answered.decisions.find(item => item.id === decision.id)?.answer, "Compact");
+    assert.deepEqual(answered.decisions.find(item => item.id === decision.id)?.recommendation, { ...decision.recommendation, outcome: "matched" }, "The recommendation survives the restart, and the answer records how it compared");
     assert.equal((await f.host.fetchApi(answerPath, "controller", answer)).status, 200);
     assert.equal((await f.host.fetchApi(answerPath, "controller", { ...answer, text: "Detailed" })).status, 409);
     const steer = { requestId: randomUUID(), revision: recovered.revision, text: "Use the revised requirements for both files." };
@@ -1282,7 +1410,7 @@ test("configured verification failures exhaust bounded repair rounds without bec
     assert.equal(blocked.status, "blocked", JSON.stringify(blocked));
     assert.ok(blocked.checks.length > 0);
     assert.ok(blocked.checks.every(check => check.status === "failed" && check.exitCode === 17));
-    assert.ok(blocked.checks.some(check => check.output.includes("Configured verification failed")));
+    assert.ok(blocked.checks.some(check => check.output.includes("Configured verification failed")) && blocked.checks.every(check => !("scan" in check)), "the view carries check output, never prompt evidence");
     assert.equal(blocked.review, undefined);
     assert.ok(blocked.members.filter(member => member.role === "integrator").length <= 2, "Repairs must have a finite attempt budget");
     assert.equal(git(f.source, "rev-parse", "HEAD"), f.base);
@@ -1412,7 +1540,7 @@ test("an unchanged required-check failure stops after one repair and owner Conti
     assert.deepEqual([context.runId, context.revision], [blocked.id, blocked.revision]);
     assert.match(context.objective, /Create independent files/);
     assert.match(context.feedback, /Configured verification failed/);
-    assert.match(context.feedback, /"exitCode":17/);
+    assert.match(context.feedback, /Check 1: failed, exit 17/); assert.ok(context.checks.every(check => (check.status === "passed") !== ("scan" in check)), "only checks that did not pass carry scan");
 
     const key = readFileSync(f.host.config.keyFile);
     const storedFile = join(f.host.config.stateDir, "teams", `${blocked.id}.sealed`);
@@ -1588,7 +1716,7 @@ test("a check past teams.checkMinutes blocks a resumable run without spending a 
     assert.equal(resumed.status, 200, JSON.stringify(resumed.body));
     assert.equal(resumed.body.revision, blocked.revision + 1);
   } finally {
-    if (checkPid) { try { process.kill(-checkPid, "SIGKILL"); } catch { /* Already exited. */ } }
+    if (checkPid) { try { process.kill(-checkPid, "SIGKILL"); } catch { } }
     await f.close();
   }
 });
@@ -1614,8 +1742,6 @@ test("pausing a running check waits for its abort and resumes once without a lat
     const duplicatePause = await f.host.fetchApi(`/teams/${id}/pause`, "owner", pause);
     assert.equal(duplicatePause.body.status, "paused");
     assert.equal(duplicatePause.body.revision, checking.revision);
-    // Allow the new revision's check to finish. The aborted process cannot turn
-    // this marker into a late success receipt for the paused revision.
     writeFileSync(join(f.receipts, "check-release"), "continue", { mode: 0o600 });
     const resume = { requestId: randomUUID(), revision: checking.revision };
     const resumed = await f.host.fetchApi(`/teams/${id}/resume`, "owner", resume);
@@ -1631,7 +1757,7 @@ test("pausing a running check waits for its abort and resumes once without a lat
     assert.ok(finished.checks.some(check => check.revision === 1 && check.status === "interrupted"));
     assert.ok(finished.checks.filter(check => check.revision === 2).every(check => check.status === "passed"));
   } finally {
-    if (checkPid) { try { process.kill(-checkPid, "SIGKILL"); } catch { /* Already exited. */ } }
+    if (checkPid) { try { process.kill(-checkPid, "SIGKILL"); } catch { } }
     await f.close();
   }
 });
@@ -1665,7 +1791,7 @@ test("steering cannot disguise a check interrupted by API restart as a new plann
     assert.equal(unchanged.members.length, checking.members.length);
     assert.equal(unchanged.review, undefined);
   } finally {
-    if (checkPid) { try { process.kill(-checkPid, "SIGKILL"); } catch { /* Already exited. */ } }
+    if (checkPid) { try { process.kill(-checkPid, "SIGKILL"); } catch { } }
     await f.close();
   }
 });
@@ -1699,8 +1825,6 @@ test("the stdio MCP report tool validates input, waits for the worker receipt, a
     assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
     const running = await waitFor(() => f.get(created.body.id), run => run.members.some(member => member.status === "running") && existsSync(join(f.receipts, "mcp-capability.json")), 30000);
     const member = running.members[0];
-    // A human lease keeps the scheduler from stopping the reported worker while
-    // its receipt is retried. This uses the real worker's report ledger.
     await claimControl(f.host, member.sessionId, "owner");
     const capability = JSON.parse(readFileSync(join(f.receipts, "mcp-capability.json"), "utf8"));
     forwardTarget = capability.url;
@@ -1725,7 +1849,6 @@ test("the stdio MCP report tool validates input, waits for the worker receipt, a
         const item = pending.get(value.id);
         if (item) { pending.delete(value.id); clearTimeout(item.timer); item.resolve(value); }
       });
-      // Drain diagnostics without exposing private runtime capabilities on failure.
       child.stderr.resume();
       child.on("exit", () => {
         for (const item of pending.values()) { clearTimeout(item.timer); item.reject(new Error("MCP helper exited before replying")); }
@@ -1763,10 +1886,22 @@ test("the stdio MCP report tool validates input, waits for the worker receipt, a
     assert.equal(listing.result.tools.length, 1);
     assert.equal(listing.result.tools[0].name, "report");
     assert.ok(listing.result.tools[0].inputSchema.properties.report);
+    const questionSchema = listing.result.tools[0].inputSchema.properties.report.oneOf.find((branch: any) => branch.properties?.kind?.const === "question");
+    assert.deepEqual(questionSchema.properties.answerMode.enum, ["approval", "single", "multiple"], "The MCP schema exposes selectable answer modes");
+    assert.ok(questionSchema.required.includes("recommendation"), "The MCP schema requires a recommendation on every question");
     const invalid = await client.rpc("tools/call", { name: "report", arguments: { report: { kind: "plan", summary: "No tasks supplied" } } });
     assert.equal(invalid.result.isError, true);
+    const invalidApproval = await client.rpc("tools/call", { name: "report", arguments: { report: { kind: "question", question: "Proceed?", options: ["Approve"], answerMode: "approval", recommendation: { answers: ["Approve"], reason: "Scoped." } } } });
+    assert.equal(invalidApproval.result.isError, true, "The MCP boundary enforces approval option cardinality from the refined schema");
+    assert.equal((await client.rpc("tools/call", { name: "report", arguments: { report: { kind: "question", question: "Proceed?", options: ["Approve", "Deny"] } } })).result.isError, true, "A question without a recommendation is refused");
     assert.equal(requests, 0, "Malformed report input must not reach the worker");
-    const report = { kind: "blocked", summary: "MCP report boundary evidence" };
+    const report = { kind: "blocked", summary: "MCP report boundary evidence", blocker: {
+      cause: { status: "hypothesis", detail: "The provider may not expose the required tool." },
+      issueRefs: ["TASK-123"], sourceRefs: ["packages/host/src/team-prompts.ts@abc123"],
+      attemptedFixes: [{ fix: "Checked the assignment's available tools.", outcome: "The required capability remains unavailable." }],
+      proposedRecovery: "Request an owner-authorized supported capability.", prevention: "Check provider capabilities before dispatch.",
+      validationEvidence: [{ sourceRef: "packages/host/src/team-prompts.ts", observation: "The assignment lists its available tools." }],
+    } };
     const forged = await client.rpc("tools/call", { name: "report", arguments: { report, memberId: randomUUID() } });
     assert.equal(forged.result.isError, true);
     assert.equal(requests, 0, "Tool callers cannot substitute an assignment identity");
@@ -1782,6 +1917,7 @@ test("the stdio MCP report tool validates input, waits for the worker receipt, a
     assert.equal(recorded[0].data.runId, running.id);
     assert.equal(recorded[0].data.memberId, member.memberId);
     assert.equal(recorded[0].data.revision, running.revision);
+    assert.deepEqual(recorded[0].data.report.blocker, report.blocker, "the durable worker journal retains structured blocker evidence");
     const release = releaseResponse!;
     releaseResponse = undefined;
     release();
@@ -1793,7 +1929,7 @@ test("the stdio MCP report tool validates input, waits for the worker receipt, a
 
     const restarted = startMcp();
     await restarted.initialize();
-    const repeated = await restarted.rpc("tools/call", { name: "report", arguments: { report: { summary: report.summary, kind: report.kind } } });
+    const repeated = await restarted.rpc("tools/call", { name: "report", arguments: { report: { blocker: report.blocker, summary: report.summary, kind: report.kind } } });
     assert.notEqual(repeated.result.isError, true);
     assert.equal(repeated.result.structuredContent.requestId, delivered.result.structuredContent.requestId, "The same validated report retains its request identity across helper processes");
     const conflict = await restarted.rpc("tools/call", { name: "report", arguments: { report: { ...report, summary: "A conflicting result" } } });
@@ -2057,7 +2193,7 @@ test("Codex sandbox guidance covers members but excludes the permission coordina
   assert.doesNotMatch(coordinator, /Codex sandbox guidance:/);
   const switchedCoordinator = retargetPrompt(
     teamPrompt(run, "permission-coordinator", undefined, "evidence", "claude", limitLineup.coordinator),
-    { provider: "codex", profile: limitLineup.coordinator },
+    { provider: "codex", profile: limitLineup.coordinator, role: "permission-coordinator", entryTools: false },
   );
   assert.doesNotMatch(switchedCoordinator!, /Codex sandbox guidance:/);
 });
@@ -2066,24 +2202,23 @@ test("retargeting a member prompt keeps its answers, swaps reporting and profile
   const run = { provider: "codex", revision: 1, objective: "Create a.txt", baseCommit: "base", headCommit: "head", steering: [], tasks: [], checks: [], lineup: limitLineup } as unknown as TeamRun;
   const [haiku, astra] = limitLineup.implementers, deepseek = limitLineup.fallbacks![0];
   const answered = (provider: TeamModelProfile["provider"], profile: TeamModelProfile) => `${teamPrompt(run, "implementer", undefined, undefined, provider, profile)}\n\nUser answered: Compact`;
-  assert.equal(retargetPrompt(answered("claude", haiku), { provider: "opencode", profile: deepseek }), answered("opencode", deepseek));
+  assert.equal(retargetPrompt(answered("claude", haiku), { provider: "opencode", profile: deepseek, role: "implementer", entryTools: false }), answered("opencode", deepseek));
   const oldHelper = teamPrompt(run, "implementer", undefined, undefined, "opencode", astra);
-  const refreshed = refreshReportingInstructions(oldHelper, "codex");
+  const refreshed = refreshReportingInstructions(oldHelper, "codex", "implementer");
   assert.match(refreshed, /report tool of the infinite_team MCP server/);
   assert.doesNotMatch(refreshed, /Pipe a JSON object matching the above schema to this command:/);
-  assert.equal(retargetPrompt(oldHelper, { provider: "codex", profile: astra }), teamPrompt(run, "implementer", undefined, undefined, "codex", astra));
-  assert.match(retargetPrompt(oldHelper, { provider: "codex", profile: astra })!, /Codex sandbox guidance:/);
-  // A Codex prompt written by an earlier release names its helper, at another release's path.
+  assert.equal(retargetPrompt(oldHelper, { provider: "codex", profile: astra, role: "implementer", entryTools: false }), teamPrompt(run, "implementer", undefined, undefined, "codex", astra));
+  assert.match(retargetPrompt(oldHelper, { provider: "codex", profile: astra, role: "implementer", entryTools: false })!, /Codex sandbox guidance:/);
   const older = oldHelper.replace(/to this command: [^\n]+?\. The helper/, "to this command: 'node' 'dist/team-report.js'. The helper");
   assert.notEqual(older, oldHelper);
-  assert.equal(refreshReportingInstructions(`${older}\n\nUser answered: Compact`, "codex"), `${refreshed}\n\nUser answered: Compact`);
-  assert.equal(retargetPrompt(answered("claude", haiku), { provider: "codex", profile: astra }), answered("codex", astra));
-  const oldCodex = teamPrompt(run, "implementer", undefined, undefined, "codex", astra).replace(/Codex sandbox guidance:[^\n]+\n\n/, "");
-  assert.match(retargetPrompt(oldCodex, { provider: "codex", profile: astra })!, /Codex sandbox guidance:/, "an older accumulated Codex prompt gains the current paragraph");
-  const switchedAway = retargetPrompt(answered("codex", astra), { provider: "opencode", profile: deepseek });
+  assert.equal(refreshReportingInstructions(`${older}\n\nUser answered: Compact`, "codex", "implementer"), `${refreshed}\n\nUser answered: Compact`);
+  assert.equal(retargetPrompt(answered("claude", haiku), { provider: "codex", profile: astra, role: "implementer", entryTools: false }), answered("codex", astra));
+  const oldCodex = teamPrompt(run, "implementer", undefined, undefined, "codex", astra).replace(/Codex sandbox guidance:[^\n]+\n\nWorking rule for tools:[^\n]+\n\n/, "");
+  assert.match(retargetPrompt(oldCodex, { provider: "codex", profile: astra, role: "implementer", entryTools: false })!, /Codex sandbox guidance:/, "an older accumulated Codex prompt gains the current paragraph");
+  const switchedAway = retargetPrompt(answered("codex", astra), { provider: "opencode", profile: deepseek, role: "implementer", entryTools: false });
   assert.equal(switchedAway, answered("opencode", deepseek));
   assert.doesNotMatch(switchedAway!, /Codex sandbox guidance:/);
-  assert.equal(retargetPrompt("Do the work and say when you are done.", { provider: "opencode", profile: deepseek }), undefined);
+  assert.equal(retargetPrompt("Do the work and say when you are done.", { provider: "opencode", profile: deepseek, role: "implementer", entryTools: false }), undefined);
 });
 
 test("project-manager prompts list configured setup and checks and forbid unauthorized verification", () => {
@@ -2151,13 +2286,11 @@ test("an unanswered report stays unconfirmed: a refused connection or a lost ack
     assert.match(message, /inspect this member's recorded report before retrying the identical report, and do not bypass/);
     return true;
   };
-  // Nothing listens: the request never left this process.
   const closed = createServer();
   await new Promise<void>(resolve => closed.listen(0, "127.0.0.1", resolve));
   const closedPort = (closed.address() as { port: number }).port;
   await new Promise<void>((resolve, reject) => closed.close(error => error ? reject(error) : resolve()));
   await assert.rejects(submitTeamReport({ kind: "result", summary: "The fixture could not reach its closed endpoint." }, env(closedPort)), unconfirmed);
-  // The endpoint read the whole report, then dropped the connection before answering.
   let received = 0;
   const lost = createServer((request, response) => { request.resume(); request.on("end", () => { received++; response.destroy(); }); });
   await new Promise<void>(resolve => lost.listen(0, "127.0.0.1", resolve));
@@ -2173,18 +2306,19 @@ test(`a report written during a stall stop wins over replacement${limited ? " an
   try {
     const member = f.run.members[0];
     const report = { kind: "question", question: "Which scope should this assignment use?", options: ["Keep the current scope"] };
+    f.manager.events = (read => (id: string, after: number, limit: number, types?: Set<string>) => read(id, after, after ? limit : 1, types))(f.manager.events);
     f.manager.stopTeamSession = async () => {
       if (f.state.status !== "exited") {
-        // The pre-stop journal is empty. The report arrives only while the stop RPC is in flight.
         if (limited) f.journal.append("signal", { kind: "provider-limit", limit: "usage", confidence: "corroborated", provider: "demo", source: "protocol", message: "Usage exhausted" });
-        for (let index = 0; index < 205; index++) f.journal.append("signal", { kind: "notice", type: "fixture" });
         const envelope = { requestId: randomUUID(), runId: f.run.id, memberId: member.memberId, revision: member.revision, report };
-        f.journal.append("team-report", { ...envelope, runId: randomUUID() });
-        f.journal.append("team-report", { ...envelope, memberId: randomUUID() });
-        f.journal.append("team-report", { ...envelope, revision: member.revision + 1 });
+        const other = (question: string) => ({ ...report, question });
+        f.journal.append("team-report", { ...envelope, runId: randomUUID(), report: other("Which scope should another run use?") });
+        f.journal.append("team-report", { ...envelope, memberId: randomUUID(), report: other("Which scope should another member use?") });
+        f.journal.append("team-report", { ...envelope, revision: member.revision + 1, report: other("Which scope should the next attempt use?") });
         f.journal.append("team-report", envelope);
         f.journal.append("lifecycle", { status: "exited" });
         f.state.status = "exited";
+        f.journal.append("usage-coverage", { coverage: "none", records: 0, provider: "demo" });
       }
       return f.manager.state();
     };
@@ -2192,11 +2326,40 @@ test(`a report written during a stall stop wins over replacement${limited ? " an
     const teams = f.openTeam(); teams.start();
     const result = await waitFor(async () => teams.get(f.run.id), run => run.decisions.length > 0 || run.members.length > 1 || run.status === "blocked");
     assert.equal(result.members.length, 1, "A final report must prevent a replacement launch");
-    assert.deepEqual(result.members[0].report, report);
+    assert.deepEqual(result.members[0].report, report, "The member must hold the report naming this run, member and attempt");
     assert.equal(result.members[0].stalledAt, undefined);
     assert.equal(result.members[0].stoppedReason, undefined);
     assert.equal(result.status, "needs-input");
     assert.equal(result.decisions[0].question, report.question, "The ordinary reported path must consume the late report");
+  } finally { f.close(); }
+});
+
+test("a stall stop's own pass pages through the journal and records the report before any later pass", async () => {
+  const f = schedulerFixture();
+  try {
+    const member = f.run.members[0];
+    const report = { kind: "question", question: "Which scope should this assignment use?", options: ["Keep the current scope"] };
+    f.manager.events = (read => (id: string, after: number, limit: number, types?: Set<string>) => read(id, after, after ? limit : 1, types))(f.manager.events);
+    f.writeTeam();
+    const teams = f.openTeam();
+    let closing: Promise<void> | undefined;
+    f.manager.stopTeamSession = async () => {
+      if (f.state.status !== "exited") {
+        f.journal.append("signal", { kind: "notice", type: "fixture" });
+        f.journal.append("team-report", { requestId: randomUUID(), runId: f.run.id, memberId: member.memberId, revision: member.revision, report });
+        f.journal.append("lifecycle", { status: "exited" });
+        f.state.status = "exited";
+        f.journal.append("usage-coverage", { coverage: "none", records: 0, provider: "demo" });
+        closing = teams.close();
+      }
+      return f.manager.state();
+    };
+    teams.start();
+    await waitFor(async () => closing !== undefined, Boolean);
+    await closing;
+    const saved = f.readRecord<{ run: TeamRun }>("team", f.run.id).run.members[0];
+    assert.equal(saved.status, "reported", "The stop's pass must page past the first entry; the closed host runs no later pass");
+    assert.deepEqual(saved.report, report);
   } finally { f.close(); }
 });
 
@@ -2241,7 +2404,6 @@ test(`a ${refusal} pre-delivery refusal with ${protection} ${earlierStop ? "reta
       stops++;
       if (earlierStop && stops === 1) throw new Error("Worker response timed out; delivery may be uncertain");
       if (refusal === "lease") throw Object.assign(new Error("Input control is held"), { code: "control-busy" });
-      // Exercise Manager's own state check after the scheduler observed a running member.
       return Manager.prototype.stopTeamSession.call({
         meta: () => ({ session: { team: member } }),
         state: async () => ({ ...await f.manager.state(), status: "unavailable" }),
@@ -2290,7 +2452,6 @@ test("promptOwner says who a member's prompt waits on: the coordinator, the owne
       targetCwd: member.cwd, promptId: 1, promptHash: prompt.hash!, evidenceHash: "c".repeat(64), option: 0, prompt,
       authorityHash: permissionAuthorityHash(f.run.permissions, []),
       expiresAt: new Date(Date.now() + 5 * 60000).toISOString(), answerRequestId: randomUUID(), status: "reviewing" as const };
-    // "answering" is not observable through a reloaded service: restart recovery marks it uncertain, which is the owner's.
     for (const [status, owner] of [["pending", "coordinator"], ["reviewing", "coordinator"], ["approved", "coordinator"], ["answering", "user"],
       ["escalated", "user"], ["uncertain", "user"], ["answered", "user"], ["stale", "user"]] as const) {
       f.run.permissionDecisions = [{ ...decision, status }];
@@ -2348,11 +2509,9 @@ test("an owner answer retires outstanding permission decisions so no verdict giv
     f.writeTeam();
     const teams = f.openTeam();
     const stored = (teams as unknown as { record(id: string): { run: TeamRun } }).record(f.run.id);
-    // An answer in flight exists only in memory: restart recovery would already have marked a stored one uncertain.
     const inFlight = { ...base, id: randomUUID(), status: "answering" as const };
     stored.run.permissionDecisions!.push(inFlight);
 
-    // A mission coordinator's answer is not owner direction; it retires nothing.
     await teams.answer(f.run.id, coordinatorQuestion.id, { requestId: randomUUID(), revision: 1, text: "a" }, undefined, "coordinator");
     assert.deepEqual(teams.get(f.run.id).permissionDecisions?.map(decision => decision.status), ["pending", "reviewing", "approved", "answered", "answering"]);
     assert.deepEqual(fences, []);
@@ -2383,10 +2542,10 @@ test("permission decisions recorded before owner-authority pinning are retired o
     const run = teams.get(f.run.id);
     assert.deepEqual(run.permissionDecisions?.map(decision => decision.status), ["stale", "answered"], "only outstanding legacy reviews are retired");
     assert.match(run.permissionDecisions?.[0].reason ?? "", /before owner authority was pinned/);
-    const scheduler = teams as unknown as { record(id: string): { run: TeamRun }; permissionAnswerInvalidReason(stored: unknown, decision: unknown): Promise<string | undefined> };
+    const scheduler = teams as unknown as { record(id: string): { run: TeamRun }; permissions: { permissionAnswerInvalidReason(stored: unknown, decision: unknown): Promise<string | undefined> } };
     const stored = scheduler.record(f.run.id);
     const approvedWithoutHash = { ...legacy, id: randomUUID(), status: "approved" as const };
-    assert.match(await scheduler.permissionAnswerInvalidReason(stored, approvedWithoutHash) ?? "", /predates owner-authority pinning/);
+    assert.match(await scheduler.permissions.permissionAnswerInvalidReason(stored, approvedWithoutHash) ?? "", /predates owner-authority pinning/);
   } finally { f.close(); }
 });
 
@@ -2415,7 +2574,6 @@ test("an owner answer during the delivery recheck stops a reused approval before
     const stored = scheduler.record(f.run.id);
     (f.manager as any).meta = () => ({ session: { cwd: target.cwd, team: { runId: f.run.id, memberId: target.memberId,
       revision: target.revision, role: target.role } } });
-    // The first state read qualifies the prompt; the second is the delivery recheck, where the owner's answer lands.
     let stateReads = 0;
     const baseState = f.manager.state;
     (f.manager as any).state = async (...args: unknown[]) => {
@@ -2458,8 +2616,8 @@ test("an identical approved permission request reuses the review and delivers on
       revision: target.revision, role: target.role } } });
     let deliveries = 0;
     let deliveredCoordinatorId: string | undefined;
-    (f.manager as any).answerTeamPermission = async (_sessionId: string, _requestId: string, _assignment: unknown, decision: { coordinatorMemberId?: string }) => {
-      deliveries++; deliveredCoordinatorId = decision.coordinatorMemberId;
+    (f.manager as any).answerTeamPermission = async (_sessionId: string, _requestId: string, _assignment: unknown, decision: { coordinatorMemberId?: string }, _current?: unknown, sourceCoordinatorMemberId?: string) => {
+      deliveries++; assert.equal(decision.coordinatorMemberId, undefined); deliveredCoordinatorId = sourceCoordinatorMemberId;
       return { requestId: _requestId, state: "delivered", result: "closed", seq: 1 };
     };
     f.writeTeam();
@@ -2560,7 +2718,6 @@ test("permission reuse rejects changed evidence, task, role, and revision mismat
         expiresAt: new Date(Date.now() + 5 * 60000).toISOString(), coordinatorMemberId: randomUUID(), answerRequestId: randomUUID(),
         status: "answered" as const, verdict: "approve-once" as const };
       f.run.permissionDecisions = [prior];
-      // An owner answer after the recorded verdict is new direction the verdict never saw.
       if (mismatch === "owner answer") f.run.decisions.push({ id: randomUUID(), memberId: target.memberId, revision: 1, question: "Run the check again?",
         options: ["yes", "no"], createdAt: new Date().toISOString(), answer: "No. Do not run that command again.", answeredBy: "owner", answeredAt: new Date().toISOString() });
       if (mismatch === "changed source contents") writeFileSync(join(target.cwd, "check.js"), "process.exitCode = 1;\n");
@@ -2712,7 +2869,6 @@ test("sequential permission prompts reuse one reviewer and resume its observed n
     f.state.attention.prompt = prompt(2, "npm run build");
     const launchesBefore = f.launches.length;
     const scheduler = teams as unknown as { step(stored: unknown): Promise<void>; record(id: string): { run: TeamRun } };
-    // A task integrated meanwhile: the reviewer has no file tools, so it keeps its member and conversation.
     scheduler.record(f.run.id).run.headCommit = "f".repeat(40);
     await scheduler.step(scheduler.record(f.run.id));
     await waitFor(async () => teams.get(f.run.id), run => run.permissionDecisions?.length === 2 && f.launches.length > launchesBefore);
@@ -2868,7 +3024,6 @@ for (const [ending, minutes, event] of [
         startedAt: new Date(Date.now() - minutes * 60000).toISOString() };
       f.run.members.push(coordinator);
       f.run.permissions = { mode: "coordinator", scope: "Approve one-time runs of the accepted checks.", maxDecisions: 2 };
-      // The decision's target member is gone, so the review is obsolete even inside its window.
       f.run.permissionDecisions = [{ id: randomUUID(), revision: 1, policyHash: "a".repeat(64), authorityHash: permissionAuthorityHash(f.run.permissions, []), targetMemberId: randomUUID(), targetSessionId: randomUUID(),
         targetCwd: coordinator.cwd, promptId: 1, promptHash: "b".repeat(64), evidenceHash: "c".repeat(64), option: 0,
         prompt: { id: 1, kind: "permission", source: "screen", hash: "b".repeat(64), pinned: true, acceptsText: false,
@@ -2876,14 +3031,11 @@ for (const [ending, minutes, event] of [
           options: [{ index: 0, label: "Yes, proceed (y)", role: "accept" }, { index: 1, label: "No, and tell Codex what to do differently (esc)", role: "reject-with-feedback" }] },
         expiresAt: new Date(Date.now() + 5 * 60000).toISOString(), coordinatorMemberId: coordinator.memberId, answerRequestId: randomUUID(), status: "reviewing" }];
       if (minutes > 0) {
-        // Keep the target request current so this case exercises review expiry rather than
-        // the earlier obsolete-request reconciliation.
         const decision = f.run.permissionDecisions[0];
         decision.targetMemberId = manager.memberId; decision.targetSessionId = manager.sessionId;
         decision.evidenceHash = permissionEvidenceHash(decision.prompt);
         f.state.attention.state = "needs-you"; f.state.attention.prompt = decision.prompt;
       }
-      // Its process keeps running after the host asks it to stop.
       f.manager.stopTeamSession = async () => f.manager.state();
       f.writeTeam();
       const teams = f.openTeam();
@@ -2916,7 +3068,6 @@ test("a permission coordinator back from an outage during a current review runs 
     f.run.permissionDecisions = [{ id: randomUUID(), revision: 1, policyHash: "a".repeat(64), authorityHash: permissionAuthorityHash(f.run.permissions, []), targetMemberId: target.memberId, targetSessionId: target.sessionId,
       targetCwd: target.cwd, promptId: prompt.id, promptHash: prompt.hash, evidenceHash: permissionEvidenceHash(prompt), prompt, option: 0,
       expiresAt: new Date(Date.now() + 5 * 60000).toISOString(), coordinatorMemberId: coordinator.memberId, answerRequestId: randomUUID(), status: "reviewing" }];
-    // The target still waits on the same prompt; the coordinator's own session is running again and has reported nothing yet.
     const targetState = f.manager.state, targetEvents = f.manager.events;
     f.manager.state = async (sessionId?: string) => sessionId === coordinator.sessionId ? structuredClone(idle) : targetState();
     f.manager.events = (sessionId: string, after: number, limit: number, types?: Set<string>) =>
@@ -3010,9 +3161,7 @@ test("a persisted mission team replays a legacy create identity when capacity ce
     teams.close();
     const file = join(f.host.config.stateDir, "teams", `${created.id}.sealed`), key = readFileSync(f.host.config.keyFile);
     const persisted = unseal<any>(key, `team:${created.id}`, readFileSync(file, "utf8"));
-    // This is the fingerprint a pre-upgrade createForMission wrote: derived capacity was not part of identity.
     persisted.fingerprint = createHash("sha256").update(JSON.stringify({ request: parsed, missionId, lineup: pinnedLineup })).digest("hex");
-    // A legacy pending solo child may have started from an owner-selected value and no stored ceiling.
     persisted.run.parallelism = 4;
     delete persisted.run.parallelismCeiling;
     writeSealed(file, key, `team:${created.id}`, persisted);
@@ -3043,7 +3192,6 @@ test("an old member that still shows activity is not stalled after a restart", {
     for (const member of stored.run.members) member.startedAt = startedAt;
     writeSealed(file, key, `team:${id}`, stored);
     await f.host.start();
-    // The host observes attention activity before deciding a member is stalled, so the observation is the proof.
     const observed = await waitFor(() => f.get(id), run => run.members.some(member => member.lastActivityAt), 30000);
     assert.notEqual(observed.status, "blocked", JSON.stringify(observed));
     assert.ok(observed.members.some(member => member.status === "running"), JSON.stringify(observed.members));
@@ -3247,4 +3395,40 @@ test("an unreadable record directory keeps the run's evidence", { skip: process.
     chmodSync(directory, 0o700);
     assert.equal(evidence.events({ runId: f.run.id, limit: 10 }).events.length, 1);
   } finally { chmodSync(directory, 0o700); evidence.close(); teams.close(); f.close(); }
+});
+
+test("a steered run keeps its integrated attempts in the scorecard", { timeout: 180000 }, async () => {
+  const lineup = structuredClone(mixedLineup);
+  lineup.implementers = [lineup.implementers[0]!, { id: "deepseek-high", label: "DeepSeek implementer", provider: "opencode", model: "deepseek/deepseek-flash", variant: "high", tier: "light", dataUse: "contributor" }];
+  const f = await fixture("usage", lineup);
+  try {
+    const created = await f.host.fetchApi("/teams", "owner", f.create());
+    assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
+    const settled = await f.settled(created.body.id);
+    assert.equal(settled.status, "ready-for-review", JSON.stringify(settled));
+    const before = await waitFor(() => f.host.fetchApi(`/outcomes/runs/${settled.id}`, "owner"), response => response.status === 200 && response.body.rows.length > 0, 30000);
+    const integratedBefore = before.body.rows.filter((row: { integrated: number | null }) => row.integrated === 1).map((row: { memberId: string }) => row.memberId);
+    assert.ok(integratedBefore.length > 0);
+
+    const steer = { requestId: randomUUID(), revision: settled.revision, text: "Keep the original acceptance criteria and add nothing new." };
+    let steered = await f.host.fetchApi(`/teams/${settled.id}/steer`, "owner", steer);
+    for (let attempt = 0; attempt < 40 && steered.status === 409 && steered.body.code === "team-operation-running"; attempt++) {
+      await new Promise(resolve => setTimeout(resolve, 50));
+      steered = await f.host.fetchApi(`/teams/${settled.id}/steer`, "owner", steer);
+    }
+    assert.equal(steered.status, 200, JSON.stringify(steered.body));
+    const finished = await waitFor(() => f.get(settled.id), run => run.revision > settled.revision && ["ready-for-review", "merged", "blocked"].includes(run.status), 90000);
+
+    const view = await waitFor(() => f.host.fetchApi(`/outcomes/runs/${settled.id}`, "owner"), response => response.status === 200, 30000);
+    for (const memberId of integratedBefore) {
+      const row = view.body.rows.find((candidate: { memberId: string }) => candidate.memberId === memberId);
+      assert.equal(row?.integrated, 1, `row ${memberId} stays integrated after the steer`);
+    }
+    const integratedRows = view.body.rows.filter((row: { integrated: number | null }) => row.integrated === 1).length;
+    const summed = (models: { rows: { integrated: number }[] }) => models.rows.reduce((sum, row) => sum + row.integrated, 0);
+    const models = await waitFor(() => f.host.fetchApi("/usage/models"), response => response.status === 200 && summed(response.body) === integratedRows, 30000);
+    assert.equal(summed(models.body), integratedRows);
+    const currentIntegrated = finished.tasks.filter(task => task.status === "integrated").length;
+    assert.ok(integratedRows > currentIntegrated, `${integratedRows} integrated rows against ${currentIntegrated} in the current revision`);
+  } finally { await f.close(); }
 });

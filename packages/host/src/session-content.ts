@@ -14,15 +14,9 @@ export interface ChatMessage {
   text: string;
   toolName?: string;
   ts: string;
-  /** Journal position of the recording event, comparable with the page cursor. */
   seq?: number;
 }
 
-/**
- * Only explicit recorded messages become chat; terminal output remains terminal output.
- * With `transcript`, the provider's own conversation record was journaled as `message`
- * events, which already carry the prompts and replies the fallback would synthesize.
- */
 export function recordedMessages(manager: Manager, session: Session, after = "0", limit = 200, transcript = false) {
   if (!/^\d{1,16}$/.test(after) || !Number.isSafeInteger(Number(after)))
     throw new ContentError("Invalid message cursor", 400);
@@ -60,7 +54,6 @@ function contained(root: string, file: string) {
   return path !== "" && !path.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`) && path !== ".." && !isAbsolute(path);
 }
 
-/** Read only the chosen session workspace, following symlinks before the containment check. */
 export async function sessionFile(session: Pick<Session, "cwd">, path: string) {
   if (!path || path.length > 4096 || path.includes("\0")) throw new ContentError("Choose a file in this session's project", 400);
   const root = await realpath(session.cwd);
@@ -72,7 +65,6 @@ export async function sessionFile(session: Pick<Session, "cwd">, path: string) {
     const mimeType = images[extname(file).toLowerCase()];
     if (!stat.isFile() || stat.size > (mimeType ? 2 * 1024 * 1024 : 1024 * 1024))
       throw new ContentError("File preview is limited to 1 MiB of text or 2 MiB of images", 413);
-    // Bounded read also handles a file that grows after stat.
     const bytes = Buffer.alloc(stat.size + 1);
     const { bytesRead } = await handle.read(bytes, 0, bytes.length, 0);
     const after = await handle.stat();

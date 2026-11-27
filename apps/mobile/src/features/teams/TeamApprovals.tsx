@@ -11,18 +11,12 @@ import { useControlSync, useSessionControl } from "../session/useSessionControl"
 import { ROLE_NAMES, type PermissionDecision, type TeamMember } from "./model";
 import { t } from "./parts";
 
-/**
- * One agent's open provider prompt, answered from the team. The person's tap is the consent: the
- * answer goes to that exact prompt with this phone's control lease, borrowed only for the answer
- * and released once it lands. The coordinator's escalation reason, when it gave one, sits on top.
- */
 export function AgentApproval({ connection, member, agent, provider, decision, me, onOpenSession }: {
   connection: Connection; member: TeamMember; agent: string; provider?: string; decision?: PermissionDecision; me: Me | null; onOpenSession: () => void;
 }) {
   const id = member.sessionId;
   const control = useSessionControl(connection, id);
   const poll = usePoll(async () => {
-    // A poll that started before a local control change must not undo it.
     const revision = control.generation();
     const session = await api<SessionDetail>(connection, `/sessions/${id}`);
     return { session, revision, receivedAt: Date.now() };
@@ -39,7 +33,6 @@ export function AgentApproval({ connection, member, agent, provider, decision, m
   useEffect(() => { if (sent && lease) forget(true); }, [sent, lease, forget]);
 
   async function answer(option?: number, text?: string) {
-    // Enforcing workers take input only with a lease; claim it for this one answer.
     if (requiresControl && !control.lease) await control.claim(false);
     answering.answer(option, text);
   }

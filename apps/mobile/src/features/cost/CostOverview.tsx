@@ -14,12 +14,6 @@ import { useDaily, useModels, useProjects, useUsageOverview } from "./useCost";
 
 type Tab = "spend" | "models";
 
-/**
- * What the host's agents cost, in figures: this month's metered spend, thirty days of bars
- * stacked by account, each account's balance or plan fee, and projects ranked by accrued cost.
- * Models compares profiles per role with their sample size and uncertainty shown; it suggests,
- * never routes. Plan fees stay out of the headline, the bars, and the delta.
- */
 export function CostOverview({ connection }: { connection: Connection }) {
   const router = useRouter();
   const machine = connectionKey(connection);
@@ -32,7 +26,6 @@ export function CostOverview({ connection }: { connection: Connection }) {
   const models = useModels(connection, role);
   const accounts = overview.data?.accounts ?? [];
   const days = daily.data?.days ?? [], dailyAccounts = daily.data?.accounts ?? [];
-  // Every account that spent in the window is plotted, configured card or not; one hue map serves the bars and the cards.
   const shown = dailyAccounts;
   const colors = accountColors([...new Set([...dailyAccounts, ...accounts.map(account => account.id)])]);
   const selectedDay = days.find(day => day.date === selected);
@@ -43,7 +36,6 @@ export function CostOverview({ connection }: { connection: Connection }) {
     try { await api(connection, "/usage/balances/refresh", { method: "POST" }); overview.refresh(); setBalances("idle"); }
     catch { setBalances("failed"); }
   }
-  /** The owner's plan fee for a subscription account; `null` restores the config default. The host's refusal text reaches the card. */
   async function savePlan(id: string, planUsd: number | null) {
     await api(connection, `/usage/accounts/${encodeURIComponent(id)}/plan`, { method: "PUT", body: { planUsd } });
     overview.refresh();

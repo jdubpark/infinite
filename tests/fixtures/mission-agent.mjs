@@ -2,7 +2,6 @@ import { existsSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 
-// Plays the mission coordinator and each subteam role, deciding from the prompt the host built.
 const [receipts] = process.argv.slice(3);
 const assignment = JSON.parse(process.env.INFINITE_TEAM_ASSIGNMENT ?? "null");
 if (!assignment || !process.env.INFINITE_HOOK_URL || !process.env.INFINITE_HOOK_TOKEN)
@@ -31,6 +30,15 @@ async function coordinator() {
   const state = json("Mission state (JSON): "), messages = json("Messages since your last attempt (JSON): ");
   const held = prompt.includes("HOLD-SUBTEAM"), refusal = messages.find(message => message.type === "refused")?.reason ?? "";
   const step = (id, repoProjectId, dependsOn) => ({ id, repoProjectId, title: id, objective: "HOLD-SUBTEAM", size: "solo", dependsOn });
+  if (prompt.includes("ANSWER-DIRECT") && messages.some(message => message.type === "start")) { await report({ kind: "result", summary: "Rows 14, 90 and 212 were empty." }); return; }
+  if (prompt.includes("ANSWER-ONLY") || state.subtasks.some(subtask => subtask.objective === "NO-CHANGE-ANSWER")) {
+    const answered = messages.find(message => message.type === "subtask-finished" && message.report);
+    if (answered) { await report({ kind: "result", summary: answered.report.text }); return; }
+    if (messages.some(message => message.type === "start")) {
+      await report({ kind: "dispatch", summary: "Answer the question from the export logs", subtasks: [{ id: "answer", repoProjectId: "api", title: "Answer the question", objective: "NO-CHANGE-ANSWER", size: "solo", dependsOn: [] }] });
+      return;
+    }
+  }
   if (prompt.includes("INVALID-DISPATCH") && messages.some(message => message.type === "start")) {
     await report({ kind: "dispatch", summary: "Two subtasks that wait on each other", subtasks: [step("first", "api", ["second"]), step("second", "web", ["first"])] });
     return;
@@ -49,11 +57,17 @@ async function coordinator() {
       ] });
     return;
   }
+  const connectorDirection = messages.find(message => message.type === "connector-direction" && message.text.startsWith("CONNECTOR-STEER:"));
+  if (connectorDirection && state.subtasks.some(subtask => subtask.id === "held" && subtask.teamId)) {
+    await report({ kind: "steer-subtask", subtaskId: "held", text: connectorDirection.text });
+    return;
+  }
   if (held) return hold();
   const decision = messages.find(message => message.type === "child-decision");
   const openDecision = decision && state.openChildDecisions.find(item => item.decisionId === decision.decisionId);
   if (decision?.subtaskId === "api-change") {
-    await report({ kind: "question", question: `The API subteam asks: ${openDecision?.question}`, options: openDecision?.options ?? [], subtaskId: decision.subtaskId, childDecisionId: decision.decisionId });
+    await report({ kind: "question", question: `The API subteam asks: ${openDecision?.question}`, options: openDecision?.options ?? [], subtaskId: decision.subtaskId, childDecisionId: decision.decisionId,
+      recommendation: { answers: ["JSON"], reason: openDecision?.recommendation ? "The subteam recommends it, and the web client parses JSON." : "The web client parses JSON." } });
     return;
   }
   if (decision?.subtaskId === "web-change") {
@@ -68,14 +82,20 @@ async function subteam() {
   const api = prompt.includes("Subtask api-change"), file = api ? "api.txt" : "web.txt";
   if (assignment.role === "project-manager") {
     if (prompt.includes("HOLD-SUBTEAM")) return hold();
+    if (prompt.includes("NO-CHANGE-ANSWER")) {
+      await report({ kind: "no-change", summary: "Three exports failed last week.", evidence: [{ source: "export log", observation: "Rows 14, 90 and 212 were empty." }] });
+      return;
+    }
     if (!api) await until(() => existsSync(join(receipts, "release-web-question")));
-    if (!/(?:User|Mission coordinator) answered:/.test(prompt)) {
-      await report({ kind: "question", question: api ? "Which response format should the endpoint use?" : "Should the button be primary?", options: api ? ["JSON", "Text"] : ["Primary", "Secondary"] });
+    if (!/(?:User|Mission coordinator|Connector(?: \([^\n]*\))?) answered(?: "[^\n]*")?:/.test(prompt)) {
+      await report(api
+        ? { kind: "question", question: "Which response format should the endpoint use?", options: ["JSON", "Text"], recommendation: { answers: ["JSON"], reason: "Clients already parse JSON." } }
+        : { kind: "question", question: "Should the button be primary?", options: ["Primary", "Secondary"] });
       return;
     }
     await report({ kind: "plan", summary: `Write ${file}`, tasks: [{ id: "write", title: `Write ${file}`, instructions: `Create ${file}`, agentProfileId: "light", paths: [file], dependsOn: [] }] });
   } else if (assignment.role === "implementer") {
-    writeFileSync(file, `${prompt.match(/(?:User|Mission coordinator) answered: (.*)/)?.[1] ?? "ready"}\n`);
+    writeFileSync(file, `${prompt.match(/(?:User|Mission coordinator|Connector(?: \([^\n]*\))?) answered(?: "[^\n]*")?: (.*)/)?.[1] ?? "ready"}\n`);
     await report({ kind: "result", summary: `Wrote ${file}` });
   } else if (assignment.role === "reviewer") {
     await report({ kind: "review", verdict: "approved", summary: `Inspected ${file} and the passing check` });

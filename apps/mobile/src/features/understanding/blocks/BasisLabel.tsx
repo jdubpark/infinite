@@ -10,7 +10,6 @@ const LABELS: Record<Basis, string> = {
   host: "Host",
 };
 
-/** Names who said the text beside it, so the honesty boundary is visible on every card. */
 export function BasisLabel({ basis }: { basis: Basis }) {
   return <Text style={styles.basis}>{LABELS[basis]}</Text>;
 }

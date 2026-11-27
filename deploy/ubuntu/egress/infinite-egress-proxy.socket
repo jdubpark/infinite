@@ -1,0 +1,10 @@
+[Unit]
+Description=Infinite agent egress proxy socket (see deploy/ubuntu/egress.md)
+
+[Socket]
+ListenStream=127.0.0.1:4785
+NoDelay=true
+Service=infinite-egress-proxy.service
+
+[Install]
+WantedBy=sockets.target

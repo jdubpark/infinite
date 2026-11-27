@@ -1,10 +1,22 @@
 import { PROVIDER_NAMES, type Attention, type Prompt, type Provider } from "@infinite/attention";
-import type { Manager } from "./manager.js";
+import { publicAttention, type Manager } from "./manager.js";
 import type { PushSender, PushStore } from "./push.js";
+import type { FuseService, FuseInterrupt } from "./fuse/service.js";
+import type { MainCheckNotice, MainCheckService } from "./main-check.js";
+import type { PermissionDeliveryService } from "./permission-agent-types.js";
+import { INTERRUPT_CLASSES, type InterruptClass } from "./permission-policy.js";
+import { isEvalSession, type ExecutionIdentity, type SessionPurpose } from "./types.js";
+import { createHash } from "node:crypto";
 
-type Row = { id: string; title: string; provider: Provider; attention: Attention; reading?: { now?: { text: string } } };
+const fuseSubject = (projectId: string | undefined) =>
+  projectId === undefined ? "host" : projectId.length <= 40 ? projectId : createHash("sha256").update(projectId, "utf8").digest("hex").slice(0, 32);
+
+type Row = {
+  id: string; title: string; provider: Provider; attention: Attention; reading?: { now?: { text: string } }; purpose?: SessionPurpose; executionIdentity?: ExecutionIdentity;
+  permissionChannel?: { waiting?: { interruptClass: string }; notice?: { id: string; interruptClass?: string } };
+  permissionNotice?: true;
+};
 type TeamRow = { id: string; title: string; status: string; reason?: string; resumable?: boolean; goal?: boolean; mission?: boolean };
-/** Who a team member's open prompt waits on: the run's delegated coordinator, the owner, or a review the run has not started yet. */
 export type PromptOwner = "coordinator" | "user" | "undecided";
 type Teams = { statuses(): TeamRow[]; promptOwner?(sessionId: string, prompt: Prompt): PromptOwner };
 type GoalRow = { id: string; title: string; status: string; reason?: string };
@@ -12,10 +24,23 @@ type Lifecycle = { id: string; title: string; status: string; reason?: string; r
 type StorageVolume = { label: string; path: string; fullness: number; availableInodes: number; availableBytes: number; fullnessBy?: "bytes" | "inodes" };
 type StorageAlert = { label: string; fullness: number; availableInodes: number; availableBytes: number; fullnessBy: "bytes" | "inodes"; critical: boolean };
 type StorageCrossing = { previous: number; warningArmed: boolean; criticalArmed: boolean };
+
+export function promptOwner(
+  row: Pick<Row, "id" | "attention">,
+  permissions?: Pick<PermissionDeliveryService, "holder">,
+  teams?: Pick<Teams, "promptOwner">,
+): PromptOwner {
+  const prompt = row.attention.prompt;
+  if (row.attention.state !== "needs-you" || !prompt) return "user";
+  let holder: "agent" | "owner" | "undecided" = "owner";
+  if (permissions) try { holder = permissions.holder(row.id, prompt.id); } catch {}
+  if (holder !== "owner") return holder === "agent" ? "coordinator" : "undecided";
+  if (!teams?.promptOwner) return "user";
+  try { return teams.promptOwner(row.id, prompt); } catch { return "user"; }
+}
+
 const PUSH_STATES = new Set(["needs-you", "turn-finished", "exited", "recording-error"]);
-/** How long a delegated run may take to pick a member's prompt up for review before the owner hears about it. */
 const REVIEW_START_GRACE_MS = 45_000;
-/** A review window is five minutes; a prompt held longer than this reaches the owner even if the run never settled it. */
 const REVIEW_HOLD_LIMIT_MS = 8 * 60_000;
 const REMOVED_LIMIT = 1024;
 const GOAL_EVENTS: Record<string, { event: string; title: string; body: string; priority: "default" | "high" }> = {
@@ -38,7 +63,8 @@ const TEAM_EVENTS: Record<string, { event: string; title: string; body: string; 
 
 export class Notifier {
   private seen = new Map<string, string>();
-  /** Needs-you prompts held back because the run's coordinator may answer them, by session id. */
+  private notices = new Map<string, string>();
+  private noticesPrimed = false;
   private deferred = new Map<string, { key: string; since: number }>();
   private teamStatus = new Map<string, string>();
   private goalStatus = new Map<string, string>();
@@ -57,15 +83,20 @@ export class Notifier {
     private readonly teams?: Teams,
     private readonly goals?: { statuses(): GoalRow[] },
     private readonly storage?: { sample(): Promise<StorageVolume[]> },
+    private readonly fuse?: Pick<FuseService, "interrupts" | "markAnnounced">,
+    private readonly permissions?: Pick<PermissionDeliveryService, "holder" | "ownerClass">,
+    private readonly mainCheck?: Pick<MainCheckService, "notices" | "accepted">,
   ) {}
-  /** Lifecycle baselines are taken now, synchronously, so a change during the first interval is not absorbed as startup state. */
+  private fuseRetryAt = 0;
+  private monotonic = () => performance.now();
   start() { this.teamEvents(); this.goalEvents(); this.timer = setInterval(() => void this.tick().catch(() => {}), this.options.intervalMs); this.timer.unref(); }
   stop() { clearInterval(this.timer); }
   async tick() {
     const due: Row[] = [];
     try {
-      const rows = (await this.manager.list()) as unknown as Row[];
+      const rows = ((await this.manager.list({ includeFullMessage: true })) as unknown as Row[]).filter(row => !isEvalSession(row));
       const now = Date.now();
+      const redact = (row: Row): Row => ({ ...row, attention: publicAttention(row.attention) });
       for (const row of rows) {
         const key = `${row.attention.state}:${row.attention.prompt?.id ?? ""}`;
         const previous = this.previous("session", row.id, this.seen);
@@ -74,41 +105,54 @@ export class Notifier {
         if (held && held.key !== key) this.deferred.delete(row.id);
         if (this.primed && previous !== key && PUSH_STATES.has(row.attention.state) && this.options.events.includes(row.attention.state)) {
           if (this.promptOwner(row) !== "user") { this.deferred.set(row.id, { key, since: now }); continue; }
-          due.push(row);
+          due.push(redact(row));
         } else if (held && held.key === key) {
-          // A held prompt reaches the owner once it is theirs: the coordinator escalated it, the
-          // run never started a review in time, or the hold outlived any possible review.
           const owner = this.promptOwner(row);
           const heldFor = now - held.since;
           if (owner === "user" || (owner === "undecided" && heldFor >= (this.options.reviewGraceMs ?? REVIEW_START_GRACE_MS)) ||
               heldFor >= (this.options.reviewHoldLimitMs ?? REVIEW_HOLD_LIMIT_MS)) {
             this.deferred.delete(row.id);
-            due.push(row);
+            due.push(redact(row));
           }
         }
       }
+      due.push(...this.channelNotices(rows).map(redact));
       this.prune("session", this.seen, new Set(rows.map(row => row.id)));
-      // A session missing from one listing keeps its hold, so a prompt that comes back unchanged
-      // can still reach the owner; the hold limit bounds how long an absent session is remembered.
       for (const [id, held] of this.deferred) if (!this.seen.has(id) && now - held.since >= (this.options.reviewHoldLimitMs ?? REVIEW_HOLD_LIMIT_MS)) this.deferred.delete(id);
       this.primed = true;
     } catch {}
     const lifecycle = [...this.teamEvents(), ...this.goalEvents()];
     const storageDue = await this.storageEvents(Date.now());
-    if (!due.length && !lifecycle.length && !storageDue.length) return;
+    const fuseDue = this.fuseEvents();
+    const mainCheckDue = this.mainCheckEvents();
+    if (!due.length && !lifecycle.length && !storageDue.length && !fuseDue.length && !mainCheckDue.length) return;
     const devices = this.store.list();
     if (!devices.length) return;
     const messages = [
       ...due.flatMap((row) => devices.map((d) => this.message(row, d.token))),
       ...lifecycle.flatMap((item) => devices.map((d) => this.lifecycleMessage(item, d.token))),
       ...storageDue.flatMap((item) => devices.map((d) => this.storageMessage(item, d.token))),
+      ...mainCheckDue.flatMap((item) => devices.map((d) => this.mainCheckMessage(item, d.token))),
+      ...fuseDue.flatMap((item) => devices.map((d) => this.fuseMessage(item, d.token))),
     ];
+    const mainFirst = messages.length - (mainCheckDue.length + fuseDue.length) * devices.length;
     let tickets: Awaited<ReturnType<PushSender>>;
     try {
       tickets = await this.sender(messages);
     } catch (error) {
       console.warn(`push: sender failed (${(error as Error).name})`);
       return;
+    }
+    mainCheckDue.forEach((item, index) => {
+      const reached = devices.some((_device, device) => tickets[mainFirst + index * devices.length + device]?.status === "ok");
+      if (reached) this.mainCheck?.accepted(item.projectId, item.notice, item.outcome);
+    });
+    if (fuseDue.length) {
+      const first = messages.length - fuseDue.length * devices.length;
+      const reached = fuseDue.filter((_item, index) =>
+        devices.some((_device, device) => tickets[first + index * devices.length + device]?.status === "ok"));
+      if (reached.length) this.fuse?.markAnnounced(reached.map((item) => item.tripId));
+      if (reached.length < fuseDue.length) this.fuseRetryAt = this.monotonic() + 60_000;
     }
     const failures = new Set<string>();
     tickets.forEach((ticket, i) => {
@@ -117,6 +161,24 @@ export class Notifier {
       else failures.add(ticket.details?.error ?? ticket.message ?? "error");
     });
     if (failures.size) console.warn(`push: ${[...failures].join(", ")}`);
+  }
+  private mainCheckEvents(): MainCheckNotice[] {
+    if (!this.mainCheck || !this.enabled("main-check")) return [];
+    try { return this.mainCheck.notices(); } catch { return []; }
+  }
+  private mainCheckMessage(item: MainCheckNotice, to: string) {
+    const { summary } = item;
+    const head = summary.head.slice(0, 7);
+    const text = summary.outcome === "passed"
+      ? { title: "Main passes again", body: `all ${summary.expected} checks passed at ${head}.` }
+      : { title: "Main is failing", body: summary.failed
+        ? `check ${summary.failed.index} of ${summary.expected} ${summary.failed.exitCode === null ? "exited with no exit code" : `exited ${summary.failed.exitCode}`} at ${head}.`
+        : `a check failed at ${head}.` };
+    return {
+      to, title: text.title, body: `${item.label}: ${text.body}`,
+      data: { url: "/teams", ...(this.options.machineId ? { machineId: this.options.machineId } : {}) }, channelId: "attention" as const,
+      priority: "default" as const, collapseId: `main-check:${fuseSubject(item.projectId)}`,
+    };
   }
   private async storageEvents(now: number): Promise<StorageAlert[]> {
     if (!this.storage || !this.enabled("host-storage") || (this.lastStorageEvaluationAt !== undefined && now - this.lastStorageEvaluationAt < 60_000)) return [];
@@ -129,7 +191,6 @@ export class Notifier {
       const fullnessBy = volume.fullnessBy ?? "inodes";
       const previous = this.storageStatus.get(volume.label);
       if (!previous) {
-        // Tell the owner once at startup when a volume is already high; choose its current severity and do not emit both crossings.
         const critical = volume.fullness >= 0.95;
         if (critical || volume.fullness >= 0.85) due.push({ ...volume, fullnessBy, critical });
         this.storageStatus.set(volume.label, { previous: volume.fullness, warningArmed: volume.fullness < 0.85, criticalArmed: volume.fullness < 0.95 });
@@ -149,6 +210,22 @@ export class Notifier {
     }
     return due;
   }
+  private fuseEvents(): FuseInterrupt[] {
+    if (!this.fuse || !this.enabled("autonomy-interrupt") || this.monotonic() < this.fuseRetryAt) return [];
+    try { return this.fuse.interrupts(); } catch { return []; }
+  }
+  private fuseMessage(item: FuseInterrupt, to: string) {
+    const cause = item.cause === "unmeasurable" ? "its launch record cannot be read"
+      : item.cause === "write-failed" ? "it cannot record a launch" : "it reached its launch limit for the last hour";
+    const closing = item.cause === "unmeasurable" ? "It closes once the record can be read."
+      : item.cause === "write-failed" ? "Launches resume once the host can write its state again."
+      : item.ownerClose ? "It stays open until you close it." : "It closes on its own as launches leave the last hour.";
+    return {
+      to, title: "Spend fuse open", body: `Launches paused for ${item.label}: ${cause}. ${closing}`,
+      data: { url: "/teams", ...(this.options.machineId ? { machineId: this.options.machineId } : {}) }, channelId: "attention" as const,
+      priority: "high" as const, collapseId: `interrupt:fuse:${fuseSubject(item.projectId)}`,
+    };
+  }
   private storageMessage(item: StorageAlert, to: string) {
     const count = (value: number) => value >= 1_000_000 ? `${(value / 1_000_000).toFixed(1).replace(/\.0$/, "")}M` : value >= 1_000 ? `${(value / 1_000).toFixed(1).replace(/\.0$/, "")}K` : String(Math.round(value));
     const gigabytes = (value: number) => `${(value / 1024 ** 3).toFixed(0)} GB`;
@@ -159,11 +236,15 @@ export class Notifier {
       channelId: "attention" as const, priority: item.critical ? "high" as const : "default" as const, collapseId: `storage:${item.label}`,
     };
   }
-  /** A team member's open permission prompt is the owner's unless its run can still decide it. Everything else is always the owner's. */
   private promptOwner(row: Row): PromptOwner {
+    return promptOwner(row, this.permissions, this.teams);
+  }
+  private ownerClass(row: Row): InterruptClass | undefined {
     const prompt = row.attention.prompt;
-    if (row.attention.state !== "needs-you" || !prompt || !this.teams?.promptOwner) return "user";
-    try { return this.teams.promptOwner(row.id, prompt); } catch { return "user"; }
+    if (row.attention.state !== "needs-you" || !prompt || !this.permissions?.ownerClass) return undefined;
+    let named: unknown;
+    try { named = this.permissions.ownerClass(row.id, prompt.id); } catch { return undefined; }
+    return (INTERRUPT_CLASSES as readonly unknown[]).includes(named) ? named as InterruptClass : undefined;
   }
   private teamEvents(): Lifecycle[] {
     if (!this.teams) return [];
@@ -181,7 +262,6 @@ export class Notifier {
     this.goalsPrimed = true;
     return due;
   }
-  /** A record first seen after priming announces its start and, if it is already stuck or done, that status too. */
   private lifecycle(kind: "goal" | "team", rows: TeamRow[], statuses: Map<string, string>, primed: boolean, map: typeof TEAM_EVENTS, startedTitle: string) {
     const due: Lifecycle[] = [];
     for (const row of rows) {
@@ -228,16 +308,48 @@ export class Notifier {
       data: { url: `/${item.kind}/${item.id}`, ...(this.options.machineId ? { machineId: this.options.machineId } : {}) }, channelId: "attention" as const,
       priority: item.priority, collapseId: `${item.kind}:${item.id}` };
   }
+  private channelNotices(rows: Row[]): Row[] {
+    const due: Row[] = [];
+    for (const row of rows) {
+      const notice = row.permissionChannel?.notice;
+      if (!notice || this.notices.get(row.id) === notice.id) continue;
+      this.notices.set(row.id, notice.id);
+      if (this.noticesPrimed && this.options.events.includes("needs-you")) due.push({ ...row, permissionNotice: true });
+    }
+    const listed = new Set(rows.map(row => row.id));
+    for (const id of this.notices.keys()) if (!listed.has(id)) this.notices.delete(id);
+    this.noticesPrimed = true;
+    return due;
+  }
   private message(row: Row, to: string) {
     const name = PROVIDER_NAMES[row.provider] ?? row.provider;
+    const channel = row.permissionChannel;
+    if (row.permissionNotice) {
+      const named = channel?.notice?.interruptClass ? ` (${channel.notice.interruptClass})` : "";
+      return {
+        to, title: "Call denied: needs you", body: `${name} in ${row.title} made a call${named} that needs your own answer. It was denied and can be asked again.`,
+        data: { url: `/session/${row.id}`, ...(this.options.machineId ? { machineId: this.options.machineId } : {}) }, channelId: "attention" as const,
+        priority: "high" as const, collapseId: `${row.id}:permission`,
+      };
+    }
+    if (row.attention.state === "needs-you" && channel?.waiting) {
+      const minimal = `${name} waits for your answer in ${row.title} (${channel.waiting.interruptClass})`;
+      return {
+        to, title: "Needs your answer", body: minimal,
+        data: { url: `/session/${row.id}`, ...(this.options.machineId ? { machineId: this.options.machineId } : {}) }, channelId: "attention" as const,
+        priority: "high" as const, collapseId: row.id,
+      };
+    }
     const [title, minimal] =
       row.attention.state === "needs-you"
         ? row.attention.prompt?.kind === "question" ? ["Question for you", `${name} asked a question in ${row.title}`] : ["Needs your approval", `${name} needs your approval in ${row.title}`]
         : row.attention.state === "turn-finished" ? ["Turn finished", `${row.title} finished a turn`]
         : row.attention.state === "exited" ? ["Session exited", `${row.title} exited`]
         : ["Recording stopped", `${row.title} stopped recording`];
+    const body = this.options.detail === "full" ? (row.attention.state === "turn-finished" ? row.reading?.now?.text : undefined) || row.attention.now || minimal : minimal;
+    const interrupt = this.ownerClass(row);
     return {
-      to, title, body: this.options.detail === "full" ? (row.attention.state === "turn-finished" ? row.reading?.now?.text : undefined) || row.attention.now || minimal : minimal,
+      to, title, body: interrupt ? `${body} (${interrupt})` : body,
       data: { url: `/session/${row.id}`, ...(this.options.machineId ? { machineId: this.options.machineId } : {}) }, channelId: "attention" as const,
       priority: row.attention.state === "needs-you" ? ("high" as const) : ("default" as const), collapseId: row.id,
     };

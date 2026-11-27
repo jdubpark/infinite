@@ -2,15 +2,7 @@ import { ProjectContexts } from "./project-context.js";
 import { assertFreshNativeContext } from "./context-continuation.js";
 import { handoffNativePrompt, handoffPathsOverlap } from "./handoff-types.js";
 import { spawn } from "node:child_process";
-import {
-  readFileSync,
-  mkdirSync,
-  readdirSync,
-  existsSync,
-  rmSync,
-  realpathSync,
-  statSync,
-} from "node:fs";
+import { readFileSync, mkdirSync, readdirSync, existsSync, rmSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createHash, randomUUID } from "node:crypto";
@@ -19,33 +11,37 @@ import {
   initialAttention,
   type Attention,
 } from "@infinite/attention";
-import { readEvents, unseal, writeSealed } from "./vault.js";
-import { workerCall } from "./ipc.js";
+import { unseal, writeSealed } from "./vault.js";
+import { readIndexedEvents } from "./signal-index.js";
+import { canonicalOrResolved, collectLivePermissionSockets, ensureSocketDir, existingWorkerSocket, readRecordedSocketPath, removeWorkerSockets, trustedWorkerSocket, workerCall, workerCallAt, type SocketTarget } from "./ipc.js";
+import { SealedFileCache, listedSavedState, listedSession, savedState, unavailableState, type ListedSession, type SavedStatus } from "./session-listing.js";
 import { assertRunnerDeployment } from "./deployment.js";
 import { DEFAULT_HOOKS } from "./config.js";
+import { codeModeEnabled, memberLaunchPrompt } from "./code-mode.js";
+import { HostLoadGate, LaunchHeldError, readHostLoad, type HostLoadProbe } from "./host-load.js";
 import { validateNativeCodexArgs } from "./native-codex.js";
 import { validateNativeOpenCodeArgs } from "./native-opencode.js";
 import { ContentError } from "./session-content.js";
-import { isCollapsedPermissionPrompt, permissionEvidenceHash, oneShotPermissionOption } from "./team-permissions.js";
+import { fuseReason, workLaunch } from "./fuse/rules.js";
+import type { FuseGate } from "./fuse/types.js";
+import { haltReason } from "./halt/rules.js";
+import { agentAcceptOption, isCollapsedPermissionPrompt, oneShotRejectOption, permissionEvidenceHash, oneShotPermissionOption } from "./team-permissions.js";
 import { nativeContinuationSchema, teamModelProfileSchema, type NativeContinuation, type TeamAssignment, type TeamModelProfile, type TeamPermissionDecision } from "./team-types.js";
-import { missionCoordinatorLaunch, permissionCoordinatorLaunch, teamModelLaunch } from "./launch.js";
+import { hasHostLaunchFields, headlessLaunch, matchesSessionRequestFingerprint, missionCoordinatorLaunch, parseMissionCoordinatorProvider, permissionCoordinatorLaunch, sessionAgentProfile, sessionRequestFingerprint, stripHostLaunchFields, teamModelLaunch, withoutSharedContext } from "./launch.js";
 import { withNativeContinuation } from "./native-continuation.js";
+import { SESSION_PERMISSION_ACTOR_LABEL, isRequesterNotice, sessionPermissionRequestId, type SessionPermissionAnswer } from "./permission-session-requests.js";
+import { deferredCallOpen, type HeadlessPermissionChannel } from "./permission-headless.js";
 import { agentBoundary, inventoryRuntimeProcesses, runtimeIdentity, stopRuntimeTree, type RuntimeProcess, type TeamRuntimeInspection, type TeamRuntimeRetirement } from "./team-retirement.js";
 import { TeamError } from "./team-workspace.js";
-import type {
-  Config,
-  Provider,
-  Session,
-  WorkerState,
-  Bootstrap,
-  LaptopWorkspace,
-  WorkerRequest,
-  ControlLease,
-  Receipt,
-  TeamPermissionExpansionExpectation,
+import { prepareMemberTrace } from "./member-traces.js";
+import { projectGithubRepository, sessionGithubGrant, sessionGithubScopeFor, type GithubGrantScope, type SessionGithubOrigin } from "./github-grants.js";
+import {
+  isEvalSession, resolveLaunchExecutionIdentity, sessionExecutionIdentity,
+  type Bootstrap, type Config, type ControlLease, type ExecutionIdentity, type LaptopWorkspace, type Provider,
+  type Receipt, type Session, type SessionPurpose, type TeamMemberAssignment, type TeamPermissionExpansionExpectation,
+  type WorkerRequest, type WorkerState,
 } from "./types.js";
 
-/** This stop attempt was refused before any worker RPC could deliver it. */
 export class TeamStopRefused extends ContentError {}
 
 export interface CreateSession {
@@ -57,13 +53,13 @@ export interface CreateSession {
   prompt: string;
   nativeArgs?: string[];
   localUi?: boolean;
-  /** Working directory relative to the configured project root. */
   cwd?: string;
   workspace?: LaptopWorkspace & { token: string };
   resumedFrom?: string;
   resumeNativeSession?: { id: string; source: "hook" | "protocol" };
   continuation?: NativeContinuation;
 }
+type ManagedCreateSession = CreateSession & { recordedCodeMode?: true };
 interface StoredSession {
   session: Session;
   fingerprint: string;
@@ -130,11 +126,10 @@ export function projectCwd(projectPath: string, cwd?: string): string {
   if (isAbsolute(child) || child === ".." || child.startsWith("../") || !statSync(directory).isDirectory()) throw new ContentError("The session directory must be inside its project", 400);
   return directory;
 }
-/** List rows stay small: the last message is cut and tool input stays on the detail endpoint. */
 export function publicAttention(att: Attention): Attention {
   const lastMessage = att.lastMessage?.slice(0, 280);
   const limit = att.limit ? { ...att.limit, message: att.limit.message.slice(0, 300) } : undefined;
-  if (!att.prompt) return { ...att, lastMessage, ...(limit ? { limit } : {}) };
+  if (att.state !== "needs-you" || !att.prompt) return { ...att, lastMessage, ...(limit ? { limit } : {}) };
   const { tool, ...prompt } = att.prompt;
   return {
     ...att,
@@ -142,18 +137,11 @@ export function publicAttention(att: Attention): Attention {
     prompt: {
       ...prompt,
       ...(tool ? { tool: { name: tool.name, input: {} } } : {}),
-      // Decided on the full prompt, since the row drops the tool input the check reads.
       ...(oneShotPermissionOption(att.prompt) !== undefined ? { delegable: true } : {}),
     },
     lastMessage,
   };
 }
-/**
- * Older workers deliberately survive API upgrades and answer `state` without attention. Such a
- * row gets an attention block so list rows, the Notifier and the phone never meet a missing
- * field, but the block never invents an idle or finished state: a live old worker reads as
- * `unavailable` (the host cannot tell what it is doing) and a stopped one keeps its lifecycle.
- */
 export function withDefaultAttention(
   state: Omit<WorkerState, "attention"> & { attention?: Attention },
   now = new Date().toISOString(),
@@ -168,15 +156,23 @@ export function withDefaultAttention(
     attention: applyLifecycle(initialAttention(now, false), status, now),
   };
 }
-const unavailable = (now = new Date().toISOString()): WorkerState => ({
-  status: "unavailable",
-  seq: 0,
-  screen: "",
-  attention: applyLifecycle(initialAttention(now, false), "unavailable", now),
-});
 export class Manager {
-  private serial: Promise<unknown> = Promise.resolve();
+  private contexts?: ProjectContexts;
+  get projectContexts() { return this.contexts ??= new ProjectContexts(this.config, this.key); }
+  private readonly sessionQueues = new Map<string, Promise<unknown>>();
+  private readonly conversationQueues = new Map<string, Promise<unknown>>();
+  private readonly pendingCreates = new Set<string>();
+  private createAdmission: Promise<unknown> = Promise.resolve();
+  readonly hostLoad: HostLoadGate;
+  readonly socketDir: string; readonly socketTarget: Exclude<SocketTarget, string>;
+  private readonly staticSocketTarget: Exclude<SocketTarget, string>;
   private readonly handoffProjects = new Map<string, string>();
+  private fuse?: FuseGate;
+  private readonly listedMeta = new SealedFileCache<ListedSession>((id, raw) => listedSession(unseal<StoredSession>(this.key, `${id}:meta`, raw).session));
+  private readonly savedStatus = new SealedFileCache<SavedStatus>((id, raw, mtimeMs) => { const state = unseal<WorkerState>(this.key, `${id}:status`, raw); return { state, savedAt: new Date(mtimeMs).toISOString(), ...(state.socketPath ? { socketPath: state.socketPath } : {}), ...(state.permissionSocketPath ? { permissionSocketPath: state.permissionSocketPath } : {}) }; });
+  useFuse(fuse: FuseGate) { this.fuse = fuse; }
+  private headlessChannel?: Pick<HeadlessPermissionChannel, "admit">;
+  useHeadlessChannel(channel: Pick<HeadlessPermissionChannel, "admit">) { this.headlessChannel = channel; }
   reserveHandoff(projectId: string) {
     const project = this.config.projects.find(project => project.id === projectId);
     if (!project) throw new ContentError("Handoff project is unavailable");
@@ -185,8 +181,8 @@ export class Manager {
   releaseHandoff(projectId: string) { this.handoffProjects.delete(projectId); }
   async assertHandoffAlone(sessionId: string) {
     const source = this.meta(sessionId).session;
-    for (const id of readdirSync(join(this.config.stateDir, "sessions")).filter(id => /^[a-f0-9-]{36}$/.test(id))) {
-      if (id === sessionId) continue;
+    for (const id of readdirSync(join(this.config.stateDir, "sessions")).filter(id => /^[a-f0-9-]{36}$/i.test(id))) {
+      if (id.toLowerCase() === sessionId.toLowerCase()) continue;
       const other = this.meta(id).session;
       if ((await this.state(id)).status === "exited") continue;
       const otherPath = realpathSync(other.cwd);
@@ -204,21 +200,27 @@ export class Manager {
       return state;
     }
     if (state.status !== "running") throw new ContentError("The source runtime has not confirmed a controllable state");
-    await workerCall(this.config.runDir, sessionId, { op: "handoff-stop", requestId }, 10000);
+    await workerCall(this.socketTarget, sessionId, { op: "handoff-stop", requestId }, 10000);
     return this.state(sessionId);
   }
   constructor(
     readonly config: Config,
     readonly key: Buffer,
+    hostProbe: HostLoadProbe = readHostLoad,
+    options?: { socketDir?: string; projectContexts?: ProjectContexts },
   ) {
+    this.contexts = options?.projectContexts;
     assertRunnerDeployment(config);
-    mkdirSync(join(config.stateDir, "sessions"), {
-      recursive: true,
-      mode: 0o700,
-    });
+    const configuredSocketDir = options?.socketDir ?? config.socketDir;
+    this.socketDir = ensureSocketDir(configuredSocketDir ?? config.runDir, configuredSocketDir !== undefined ? "socketDir" : "runDir");
+    const hostKey = canonicalOrResolved(config.runDir);
+    this.staticSocketTarget = { runDir: config.runDir, socketDir: this.socketDir, hostKey };
+    this.socketTarget = { ...this.staticSocketTarget, recordedSocket: id => readRecordedSocketPath(this.config.stateDir, this.key, id) };
+    this.hostLoad = new HostLoadGate(config.hostLoad, hostProbe);
+    mkdirSync(join(config.stateDir, "sessions"), { recursive: true, mode: 0o700 });
     const deletedDir = join(config.stateDir, "deleted-sessions");
     mkdirSync(deletedDir, { recursive: true, mode: 0o700 });
-    for (const name of readdirSync(deletedDir).filter(name => /^[a-f0-9-]{36}\.sealed$/.test(name))) {
+    for (const name of readdirSync(deletedDir).filter(name => /^[a-f0-9-]{36}\.sealed$/i.test(name))) {
       const id = name.slice(0, -7);
       let receipt: DeletedSessionReceipt;
       try {
@@ -230,31 +232,55 @@ export class Manager {
       rmSync(join(config.stateDir, "sessions", id), { recursive: true, force: true });
     }
     mkdirSync(config.runDir, { recursive: true, mode: 0o700 });
-    if (
-      Buffer.byteLength(
-        join(config.runDir, "00000000-0000-0000-0000-000000000000.sock"),
-      ) > 100
-    )
-      throw new Error(
-        "runDir is too long for a Unix socket; choose a shorter path",
-      );
   }
-  private deletedReceiptPath(id: string) {
-    return join(this.config.stateDir, "deleted-sessions", `${id}.sealed`);
+  activePermissionSockets(): string[] { return collectLivePermissionSockets(this.config.stateDir, this.key); }
+  private deletedReceiptPath(id: string) { return join(this.config.stateDir, "deleted-sessions", `${id}.sealed`); }
+  private sessionDirEntry(id: string): string | undefined {
+    const lower = id.toLowerCase();
+    return readdirSync(join(this.config.stateDir, "sessions")).find(name => name.toLowerCase() === lower);
+  }
+  private deletedReceiptEntry(id: string): string | undefined {
+    const lower = id.toLowerCase();
+    const entry = readdirSync(join(this.config.stateDir, "deleted-sessions")).find(name => name.endsWith(".sealed") && name.slice(0, -7).toLowerCase() === lower);
+    return entry ? entry.slice(0, -7) : undefined;
+  }
+  private resumptionReceiptEntry(requestId: string): string | undefined {
+    const dir = join(this.config.stateDir, "resumptions");
+    if (!existsSync(dir)) return undefined;
+    const lower = requestId.toLowerCase();
+    const entry = readdirSync(dir).find(name => name.endsWith(".sealed") && name.slice(0, -7).toLowerCase() === lower);
+    return entry ? entry.slice(0, -7) : undefined;
   }
   meta(id: string): StoredSession {
     if (existsSync(this.deletedReceiptPath(id))) throw Object.assign(new Error("Session not found"), { code: "ENOENT" });
-    return unseal(
-      this.key,
-      `${id}:meta`,
-      readFileSync(
-        join(this.config.stateDir, "sessions", id, "meta.sealed"),
-        "utf8",
-      ),
-    );
+    return unseal(this.key, `${id}:meta`, readFileSync(join(this.config.stateDir, "sessions", id, "meta.sealed"), "utf8"));
+  }
+  private serializeKeyed<T>(queues: Map<string, Promise<unknown>>, key: string, fn: () => Promise<T>): Promise<T> {
+    const prev = queues.get(key) ?? Promise.resolve();
+    const operation = prev.then(fn);
+    const settled = operation.catch(() => {}).finally(() => {
+      if (queues.get(key) === settled) queues.delete(key);
+    });
+    queues.set(key, settled);
+    return operation;
+  }
+  private serializeSession<T>(id: string, fn: () => Promise<T>): Promise<T> { return this.serializeKeyed(this.sessionQueues, id.toLowerCase(), fn); }
+  private serializeConversation<T>(key: string, task: () => Promise<T>): Promise<T> { return this.serializeKeyed(this.conversationQueues, key, task); }
+  private reserveCreateSlot(id: string): Promise<void> {
+    const key = id.toLowerCase();
+    const operation = this.createAdmission.then(async () => {
+      const pendingBeforeList = new Set(this.pendingCreates);
+      const listed = await this.list();
+      const active = new Set([...listed.filter(s => s.status === "running" || s.status === "starting").map(s => s.id.toLowerCase()), ...pendingBeforeList, ...this.pendingCreates]);
+      if (active.size >= this.config.maxSessions)
+        throw new Error("The configured session limit has been reached");
+      this.pendingCreates.add(key);
+    });
+    this.createAdmission = operation.catch(() => {});
+    return operation;
   }
   setArchived(id: string, archived: boolean): Promise<StoredSession["session"]> {
-    const operation = this.serial.then(async () => {
+    return this.serializeSession(id, async () => {
       const stored = this.meta(id);
       if (stored.session.team) throw new ContentError("Team sessions cannot be archived", 409);
       if ((await this.state(id)).status !== "exited")
@@ -264,28 +290,17 @@ export class Manager {
       const session = archived
         ? { ...stored.session, archivedAt: stored.session.archivedAt ?? new Date().toISOString() }
         : unarchived;
-      writeSealed(
-        join(this.config.stateDir, "sessions", id, "meta.sealed"),
-        this.key,
-        `${id}:meta`,
-        { session, fingerprint: stored.fingerprint },
-      );
+      writeSealed(join(this.config.stateDir, "sessions", id, "meta.sealed"), this.key, `${id}:meta`, { session, fingerprint: stored.fingerprint });
       return session;
     });
-    this.serial = operation.catch(() => {});
-    return operation;
   }
   remove(id: string): Promise<void> {
-    const operation = this.serial.then(async () => {
+    return this.serializeSession(id, async () => {
       const stored = this.meta(id);
-      if (stored.session.team) throw new ContentError("Team sessions cannot be removed", 409);
+      if (stored.session.team && !isEvalSession(stored.session)) throw new ContentError("Team sessions cannot be removed", 409);
 
       let workerStateReadFailed = false;
-      try {
-        await workerCall(this.config.runDir, id, { op: "state" });
-      } catch {
-        workerStateReadFailed = true;
-      }
+      try { await workerCall(this.socketTarget, id, { op: "state" }); } catch { workerStateReadFailed = true; }
       if (!workerStateReadFailed)
         throw new ContentError("Only an exited session with unavailable worker state can be removed", 409);
 
@@ -293,77 +308,48 @@ export class Manager {
       if (!existsSync(statusFile))
         throw new ContentError("Only an exited session with unavailable worker state can be removed", 409);
       let saved: WorkerState;
-      try {
-        saved = unseal<WorkerState>(this.key, `${id}:status`, readFileSync(statusFile, "utf8"));
-      } catch {
-        throw new ContentError("Only an exited session with unavailable worker state can be removed", 409);
-      }
+      try { saved = unseal<WorkerState>(this.key, `${id}:status`, readFileSync(statusFile, "utf8")); }
+      catch { throw new ContentError("Only an exited session with unavailable worker state can be removed", 409); }
       if (saved.status !== "exited")
         throw new ContentError("Only an exited session with unavailable worker state can be removed", 409);
 
-      writeSealed(
-        this.deletedReceiptPath(id),
-        this.key,
-        `deleted:${id}`,
-        { id, fingerprint: stored.fingerprint } satisfies DeletedSessionReceipt,
-      );
+      writeSealed(this.deletedReceiptPath(id), this.key, `deleted:${id}`, { id, fingerprint: stored.fingerprint } satisfies DeletedSessionReceipt);
       rmSync(join(this.config.stateDir, "sessions", id), { recursive: true });
+      removeWorkerSockets(this.socketTarget, id, saved.socketPath);
     });
-    this.serial = operation.catch(() => {});
-    return operation;
   }
   async state(id: string, screen = false): Promise<WorkerState> {
-    try {
-      return withDefaultAttention(
-        await workerCall(this.config.runDir, id, { op: "state", screen }),
-      );
-    } catch {
+    try { return withDefaultAttention(await workerCall(this.socketTarget, id, { op: "state", screen })); }
+    catch {
+      const now = new Date().toISOString();
       const file = join(this.config.stateDir, "sessions", id, "status.sealed");
-      if (existsSync(file)) {
-        const saved = unseal<WorkerState>(
-          this.key,
-          `${id}:status`,
-          readFileSync(file, "utf8"),
-        );
-        const status = saved.status === "exited" ? "exited" : "unavailable";
-        const now = new Date().toISOString();
-        return {
-          ...saved,
-          status,
-          screen: "",
-          attention: applyLifecycle(
-            saved.attention ?? initialAttention(now, false),
-            status,
-            now,
-          ),
-        };
-      }
-      return unavailable();
+      if (existsSync(file)) return savedState(unseal<WorkerState>(this.key, `${id}:status`, readFileSync(file, "utf8")), now);
+      return unavailableState(now);
     }
   }
-  /**
-   * Every session whose metadata can be read. One session's unreadable status (or a worker
-   * that fails to answer) shows that row as unavailable instead of failing the whole list;
-   * a session without readable metadata has no title or provider to show and is left out.
-   */
+  private async listedState(id: string, createdAt: string, dirTrustCache: Map<string, boolean>): Promise<WorkerState> {
+    const direct = existingWorkerSocket(this.staticSocketTarget, id, undefined, dirTrustCache);
+    if (direct) try { return withDefaultAttention(await workerCallAt(direct, { op: "state", screen: false })); } catch {}
+    const saved = this.savedStatus.read(id, join(this.config.stateDir, "sessions", id, "status.sealed"), Date.now());
+    const recorded = saved?.socketPath ? trustedWorkerSocket(saved.socketPath, dirTrustCache) : undefined;
+    if (recorded) try { return withDefaultAttention(await workerCallAt(recorded, { op: "state", screen: false })); } catch {}
+    return saved === undefined ? unavailableState(createdAt) : listedSavedState(saved);
+  }
   async list(options: { includeFullMessage?: boolean } = {}) {
+    const now = Date.now(), dirTrustCache = new Map<string, boolean>();
     const ids = readdirSync(join(this.config.stateDir, "sessions")).filter(
-      (n) => /^[a-f0-9-]{36}$/.test(n) && !existsSync(this.deletedReceiptPath(n)),
+      (n) => /^[a-f0-9-]{36}$/i.test(n) && !existsSync(this.deletedReceiptPath(n)),
     );
+    this.listedMeta.retain(new Set(ids), now);
+    this.savedStatus.retain(new Set(ids), now);
     const rows = await Promise.allSettled(
       ids.map(async (id) => {
-        const { session } = this.meta(id);
-        const { screen: _screen, ...state } = await this.state(id).catch(
-          () => unavailable(),
+        if (existsSync(this.deletedReceiptPath(id))) throw new Error("Session not found");
+        const summary = this.listedMeta.read(id, join(this.config.stateDir, "sessions", id, "meta.sealed"), now);
+        if (summary === undefined) throw new Error("Session not found");
+        const { screen: _screen, ...state } = await this.listedState(id, summary.createdAt, dirTrustCache).catch(
+          () => unavailableState(summary.createdAt),
         );
-        const {
-          context: _context,
-          initialPrompt: _prompt,
-          generatedTitle: _generatedTitle,
-          nativeArgs: _nativeArgs,
-          handoff: _handoff,
-          ...summary
-        } = session;
         return {
           ...summary,
           ...state,
@@ -371,25 +357,37 @@ export class Manager {
         };
       }),
     );
-    return rows.flatMap((row) =>
+    const listed = rows.flatMap((row) =>
       row.status === "fulfilled" ? [row.value] : [],
     );
+    for (const observer of this.listingObservers) try { observer(listed); } catch { }
+    return listed;
   }
-  context(projectId: string) { return new ProjectContexts(this.config, this.key).context(projectId); }
-  setContext(projectId: string, text: string, expectedVersion: number) {
-    return new ProjectContexts(this.config, this.key).setContext(projectId, text, expectedVersion);
+  private readonly listingObservers = new Set<(rows: Awaited<ReturnType<Manager["list"]>>) => void>();
+  observeListings(observer: (rows: Awaited<ReturnType<Manager["list"]>>) => void): () => void {
+    this.listingObservers.add(observer);
+    return () => { this.listingObservers.delete(observer); };
   }
-  create(request: CreateSession): Promise<Session & WorkerState> {
+
+  metaRevision(id: string): string | undefined { return this.listedMeta.revision(id); }
+  create(request: CreateSession, startedBy?: "owner"): Promise<Session & WorkerState> {
     if (request.continuation !== undefined)
       throw new ContentError("Native continuation is only available for managed coordinator team sessions", 400);
-    const operation = this.serial.then(() => this.createOnce(request));
-    this.serial = operation.catch(() => {});
-    return operation;
+    if (hasHostLaunchFields(request))
+      throw new ContentError("Host-owned launch fields cannot be supplied when creating a session", 400);
+    return this.serializeSession(request.requestId, () =>
+      this.createOnce(stripHostLaunchFields(request), false, startedBy === "owner" ? "owner-started" : undefined),
+    );
   }
-  /** The team scheduler owns cwd selection, below the root its run was created under. Public create requests never accept this override. */
-  createTeamSession(request: CreateSession, team: TeamAssignment, cwd: string, modelProfile?: TeamModelProfile, workspaceRoot?: string, workspaceTrusted = false): Promise<Session & WorkerState> {
+  createTeamSession(request: CreateSession, team: TeamAssignment, cwd: string, modelProfile?: TeamModelProfile, workspaceRoot?: string, workspaceTrusted = false,
+    header: { purpose?: SessionPurpose; executionIdentity?: ExecutionIdentity; configId?: string; haltScope?: readonly string[] } = {}, github?: GithubGrantScope): Promise<Session & WorkerState> {
     if (!this.config.teams || request.nativeArgs !== undefined || request.localUi || request.workspace || request.resumedFrom)
       throw new ContentError("Team sessions require a configured team workspace and managed launch", 400);
+    if (hasHostLaunchFields(request))
+      throw new ContentError("Host-owned launch fields must be supplied through the team launch header", 400);
+    const resolvedIdentity = resolveLaunchExecutionIdentity(header);
+    if (!resolvedIdentity.ok) throw new ContentError(resolvedIdentity.message, 400);
+    if (header.configId !== undefined && !/^[0-9a-f]{64}$/.test(header.configId)) throw new ContentError("The session config ID must be a lowercase SHA-256 digest", 400);
     let continuation: NativeContinuation | undefined;
     if (request.continuation !== undefined) {
       const parsed = nativeContinuationSchema.safeParse(request.continuation);
@@ -405,10 +403,12 @@ export class Manager {
     const canonical = realpathSync(cwd);
     const rel = relative(root, canonical);
     if (!rel || rel.startsWith("..") || isAbsolute(rel)) throw new ContentError("Invalid team working directory", 400);
-    // Trust is outside the request fingerprint: a replay returns the session as first created.
-    const operation = this.serial.then(() => this.createOnce({ ...request, ...(continuation ? { continuation } : {}), team, teamCwd: canonical, ...(selection ? { teamModelProfile: selection } : {}) }, workspaceTrusted));
-    this.serial = operation.catch(() => {});
-    return operation;
+    return this.serializeSession(request.requestId, () => this.createOnce({
+      ...stripHostLaunchFields(request), ...(continuation ? { continuation } : {}), team, teamCwd: canonical, ...(selection ? { teamModelProfile: selection } : {}),
+      ...(header.purpose !== undefined ? { purpose: header.purpose } : {}),
+      ...(header.executionIdentity !== undefined ? { executionIdentity: header.executionIdentity } : {}),
+      ...(header.configId !== undefined ? { configId: header.configId } : {}),
+    }, workspaceTrusted, { team: github }, header.haltScope));
   }
   async inspectTeamRuntime(sessionId: string, team: TeamAssignment): Promise<TeamRuntimeInspection> {
     const stored = this.meta(sessionId).session;
@@ -440,19 +440,15 @@ export class Manager {
       ...(state.attention?.since ? { since: state.attention.since } : {}), agentUid, processes: tree, identity };
   }
   retireTeamRuntime(sessionId: string, requestId: string, team: TeamAssignment, identity: string): Promise<TeamRuntimeRetirement> {
-    const operation = this.serial.then(() => this.retireTeamRuntimeOnce(sessionId, requestId, team, identity));
-    this.serial = operation.catch(() => {});
-    return operation;
+    return this.serializeSession(sessionId, () => this.retireTeamRuntimeOnce(sessionId, requestId, team, identity));
   }
   controlSession(sessionId: string, request: Extract<WorkerRequest, { op: "control" }>): Promise<ControlLease | null> {
-    const operation = this.serial.then(async () => {
+    return this.serializeSession(sessionId, async () => {
       this.meta(sessionId);
       if (request.action !== "release" && existsSync(join(this.config.stateDir, "sessions", sessionId, "retirement.sealed")))
         throw new TeamError(409, "runtime-retiring", "This runtime is being retired; its retained journal remains available read-only.");
-      return workerCall<ControlLease | null>(this.config.runDir, sessionId, request);
+      return workerCall<ControlLease | null>(this.socketTarget, sessionId, request);
     });
-    this.serial = operation.catch(() => {});
-    return operation;
   }
   private async retireTeamRuntimeOnce(sessionId: string, requestId: string, team: TeamAssignment, identity: string): Promise<TeamRuntimeRetirement> {
     const stored = this.meta(sessionId).session;
@@ -471,7 +467,6 @@ export class Manager {
     } else {
       const inspection = await this.inspectTeamRuntime(sessionId, team);
       if (inspection.identity !== identity) throw new TeamError(409, "runtime-identity-changed", "The runtime identity changed before retirement began.");
-      // Establish the configured process boundary before sealing a record or signaling anything.
       const boundary = this.config.teams?.commandPrefix ? agentBoundary(this.config.teams.commandPrefix, stored.cwd) : undefined;
       const agentUid = boundary ? await boundary.uid() : null;
       if (inspection.agentUid !== agentUid) throw new TeamError(409, "runtime-identity-changed", "The configured agent identity changed before retirement began.");
@@ -488,9 +483,6 @@ export class Manager {
     const sealed = unseal<WorkerState>(this.key, `${sessionId}:status`, readFileSync(join(this.config.stateDir, "sessions", sessionId, "status.sealed"), "utf8"));
     const workerPid = sealed.workerPid;
     if (!workerPid || !record.known.some(row => row.pid === workerPid)) throw new TeamError(409, "runtime-identity-changed", "The recorded worker identity is unavailable.");
-    // A prior attempt may have killed the worker but lost its acknowledgement. Rebuild only
-    // descendants of still-live, start-time-matched recorded processes and seal them before
-    // signaling so a later retry has the expanded identity set.
     record.known = mergeRecordedRuntimeTree(record.known, await inventoryRuntimeProcesses());
     writeSealed(file, this.key, scope, record);
     try {
@@ -512,7 +504,6 @@ export class Manager {
       throw error;
     }
   }
-  /** A scheduler may stop only its own member and never take over an active human lease. */
   async stopTeamSession(sessionId: string, requestId: string, team: TeamAssignment): Promise<WorkerState> {
     const stored = this.meta(sessionId).session.team;
     if (!stored || stored.runId !== team.runId || stored.memberId !== team.memberId || stored.revision !== team.revision)
@@ -520,19 +511,16 @@ export class Manager {
     const state = await this.state(sessionId);
     if (state.status === "exited") return state;
     if (state.status !== "running") throw new TeamStopRefused("The team member has not confirmed a controllable runtime");
-    await workerCall(this.config.runDir, sessionId, { op: "stop", requestId });
+    await workerCall(this.socketTarget, sessionId, { op: "stop", requestId });
     return this.state(sessionId);
   }
-  /** Expand the visible command text for one exact collapsed Codex prompt, without answering it. */
   expandTeamPermission(
     sessionId: string,
     requestId: string,
     team: TeamAssignment,
     expected: TeamPermissionExpansionExpectation,
   ): Promise<Receipt> {
-    const operation = this.serial.then(() => this.expandTeamPermissionOnce(sessionId, requestId, team, expected));
-    this.serial = operation.catch(() => {});
-    return operation;
+    return this.serializeSession(sessionId, () => this.expandTeamPermissionOnce(sessionId, requestId, team, expected));
   }
   private async expandTeamPermissionOnce(
     sessionId: string,
@@ -547,7 +535,7 @@ export class Manager {
       const candidate = value as Partial<TeamAssignment>;
       return typeof candidate.runId === "string" && typeof candidate.memberId === "string" &&
         Number.isInteger(candidate.revision) &&
-        ["permission-coordinator", "project-manager", "scout", "implementer", "integrator", "reviewer", "delivery"].includes(candidate.role ?? "") &&
+        ["permission-coordinator", "project-manager", "scout", "implementer", "integrator", "reviewer", "delivery", "intent-checker", "evaluator", "judge"].includes(candidate.role ?? "") &&
         (candidate.taskId === undefined || typeof candidate.taskId === "string");
     };
     const sameAssignment = (left: TeamAssignment | undefined, right: TeamAssignment) =>
@@ -623,7 +611,7 @@ export class Manager {
     const actor = { id: `team-permission-expand:${requestId}`, label: "Team permission display expansion" };
     let lease: ControlLease | undefined;
     try {
-      lease = await workerCall<ControlLease>(this.config.runDir, sessionId, {
+      lease = await workerCall<ControlLease>(this.socketTarget, sessionId, {
         op: "control", action: "claim", actor,
       });
       const controlled = await this.state(sessionId);
@@ -631,16 +619,13 @@ export class Manager {
         throw new ContentError("The team member control lease changed before display expansion", 409);
       assertEligible(controlled, lease.id);
 
-      // Seal the at-most-once intent before the worker can send the toggle key. A
-      // host crash or lost acknowledgement leaves an uncertain receipt that is
-      // replayed as-is and never dispatched again.
       const receipt: Receipt = { requestId, state: "uncertain", seq: controlled.seq };
       ledger.requests[requestId] = { digest, promptKey, receipt, at: new Date().toISOString() };
       ledger.prompts[promptKey] = requestId;
       writeSealed(file, this.key, scope, ledger);
 
       try {
-        const result = await workerCall<Receipt>(this.config.runDir, sessionId, {
+        const result = await workerCall<Receipt>(this.socketTarget, sessionId, {
           op: "team-permission-expand", requestId, targetSessionId: sessionId, assignment: stored,
           expected: requestIdentity.expected, actor, leaseId: lease.id,
         }, 12000);
@@ -654,7 +639,6 @@ export class Manager {
       } catch (error) {
         const code = (error as { code?: unknown }).code;
         if (typeof code === "string" && ["unsupported", "prompt-changed", "control-busy", "control-lost"].includes(code)) {
-          // A named worker refusal is guaranteed to precede its Ctrl+A write.
           delete ledger.requests[requestId];
           if (ledger.prompts[promptKey] === requestId) delete ledger.prompts[promptKey];
           writeSealed(file, this.key, scope, ledger);
@@ -664,39 +648,39 @@ export class Manager {
       }
     } finally {
       if (lease) {
-        try { await workerCall(this.config.runDir, sessionId, { op: "control", action: "release", actor, leaseId: lease.id }); }
-        catch { /* the next state read reports an expired or lost lease */ }
+        try { await workerCall(this.socketTarget, sessionId, { op: "control", action: "release", actor, leaseId: lease.id }); }
+        catch { }
       }
     }
   }
-  /** Apply only the persisted, one-shot approval for this exact assigned member and prompt. */
   async answerTeamPermission(
-    sessionId: string,
-    requestId: string,
-    team: TeamAssignment,
-    decision: TeamPermissionDecision,
-  ): Promise<import("./types.js").Receipt & { result?: import("@infinite/attention").AnswerResult }> {
+    sessionId: string, requestId: string, team: TeamAssignment,
+    decision: TeamPermissionDecision, current?: () => boolean, sourceCoordinatorMemberId?: string,
+  ): Promise<Receipt & { result?: import("@infinite/attention").AnswerResult }> {
     const session = this.meta(sessionId).session;
     const stored = session.team;
-    const validAssignment = (value: unknown): value is TeamAssignment => {
+    const validAssignment = (value: unknown): value is TeamMemberAssignment => {
       if (!value || typeof value !== "object" || Array.isArray(value)) return false;
       const candidate = value as Partial<TeamAssignment>;
       return typeof candidate.runId === "string" && typeof candidate.memberId === "string" &&
         Number.isInteger(candidate.revision) &&
-        ["permission-coordinator", "project-manager", "scout", "implementer", "integrator", "reviewer", "delivery"].includes(candidate.role ?? "") &&
+        ["permission-coordinator", "project-manager", "scout", "implementer", "integrator", "reviewer", "delivery", "intent-checker", "evaluator", "judge"].includes(candidate.role ?? "") &&
         (candidate.taskId === undefined || typeof candidate.taskId === "string");
     };
     const sameAssignment = (left: TeamAssignment | undefined, right: TeamAssignment) =>
       Boolean(left && left.runId === right.runId && left.memberId === right.memberId &&
         left.revision === right.revision && left.role === right.role && left.taskId === right.taskId);
-    if (!validAssignment(team) || !stored || !sameAssignment(stored, team) || decision.revision !== stored.revision ||
+    if (!validAssignment(team) || !validAssignment(stored) || !sameAssignment(stored, team) || decision.revision !== stored.revision ||
         decision.targetMemberId !== stored.memberId || decision.targetSessionId !== sessionId ||
         requestId !== decision.answerRequestId)
       throw new ContentError("This permission decision does not match the assigned team member", 403);
+    const coordinatorMemberId = decision.coordinatorMemberId
+      ? (sourceCoordinatorMemberId === undefined || sourceCoordinatorMemberId === decision.coordinatorMemberId ? decision.coordinatorMemberId : undefined)
+      : (decision.reusedFromDecisionId && /^[a-f0-9-]{36}$/i.test(decision.reusedFromDecisionId) ? sourceCoordinatorMemberId : undefined);
     if (decision.status !== "answering" || !/^[a-f0-9-]{36}$/i.test(decision.id) ||
         !/^[a-f0-9-]{36}$/i.test(decision.answerRequestId) ||
-        !/^[a-f0-9]{64}$/i.test(decision.policyHash) || !decision.coordinatorMemberId ||
-        !/^[a-f0-9-]{36}$/i.test(decision.coordinatorMemberId) ||
+        !/^[a-f0-9]{64}$/i.test(decision.policyHash) || !coordinatorMemberId ||
+        !/^[a-f0-9-]{36}$/i.test(coordinatorMemberId) ||
         !Number.isInteger(decision.promptId) || decision.promptId < 1 || decision.prompt.id !== decision.promptId ||
         !/^[a-f0-9]{64}$/i.test(decision.promptHash) || !/^[a-f0-9]{64}$/i.test(decision.evidenceHash) ||
         decision.prompt.hash !== decision.promptHash || permissionEvidenceHash(decision.prompt) !== decision.evidenceHash ||
@@ -716,7 +700,7 @@ export class Manager {
     const actor = { id: `team-permission:${decision.id}`, label: "Team permission" };
     let lease: { id: string } | undefined;
     try {
-      const acquired = await workerCall<{ id: string }>(this.config.runDir, sessionId, {
+      const acquired = await workerCall<{ id: string }>(this.socketTarget, sessionId, {
         op: "control", action: "claim", actor,
       });
       lease = acquired;
@@ -724,12 +708,12 @@ export class Manager {
       if (controlled.status !== "running" || controlled.control?.id !== acquired.id ||
           controlled.runtime?.nativeUi || session.runtime?.nativeUi)
         throw new ContentError("The team member or its control lease changed before the answer");
-      if (decision.status !== "answering" || Date.parse(decision.expiresAt) <= Date.now())
+      if (decision.status !== "answering" || Date.parse(decision.expiresAt) <= Date.now() || (current && !current()))
         throw new ContentError("The permission decision was invalidated before the answer");
       try {
-        return await workerCall(this.config.runDir, sessionId, {
+        return await workerCall(this.socketTarget, sessionId, {
           op: "team-answer", requestId, decisionId: decision.id,
-          coordinatorMemberId: decision.coordinatorMemberId,
+          coordinatorMemberId,
           targetSessionId: sessionId, assignment: stored, targetCwd: canonicalCwd,
           expiresAt: decision.expiresAt, policyHash: decision.policyHash,
           promptId: decision.promptId, promptHash: decision.promptHash,
@@ -738,44 +722,164 @@ export class Manager {
         }, 12000);
       } catch (error) {
         if ((error as { code?: unknown }).code) throw error;
-        // The worker may have written keys before its acknowledgement was lost. Never replay here.
         return { requestId, state: "uncertain", seq: controlled.seq };
       }
     } finally {
       if (lease) {
-        try { await workerCall(this.config.runDir, sessionId, { op: "control", action: "release", actor, leaseId: lease.id }); }
-        catch { /* a lost worker or lease is reported by the next state read */ }
+        try { await workerCall(this.socketTarget, sessionId, { op: "control", action: "release", actor, leaseId: lease.id }); }
+        catch { }
       }
     }
   }
-  /** Fence one persisted delegated decision before its owner revokes or pauses it. */
-  async invalidateTeamPermission(sessionId: string, decisionId: string): Promise<"invalidated" | "uncertain"> {
-    if (!this.meta(sessionId).session.team || !/^[a-f0-9-]{36}$/i.test(decisionId)) return "uncertain";
+  async answerSessionPermission(sessionId: string, input: SessionPermissionAnswer): Promise<Receipt & { result?: import("@infinite/attention").AnswerResult }> {
+    const session = this.meta(sessionId).session;
+    if (session.team || session.workspace || session.executionLocation === "laptop" || session.runtime?.transport !== "pty" || session.runtime.nativeUi)
+      throw new ContentError("Only an interactive host session outside a team run takes a permission-agent answer", 403);
+    if (!input || typeof input.decisionId !== "string" || !/^[A-Za-z0-9._:-]{1,100}$/.test(input.decisionId) ||
+        !Number.isInteger(input.promptId) || input.promptId < 1 || !Number.isInteger(input.option) || input.option < 0 ||
+        !/^[a-f0-9]{64}$/i.test(input.promptHash) || !/^[a-f0-9]{64}$/i.test(input.evidenceHash) || typeof input.targetCwd !== "string")
+      throw new ContentError("The permission answer is incomplete");
+    if (input.notice !== undefined && !isRequesterNotice(input.notice))
+      throw new ContentError("The permission answer's notice is not the host's fixed reject notice");
+    let cwd: string;
+    try { cwd = realpathSync(session.cwd); }
+    catch { throw new ContentError("The session directory is unavailable"); }
+    if (cwd !== input.targetCwd) throw new ContentError("The permission answer targets a different directory", 403);
+    const state = await this.state(sessionId);
+    if (state.status !== "running" || state.runtime?.nativeUi) throw new ContentError("The session has no running managed terminal");
+    if (state.control) throw new ContentError("A person currently controls this session", 409);
+    const requestId = sessionPermissionRequestId(sessionId, input.decisionId);
+    const actor = { id: `session-permission:${input.decisionId}`, label: SESSION_PERMISSION_ACTOR_LABEL };
+    let lease: ControlLease | undefined;
     try {
-      const result = await workerCall<{ invalidated: boolean }>(this.config.runDir, sessionId, {
-        op: "team-answer-invalidate", decisionId,
-      }, 4000);
+      lease = await workerCall<ControlLease>(this.socketTarget, sessionId, { op: "control", action: "claim", actor });
+      const controlled = await this.state(sessionId);
+      if (controlled.status !== "running" || controlled.control?.id !== lease.id)
+        throw new ContentError("The session or its control lease changed before the answer", 409);
+      if (input.current && !input.current())
+        throw new ContentError("The permission answer was invalidated before the answer", 409);
+      try {
+        return await workerCall(this.socketTarget, sessionId, {
+          op: "session-permission-answer", requestId, decisionId: input.decisionId, targetSessionId: sessionId, targetCwd: cwd,
+          promptId: input.promptId, promptHash: input.promptHash, evidenceHash: input.evidenceHash, option: input.option,
+          ...(input.notice !== undefined ? { text: input.notice } : {}),
+          actor, leaseId: lease.id,
+        }, 12000);
+      } catch (error) {
+        if ((error as { code?: unknown }).code) throw error;
+        return { requestId, state: "uncertain", seq: controlled.seq };
+      }
+    } finally {
+      if (lease) {
+        try { await workerCall(this.socketTarget, sessionId, { op: "control", action: "release", actor, leaseId: lease.id }); }
+        catch { }
+      }
+    }
+  }
+  async answerAgentPermission(
+    sessionId: string,
+    team: TeamAssignment,
+    delivery: {
+      deliveryId: string; requestId: string; choice: "accept" | "reject"; option: number; notice?: string;
+      prompt: import("@infinite/attention").Prompt; evidenceHash: string; targetCwd: string; expiresAt: string; authorityHash: string;
+      current: () => boolean;
+    },
+  ): Promise<import("./types.js").Receipt & { result?: import("@infinite/attention").AnswerResult }> {
+    const session = this.meta(sessionId).session;
+    const stored = session.team;
+    const sameAssignment = Boolean(stored && stored.runId === team.runId && stored.memberId === team.memberId &&
+      stored.revision === team.revision && stored.role === team.role && stored.taskId === team.taskId);
+    if (!sameAssignment || !stored || stored.role === "mission-coordinator" || !/^[a-f0-9-]{36}$/i.test(delivery.deliveryId) || !/^[a-f0-9-]{36}$/i.test(delivery.requestId) ||
+        team.role === "permission-coordinator")
+      throw new ContentError("This permission delivery does not match the assigned team member", 403);
+    const prompt = delivery.prompt;
+    const option = delivery.choice === "accept" ? agentAcceptOption(prompt) : oneShotRejectOption(prompt);
+    if (!prompt.hash || permissionEvidenceHash(prompt) !== delivery.evidenceHash || option === undefined || option !== delivery.option ||
+        !/^[a-f0-9]{64}$/i.test(delivery.authorityHash) || !Number.isFinite(Date.parse(delivery.expiresAt)) || Date.parse(delivery.expiresAt) <= Date.now())
+      throw new ContentError("The permission delivery is incomplete, expired, or not a one-shot option");
+    let canonicalCwd: string;
+    try { canonicalCwd = realpathSync(session.cwd); }
+    catch { throw new ContentError("The assigned team working directory is unavailable"); }
+    if (delivery.targetCwd !== canonicalCwd)
+      throw new ContentError("The permission delivery targets a different working directory", 403);
+    const state = await this.state(sessionId);
+    if (state.status !== "running" || session.runtime?.nativeUi || state.runtime?.nativeUi)
+      throw new ContentError("The assigned team member has no running managed terminal");
+    if (state.control) throw new ContentError("A person currently controls this session", 409);
+
+    const actor = { id: `team-permission:${delivery.deliveryId}`, label: "Team permission" };
+    let lease: { id: string } | undefined;
+    try {
+      const acquired = await workerCall<{ id: string }>(this.socketTarget, sessionId, { op: "control", action: "claim", actor });
+      lease = acquired;
+      const controlled = await this.state(sessionId);
+      if (controlled.status !== "running" || controlled.control?.id !== acquired.id || controlled.runtime?.nativeUi || session.runtime?.nativeUi)
+        throw new ContentError("The team member or its control lease changed before the answer");
+      if (!delivery.current() || Date.parse(delivery.expiresAt) <= Date.now())
+        throw new ContentError("The permission delivery was invalidated before the answer");
+      try {
+        return await workerCall(this.socketTarget, sessionId, {
+          op: "team-answer", requestId: delivery.requestId, decisionId: delivery.deliveryId,
+          ...(delivery.choice === "accept" ? { choice: "accept" as const } : { choice: "reject" as const, ...(delivery.notice ? { text: delivery.notice } : {}) }),
+          targetSessionId: sessionId, assignment: { ...stored, role: stored.role }, targetCwd: canonicalCwd,
+          expiresAt: delivery.expiresAt, policyHash: delivery.authorityHash,
+          promptId: prompt.id, promptHash: prompt.hash, evidenceHash: delivery.evidenceHash, option: delivery.option,
+          actor, leaseId: acquired.id,
+        }, 12000);
+      } catch (error) {
+        if ((error as { code?: unknown }).code) throw error;
+        return { requestId: delivery.requestId, state: "uncertain", seq: controlled.seq };
+      }
+    } finally {
+      if (lease) {
+        try { await workerCall(this.socketTarget, sessionId, { op: "control", action: "release", actor, leaseId: lease.id }); }
+        catch { }
+      }
+    }
+  }
+  async invalidateSessionPermission(sessionId: string, decisionId: string): Promise<"invalidated" | "uncertain"> {
+    try {
+      if (this.meta(sessionId).session.team || !/^[A-Za-z0-9._:-]{1,100}$/.test(decisionId)) return "uncertain";
+      const result = await workerCall<{ invalidated: boolean }>(this.socketTarget, sessionId, { op: "session-permission-invalidate", decisionId }, 4000);
       return result.invalidated === true ? "invalidated" : "uncertain";
     } catch { return "uncertain"; }
   }
-  resume(sessionId: string, requestId: string): Promise<Session & WorkerState> {
-    const operation = this.serial.then(() => this.resumeOnce(sessionId, requestId));
-    this.serial = operation.catch(() => {});
-    return operation;
+  async invalidateTeamPermission(sessionId: string, decisionId: string): Promise<"invalidated" | "uncertain"> {
+    if (!this.meta(sessionId).session.team || !/^[a-f0-9-]{36}$/i.test(decisionId)) return "uncertain";
+    try {
+      const result = await workerCall<{ invalidated: boolean }>(this.socketTarget, sessionId, { op: "team-answer-invalidate", decisionId }, 4000);
+      return result.invalidated === true ? "invalidated" : "uncertain";
+    } catch { return "uncertain"; }
   }
-  private async resumeOnce(sessionId: string, requestId: string): Promise<Session & WorkerState> {
+  resume(sessionId: string, requestId: string, startedBy?: "owner"): Promise<Session & WorkerState> {
+    if (requestId.toLowerCase() === sessionId.toLowerCase()) throw new ContentError("Resumption needs a new request identity", 400);
+    const [first, second] = sessionId.toLowerCase() < requestId.toLowerCase() ? [sessionId, requestId] : [requestId, sessionId];
+    return this.serializeSession(first, () => this.serializeSession(second, () =>
+      this.resumeOnce(sessionId, requestId, startedBy === "owner" ? "owner-started" : undefined),
+    )).then(outcome => "aliasedTargetId" in outcome ? this.serializeSession(outcome.aliasedTargetId, async () => {
+      const target = this.meta(outcome.aliasedTargetId).session;
+      if (target.projectId !== outcome.projectId || (target.projectRoot ?? target.cwd) !== outcome.projectPath)
+        throw new ContentError("The saved continuation receipt belongs to another project or codebase. Open the original session instead.", 409);
+      return { ...target, ...(await this.state(outcome.aliasedTargetId)) };
+    }) : outcome);
+  }
+  private async resumeOnce(sessionId: string, requestId: string, github?: SessionGithubOrigin): Promise<(Session & WorkerState) | { aliasedTargetId: string; projectId: string; projectPath: string }> {
     if (this.handoffRequest(sessionId)) throw new ContentError("This session yielded to a team; inspect its handoff instead of resuming it");
-    if (requestId === sessionId) throw new ContentError("Resumption needs a new request identity", 400);
+    if (requestId.toLowerCase() === sessionId.toLowerCase()) throw new ContentError("Resumption needs a new request identity", 400);
     const session = this.meta(sessionId).session;
     const project = this.config.projects.find(project => project.id === session.projectId);
     if (!project || (session.projectRoot ? realpathSync(project.path) !== session.projectRoot : session.cwd !== realpathSync(project.path)))
       throw new ContentError("The recorded conversation belongs to a different codebase binding. Start a new session.", 409);
-    const receiptFile = join(this.config.stateDir, "resumptions", `${requestId}.sealed`);
-    if (existsSync(receiptFile)) {
-      const receipt = unseal<{ sourceId: string; targetId: string }>(this.key, `resume:${requestId}`, readFileSync(receiptFile, "utf8"));
-      if (receipt.sourceId !== sessionId) throw new ContentError("Request ID already belongs to a different resumption");
+    const existingReceiptId = this.resumptionReceiptEntry(requestId);
+    const receiptFile = join(this.config.stateDir, "resumptions", `${existingReceiptId ?? requestId}.sealed`);
+    if (existingReceiptId !== undefined) {
+      const receipt = unseal<{ sourceId: string; targetId: string }>(this.key, `resume:${existingReceiptId}`, readFileSync(receiptFile, "utf8"));
+      if (receipt.sourceId.toLowerCase() !== sessionId.toLowerCase()) throw new ContentError("Request ID already belongs to a different resumption");
+      const projectPath = realpathSync(project.path);
+      if (receipt.targetId.toLowerCase() !== sessionId.toLowerCase() && receipt.targetId.toLowerCase() !== requestId.toLowerCase())
+        return { aliasedTargetId: receipt.targetId, projectId: session.projectId, projectPath };
       const target = this.meta(receipt.targetId).session;
-      if (target.projectId !== session.projectId || (target.projectRoot ?? target.cwd) !== realpathSync(project.path))
+      if (target.projectId !== session.projectId || (target.projectRoot ?? target.cwd) !== projectPath)
         throw new ContentError("The saved continuation receipt belongs to another project or codebase. Open the original session instead.", 409);
       return { ...target, ...(await this.state(receipt.targetId)) };
     }
@@ -784,7 +888,10 @@ export class Manager {
       return result;
     };
     if (session.team) throw new ContentError("Resume this member from its team so its assignment stays consistent");
+    if (isEvalSession(session)) throw new ContentError("Eval sessions cannot be resumed", 409);
     const state = await this.state(sessionId);
+    if (session.headless?.channel && deferredCallOpen((after, limit) => this.events(sessionId, after, limit, new Set(["lifecycle"]))))
+      throw new ContentError("This session ended while a call waited for the owner's answer. Start a new session instead of resuming it.", 409);
     if (state.status === "running" || state.status === "starting") return remember({ ...session, ...state });
     const native = state.nativeSession ?? session.resumeNativeSession;
     if (state.status !== "exited") throw new ContentError("The previous process has not confirmed exit. Reconnect before resuming.");
@@ -793,38 +900,48 @@ export class Manager {
     if (session.workspace) throw new ContentError("Recover this hybrid workspace with the laptop CLI before starting a new runtime");
     const args = session.provider === "claude" ? ["--resume", native.id]
       : session.provider === "codex" ? ["resume", native.id] : ["--session", native.id];
-    const request: CreateSession = { requestId, provider: session.provider, projectId: session.projectId,
-      title: session.title, prompt: "", nativeArgs: args, resumedFrom: sessionId, resumeNativeSession: native };
+    const request: ManagedCreateSession = { requestId, provider: session.provider, projectId: session.projectId,
+      title: session.title, prompt: "", nativeArgs: args, resumedFrom: sessionId, resumeNativeSession: native, ...(session.codeMode === true ? { recordedCodeMode: true as const } : {}) };
     if (project) {
       const cwd = relative(realpathSync(project.path), session.cwd);
       if (cwd) request.cwd = cwd;
     }
-    // Creation metadata is durable before spawn. Recover its exact receipt even
-    // if the API stopped before it could record the resumption result.
-    if (existsSync(join(this.config.stateDir, "sessions", requestId, "meta.sealed")))
-      return remember(await this.createOnce(request));
-    const ids = readdirSync(join(this.config.stateDir, "sessions")).filter(id => /^[a-f0-9-]{36}$/.test(id) && id !== sessionId);
-    const continuations = await Promise.all(ids.map(async id => {
-      let candidate: Session;
-      try { candidate = this.meta(id).session; }
-      catch { throw new ContentError("A recording cannot be authenticated. Recover it before starting another continuation."); }
-      if (candidate.provider !== session.provider) return undefined;
-      const current = await this.state(id).catch(() => unavailable());
-      if (candidate.resumedFrom !== sessionId && candidate.resumeNativeSession?.id !== native.id && current.nativeSession?.id !== native.id) return undefined;
-      if (current.status === "exited") return undefined;
-      if (candidate.projectId !== session.projectId || (candidate.projectRoot ?? candidate.cwd) !== realpathSync(project.path))
-        throw new ContentError("This native conversation has a continuation in another project or codebase. Open its original session instead.", 409);
-      if (current.status !== "running" && current.status !== "starting")
-        throw new ContentError("Another continuation has not confirmed exit. Reconnect before resuming.");
-      return { ...candidate, ...current };
-    }));
-    const live = continuations.filter((candidate): candidate is Session & WorkerState => candidate !== undefined);
-    if (live.length > 1) throw new ContentError("Multiple continuations are active. Open an existing session before resuming.");
-    if (live[0]) return remember(live[0]);
-    // Use the same admission queue as create, without re-entering it.
-    return remember(await this.createOnce(request));
+    return this.serializeConversation(`${session.provider}:${native.id}`, async () => {
+      const existingTarget = this.sessionDirEntry(requestId);
+      if (existingTarget && existsSync(join(this.config.stateDir, "sessions", existingTarget, "meta.sealed")))
+        return remember(await this.createOnce(request, false, github));
+      const ids = readdirSync(join(this.config.stateDir, "sessions")).filter(id => /^[a-f0-9-]{36}$/i.test(id) && id.toLowerCase() !== sessionId.toLowerCase());
+      const continuations = await Promise.all(ids.map(async id => {
+        let candidate: Session;
+        try { candidate = this.meta(id).session; }
+        catch { throw new ContentError("A recording cannot be authenticated. Recover it before starting another continuation."); }
+        if (candidate.provider !== session.provider) return undefined;
+        const current = await this.state(id).catch(() => unavailableState(new Date().toISOString()));
+        if (candidate.resumedFrom !== sessionId && candidate.resumeNativeSession?.id !== native.id && current.nativeSession?.id !== native.id) return undefined;
+        if (current.status === "exited") return undefined;
+        if (candidate.projectId !== session.projectId || (candidate.projectRoot ?? candidate.cwd) !== realpathSync(project.path))
+          throw new ContentError("This native conversation has a continuation in another project or codebase. Open its original session instead.", 409);
+        if (current.status !== "running" && current.status !== "starting")
+          throw new ContentError("Another continuation has not confirmed exit. Reconnect before resuming.");
+        return { ...candidate, ...current };
+      }));
+      const live = continuations.filter((candidate): candidate is Session & WorkerState => candidate !== undefined);
+      if (live.length > 1) throw new ContentError("Multiple continuations are active. Open an existing session before resuming.");
+      if (live[0]) return remember(live[0]);
+      return remember(await this.createOnce(request, false, github));
+    });
   }
-  private async createOnce(request: CreateSession & { team?: TeamAssignment; teamCwd?: string; teamModelProfile?: TeamModelProfile }, workspaceTrusted = false) {
+  private async createOnce(request: ManagedCreateSession & { team?: TeamAssignment; teamCwd?: string; teamModelProfile?: TeamModelProfile; purpose?: SessionPurpose; executionIdentity?: ExecutionIdentity; configId?: string }, workspaceTrusted = false, github?: SessionGithubOrigin, haltScope?: readonly string[]) {
+    try { return await this.createRecorded(request, workspaceTrusted, github, haltScope); }
+    catch (error) {
+      if (request.team) try { this.fuse?.release(request.requestId); } catch { }
+      throw error;
+    }
+  }
+  private async createRecorded(request: ManagedCreateSession & { team?: TeamAssignment; teamCwd?: string; teamModelProfile?: TeamModelProfile; purpose?: SessionPurpose; executionIdentity?: ExecutionIdentity; configId?: string }, workspaceTrusted = false, github?: SessionGithubOrigin, haltScope?: readonly string[]) {
+    const resolvedIdentity = resolveLaunchExecutionIdentity(request);
+    if (!resolvedIdentity.ok) throw new ContentError(resolvedIdentity.message, 400);
+    const executionIdentity = resolvedIdentity.identity;
     if (!request.resumedFrom && request.nativeArgs) assertFreshNativeContext(request.provider, request.nativeArgs);
     if (request.workspace && (request.provider !== "codex" || !request.localUi))
       throw new Error("Laptop execution requires the Codex native interface");
@@ -834,22 +951,21 @@ export class Manager {
       else validateNativeOpenCodeArgs(request.nativeArgs ?? [], request.nativeArgs === undefined ? request.prompt : "");
     }
     const id = request.requestId;
-    const fingerprint = createHash("sha256")
-      .update(JSON.stringify(request))
-      .digest("hex");
+    const fingerprint = sessionRequestFingerprint(request, id);
     const dir = join(this.config.stateDir, "sessions", id);
-    const deletedPath = this.deletedReceiptPath(id);
-    if (existsSync(deletedPath)) {
-      const deleted = unseal<DeletedSessionReceipt>(this.key, `deleted:${id}`, readFileSync(deletedPath, "utf8"));
-      if (deleted.id !== id) throw new Error("Invalid deleted session receipt");
-      if (deleted.fingerprint !== fingerprint) throw new Error("Request ID already belongs to a different session");
+    const deletedId = this.deletedReceiptEntry(id);
+    if (deletedId !== undefined) {
+      const deleted = unseal<DeletedSessionReceipt>(this.key, `deleted:${deletedId}`, readFileSync(this.deletedReceiptPath(deletedId), "utf8"));
+      if (deleted.id !== deletedId) throw new Error("Invalid deleted session receipt");
+      if (!matchesSessionRequestFingerprint(deleted.fingerprint, request, deletedId, executionIdentity)) throw new Error("Request ID already belongs to a different session");
       throw new ContentError("This session was deleted and cannot be started again", 410);
     }
-    if (existsSync(join(dir, "meta.sealed"))) {
-      const stored = this.meta(id);
-      if (stored.fingerprint !== fingerprint)
+    const existingId = this.sessionDirEntry(id);
+    if (existingId !== undefined && existsSync(join(this.config.stateDir, "sessions", existingId, "meta.sealed"))) {
+      const stored = this.meta(existingId);
+      if (!matchesSessionRequestFingerprint(stored.fingerprint, request, existingId, executionIdentity) || sessionExecutionIdentity(stored.session) !== executionIdentity)
         throw new Error("Request ID already belongs to a different session");
-      return { ...stored.session, ...(await this.state(id)) };
+      return { ...stored.session, ...(await this.state(existingId)) };
     }
     const project = this.config.projects.find(
       (p) => p.id === request.projectId,
@@ -857,125 +973,151 @@ export class Manager {
     if (!project) throw new Error("Unknown project");
     if (request.provider === "demo" && !this.config.enableDemo)
       throw new Error("Demo is disabled");
-    if (
-      (await this.list()).filter(
-        (s) => s.status === "running" || s.status === "starting",
-      ).length >= this.config.maxSessions
-    )
-      throw new Error("The configured session limit has been reached");
-    if (!request.team && [...this.handoffProjects.values()].some(path => handoffPathsOverlap(path, realpathSync(project.path)))) throw new ContentError("This project is capturing an accepted team handoff");
-    const configuredProfile = this.config.agents[request.provider];
-    if (!configuredProfile) throw new Error("Provider is not configured on this host");
-    let profile = request.teamModelProfile ? teamModelLaunch(configuredProfile, request.teamModelProfile) : configuredProfile;
-    if (request.team?.role === "permission-coordinator") profile = permissionCoordinatorLaunch(request.provider, profile);
-    if (request.team?.role === "mission-coordinator") profile = missionCoordinatorLaunch(request.provider, profile);
-    if (request.continuation) profile = withNativeContinuation(profile, request.continuation);
-    const context = new ProjectContexts(this.config, this.key).snapshot(request.projectId);
-    const session: Session = {
-      id,
-      ...(request.team ? { team: request.team } : {}),
-      ...(request.teamModelProfile ? { teamModelProfile: request.teamModelProfile } : {}),
-      ...(request.team && workspaceTrusted ? { workspaceTrusted: true as const } : {}),
-      backend: "infinite",
-      machineId: this.config.machine?.id,
-      executionLocation: request.workspace ? "laptop" : "cloud",
-      ...(request.resumedFrom ? { resumedFrom: request.resumedFrom, resumeNativeSession: request.resumeNativeSession } : {}),
-      provider: request.provider,
-      title: request.title,
-      ...(request.generatedTitle ? { generatedTitle: true as const } : {}),
-      projectId: request.projectId,
-      cwd: request.teamCwd ?? projectCwd(project.path, request.cwd),
-      createdAt: new Date().toISOString(),
-      status: "starting",
-      projectRoot: context.root,
-      contextSources: context.sources,
-      contextLinksVersion: context.linksVersion,
-      contextVersion: context.version,
-      context: context.text,
-      initialPrompt: request.prompt,
-      runtime: { id: randomUUID(), location: this.config.environment, transport: "pty", ...(request.localUi ? { nativeUi: request.provider as "codex" | "opencode" } : {}) },
-      ...(request.nativeArgs !== undefined ? { nativeArgs: request.nativeArgs } : {}),
-      ...(request.workspace ? { workspace: { cwd: request.workspace.cwd, roots: request.workspace.roots } } : {}),
-    };
-    if (!request.team) {
-      const userRequest = request.nativeArgs === undefined ? request.prompt : handoffNativePrompt(request.provider, request.nativeArgs);
-      let reason = "This project has not enabled automatic team handoff.";
-      if (project.team?.handoff === "auto") {
-        reason = "Handoff requires a new Claude or Codex PTY session at the project root, a supported prompt up to 12000 characters, and only supported model flags.";
-        if (!request.localUi && !request.workspace && !request.resumedFrom && ["claude", "codex"].includes(request.provider) && userRequest !== undefined && userRequest.length <= 12000 && session.cwd === realpathSync(project.path)) {
-          reason = "Handoff requires configured checks or authorization to establish them, and a reviewed model lineup.";
-          if (this.config.teams?.lineup && (project.team.checks.length || project.team.establishChecks)) session.handoff = { policy: structuredClone({
-            sourceSessionId: id, projectId: project.id, path: session.cwd, userRequest,
-            lineup: this.config.teams.lineup, project: project.team, linear: project.linear,
-            commandPrefix: this.config.teams.commandPrefix, workspaceDir: this.config.teams.workspaceDir,
-            maxMinutes: project.team.handoffMinutes ?? 60, maxMembers: 16, parallelism: 2,
-            ...(project.team.handoffExtendMinutes ? { extendMinutes: project.team.handoffExtendMinutes } : {}),
-            ...(project.team.handoffMaxTotalMinutes ? { maxTotalMinutes: project.team.handoffMaxTotalMinutes } : {}),
-          }) };
+    const assertHostLoad = () => { const hold = request.team ? this.hostLoad.held() : undefined; if (hold) throw new LaunchHeldError(hold); };
+    assertHostLoad();
+    await this.reserveCreateSlot(id);
+    try {
+      assertHostLoad();
+      if (request.team && this.fuse) {
+        const spanning = haltScope?.length ? this.fuse.held?.(haltScope) : undefined;
+        const admission = spanning ? { ok: false as const, launchId: id, halted: spanning }
+          : this.fuse.admit(workLaunch({ launchId: id, projectId: request.projectId, provider: request.provider, team: request.team, profile: request.teamModelProfile, purpose: request.purpose }));
+        if (!admission.ok && "halted" in admission) {
+          this.fuse.refund?.(id);
+          throw new TeamError(409, "halted", haltReason(admission.halted));
         }
+        if (!admission.ok) throw new TeamError(409, "fuse-open", fuseReason("open" in admission ? admission.open : "write-failed"));
       }
-      session.handoff ??= { reason };
-    }
-    // Keep the native prompt exact. Only opted-in, qualified sessions receive the
-    // separate handoff MCP capability; the context snapshot stays in the record.
-    const prompt = request.nativeArgs !== undefined ? "" : [
-      context.text
-        ? `Shared project context (version ${context.version}, provided by the owner):\n${context.text}`
-        : "",
-      request.prompt,
-    ]
-      .filter(Boolean)
-      .join("\n\n");
-    mkdirSync(dir, { recursive: true, mode: 0o700 });
-    writeSealed(join(dir, "meta.sealed"), this.key, `${id}:meta`, {
-      session,
-      fingerprint,
-    });
-    const worker = fileURLToPath(
-      new URL(
-        import.meta.url.endsWith(".ts") ? "./worker.ts" : "./worker.js",
-        import.meta.url,
-      ),
-    );
-    const args = worker.endsWith(".ts")
-      ? ["--import", "tsx", worker]
-      : [worker];
-    const child = spawn(process.execPath, args, {
-      detached: true,
-      stdio: ["pipe", "ignore", "ignore"],
-      cwd: fileURLToPath(new URL("../../../", import.meta.url)),
-    });
-    child.on("error", () => {});
-    child.stdin.on("error", () => {});
-    child.stdin.end(
-      JSON.stringify({
+      if (!request.team && [...this.handoffProjects.values()].some(path => handoffPathsOverlap(path, realpathSync(project.path)))) throw new ContentError("This project is capturing an accepted team handoff");
+      const configuredProfile = sessionAgentProfile(this.config, request.provider, executionIdentity);
+      if (!configuredProfile) throw new Error("Provider is not configured on this host");
+      let profile = request.teamModelProfile ? teamModelLaunch(configuredProfile, request.teamModelProfile) : configuredProfile;
+      if (request.team?.role === "permission-coordinator") profile = permissionCoordinatorLaunch(request.provider, profile);
+      if (request.team?.role === "mission-coordinator") profile = missionCoordinatorLaunch(parseMissionCoordinatorProvider(request.provider), profile);
+      if (request.continuation) profile = withNativeContinuation(profile, request.continuation);
+      const context = withoutSharedContext(this.projectContexts.snapshot(request.projectId), executionIdentity);
+      const session: Session = {
+        id,
+        ...(request.team ? { team: request.team } : {}),
+        ...(request.teamModelProfile ? { teamModelProfile: request.teamModelProfile } : {}),
+        ...(request.purpose !== undefined ? { purpose: request.purpose } : {}),
+        executionIdentity,
+        ...(request.configId !== undefined ? { configId: request.configId } : {}),
+        ...(request.team && workspaceTrusted ? { workspaceTrusted: true as const } : {}),
+        backend: "infinite",
+        machineId: this.config.machine?.id,
+        executionLocation: request.workspace ? "laptop" : "cloud",
+        ...(request.resumedFrom ? { resumedFrom: request.resumedFrom, resumeNativeSession: request.resumeNativeSession } : {}),
+        provider: request.provider,
+        title: request.title,
+        ...(request.generatedTitle ? { generatedTitle: true as const } : {}),
+        projectId: request.projectId,
+        cwd: request.teamCwd ?? projectCwd(project.path, request.cwd),
+        createdAt: new Date().toISOString(),
+        status: "starting",
+        projectRoot: context.root,
+        contextSources: context.sources,
+        contextLinksVersion: context.linksVersion,
+        contextVersion: context.version,
+        context: context.text,
+        initialPrompt: request.prompt,
+        runtime: { id: randomUUID(), location: this.config.environment, transport: "pty", ...(request.localUi ? { nativeUi: request.provider as "codex" | "opencode" } : {}) },
+        ...(request.nativeArgs !== undefined ? { nativeArgs: request.nativeArgs } : {}),
+        ...(request.workspace ? { workspace: { cwd: request.workspace.cwd, roots: request.workspace.roots } } : {}),
+      };
+      if (!request.team) {
+        const userRequest = request.nativeArgs === undefined ? request.prompt : handoffNativePrompt(request.provider, request.nativeArgs);
+        let reason = "This project has not enabled automatic team handoff.";
+        if (project.team?.handoff === "auto") {
+          reason = "Handoff requires a new Claude or Codex PTY session at the project root, a supported prompt up to 12000 characters, and only supported model flags.";
+          if (!request.localUi && !request.workspace && !request.resumedFrom && ["claude", "codex"].includes(request.provider) && userRequest !== undefined && userRequest.length <= 12000 && session.cwd === realpathSync(project.path)) {
+            reason = "Handoff requires configured checks or authorization to establish them, and a reviewed model lineup.";
+            if (this.config.teams?.lineup && (project.team.checks.length || project.team.establishChecks)) session.handoff = { policy: structuredClone({
+              sourceSessionId: id, projectId: project.id, path: session.cwd, userRequest,
+              lineup: this.config.teams.lineup, project: project.team, linear: project.linear,
+              commandPrefix: this.config.teams.commandPrefix, workspaceDir: this.config.teams.workspaceDir,
+              maxMinutes: project.team.handoffMinutes ?? 60, maxMembers: 16, parallelism: 2,
+              ...(project.team.handoffExtendMinutes ? { extendMinutes: project.team.handoffExtendMinutes } : {}),
+              ...(project.team.handoffMaxTotalMinutes ? { maxTotalMinutes: project.team.handoffMaxTotalMinutes } : {}),
+            }) };
+          }
+        }
+        session.handoff ??= { reason };
+      }
+      const launchProfile = request.nativeArgs === undefined || request.localUi ? profile : { ...profile, args: [...profile.args, ...request.nativeArgs] };
+      const headless = this.headlessChannel?.admit({ provider: request.provider, profile: launchProfile, session, hooks: request.nativeArgs === undefined && !request.localUi });
+      if (headless) session.headless = headless.record;
+      const coordinator = request.team?.role === "permission-coordinator" || request.team?.role === "mission-coordinator";
+      const facts = { headless: headlessLaunch(request.provider, launchProfile).headless, served: session.headless?.channel === true, excluded: coordinator };
+      const recorded = request.recordedCodeMode ?? (request.resumedFrom === undefined ? undefined : false);
+      session.codeMode = codeModeEnabled(this.config.codeMode?.claude, request.provider, facts, recorded, executionIdentity);
+      if (request.recordedCodeMode && !session.codeMode)
+        throw new ContentError("The host asked for Code Mode when this conversation started. Claude Code resumes a Code Mode conversation only with Code Mode on, and a headless resume on this host cannot ask for it. Start a new session instead of resuming it.", 409);
+      const prompt = request.nativeArgs !== undefined ? "" : [
+        context.text
+          ? `Shared project context (version ${context.version}, provided by the owner):\n${context.text}`
+          : "",
+        request.team ? memberLaunchPrompt(request.prompt, request.provider, session.codeMode === true) : request.prompt,
+      ]
+        .filter(Boolean)
+        .join("\n\n");
+      mkdirSync(dir, { recursive: true, mode: 0o700 });
+      writeSealed(join(dir, "meta.sealed"), this.key, `${id}:meta`, {
         session,
-        profile: request.nativeArgs === undefined || request.localUi ? profile : {
-          ...profile, args: [...profile.args, ...request.nativeArgs],
-        },
-        stateDir: this.config.stateDir,
-        runDir: this.config.runDir,
-        key: this.key.toString("base64"),
-        prompt,
-        ...(request.workspace ? { executorTokenHash: createHash("sha256").update(request.workspace.token).digest("hex") } : {}),
-        attention: {
-          // Native CLI launches keep their exact argv: no hook settings are injected.
-          hooks: request.nativeArgs !== undefined
-            ? { claude: false, codex: false }
-            : this.config.attention?.hooks ?? DEFAULT_HOOKS,
-          idleAfterMs: this.config.attention?.idleAfterMs ?? 20000,
-          limitConfirmMs: this.config.attention?.limitConfirmMs ?? 30000,
-        },
-      } satisfies Bootstrap),
-    );
-    child.unref();
-    for (let attempt = 0; attempt < 80; attempt++) {
-      const state = await this.state(id);
-      if (state.status !== "unavailable" && (request.workspace || state.status !== "starting"))
-        return { ...session, ...state };
-      await new Promise((resolve) => setTimeout(resolve, 50));
+        fingerprint,
+      });
+      if (request.team) try { this.fuse?.started(id); } catch {}
+      const worker = fileURLToPath(
+        new URL(
+          import.meta.url.endsWith(".ts") ? "./worker.ts" : "./worker.js",
+          import.meta.url,
+        ),
+      );
+      const args = worker.endsWith(".ts")
+        ? ["--import", "tsx", worker]
+        : [worker];
+      const child = spawn(process.execPath, args, {
+        detached: true,
+        stdio: ["pipe", "ignore", "ignore"],
+        cwd: fileURLToPath(new URL("../../../", import.meta.url)),
+      });
+      child.on("error", () => {});
+      child.stdin.on("error", () => {});
+      const githubScope = sessionGithubScopeFor({ team: Boolean(request.team), origin: github, repository: projectGithubRepository(project), executionIdentity });
+      const githubGrant = sessionGithubGrant(this.config, githubScope, { sessionId: id, projectId: request.projectId }), codexTraceRoot = prepareMemberTrace(this.config, id, request.provider, request.team, launchProfile);
+      child.stdin.end(
+        JSON.stringify({
+          session,
+          executionIdentity,
+          profile: launchProfile,
+          stateDir: this.config.stateDir,
+          runDir: this.config.runDir, ...(this.socketDir !== this.config.runDir ? { socketDir: this.socketDir } : {}),
+          key: this.key.toString("base64"),
+          prompt,
+          codeMode: session.codeMode === true,
+          ...(request.workspace ? { executorTokenHash: createHash("sha256").update(request.workspace.token).digest("hex") } : {}),
+          ...(headless?.bootstrap ? { permissionChannel: headless.bootstrap } : {}),
+          ...(githubGrant ? { github: githubGrant } : {}), ...(codexTraceRoot ? { codexTraceRoot } : {}),
+          attention: {
+            hooks: request.nativeArgs !== undefined
+              ? { claude: false, codex: false }
+              : this.config.attention?.hooks ?? DEFAULT_HOOKS,
+            idleAfterMs: this.config.attention?.idleAfterMs ?? 20000,
+            limitConfirmMs: this.config.attention?.limitConfirmMs ?? 30000,
+          },
+        } satisfies Bootstrap),
+      );
+      child.unref();
+      for (let attempt = 0; attempt < 80; attempt++) {
+        const state = await this.state(id);
+        if (state.status !== "unavailable" && (request.workspace || state.status !== "starting"))
+          return { ...session, ...state };
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      return { ...session, ...(await this.state(id)) };
+    } finally {
+      this.pendingCreates.delete(id.toLowerCase());
     }
-    return { ...session, ...(await this.state(id)) };
   }
   handoffRequest(id: string) {
     let cursor = 0;
@@ -988,13 +1130,6 @@ export class Manager {
   }
   events(id: string, after: number, limit: number, types?: Set<string>) {
     this.meta(id);
-    return readEvents(
-      join(this.config.stateDir, "sessions", id, "events"),
-      this.key,
-      id,
-      after,
-      limit,
-      types,
-    );
+    return readIndexedEvents(join(this.config.stateDir, "sessions", id), this.key, id, after, limit, types);
   }
 }

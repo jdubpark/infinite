@@ -8,12 +8,27 @@ export interface LinearIssueView {
   updatedAt: string;
 }
 
-/** Present only for a run opted into tracking at creation or with a saved link.
- * Linear workflow state stays separate from local execution status.
- */
-export interface LinearTrackingView {
-  status: "pending" | "synced" | "blocked" | "error";
-  reason?: string;
-  checkedAt?: string;
-  issue?: LinearIssueView;
+export type LinearTrackingView =
+  | { status: "pending"; reason?: string; checkedAt?: string; retryAt?: string; issue?: LinearIssueView }
+  | { status: "synced"; issue: LinearIssueView; checkedAt?: string; reason?: never; retryAt?: never }
+  | { status: "blocked"; reason: string; checkedAt?: string; retryAt?: string; issue?: LinearIssueView }
+  | { status: "error"; reason: string; checkedAt?: string; retryAt?: string; issue?: LinearIssueView };
+
+export interface LinearLimitView {
+  limit?: number;
+  remaining?: number;
+  resetAt?: string;
+}
+
+export interface LinearBridgeStatus {
+  configured: boolean;
+  records: { total: number; gating: number };
+  sentLastHour: { requests: number; complexity: number };
+  limits?: {
+    observedAt: string; operation: string;
+    requests?: LinearLimitView; complexity?: LinearLimitView; lastComplexity?: number;
+    endpoint?: LinearLimitView & { name?: string; observedAt: string };
+  };
+  pausedUntil?: string;
+  lastRateLimit?: { at: string; operation: string; httpStatus: number; retryAfterSeconds?: number; waitSeconds: number; basis: "retry-after" | "reset" | "fallback"; shared: boolean };
 }

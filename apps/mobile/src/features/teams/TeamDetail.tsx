@@ -1,7 +1,7 @@
 import { useState, type ReactNode } from "react";
 import { ActivityIndicator, Alert, Linking, Pressable, RefreshControl, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import { useRouter } from "expo-router";
-import { api, connectionKey, type Connection, type Me, type SessionRow } from "../../api/client";
+import { api, connectionKey, listSessions, type Board as BoardData, type BoardItem, type Connection, type Me } from "../../api/client";
 import { usePoll } from "../../api/usePoll";
 import { useLive } from "../../api/useLive";
 import { Avatar } from "../../components/Avatar";
@@ -10,34 +10,34 @@ import { Button } from "../../components/Button";
 import { Card, Chip, GlassButton, GroupHeader, LiveStatus, ProgressBar, Segmented, TopBar } from "../../components/Glass";
 import { Glyph, StatusIcon } from "../../components/Icon";
 import { FloatingNotice } from "../../components/FloatingNotice";
+import { HaltBanner } from "../halt/HaltBanner";
 import type { StatusKind } from "../../status";
 import { theme } from "../../theme";
 import { DictationNotice } from "../../dictation/DictationControls";
 import { useDictation } from "../../dictation/useDictation";
 import {
-  MEMBER_LABELS, memberKind, newer, openDecisions, pendingApprovals, ROLE_NAMES, shortDate, TEAM_LABELS, taskGroups, taskKind, canContinueBlockedTeam, teamControls, teamKind, teamPhases, teamProgress, workerStatus,
+  directionSourceLabel, MEMBER_LABELS, memberKind, newer, openDecisions, pendingApprovals, ROLE_NAMES, shortDate, TEAM_LABELS, taskGroups, taskKind, canContinueBlockedTeam, teamControls, teamKind, teamPhases, teamProgress, workerStatus,
   type ModelProfile, type PhaseState, type TeamCheck, type TeamDecision, type TeamMember, type TeamTask, type TeamView,
 } from "./model";
 import { Clamp, Disclosure, LinearChip, LineupView, ProfileLine, providerName, RequestStatus, Section, SteerBox, t } from "./parts";
+import { DecisionOptions, OutcomeNote, RecommendationBlock } from "./Recommendation";
 import { useRunRequest } from "./useRunRequest";
 import { AgentApproval } from "./TeamApprovals";
+import { TeamEvidenceSection } from "./TeamEvidenceSection";
+import { TeamOverviewGroups } from "./TeamOverviewGroups";
 import { AgentLog, UnderstandingSummary } from "./TeamSummary";
+import { memberScreenNotices, partitionMobileRoster } from "./inspector-model";
 import { orderedMembers } from "./summary";
 import { CostLine, RatingControl, RubricLine } from "../cost/parts";
 import { useTaskRating } from "../cost/useCost";
 import { MissionManagedLine } from "../board/MissionManagedLine";
+import { Attempts } from "../board/Attempts";
+import { attemptLabel, attemptsOf, findBoardItem } from "../board/model";
 
 type Tab = "overview" | "tasks" | "agents" | "activity";
 const CHECK_KIND: Record<TeamCheck["status"], StatusKind> = { running: "progress", passed: "done", failed: "blocked", interrupted: "stopped" };
 const live = (member: TeamMember) => member.status === "running" || member.status === "waiting";
 
-/**
- * One team run, tracked the way Linear tracks a project and run through its coordinator. Overview
- * opens on the coordinator card (phase, progress, latest activity, and the run's controls), then
- * what needs a person: the team's questions and agent requests the coordinator escalated or was not
- * delegated. Members are monitored, not steered: Tasks lists the plan with its assignees, Agents
- * shows what each one is doing, and Activity holds the evidence.
- */
 export function TeamDetail({ connection, id }: { connection: Connection; id: string }) {
   const router = useRouter();
   const keyboardPadding = useKeyboardPadding();
@@ -49,14 +49,15 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
   });
   const rating = useTaskRating(connection, id, poll.refresh);
   const { data: me } = usePoll(() => api<Me>(connection, "/me"), 10000, [connection]);
-  const sessionsPoll = usePoll(() => api<{ sessions: SessionRow[] }>(connection, "/sessions").then(value => value.sessions), 4000, [connection]);
+  const sessionsPoll = usePoll(() => listSessions(connection), 4000, [connection]);
   const sessions = sessionsPoll.data;
-  // A mutation's result shows at once; a poll that started before it cannot undo it.
+  const boardPoll = usePoll(() => api<BoardData>(connection, "/board").then(value => ({ items: value.items, at: Date.now() })).catch(() => ({ items: [] as BoardItem[], at: Date.now() })), 4000, [connection]);
   const [recorded, setRecorded] = useState<TeamView | null>(null);
   const team = poll.data ? newer(recorded, poll.data) : recorded;
   const [direction, setDirection] = useState("");
   const [tab, setTab] = useState<Tab>("overview");
   const [agentId, setAgentId] = useState("");
+  const [finishedOpen, setFinishedOpen] = useState(false);
   const [agentStale, setAgentStale] = useState(false);
   const [dockHeight, setDockHeight] = useState(0);
   const [taskId, setTaskId] = useState("");
@@ -65,7 +66,6 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
     refused: poll.refresh,
   });
   const fresh = poll.online;
-  // Created before the early return below, so it reads the steer rule directly rather than `controls`.
   const dictation = useDictation({
     connection,
     value: direction,
@@ -78,31 +78,48 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
     else router.replace({ pathname: "/", params: { machine, view: "teams" } });
   }
   const openSession = (sessionId: string) => router.push({ pathname: "/session/[id]", params: { id: sessionId, machine } });
-  // A mission's subteam is run by its coordinator: no owner run controls, and its questions are not the owner's.
   const owns = me?.role === "owner" && team && !team.goal && !team.missionId && team.status !== "cancelled";
   const top = <TopBar backLabel="Teams" onBack={back} right={<LiveStatus online={fresh} loading={poll.loading} seen={poll.seen} stale={poll.stale} />} />;
   if (!team) return <View style={[s.fill, s.overlayRoot]}>{top}<FloatingNotice position="top" offset={58} message={poll.stale ? "Can't reach this machine." : null} actions={poll.stale ? <Button compact title="Refresh" secondary onPress={poll.refresh} /> : null} /><View style={s.empty}><ActivityIndicator /><Text style={t.note}>{poll.loading ? "Loading…" : "Could not load the team."}</Text></View></View>;
 
   const controls = teamControls(team, me?.role, fresh);
-  // Which controls the run offers at all; a stale view disables them in place rather than removing them.
   const offered = teamControls(team, me?.role, true);
   const canContinue = canContinueBlockedTeam(team, me?.role);
+  const board = boardPoll.data?.items ?? [];
+  const boardNow = boardPoll.data?.at ?? 0;
+  const boardItem = findBoardItem(board, "team", id);
+  const attempts = boardItem ? attemptsOf(board, boardItem) : [];
+  const attemptChip = boardItem ? attemptLabel(boardItem) : undefined;
+  const cancelOrphan = !owns && offered.cancel && team.status === "blocked";
+  const cancelAlert = (body: string) => Alert.alert("Cancel this team?", body, [
+    { text: "Keep running", style: "cancel" },
+    { text: "Cancel team", style: "destructive", onPress: () => send("/cancel", "Cancellation") },
+  ]);
   const continuationEligible = team.status === "blocked" && team.continuable === true && !team.goal && !team.missionId && !team.deliveryReceipt && !team.pullRequest;
   const locked = request.busy || Boolean(request.pending);
   const decisions: TeamDecision[] = team.missionId ? [] : openDecisions(team);
   const listed = new Map((sessions ?? []).map(session => [session.id, session]));
   const project = me?.projects?.find(value => value.id === team.projectId)?.name ?? team.projectId;
   const send = (path: string, label: string, fields?: Record<string, string | number>) => request.send(`/teams/${id}${path}`, label, team.revision, fields);
+  const rawRoster = partitionMobileRoster(team.members, team.revision);
+  const memberById = new Map(team.members.map(member => [member.memberId, member]));
+  const replacedByMap = new Map(
+    [...rawRoster.active, ...rawRoster.finished]
+      .filter(entry => entry.replacedByMemberId)
+      .map(entry => [entry.member.memberId, entry.replacedByMemberId!]),
+  );
+  const activeIds = new Set(rawRoster.active.map(entry => entry.member.memberId));
   const members = orderedMembers(team.members, team.revision);
   const current = members.filter(member => member.revision === team.revision);
-  const earlier = members.filter(member => member.revision !== team.revision);
+  const activeRosterMembers = members.filter(member => activeIds.has(member.memberId));
+  const finishedRosterMembers = members.filter(member => !activeIds.has(member.memberId));
+  const isFailedOrStopped = (member: TeamMember) =>
+    member.status === "stopped" || member.status === "unavailable" || Boolean(member.stoppedReason) || Boolean(member.stalledAt);
   const approvals = pendingApprovals(team, sessions ?? []);
-  // Open agent prompts the coordinator is deciding under the run's delegation; nothing for a person to do.
   const coordinatorHandling = current.filter(member => live(member) && listed.get(member.sessionId)?.attention.state === "needs-you").length - approvals.length;
   const working = current.filter(live);
   const { kind, fraction } = teamKind(team, approvals.length);
   const coordinator = current.find(member => member.role === "project-manager");
-  // The coordinator's own activity when its session reports one; otherwise the run's latest recorded event.
   const coordinatorNow = coordinator ? listed.get(coordinator.sessionId)?.attention.now : undefined;
   const latest = coordinatorNow || team.events.at(-1)?.text;
   const checksNow = team.checks.filter(check => check.revision === team.revision);
@@ -110,7 +127,6 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
   const profileOf = (member?: TeamMember, task?: TeamTask): ModelProfile | undefined => member?.modelProfile
     ?? [...(team.lineup?.implementers ?? []), ...(team.lineup?.escalations ?? [])].find(value => value.id === task?.agentProfileId);
   const agentLabel = (member: TeamMember) => member.modelProfile?.label ?? providerName(member.provider ?? team.provider);
-  // A person-owned prompt is attention; a live member whose prompt the coordinator is reviewing is live with a note instead.
   const personOwned = new Set(approvals.map(item => item.member.memberId));
   const coordinatorOwned = (member: TeamMember) => member.revision === team.revision && live(member) && listed.get(member.sessionId)?.attention.state === "needs-you" && !personOwned.has(member.memberId);
   const agentState = (member: TeamMember) => personOwned.has(member.memberId) ? "attention" as const : coordinatorOwned(member) || member.status === "running" ? "live" as const : undefined;
@@ -119,14 +135,17 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
     decision={[...(team.permissionDecisions ?? [])].reverse().find(item => item.targetSessionId === member.sessionId && item.promptId === session.attention.prompt?.id)}
     onOpenSession={() => openSession(member.sessionId)} />;
   const taskOf = (member: TeamMember) => team.tasks.find(task => task.id === member.taskId);
-  // Member titles repeat the role id and often the run title; keep only what adds information.
   const work = (member: TeamMember) => {
     const task = taskOf(member)?.title;
     if (task) return task;
     const title = member.title.replace(/^[a-z-]+:\s*/, "");
     return title === team.title ? "" : title;
   };
-  const showAgent = (member: TeamMember) => { setTab("agents"); setAgentId(member.memberId); };
+  const showAgent = (member: TeamMember) => {
+    setTab("agents");
+    setAgentId(member.memberId);
+    if (!activeIds.has(member.memberId)) setFinishedOpen(true);
+  };
   const answered = team.decisions.filter(decision => decision.answer != null);
   const lead = team.lineup?.coordinator;
 
@@ -134,8 +153,17 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
     const open = agentId === member.memberId;
     const session = listed.get(member.sessionId);
     const approval = approvals.find(item => item.member.memberId === member.memberId);
+    const workTitle = work(member);
+    const notices = memberScreenNotices(member);
+    const accessibilityParts = [
+      `${ROLE_NAMES[member.role]}${workTitle ? `, ${workTitle}` : ""}`,
+      MEMBER_LABELS[member.status] ?? member.status,
+      ...notices.map(notice => notice.text),
+      member.stoppedReason ? `Stopped: ${member.stoppedReason}` : undefined,
+      `${open ? "Hide" : "Show"} log`,
+    ].filter(Boolean);
     return <View key={member.memberId}>
-      <Pressable accessibilityRole="button" accessibilityState={{ expanded: open }} accessibilityLabel={`${ROLE_NAMES[member.role]}, ${MEMBER_LABELS[member.status] ?? member.status}. ${open ? "Hide" : "Show"} log`}
+      <Pressable accessibilityRole="button" accessibilityState={{ expanded: open }} accessibilityLabel={accessibilityParts.join(". ")}
         onPress={() => setAgentId(open ? "" : member.memberId)} style={({ pressed }) => [s.row, pressed && s.pressed]}>
         <Avatar label={agentLabel(member)} provider={member.modelProfile?.provider ?? member.provider ?? team.provider} size={30} state={agentState(member)} />
         <View style={s.main}>
@@ -145,15 +173,35 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
             <Text style={s.state}>{MEMBER_LABELS[member.status] ?? member.status}</Text>
             {member.revision !== team.revision ? <Text style={t.note}>rev {member.revision}</Text> : null}
           </View>
-          <Text style={t.note} numberOfLines={1}>{[work(member), agentLabel(member)].filter(Boolean).join(" · ")}</Text>
+          <Text style={t.note} numberOfLines={1}>{[workTitle, agentLabel(member)].filter(Boolean).join(" · ")}</Text>
           {coordinatorOwned(member) ? <Text style={t.note} numberOfLines={2}>{`Coordinator reviewing${session?.attention.now ? `: ${session.attention.now}` : ""}`}</Text>
             : session?.attention.now ? <Text style={[s.now, personOwned.has(member.memberId) && s.attentionText]} numberOfLines={2}>{session.attention.now}</Text> : null}
+          {notices.map(notice => (
+            <Text key={notice.kind} style={notice.tone === "error" ? t.error : t.warning} numberOfLines={2}>
+              {notice.text}
+            </Text>
+          ))}
           {member.stoppedReason ? <Text style={t.warning} numberOfLines={2}>Stopped: {member.stoppedReason}</Text> : null}
         </View>
         <Glyph name={open ? "down" : "forward"} size={12} color={theme.colors.mutedInk} />
       </Pressable>
       {open ? <>
         {approval ? <View style={s.approval}>{approvalCard(approval)}</View> : null}
+        {(() => {
+          const replacementId = replacedByMap.get(member.memberId);
+          const replacement = replacementId && isFailedOrStopped(member) ? memberById.get(replacementId) : undefined;
+          const replacementWork = replacement ? work(replacement) : "";
+          return replacement ? <View style={s.approval}>
+            <Button
+              compact
+              secondary
+              glyph="forward"
+              title="Jump to replacement"
+              accessibilityLabel={`Jump to replacement ${ROLE_NAMES[replacement.role]}${replacementWork ? `, ${replacementWork}` : ""}`}
+              onPress={() => showAgent(replacement)}
+            />
+          </View> : null;
+        })()}
         <AgentLog connection={connection} member={member} live={live(member)} onOpen={() => openSession(member.sessionId)} onStaleChange={setAgentStale} />
       </> : null}
     </View>;
@@ -170,9 +218,11 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
         <Text style={t.title} numberOfLines={3}>{team.title}</Text>
         <View style={s.chips}>
           <Chip kind={kind} fraction={fraction} label={TEAM_LABELS[team.status]} tone={kind === "attention" || kind === "paused" ? "attention" : kind === "blocked" ? "error" : undefined} accessibilityLabel={`State: ${TEAM_LABELS[team.status]}`} />
+          {attemptChip ? <Chip label={attemptChip} /> : null}
                     <Chip icon={<Avatar label={lead?.label ?? providerName(team.provider)} provider={lead?.provider ?? team.provider} size={16} />} label={lead?.label ?? providerName(team.provider)} accessibilityLabel={`Lead: ${lead?.label ?? providerName(team.provider)}`} />
           <LinearChip tracking={team.linear} fresh={fresh} />
         </View>
+        <HaltBanner connection={connection} place={{ projectIds: [team.projectId] }} />
         <Text style={s.workerStatus} numberOfLines={2}>{workerStatus(team)}</Text>
         <Text style={t.note}>The PM and coordinator adjust workers as work changes.</Text>
         {team.linear?.reason ? <Text style={t.warning}>{team.linear.reason}</Text> : null}
@@ -199,7 +249,6 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
             <Avatar label={lead?.label ?? providerName(team.provider)} provider={lead?.provider ?? team.provider} size={22} state={coordinator && live(coordinator) ? "live" : undefined} />
             <Text style={[t.body, s.fill]} numberOfLines={2}>{latest}</Text>
           </View> : null}
-          {/* The host's reason for an open agent prompt points at the member session; the approvals below answer it here. */}
           {team.reason && !approvals.length && !sessionsPoll.loading ? <Text style={kind === "blocked" ? t.error : t.warning}>{team.reason}</Text> : null}
           {owns ? <View style={s.controls}>
             {(team.status === "paused" || team.resumable) && !team.deliveryReceipt && !canContinue ? <Button compact busy={Boolean(request.pending?.label === "Resume" && request.busy)} glyph="play" title="Resume" disabled={!controls.resume || locked} onPress={() => send("/resume", "Resume")} />
@@ -208,10 +257,13 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
               { text: "Keep running", style: "cancel" },
               { text: "Cancel team", style: "destructive", onPress: () => send("/cancel", "Cancellation") },
             ])} />
-          </View> : team.goal ? <View style={s.controls}>
-            <Button compact secondary glyph="target" title={`Goal cycle ${team.goal.cycle}`} onPress={() => router.push({ pathname: "/goal/[id]", params: { id: team.goal!.id, machine } })} />
-                      </View> : null}
+          </View> : team.goal || cancelOrphan ? <View style={s.controls}>
+            {team.goal ? <Button compact secondary glyph="target" title={`Goal cycle ${team.goal.cycle}`} onPress={() => router.push({ pathname: "/goal/[id]", params: { id: team.goal!.id, machine } })} /> : null}
+            {cancelOrphan ? <Button compact secondary glyph="close" title="Cancel…" busy={Boolean(request.pending?.label === "Cancellation" && request.busy)} disabled={!controls.cancel || locked}
+              onPress={() => cancelAlert("Stops this blocked run. Work and evidence stay. A run still controlled by a live goal or mission cannot be cancelled here.")} /> : null}
+          </View> : null}
         </Card>
+        {attempts.length ? <View style={s.gapTop}><Attempts attempts={attempts} current={id} machine={machine} now={boardNow} /></View> : null}
         {canContinue ? <Card style={s.gapTop}>
           <Text style={t.strong}>Continue this blocked run</Text>
           <Text style={t.note}>A fresh plan preserves the current work, linked issue, policies, and evidence. Required checks still apply. If delivery is uncertain, retry the same request instead of starting another.</Text>
@@ -268,6 +320,8 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
           </Card>
         </Section> : null}
 
+        <TeamOverviewGroups team={team} onSelectMember={showAgent} />
+
         <Section title="Brief"><UnderstandingSummary connection={connection} team={team} /></Section>
       </View> : null}
 
@@ -310,8 +364,8 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
       </View> : null}
 
       {tab === "agents" ? <View>
-        {current.length ? current.map(agentRow) : <Text style={[t.note, s.gapTop]}>No agents yet.</Text>}
-        {earlier.length ? <Disclosure title={`Earlier revisions · ${earlier.length}`}>{earlier.map(agentRow)}</Disclosure> : null}
+        {activeRosterMembers.length ? activeRosterMembers.map(agentRow) : <Text style={[t.note, s.gapTop]}>No active agents.</Text>}
+        {finishedRosterMembers.length ? <Disclosure title={`Finished (${finishedRosterMembers.length})`} expanded={finishedOpen} onToggle={() => setFinishedOpen(open => !open)}>{finishedRosterMembers.map(agentRow)}</Disclosure> : null}
         {team.lineup ? <Disclosure title="Recorded lineup">
           <Text style={t.note}>Requested; providers may override.</Text>
           <LineupView lineup={team.lineup} />
@@ -319,6 +373,7 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
       </View> : null}
 
       {tab === "activity" ? <View>
+        <TeamEvidenceSection connection={connection} team={team} onOpenSession={openSession} />
         <Section title="Checks" count={team.checks.length}>
           {team.checks.length ? team.checks.map((check, index) => <CheckRow key={`${check.startedAt}/${index}`} check={check} />) : <Text style={t.note}>None yet.</Text>}
         </Section>
@@ -366,9 +421,9 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
             {continuation.brief ? <Disclosure title="Preserved opportunity brief"><Text style={t.strong}>{continuation.brief.title}</Text><Clamp text={continuation.brief.problem} lines={4} />{continuation.brief.evidence.map((item, index) => <Text key={index} style={t.note}>{item.source}: {item.observation}</Text>)}</Disclosure> : null}
           </View>)}
         </Section> : null}
-        {team.steering.length || answered.length ? <Section title="Your directions and decisions" count={team.steering.length + answered.length}>
-          {team.steering.map((entry, index) => <View key={`${entry.at}/${index}`} style={s.record}><Text style={t.note}>Direction · rev {entry.revision} · {shortDate(entry.at)}</Text><Clamp text={entry.text} lines={3} /></View>)}
-          {answered.map(decision => <View key={decision.id} style={s.record}><Text style={t.note}>Decision · rev {decision.revision}</Text><Text style={t.body}>{decision.question}</Text><Text style={t.strong}>{decision.answeredBy === "coordinator" ? "Mission coordinator" : "You"}: {decision.answer}</Text></View>)}
+        {team.steering.length || answered.length ? <Section title="Directions and decisions" count={team.steering.length + answered.length}>
+          {team.steering.map((entry, index) => <View key={`${entry.at}/${index}`} style={s.record}><Text style={t.note}>{directionSourceLabel(entry.source)} · direction · rev {entry.revision} · {shortDate(entry.at)}</Text><Clamp text={entry.text} lines={3} /></View>)}
+          {answered.map(decision => <View key={decision.id} style={s.record}><Text style={t.note}>Decision · rev {decision.revision}</Text><Text style={t.body}>{decision.question}</Text><Text style={t.strong}>{decision.answeredBy === "connector" ? decision.source?.name ?? "Connector" : decision.answeredBy === "coordinator" ? "Mission coordinator" : "You"}: {decision.answer}</Text><OutcomeNote recommendation={decision.recommendation} /></View>)}
         </Section> : null}
         {team.events.length ? <Section title="History" count={team.events.length}>
           {[...team.events].reverse().slice(0, 6).map((event, index) => <HistoryRow key={`${event.at}/${index}`} at={event.at} day={team.updatedAt} text={event.text} />)}
@@ -391,7 +446,6 @@ export function TeamDetail({ connection, id }: { connection: Connection; id: str
   </View>;
 }
 
-/** An icon and a number, with the full meaning for screen readers; tapping opens its tab. */
 function Stat({ icon, value, label, onPress }: { icon: ReactNode; value: string; label: string; onPress?: () => void }) {
   const body = <>{icon}<Text style={s.statValue}>{value}</Text></>;
   return onPress
@@ -401,7 +455,6 @@ function Stat({ icon, value, label, onPress }: { icon: ReactNode; value: string;
 
 const PHASE_TONE: Partial<Record<string, string>> = { attention: theme.colors.warningInk, paused: theme.colors.warningInk, blocked: theme.colors.error, cancelled: theme.colors.placeholder, stopped: theme.colors.placeholder };
 
-/** Plan to review (and delivery) as one track; the current step takes the run's state colour. */
 function PhaseTrack({ phases, kind }: { phases: { label: string; state: PhaseState }[]; kind: string }) {
   const tone = PHASE_TONE[kind] ?? theme.colors.running;
   const now = phases.find(phase => phase.state === "current");
@@ -419,14 +472,14 @@ function PhaseTrack({ phases, kind }: { phases: { label: string; state: PhaseSta
   </View>;
 }
 
-/** A member's question. The team records the answer and continues in a new attempt. */
 function DecisionCard({ decision, member, disabled, onAnswer }: { decision: TeamDecision; member?: TeamMember; disabled: boolean; onAnswer: (text: string) => void }) {
   const [text, setText] = useState("");
   return <Card attention>
     <Text style={s.decisionMeta}>{member ? ROLE_NAMES[member.role] : "Team"} · rev {decision.revision} · {shortDate(decision.createdAt)}</Text>
     <Text selectable style={t.body}>{decision.question}</Text>
-    {decision.options.length ? <View style={s.options}>
-      {decision.options.map((option, index) => <Button key={index} compact secondary title={option} disabled={disabled} onPress={() => onAnswer(option)} />)}
+    {decision.recommendation ? <RecommendationBlock recommendation={decision.recommendation} /> : null}
+    {decision.options.length || decision.recommendation ? <View style={s.options}>
+      <DecisionOptions options={decision.options} recommendation={decision.recommendation} disabled={disabled} onAnswer={onAnswer} />
     </View> : null}
     <View style={s.answer}>
       <TextInput accessibilityLabel="Your answer" value={text} onChangeText={setText} editable={!disabled} multiline maxLength={8000}
@@ -454,7 +507,6 @@ function CheckRow({ check }: { check: TeamCheck }) {
   </View>;
 }
 
-/** Times on the run's latest day show the clock only; earlier days add the date. */
 function HistoryRow({ at, day, text }: { at: string; day: string; text: string }) {
   const when = new Date(at);
   const clock = when.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });

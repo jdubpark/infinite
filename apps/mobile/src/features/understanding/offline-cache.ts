@@ -13,7 +13,6 @@ type Entry = { scope: string; credential: string; workspaceId: string; generatio
 type Index = { entries: Entry[] };
 let indexWrites: Promise<void> = Promise.resolve();
 
-/** Caches workspace and repository labels only. Briefs, plans, code, and task text never enter the cache. */
 export async function saveUnderstandingSummary(connection: Connection, data: WorkspaceUnderstanding): Promise<void> {
   return withIndexLock(() => saveSummary(connection, data));
 }
@@ -36,7 +35,6 @@ async function saveSummary(connection: Connection, data: WorkspaceUnderstanding)
   try {
     for (let i = 0; i < chunks.length; i++) await SecureStore.setItemAsync(chunkKeys[i], chunks[i], { keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY });
     const prior = index.entries.filter(entry => !(entry.scope === scope && entry.workspaceId === data.workspace.id));
-    // A new credential for this host invalidates every prior offline snapshot on that host.
     const retained = prior.filter(entry => entry.scope !== scope || entry.credential === credential);
     const entries = [nextEntry, ...retained].sort((a, b) => Date.parse(b.capturedAt) - Date.parse(a.capturedAt)).slice(0, WORKSPACE_LIMIT);
     await writeIndex({ entries });
@@ -63,16 +61,16 @@ export async function readUnderstandingSummary(connection: Connection, workspace
     return null;
   }
   const capturedAt = Date.parse(entry.capturedAt);
-  if (!Number.isFinite(capturedAt) || Date.now() - capturedAt > TTL_MS || entry.chunkCount < 1 || entry.chunkCount > CHUNK_LIMIT) { await clearEntry(index, entry); return null; }
+  if (!Number.isFinite(capturedAt) || Date.now() - capturedAt > TTL_MS || entry.chunkCount < 1 || entry.chunkCount > CHUNK_LIMIT) { await clearEntry(entry); return null; }
   const workspaceHash = (await digest(workspaceId)).slice(0, 24);
   try {
     const chunks = await Promise.all(Array.from({ length: entry.chunkCount }, (_, i) => SecureStore.getItemAsync(chunkKey(workspaceHash, entry.generation, i))));
-    if (chunks.some(chunk => chunk === null)) { await clearEntry(index, entry); return null; }
+    if (chunks.some(chunk => chunk === null)) { await clearEntry(entry); return null; }
     const data = JSON.parse(chunks.join("")) as WorkspaceUnderstanding;
-    if (data.schemaVersion !== 1 || data.workspace.id !== workspaceId || !Array.isArray(data.repositories) || !Array.isArray(data.work)) { await clearEntry(index, entry); return null; }
+    if (data.schemaVersion !== 1 || data.workspace.id !== workspaceId || !Array.isArray(data.repositories) || !Array.isArray(data.work)) { await clearEntry(entry); return null; }
     return { data, cachedAt: entry.capturedAt };
   } catch {
-    await clearEntry(index, entry);
+    await clearEntry(entry);
     return null;
   }
 }
@@ -129,7 +127,7 @@ async function readIndex(): Promise<Index> {
 async function writeIndex(index: Index) {
   await SecureStore.setItemAsync(INDEX_KEY, JSON.stringify(index), { keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY });
 }
-async function clearEntry(index: Index, entry: Entry) {
+async function clearEntry(entry: Entry) {
   await withIndexLock(async () => {
     const latest = await readIndex();
     const current = latest.entries.find(candidate => candidate.scope === entry.scope && candidate.credential === entry.credential && candidate.workspaceId === entry.workspaceId && candidate.generation === entry.generation);

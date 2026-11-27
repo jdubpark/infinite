@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { ArrowUpRight, Check, ChevronRight, GitBranch, Plus, RefreshCw, Send, Users, X } from "lucide-react";
-import { ApiError, ago, clock, isMissionManaged, missionManagedLine, names, useApi, type LimitSwitch, type LogEvent, type ProviderLimit, type Me, type OwnerRating, type Rubric, type Session, type TaskUsage, type TeamLineup, type TeamModelProfile, type TeamBrief, type TeamEvidence, type LinearTrackingView, type TeamUsage, type UsageTotals } from "./api";
+import { ApiError, ago, clock, isMissionManaged, missionManagedLine, names, postDecisionAnswer, useApi, type LimitSwitch, type LogEvent, type ProviderLimit, type Me, type OwnerRating, type Rubric, type Session, type TaskUsage, type TeamLineup, type TeamModelProfile, type TeamBrief, type TeamEvidence, type LinearTrackingView, type TeamUsage, type UsageTotals } from "./api";
 import { UsageFigure, UsageRollup, usageEnabled } from "./usage";
 import { SpendGlance, TaskCostRow } from "./cost";
 import { briefText, chooseBrief, monitorMembers, summarySessionId, type BriefingView } from "./team-monitor";
@@ -9,31 +9,42 @@ import { useLiveRefresh } from "./live-refresh";
 import { requestStore } from "./requests";
 import { LinearTracking } from "./linear";
 import { DictationNotice, MicButton, useDictation } from "./dictation";
+import { Decision } from "./team-decision";
+import { TeamOverview } from "./team-inspector/TeamOverview";
+import { TeamEvidenceBoard } from "./team-inspector/TeamEvidenceBoard";
+import { buildTeamEntryHash, parseTeamEntryHash } from "./team-inspector/model";
+import type { TeamAcceptanceEvidence, TeamCriterionRefs, TeamGoalRecord, TeamRunAssessment, TeamWaitReason } from "./team-inspector/types";
 
 type TeamStatus = "planning" | "discovering" | "implementing" | "integrating" | "verifying" | "reviewing" | "delivering" | "merged" | "needs-input" | "paused" | "blocked" | "ready-for-review" | "no-change" | "cancelled";
-type TeamRole = "project-manager" | "scout" | "implementer" | "integrator" | "reviewer" | "delivery";
+type TeamRole = "project-manager" | "intent-checker" | "scout" | "implementer" | "integrator" | "reviewer" | "delivery" | "evaluator";
 type TeamCommand = { command: string; args: string[] };
-export type TeamTask = { id: string; title: string; instructions: string; paths: string[]; dependsOn: string[]; status: "pending" | "running" | "waiting" | "integrated" | "blocked"; memberId?: string; commit?: string; summary?: string; agentProfileId?: string; escalation?: { fromProfileId?: string; toProfileId: string; reason: string; memberId: string; at: string }; limitSwitches?: LimitSwitch[]; usage?: TaskUsage; ownerRating?: OwnerRating; rubric?: Rubric };
-type TeamContinuation = { revision: number; requestId: string; at: string; reason: string; headCommit: string; tasks: TeamTask[]; review?: TeamView["review"]; brief?: TeamBrief };
+export type TeamTask = { id: string; title: string; instructions: string; paths: string[]; dependsOn: string[]; status: "pending" | "running" | "waiting" | "integrated" | "blocked"; revision?: number; memberId?: string; commit?: string; summary?: string; limitations?: string[]; agentProfileId?: string; criterionRefs?: TeamCriterionRefs; changedPaths?: { paths: string[]; truncated: boolean }; reviewRounds?: number; escalation?: { fromProfileId?: string; toProfileId: string; reason: string; memberId: string; at: string }; limitSwitches?: LimitSwitch[]; usage?: TaskUsage; ownerRating?: OwnerRating; rubric?: Rubric };
+type TeamContinuation = { revision: number; requestId: string; at: string; reason: string; baseCommit?: string; headCommit: string; tasks: TeamTask[]; review?: TeamView["review"]; brief?: TeamBrief };
 type TeamScout = { id: string; title: string; instructions: string; agentProfileId: string; status: "pending" | "running" | "waiting" | "complete"; memberId?: string; summary?: string; evidence?: TeamEvidence[] };
-type TeamMember = { memberId: string; sessionId: string; role: TeamRole; revision: number; title: string; status: string; taskId?: string; cwd: string; baseCommit: string; provider?: string; modelProfile?: TeamModelProfile; usage?: UsageTotals; stoppedReason?: string };
-type TeamDecision = { id: string; memberId: string; revision: number; question: string; options: string[]; createdAt: string; answer?: string; answeredAt?: string; answeredBy?: "owner" | "coordinator" };
+export type TeamMember = { memberId: string; sessionId: string; role: TeamRole; revision: number; title: string; status: string; taskId?: string; cwd: string; baseCommit: string; provider?: string; modelProfile?: TeamModelProfile; usage?: UsageTotals; stoppedReason?: string; startedAt?: string; reportedAt?: string; lastActivityAt?: string; spinnerOnlySince?: string; pendingLimit?: boolean; stalledAt?: string };
+
+export function directionSourceLabel(source: { kind: string; name: string } | string | undefined): string {
+  if (typeof source === "object") return source.kind === "github-review" ? "Owner (GitHub review)" : source.name;
+  return source === "coordinator" ? "Mission coordinator" : "You";
+}
+
+type TeamDecision = { id: string; memberId: string; revision: number; question: string; options: string[]; answerMode?: "approval" | "single" | "multiple"; createdAt: string; answer?: string; answeredAt?: string; answeredBy?: "owner" | "coordinator" | "connector"; source?: { kind: "connector"; id: string; name: string }; recommendation?: { answers: string[]; reason: string; outcome?: "matched" | "different" | "other" } };
 export type TeamView = {
   id: string; projectId: string; provider: string; title: string; objective: string; parallelism: number;
-  revision: number; status: TeamStatus; createdAt: string; updatedAt: string; workspace: string;
+  revision: number; status: TeamStatus; createdAt: string; updatedAt: string; lastActivityAt?: string; workspace: string;
   branch: string; baseCommit: string; headCommit?: string; tasks: TeamTask[]; members: TeamMember[];
-  decisions: TeamDecision[]; checks: { command: TeamCommand; status: "running" | "passed" | "failed" | "interrupted"; startedAt: string; finishedAt?: string; exitCode?: number | null; output: string; revision: number }[];
-  steering: { text: string; revision: number; at: string }[]; events: { at: string; text: string }[];
-  reason?: string; review?: { verdict: "approved" | "changes-requested"; summary: string; revision: number; uiEvidence?: string }; round: number;
+  decisions: TeamDecision[]; checks: { command: TeamCommand; phase?: "setup"; headCommit?: string; round?: number; status: "running" | "passed" | "failed" | "interrupted"; startedAt: string; finishedAt?: string; exitCode?: number | null; output: string; revision: number }[];
+  steering: { text: string; revision: number; at: string; source?: { kind: "connector" | "github-review"; id: string; name: string } | "coordinator" | "slack" }[]; events: { at: string; text: string }[];
+  reason?: string; review?: { verdict: "approved" | "changes-requested"; summary: string; revision: number; uiEvidence?: string; acceptance?: TeamAcceptanceEvidence[] }; round: number;
   deliveryReceipt?: { pullRequestUrl: string; headCommit: string; mergeCommit: string; summary: string };
   pullRequest?: { revision: number; headCommit: string; pullRequestUrl: string; summary: string; reportedAt: string };
   lineup?: TeamLineup;
   providerLimits?: ProviderLimit[];
   usage?: TeamUsage;
   linear?: LinearTrackingView;
-  /** A mission subteam is controlled from its mission. */
   missionId?: string;
-  goal?: { id: string; revision: number; cycle: number; successCriteria: string; nonGoals: string[]; allowedPaths: string[]; evidence: string[]; previousWork: string[]; deadlineAt: string; maxMembers: number; parentRunId?: string };
+  goal?: { id: string; revision: number; cycle: number; successCriteria: string; nonGoals: string[]; allowedPaths: string[]; evidence: string[]; previousWork: string[]; deadlineAt: string; maxMembers: number; parentRunId?: string; record?: TeamGoalRecord };
+  assessment?: TeamRunAssessment;
   brief?: TeamBrief;
   discovery?: { revision: number; summary: string; tasks: TeamScout[]; completedAt?: string };
   noChange?: { summary: string; evidence: TeamEvidence[] };
@@ -41,8 +52,26 @@ export type TeamView = {
   resumable?: boolean;
   continuable?: boolean;
   continuations?: TeamContinuation[];
-  /** Omitted by older hosts. */
   workers?: { limit: number; max: number; running: number; ready: number };
+  waitReasons?: TeamWaitReason[];
+};
+export type TeamListItem = Pick<TeamView, "id" | "projectId" | "provider" | "title" | "parallelism" | "revision" | "status" | "createdAt" | "updatedAt" | "lastActivityAt"
+  | "workspace" | "branch" | "baseCommit" | "headCommit" | "decisions" | "events" | "reason" | "missionId" | "resumable" | "continuable" | "workers" | "waitReasons"> & {
+  members: (Omit<TeamMember, "cwd" | "baseCommit" | "modelProfile" | "usage"> & { startedAt?: string; reportedAt?: string; lastActivityAt?: string; spinnerOnlySince?: string; pendingLimit?: boolean; stalledAt?: string;
+    modelProfile?: Pick<TeamModelProfile, "label" | "provider" | "tier">; usage?: Pick<UsageTotals, "cost"> })[];
+  tasks: (Pick<TeamTask, "id" | "title" | "status" | "paths" | "memberId" | "ownerRating"> & { changedPaths?: { paths: string[]; truncated: boolean } })[];
+  checks: Pick<TeamView["checks"][number], "status" | "revision">[];
+  lineup?: Pick<TeamLineup, "coordinator">;
+  goal?: Pick<NonNullable<TeamView["goal"]>, "id" | "revision" | "cycle">;
+  linear?: Omit<LinearTrackingView, "issue"> & { issue?: Pick<NonNullable<LinearTrackingView["issue"]>, "identifier" | "url" | "title" | "state"> };
+  review?: Pick<NonNullable<TeamView["review"]>, "verdict" | "revision">;
+  discovery?: { revision: number };
+  deliveryReceipt?: Omit<NonNullable<TeamView["deliveryReceipt"]>, "summary">;
+  pullRequest?: Omit<NonNullable<TeamView["pullRequest"]>, "summary">;
+  permissions?: { mode: "coordinator"; maxDecisions: number };
+  permissionsRevokedAt?: string;
+  permissionDecisions?: { targetSessionId: string; promptId: number; status: string }[];
+  usage?: Pick<TeamUsage, "total" | "unmeasuredMembers">;
 };
 type CreateRequest = { requestId: string; projectId: string; provider: string; title: string; objective: string; useConfiguredLineup?: boolean };
 type MutationRequest = { requestId: string; revision: number; text?: string; path: string; label: string };
@@ -54,18 +83,23 @@ const rejected = (error: unknown) => error instanceof ApiError && error.status >
 const labels: Record<TeamStatus, string> = { planning: "Planning", discovering: "Investigating", implementing: "Implementing", integrating: "Integrating", verifying: "Running checks", reviewing: "Reviewing", delivering: "Delivering", merged: "Merge reported", "needs-input": "Needs your input", paused: "Paused", blocked: "Blocked", "ready-for-review": "Ready for your review", "no-change": "No change proposed", cancelled: "Cancelled" };
 const roles: Record<TeamRole, { name: string; description: string }> = {
   "project-manager": { name: "Coordinator", description: "Plans tasks, assigns implementers, and asks for decisions." },
+  "intent-checker": { name: "Intent checker", description: "Compares the plan with the objective record before work starts." },
   scout: { name: "Scout", description: "Investigates the project and reports evidence before implementation." },
   implementer: { name: "Implementers", description: "Build independent tasks in separate workspaces." },
   integrator: { name: "Integrator", description: "Repairs failed checks and review findings." },
   delivery: { name: "Delivery", description: "Publishes and merges reviewed changes under the repository policy." },
   reviewer: { name: "Reviewer", description: "Reviews the result against your request." },
+  evaluator: { name: "Evaluator", description: "Reads the finished work and reports a provisional verdict against the objective." },
 };
 const date = (value: string) => new Date(value).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+function askedBy(team: TeamView, decision: TeamDecision) {
+  const member = team.members.find(item => item.memberId === decision.memberId);
+  return member ? roles[member.role].name : "Team";
+}
 const statusClass = (status: TeamStatus) => ["needs-input", "blocked", "paused"].includes(status) ? "waiting" : ["ready-for-review", "merged"].includes(status) ? "ready" : ["cancelled", "no-change"].includes(status) ? "inactive" : "";
 function Status({ status }: { status: TeamStatus }) { return <span className={"team-status " + statusClass(status)}><span className="dot" />{labels[status]}</span>; }
 function RoleGuide() { return <div className="team-roles" aria-label="Team responsibilities">{Object.entries(roles).map(([id, role]) => <div key={id}><strong>{role.name}</strong><p>{role.description}</p></div>)}</div>; }
-const leadLabel = (team: TeamView) => team.lineup ? "Coordinator: " + team.lineup.coordinator.label : names[team.provider] ?? team.provider;
-/** Older hosts omit worker counts, so their reported parallelism backs the live status. */
+const leadLabel = (team: Pick<TeamListItem, "lineup" | "provider">) => team.lineup ? "Coordinator: " + team.lineup.coordinator.label : names[team.provider] ?? team.provider;
 export function workerStatus(parallelism: number, workers?: NonNullable<TeamView["workers"]>) {
   if (!workers) return `Up to ${parallelism} workers`;
   const waiting = workers.ready > 0 && workers.running >= workers.limit ? ` · ${workers.ready} ready ${workers.ready === 1 ? "task" : "tasks"} waiting for a worker` : "";
@@ -75,7 +109,6 @@ export function profileSetting(profile: TeamModelProfile) { return profile.provi
 export function ModelProfile({ profile }: { profile: TeamModelProfile }) {
   return <span className="team-model-profile"><strong>{profile.label}{profile.tier && <span className="team-profile-tier">{profile.tier}</span>}</strong><span>Requested: {names[profile.provider] ?? profile.provider} · <code>{profile.model}</code> · {profileSetting(profile)}</span>{profile.limitFallback && <span>On a usage limit: <code>{profile.limitFallback}</code></span>}{profile.dataUse === "contributor" && <span className="team-data-use">Contributor data use is enabled for this profile. Its provider’s contributor terms apply.</span>}</span>;
 }
-/** Shown while the host remembers a provider at its limit. Reset times are the provider's own statement. */
 export function ProviderLimitNotice({ limits }: { limits?: ProviderLimit[] }) {
   const now = Date.now(), active = (limits ?? []).filter(limit => Date.parse(limit.expiresAt) > now);
   if (!active.length) return null;
@@ -96,7 +129,7 @@ export function Lineup({ lineup }: { lineup: TeamLineup }) {
 }
 export function EvidenceSource({ source }: { source: string }) {
   let url: URL | undefined;
-  try { const candidate = new URL(source); if (["https:", "http:"].includes(candidate.protocol) && !candidate.username && !candidate.password) url = candidate; } catch { /* Notes and repository paths stay as text. */ }
+  try { const candidate = new URL(source); if (["https:", "http:"].includes(candidate.protocol) && !candidate.username && !candidate.password) url = candidate; } catch {}
   return url ? <a href={url.href} target="_blank" rel="noopener noreferrer">{source}</a> : <span>{source}</span>;
 }
 export function EvidenceList({ evidence }: { evidence: TeamEvidence[] }) {
@@ -116,10 +149,9 @@ function SetupNotice({ me }: { me: Me }) {
   return null;
 }
 
-/** Blocked runs lead every team list; each group keeps its received order. */
-const blockedFirst = (teams: TeamView[]) => [...teams.filter(team => team.status === "blocked"), ...teams.filter(team => team.status !== "blocked")];
+const blockedFirst = (teams: TeamListItem[]) => [...teams.filter(team => team.status === "blocked"), ...teams.filter(team => team.status !== "blocked")];
 
-export function TeamPicker({ teams, selected, loading, onSelect }: { teams: TeamView[]; selected: string | null; loading: boolean; onSelect: (id: string) => void }) {
+export function TeamPicker({ teams, selected, loading, onSelect }: { teams: TeamListItem[]; selected: string | null; loading: boolean; onSelect: (id: string) => void }) {
   return <nav className="session-list team-picker" aria-label="Agent teams">
     {blockedFirst(teams).map(team => <button className={"session-row " + (selected === team.id ? "selected" : "")} key={team.id} onClick={() => onSelect(team.id)} aria-current={selected === team.id ? "page" : undefined}>
       <div className="row-top"><Users size={15} /><strong>{team.title}</strong><ChevronRight size={16} /></div>
@@ -131,7 +163,7 @@ export function TeamPicker({ teams, selected, loading, onSelect }: { teams: Team
 }
 
 export function TeamList({ teams, me, fresh, stale, loading, failed, seen, onCreate, onSelect, refresh, openCost }: {
-  teams: TeamView[]; me: Me; fresh: boolean; stale: boolean; loading: boolean; failed: boolean; seen: string;
+  teams: TeamListItem[]; me: Me; fresh: boolean; stale: boolean; loading: boolean; failed: boolean; seen: string;
   onCreate: () => void; onSelect: (id: string) => void; refresh: () => void; openCost: () => void;
 }) {
   return <div className="team-page team-list-page">
@@ -151,7 +183,7 @@ export function TeamList({ teams, me, fresh, stale, loading, failed, seen, onCre
   </div>;
 }
 
-function TeamListResume({ team, fresh, refresh }: { team: TeamView; fresh: boolean; refresh: () => void }) {
+function TeamListResume({ team, fresh, refresh }: { team: TeamListItem; fresh: boolean; refresh: () => void }) {
   const api = useApi();
   const machine = useMachines().active.id;
   const key = machine + "/" + team.id;
@@ -247,7 +279,7 @@ export function TeamCreate({ me, connected, done }: { me: Me; connected: boolean
 function eventLabel(event: LogEvent) {
   if (event.type === "signal") return String(event.data.kind ?? "Signal");
   if (event.type === "input-result") return event.data.state === "delivered" ? "Input delivered" : "Input";
-  if (event.type === "lifecycle") return String(event.data.status ?? "Session updated");
+  if (event.type === "lifecycle") return `${String(event.data.status ?? "Session updated")}${event.data.outputTailIncomplete ? " (the recording may be missing the session’s last output)" : ""}`;
   return event.type;
 }
 function eventDetail(event: LogEvent) {
@@ -344,7 +376,14 @@ export function TeamDetail({ id, me, connected, sessions, refreshTeams, openSess
     inFlight.add(body.requestId); setBusy(true);
     try {
       const { path: endpoint, label: action, ...payload } = body;
-      const result = await api<TeamView>(endpoint, payload);
+      let result: TeamView;
+      if (endpoint.endsWith("/answer")) {
+        if (typeof body.text !== "string") {
+          mutations.fail(key, body.requestId, "The answer text is missing.", true);
+          return;
+        }
+        result = await postDecisionAnswer<TeamView>(api, endpoint, { requestId: body.requestId, revision: body.revision, text: body.text });
+      } else result = await api<TeamView>(endpoint, payload);
       const accepted = mutations.complete(key, body.requestId, { id: result.id }, action + " recorded. Revision " + result.revision + ".");
       if (mounted.current) { receive(result); if (accepted && (endpoint.endsWith("/steer") || endpoint.endsWith("/continue"))) setDirection(""); view.refresh(); refreshTeams(); }
     } catch (error) {
@@ -354,7 +393,10 @@ export function TeamDetail({ id, me, connected, sessions, refreshTeams, openSess
     } finally { inFlight.delete(body.requestId); if (mounted.current) setBusy(false); }
   }
   const action = (name: string, label: string) => void mutate("/teams/" + id + "/" + name, label);
-  const [mode, setMode] = useState<"summary" | "logs">("summary");
+  const initialHash = parseTeamEntryHash(window.location.hash, id);
+  const [mode, setMode] = useState<"summary" | "board" | "logs">(initialHash?.entryId ? "board" : "summary");
+  const [selectedEntryId, setSelectedEntryId] = useState<string | null>(initialHash?.entryId ?? null);
+  const [boardMemberFilter, setBoardMemberFilter] = useState("all");
   const [agentId, setAgentId] = useState("");
   const [briefs, setBriefs] = useState<{ sessionId: string; status: BriefingView }[]>([]);
   const [briefError, setBriefError] = useState("");
@@ -363,6 +405,37 @@ export function TeamDetail({ id, me, connected, sessions, refreshTeams, openSess
   const [logEvents, setLogEvents] = useState<LogEvent[]>([]);
   const [followLog, setFollowLog] = useState(true);
   const logCursor = useRef<number | null>(null);
+  useEffect(() => {
+    const parsed = parseTeamEntryHash(window.location.hash, id);
+    if (parsed?.entryId) {
+      setMode("board");
+      setSelectedEntryId(parsed.entryId);
+    }
+    const onHashChange = () => {
+      const next = parseTeamEntryHash(window.location.hash, id);
+      if (next?.entryId) {
+        setMode("board");
+        setSelectedEntryId(next.entryId);
+      } else if (next && !next.entryId) {
+        setSelectedEntryId(null);
+      }
+    };
+    window.addEventListener("hashchange", onHashChange);
+    return () => window.removeEventListener("hashchange", onHashChange);
+  }, [id]);
+  function selectMode(next: "summary" | "board" | "logs") {
+    setMode(next);
+    if (next !== "board") {
+      setSelectedEntryId(null);
+      const current = parseTeamEntryHash(window.location.hash, id);
+      if (current?.entryId) history.replaceState(null, "", buildTeamEntryHash(machine, id));
+    }
+  }
+  function selectBoardEntry(entryId: string | null) {
+    setSelectedEntryId(entryId);
+    const current = parseTeamEntryHash(window.location.hash, id);
+    if (current) history.replaceState(null, "", buildTeamEntryHash(machine, id, entryId));
+  }
   const orderedMembers = team ? monitorMembers(team.members, team.revision) : [];
   const summaryTargets = orderedMembers.filter(member => member.revision === team?.revision).slice(0, 6);
   const summaryKey = mode === "summary" ? (summaryTargets.length ? summaryTargets : orderedMembers.slice(0, 1)).map(member => member.sessionId).join(",") : "";
@@ -425,7 +498,6 @@ export function TeamDetail({ id, me, connected, sessions, refreshTeams, openSess
   const attention = memberSessions.filter(session => session.attention?.state === "needs-you");
   const selectedMember = team.members.find(member => member.memberId === agentId);
   const workersText = workerStatus(team.parallelism, team.workers);
-  /** A mission's coordinator runs this team; people read it and talk to the coordinator from the mission. */
   const missionManaged = Boolean(team.missionId);
   const continuationComposer = me.role === "owner"
     ? <form className="team-continuation-form" onSubmit={event => { event.preventDefault(); if (!busy && !pending) void mutate("/teams/" + id + "/continue", "Continue development", direction.trim() || undefined); }}>
@@ -438,7 +510,7 @@ export function TeamDetail({ id, me, connected, sessions, refreshTeams, openSess
       </form>
     : <p className="quiet">Only an owner can continue this blocked run.</p>;
   return <div className="team-detail">
-    <header className="team-detail-heading"><div><p className="team-eyebrow">{me.projects.find(project => project.id === team.projectId)?.name ?? team.projectId} · {leadLabel(team)}</p><h1>{team.title}</h1><div className="team-detail-meta"><Status status={team.status} /><span>Revision {team.revision}</span><span className="team-workers" title={workersText}>{workersText}</span><span className="team-freshness" role="status">{view.stale ? "Showing last received state; controls are disabled." : ""}</span></div></div><div className="team-heading-actions"><div className="team-view-switch" role="group" aria-label="Team view"><button type="button" aria-pressed={mode === "summary"} onClick={() => setMode("summary")}>Summary</button><button type="button" aria-pressed={mode === "logs"} onClick={() => setMode("logs")}>Review logs</button></div><button className="text-button team-refresh" disabled={view.refreshing} onClick={view.refresh} aria-busy={view.refreshing}><RefreshCw className={view.refreshing ? "is-refreshing" : ""} size={14} />Refresh team</button></div></header>
+    <header className="team-detail-heading"><div><p className="team-eyebrow">{me.projects.find(project => project.id === team.projectId)?.name ?? team.projectId} · {leadLabel(team)}</p><h1>{team.title}</h1><div className="team-detail-meta"><Status status={team.status} /><span>Revision {team.revision}</span><span className="team-workers" title={workersText}>{workersText}</span><span className="team-freshness" role="status">{view.stale ? "Showing last received state; controls are disabled." : ""}</span></div></div><div className="team-heading-actions"><div className="team-view-switch" role="group" aria-label="Team view"><button type="button" aria-pressed={mode === "summary"} onClick={() => selectMode("summary")}>Summary</button><button type="button" aria-pressed={mode === "board"} onClick={() => selectMode("board")}>Board</button><button type="button" aria-pressed={mode === "logs"} onClick={() => selectMode("logs")}>Review logs</button></div><button className="text-button team-refresh" disabled={view.refreshing} onClick={view.refresh} aria-busy={view.refreshing}><RefreshCw className={view.refreshing ? "is-refreshing" : ""} size={14} />Refresh team</button></div></header>
     <div className="team-detail-body">
       {team.reason && <p className="team-notice" role="status">{team.reason}</p>}
       <LinearTracking tracking={team.linear} stale={view.stale} />
@@ -447,9 +519,10 @@ export function TeamDetail({ id, me, connected, sessions, refreshTeams, openSess
       {team.pullRequest && <p className="team-notice team-ready"><Check size={18} /><span>The delivery agent reports an open pull request for the reviewed commit. The host records this report; it does not independently verify GitHub. {/^https:\/\//.test(team.pullRequest.pullRequestUrl) ? <a href={team.pullRequest.pullRequestUrl} target="_blank" rel="noreferrer">Open the pull request</a> : null}</span></p>}
       {team.goal && <p className="goal-team-origin"><a href={goalHref}>Open goal</a> · cycle {team.goal.cycle} · goal revision {team.goal.revision}</p>}
       {team.noChange && <section className="team-section"><h2>No change proposed</h2><p className="team-prose">{team.noChange.summary}</p><EvidenceList evidence={team.noChange.evidence} /></section>}
-      {openDecisions.length > 0 && <section className="team-section team-decisions"><h2>{missionManaged ? "Open decisions" : "Decisions for you"} <span className="quiet">{openDecisions.length}</span></h2>{openDecisions.map(decision => <Decision key={decision.id} decision={decision} disabled={!canSteer || team.status === "paused" || busy || Boolean(pending)} member={team.members.find(member => member.memberId === decision.memberId)} answer={text => void mutate("/teams/" + id + "/decisions/" + decision.id + "/answer", "Answer", text)} readOnly={missionManaged} />)}</section>}
+      {openDecisions.length > 0 && <section className="team-section team-decisions"><h2>{missionManaged ? "Open decisions" : "Decisions for you"} <span className="quiet">{openDecisions.length}</span></h2>{openDecisions.map(decision => <Decision key={decision.id} decision={decision} disabled={!canSteer || team.status === "paused" || busy || Boolean(pending)} from={askedBy(team, decision)} answer={text => void mutate("/teams/" + id + "/decisions/" + decision.id + "/answer", "Answer", text)} readOnly={missionManaged} />)}</section>}
       {attention.length > 0 && <section className="team-section team-decisions"><h2>Agent sessions need you</h2><p className="quiet">The host answers ordinary prompts in a member’s own workspace. These sessions still wait on a provider prompt; respond in the session.</p>{attention.map(session => <button className="team-session-link" key={session.id} onClick={() => openSession(session.id)}><span><strong>{session.title}</strong><small>{session.attention?.now ?? "Open the session to respond."}</small></span><ArrowUpRight size={18} /></button>)}</section>}
       <ProviderLimitNotice limits={team.providerLimits} />
+      <TeamOverview team={team} sessions={sessions} onOpenSession={openSession} onInspectMemberEntries={memberId => { setSelectedEntryId(null); setBoardMemberFilter(memberId); selectMode("board"); }} onViewMemberLogs={memberId => { setAgentId(memberId); selectMode("logs"); }} />
       <section className="team-section"><h2>Your request</h2><p className="team-prose">{team.objective}</p></section>
       {mode === "logs" ? <>
         <div className="team-agent-switch" role="tablist" aria-label="Agents">{orderedMembers.map(member => <button type="button" role="tab" key={member.memberId} aria-selected={member.memberId === agentId} onClick={() => setAgentId(member.memberId)}><strong><span className={"team-agent-dot" + (["running", "waiting"].includes(member.status) ? " live" : "")} />{roles[member.role].name}</strong><span>{member.status}{member.revision === team.revision ? "" : ` · revision ${member.revision}`}</span></button>)}</div>
@@ -459,8 +532,9 @@ export function TeamDetail({ id, me, connected, sessions, refreshTeams, openSess
           return <div className="team-agent-stepper"><button type="button" className="text-button" onClick={() => step(-1)}>‹ Previous</button><span className="quiet">Agent {index + 1} of {orderedMembers.length}</span><button type="button" className="text-button" onClick={() => step(1)}>Next ›</button></div>;
         })()}
         {selectedMember ? <TeamLogs member={selectedMember} session={logSession?.id === selectedMember.sessionId ? logSession : null} events={logEvents} stale={logs.stale} follow={followLog} setFollow={setFollowLog} onOpen={() => openSession(selectedMember.sessionId)} /> : <p className="quiet">This run has no agents yet.</p>}
-        <button type="button" className="text-button team-back-summary" onClick={() => setMode("summary")}>Back to summary</button>
-      </> : <RepositorySummary team={team} rows={briefs} failed={briefing.failed} asking={asking} error={briefError} onRequest={sessionId => void requestSummary(sessionId)} />}
+        <button type="button" className="text-button team-back-summary" onClick={() => selectMode("summary")}>Back to summary</button>
+      </> : mode === "board" ? <TeamEvidenceBoard team={team} me={me} fresh={fresh} sessions={sessions} selectedEntryId={selectedEntryId} memberFilter={boardMemberFilter} onMemberFilterChange={setBoardMemberFilter} onSelectEntry={selectBoardEntry} onOpenSession={openSession} onViewMemberLogs={memberId => { setAgentId(memberId); selectMode("logs"); }} />
+        : <RepositorySummary team={team} rows={briefs} failed={briefing.failed} asking={asking} error={briefError} onRequest={sessionId => void requestSummary(sessionId)} />}
       <details className="team-run-details"><summary>Run details</summary>
       {team.brief && <section className="team-section"><h2>Opportunity brief <span className="quiet">(agent proposal)</span></h2><TeamBriefView brief={team.brief} /></section>}
       {team.discovery && <section className="team-section"><h2>Discovery</h2><p className="team-prose">{team.discovery.summary}</p>{team.discovery.tasks.map(task => <article className="team-task" key={task.id}><div className="team-task-heading"><h3>{task.title}</h3><span className="team-task-state">{task.status}</span></div>{team.lineup?.implementers.find(profile => profile.id === task.agentProfileId) && <ModelProfile profile={team.lineup.implementers.find(profile => profile.id === task.agentProfileId)!} />}{task.summary && <p className="team-prose">{task.summary}</p>}{task.evidence && <EvidenceList evidence={task.evidence} />}<details><summary>Scout instructions</summary><p className="team-prose">{task.instructions}</p></details></article>)}</section>}
@@ -469,7 +543,7 @@ export function TeamDetail({ id, me, connected, sessions, refreshTeams, openSess
       <section className="team-section"><h2>Verification evidence</h2><p className="quiet">Host check results and the reviewer’s assessment are recorded separately.</p><h3>Required checks</h3>{team.checks.length ? team.checks.map((check, index) => <details className="team-check" key={check.startedAt + "/" + index}><summary><code>{[check.command.command, ...check.command.args].join(" ")}</code><span className={"team-check-status " + check.status}>{check.status} · revision {check.revision}</span></summary><p className="quiet">Revision {check.revision} · started {date(check.startedAt)}{check.finishedAt && " · finished " + date(check.finishedAt)}{check.exitCode !== undefined && " · exit " + String(check.exitCode)}</p><pre>{check.output || "No output recorded."}</pre></details>) : <p className="quiet">No check results recorded yet.</p>}<h3 className="team-review-heading">Reviewer assessment <span className="quiet">(agent report)</span></h3>{team.review ? <div><p><strong>{team.review.verdict === "approved" ? "Approved by reviewer" : "Changes requested"}</strong> <span className="quiet">· revision {team.review.revision}</span></p><p className="team-prose">{team.review.summary}</p>{team.review.uiEvidence && <><h4>Reviewer UI evidence</h4><p className="team-prose">{team.review.uiEvidence}</p></>}</div> : <p className="quiet">No reviewer assessment recorded yet.</p>}</section>
       <UsageRollup me={me} usage={team.usage} heading="Agent spend" />
       <section className="team-section"><h2>Review the changes</h2><dl className="team-output"><dt><GitBranch size={15} />Branch</dt><dd><code>{team.branch}</code></dd><dt>Workspace</dt><dd><code>{team.workspace}</code></dd><dt>Base commit</dt><dd><code>{team.baseCommit}</code></dd>{team.headCommit && <><dt>Head commit</dt><dd><code>{team.headCommit}</code></dd></>}</dl></section>
-      {(team.steering.length > 0 || team.decisions.some(decision => decision.answer !== undefined)) && <section className="team-section"><h2>Your directions and decisions</h2>{team.steering.map((entry, index) => <div className="team-record" key={entry.at + "/" + index}><small>Direction · revision {entry.revision} · {date(entry.at)}</small><p className="team-prose">{entry.text}</p></div>)}{team.decisions.filter(decision => decision.answer !== undefined).map(decision => <div className="team-record" key={decision.id}><small>Decision · revision {decision.revision}</small><p className="team-prose">{decision.question}</p><p className="team-prose"><strong>{decision.answeredBy === "coordinator" ? "Mission coordinator: " : "Your answer: "}</strong>{decision.answer}</p></div>)}</section>}
+      {(team.steering.length > 0 || team.decisions.some(decision => decision.answer !== undefined)) && <section className="team-section"><h2>Directions and decisions</h2>{team.steering.map((entry, index) => <div className="team-record" key={entry.at + "/" + index}><small>{directionSourceLabel(entry.source)} · direction · revision {entry.revision} · {date(entry.at)}</small><p className="team-prose">{entry.text}</p></div>)}{team.decisions.filter(decision => decision.answer !== undefined).map(decision => <div className="team-record" key={decision.id}><small>Decision · revision {decision.revision}</small><p className="team-prose">{decision.question}</p><p className="team-prose"><strong>{decision.answeredBy === "connector" ? `${decision.source?.name ?? "Connector"}: ` : decision.answeredBy === "coordinator" ? "Mission coordinator: " : "Your answer: "}</strong>{decision.answer}</p><OutcomeNote decision={decision} /></div>)}</section>}
       {team.continuations?.length ? <section className="team-section"><h2>Earlier blocked revisions</h2>{team.continuations.map(continuation => <article className="team-record" key={continuation.requestId}><small>Revision {continuation.revision} · continued {date(continuation.at)}</small><p className="team-prose">{continuation.reason}</p><p className="quiet">Preserved head commit: <code>{continuation.headCommit}</code> · {continuation.tasks.length} tasks</p>{continuation.tasks.map(task => <details key={task.id}><summary>{task.title} · {task.status}</summary>{task.summary && <p className="team-prose">{task.summary}</p>}<p className="team-prose">{task.instructions}</p>{task.paths.length > 0 && <p className="quiet">Paths: {task.paths.join(", ")}</p>}{task.commit && <p className="quiet">Integrated commit: <code>{task.commit}</code></p>}</details>)}{continuation.review && <><h3>Reviewer assessment · revision {continuation.review.revision}</h3><p className="team-prose">{continuation.review.verdict}: {continuation.review.summary}</p>{continuation.review.uiEvidence && <p className="team-prose">Interface evidence: {continuation.review.uiEvidence}</p>}</>}{continuation.brief && <TeamBriefView brief={continuation.brief} />}</article>)}</section> : null}
       {team.events.length > 0 && <section className="team-section"><div className="team-history"><h2>Run history</h2><ol>{team.events.map((event, index) => <li key={event.at + "/" + index}><time>{date(event.at)}</time><p>{event.text}</p></li>)}</ol></div></section>}
       </details>
@@ -483,7 +557,9 @@ export function TeamDetail({ id, me, connected, sessions, refreshTeams, openSess
   </div>;
 }
 
-function Decision({ decision, disabled, member, answer, readOnly }: { decision: TeamDecision; disabled: boolean; member?: TeamMember; answer: (text: string) => void; readOnly: boolean }) {
-  const [text, setText] = useState("");
-  return <article className="team-decision"><p className="quiet">{member ? roles[member.role].name : "Team"} · revision {decision.revision}</p><p className="team-prose">{decision.question}</p>{!readOnly && <><div className="team-decision-options">{decision.options.map((option, index) => <button key={index} disabled={disabled} onClick={() => answer(option)}>{option}</button>)}</div><form onSubmit={event => { event.preventDefault(); if (text.trim()) answer(text.trim()); }}><label className="sr-only" htmlFor={"decision-" + decision.id}>Your answer</label><textarea id={"decision-" + decision.id} rows={2} maxLength={8000} placeholder="Write your answer…" value={text} onChange={event => setText(event.target.value)} disabled={disabled} /><button className="primary" disabled={disabled || !text.trim()}>Send answer <ArrowUpRight size={16} /></button></form></>}</article>;
+function OutcomeNote({ decision }: { decision: TeamDecision }) {
+  const outcome = decision.recommendation?.outcome;
+  if (outcome === "matched") return <p className="quiet">Matched the recommendation</p>;
+  if (outcome === "different") return <p className="quiet">Different from the recommendation</p>;
+  return null;
 }

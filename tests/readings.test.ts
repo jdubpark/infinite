@@ -27,7 +27,7 @@ function setup(options: { title?: string; prompt?: string; provider?: Provider; 
     context: "", initialPrompt: options.prompt ?? "", ...(options.generatedTitle ? { generatedTitle: true as const } : {}),
   };
   const row: ReadingRow = { id, title: session.title, provider: session.provider, attention: now(options.lastMessage ?? longMessage) };
-  const manager = { list: async () => [row], meta: () => ({ session }) } as any;
+  const manager = { list: async () => [row], meta: () => ({ session }), metaRevision: () => "rev-1" } as any;
   const config = { stateDir, jev: { apiKeyFile, model: "jev-latest", baseUrl: "https://api.typesafe.ai" } } as Config;
   const readings = new Readings(config, key, manager, options.writer, options.transport);
   return { root, row, session, manager, readings, config, key, dispose: () => rmSync(root, { recursive: true, force: true }) };
@@ -190,10 +190,173 @@ test("background polling retains compact session snapshots instead of full promp
   f.row.attention = { ...f.row.attention, state: "working" };
   try {
     await f.readings.tick();
-    const state = f.readings as unknown as { latestRows: Map<string, unknown>; latestSessions: Map<string, unknown> };
-    const retained = JSON.stringify({ rows: [...state.latestRows.values()], sessions: [...state.latestSessions.values()] });
-    assert.ok(retained.length < 2_048, `retained row and session snapshots were ${retained.length} bytes`);
+    const state = f.readings as unknown as { latestRows: Map<string, unknown>; latestSessions: Map<string, unknown>; settledSessions: Map<string, unknown> };
+    const retained = JSON.stringify({ rows: [...state.latestRows.values()], sessions: [...state.latestSessions.values()], settled: [...state.settledSessions.values()] });
+    assert.ok(retained.length < 2_048, `retained row, session, and settled snapshots were ${retained.length} bytes`);
+    assert.equal(state.settledSessions.has(f.row.id), true, "the listed session has a remembered snapshot");
+    f.readings.merge([]);
+    assert.equal(state.settledSessions.has(f.row.id), false, "a complete snapshot without the session drops its remembered entry");
   } finally { f.dispose(); }
+});
+
+test("polling reads a session record once unless a title job is due", async () => {
+  const f = setup({ title: "Fix the login flow" });
+  const sessions: Record<string, Session> = {
+    O: { ...f.session, id: "O", title: "Fix the login flow", generatedTitle: undefined, initialPrompt: "Fix the login flow" },
+    S: { ...f.session, id: "S", title: "", generatedTitle: true, initialPrompt: "Short prompt" },
+    C: { ...f.session, id: "C", title: "", generatedTitle: true, initialPrompt: longLine },
+  };
+  const reads: Record<string, number> = { O: 0, S: 0, C: 0 };
+  const rows: ReadingRow[] = (["O", "S", "C"] as const).map(id => ({ id, title: sessions[id].title, provider: "claude", backend: "infinite", attention: { ...now("Working."), state: "working" } }));
+  f.manager.list = async () => rows;
+  f.manager.meta = (id: string) => { reads[id]!++; return { session: sessions[id] }; };
+  try {
+    await f.readings.tick();
+    await f.readings.tick();
+    assert.deepEqual(reads, { O: 1, S: 1, C: 1 });
+    const complete = f.readings.merge(rows);
+    assert.deepEqual(complete[1]!.reading?.title, { text: "Short prompt", source: "first-line" });
+    assert.equal(reads.S, 1, "a short first line of a complete snapshot is answered from the remembered snapshot");
+    const { backend: _backend, ...bare } = rows[1]!;
+    f.readings.merge([bare]);
+    assert.equal(reads.S, 2, "a single-session read follows no listing and reads that record again");
+    await f.readings.tick();
+    assert.equal(reads.S, 2, "a tick after a single-session read answers from the remembered snapshot");
+    f.readings.merge([rows[1]!], false);
+    assert.equal(reads.S, 3, "a detail read follows no listing and reads that record again");
+    await f.readings.tick();
+    assert.deepEqual(reads, { O: 1, S: 3, C: 1 }, "a detail read keeps what the last listing learned about every other session");
+    rows[0]!.title = "Renamed login flow";
+    await f.readings.tick();
+    assert.equal(reads.O, 2, "a renamed row is read again");
+  } finally { f.dispose(); }
+
+  const writer = { titleFromPrompt: async () => ({ text: "Database read consistency", model: "writer-model" }) };
+
+  const replaced = setup({ title: "", generatedTitle: true, prompt: "Short A" });
+  let replacedPrompt = "Short A";
+  let replacedRevision: string | undefined = "rev-1";
+  let replacedReads = 0;
+  replaced.row.backend = "infinite";
+  replaced.manager.metaRevision = () => replacedRevision;
+  replaced.manager.meta = () => { replacedReads++; return { session: { ...replaced.session, initialPrompt: replacedPrompt } }; };
+  try {
+    await replaced.readings.tick();
+    await replaced.readings.tick();
+    assert.equal(replacedReads, 1, "an unchanged record is read once");
+    replacedPrompt = "Short B";
+    replacedRevision = "rev-2";
+    await replaced.readings.tick();
+    assert.equal(replacedReads, 2, "a record replaced under the same title is read again");
+    assert.deepEqual(replaced.readings.merge([replaced.row])[0]!.reading?.title, { text: "Short B", source: "first-line" });
+    replacedRevision = undefined;
+    const beforeUnsettled = replacedReads;
+    await replaced.readings.tick();
+    await replaced.readings.tick();
+    assert.equal(replacedReads, beforeUnsettled + 2, "a record with no settled revision is read on every listing");
+  } finally { replaced.dispose(); }
+
+  const titleGate = async (count: number) => {
+    const settles: Array<(error: Error) => void> = [];
+    const hanging = { systemOne: (_request: unknown) => new Promise((_resolve, reject) => { settles.push(reject); }) } as unknown as JevTransport;
+    const fixture = setup({ title: "", generatedTitle: true, prompt: longLine, lastMessage: "Short.", transport: hanging, writer });
+    const ids = Array.from({ length: count }, (_, index) => `T${index}`);
+    const counts = new Map(ids.map(id => [id, 0]));
+    const gateRows: ReadingRow[] = ids.map(id => ({ id, title: "", provider: "claude", attention: { ...now("Working."), state: "working" } }));
+    fixture.manager.list = async () => gateRows;
+    fixture.manager.meta = (id: string) => { counts.set(id, counts.get(id)! + 1); return { session: { ...fixture.session, id, initialPrompt: longLine } }; };
+    return { fixture, ids, counts, settles };
+  };
+  const pendingState = (readings: Readings) => readings as unknown as { queue: Map<string, unknown>; active: Map<string, string> };
+  const total = (counts: Map<string, number>) => [...counts.values()].reduce((sum, value) => sum + value, 0);
+
+  const five = await titleGate(5);
+  try {
+    for (let tick = 0; tick < 3; tick++) await five.fixture.readings.tick();
+    assert.deepEqual([...five.counts.values()], [1, 1, 1, 1, 1], "each candidate is read once while two jobs run and three are queued");
+    assert.equal(five.settles.length, 2, "two title jobs run");
+  } finally { five.fixture.readings.stop(); five.fixture.dispose(); }
+
+  const full = await titleGate(60);
+  try {
+    await full.fixture.readings.tick();
+    await full.fixture.readings.tick();
+    const state = pendingState(full.fixture.readings);
+    assert.equal(state.queue.size, 50, "the queue is full after the second poll");
+    const waiting = full.ids.filter(id => !state.queue.has(`${id}:title`) && !state.active.has(`${id}:title`));
+    assert.ok(waiting.length > 0, "some candidates are neither queued nor running");
+    const readsBeforeFull = total(full.counts);
+    await full.fixture.readings.tick();
+    await full.fixture.readings.tick();
+    assert.equal(total(full.counts), readsBeforeFull, "a full queue reads no record, although candidates wait");
+
+    const waitingBefore = new Set(full.ids.filter(id => !state.queue.has(`${id}:title`) && !state.active.has(`${id}:title`)));
+    const countsBefore = new Map(full.counts);
+    full.settles.shift()!(new Error("provider unavailable"));
+    await new Promise(resolve => setTimeout(resolve, 20));
+    await full.fixture.readings.tick();
+    const newlyRead = full.ids.filter(id => full.counts.get(id)! > countsBefore.get(id)!);
+    assert.equal(newlyRead.length, 1, "one free slot reads one waiting record");
+    assert.ok(waitingBefore.has(newlyRead[0]!), "the record read for the free slot was a waiting candidate");
+  } finally { full.fixture.readings.stop(); full.fixture.dispose(); }
+
+  let failedCalls = 0;
+  const failing = { systemOne: async () => { failedCalls++; throw new Error("timeout"); } } as unknown as JevTransport;
+  const failure = setup({ title: "", generatedTitle: true, prompt: longLine, lastMessage: "Short.", transport: failing, writer });
+  let failureReads = 0;
+  failure.manager.meta = () => { failureReads++; return { session: failure.session }; };
+  try {
+    await failure.readings.tick();
+    await eventually(() => failedCalls === 1);
+    await new Promise(resolve => setTimeout(resolve, 10));
+    await failure.readings.tick();
+    await failure.readings.tick();
+    assert.equal(failureReads, 1, "a failed title job is not read again while its failure holds");
+    assert.equal(failedCalls, 1);
+    const real = Date.now;
+    Date.now = () => real() + 11 * 60_000;
+    try { await failure.readings.tick(); } finally { Date.now = real; }
+    assert.equal(failureReads, 2, "an expired failure makes the record due again");
+    await eventually(() => failedCalls === 2);
+  } finally { failure.dispose(); }
+
+  const clear = responding({ clear: 0.9 });
+  const answered = setup({ title: "", generatedTitle: true, prompt: longLine, lastMessage: "Short.", transport: clear.transport, writer });
+  let answeredReads = 0;
+  answered.manager.meta = () => { answeredReads++; return { session: answered.session }; };
+  try {
+    await answered.readings.tick();
+    const listed = [{ ...answered.row, backend: "infinite" as const }];
+    await eventually(() => answered.readings.merge(listed)[0].reading?.title?.source === "jev-first-line");
+    await answered.readings.tick();
+    await answered.readings.tick();
+    assert.equal(answeredReads, 1, "a finished title reading is not read again");
+  } finally { answered.dispose(); }
+
+  let pendingCalls = 0;
+  const pending = { systemOne: async () => { pendingCalls++; return new Promise<never>(() => {}); } } as unknown as JevTransport;
+  const waiting = setup({ title: "", generatedTitle: true, prompt: longLine, lastMessage: "Short.", transport: pending, writer });
+  let waitingReads = 0;
+  waiting.manager.meta = () => { waitingReads++; return { session: waiting.session }; };
+  try {
+    await waiting.readings.tick();
+    await waiting.readings.tick();
+    await waiting.readings.tick();
+    assert.equal(waitingReads, 1, "a pending title job is not read again");
+    assert.equal(pendingCalls, 1);
+  } finally { waiting.readings.stop(); waiting.dispose(); }
+
+  const off = setup({ title: "", generatedTitle: true, prompt: longLine, lastMessage: "Short.", transport: pending, writer });
+  let offReads = 0;
+  off.manager.meta = () => { offReads++; return { session: off.session }; };
+  const quiet = new Readings({ ...off.config, jev: { ...off.config.jev!, sessionReadings: false } }, off.key, off.manager, writer, pending);
+  try {
+    const listed = [{ ...off.row, backend: "infinite" as const }];
+    quiet.merge(listed);
+    quiet.merge(listed);
+    quiet.merge(listed);
+    assert.equal(offReads, 1, "with session readings off, a title candidate is not read again");
+  } finally { off.dispose(); }
 });
 
 test("failures are held briefly, list merging stays synchronous, stale hashes drop, and cache survives restart", async () => {
@@ -366,4 +529,75 @@ test("weak rule-line gate admits weak presentation and rejects clear rule-based 
   assert.equal(isWeakRuleLine(`Progress:\n${clear}`), true, "a colon-ended lead-in has a weak rule line");
   assert.equal(isWeakRuleLine(`Changes made.\n${clear}`), true, "a filler summary lead-in has a weak rule line");
   assert.equal(isWeakRuleLine(clipped), true, "a first sentence longer than the display cap has a weak rule line");
+});
+
+test("requestRoute returns the chosen route with its confidence and sends only the clipped text", async () => {
+  const calls: any[] = [];
+  const transport = { systemOne: async (request: any) => { calls.push(request); return { model: "jev-latest", answers: { route: { type: "choice", choice: "work", confidence: 0.8, probabilities: {} } } }; } } as unknown as JevTransport;
+  const f = setup({ transport });
+  try {
+    assert.deepEqual(await f.readings.requestRoute("x".repeat(1500)), { route: "work", confidence: 0.8 });
+    assert.deepEqual(calls[0].state, { request: "x".repeat(1000) });
+    assert.deepEqual(Object.keys(calls[0].questions.route.criteria), ["answer", "work"]);
+  } finally { f.dispose(); }
+});
+
+test("requestRoute is undefined without jev, on a transport error, and on an unknown choice", async () => {
+  const failing = { systemOne: async () => { throw new Error("down"); } } as unknown as JevTransport;
+  const odd = { systemOne: async () => ({ model: "m", answers: { route: { type: "choice", choice: "other", confidence: 0.9, probabilities: {} } } }) } as unknown as JevTransport;
+  let calls = 0;
+  const working = { systemOne: async () => { calls++; return { model: "m", answers: { route: { type: "choice", choice: "work", confidence: 0.9, probabilities: {} } } }; } } as unknown as JevTransport;
+  const a = setup({ transport: failing }), b = setup({ transport: odd }), c = setup({ transport: working });
+  try {
+    assert.equal(await a.readings.requestRoute("what is this?"), undefined);
+    assert.equal(await b.readings.requestRoute("what is this?"), undefined);
+    delete (c.config as any).jev;
+    assert.equal(await c.readings.requestRoute("what is this?"), undefined);
+    assert.equal(calls, 0);
+  } finally { a.dispose(); b.dispose(); c.dispose(); }
+});
+
+test("sessionReadings false sends no session text to the reading service", async () => {
+  const fake = responding({});
+  const f = setup({ title: "", generatedTitle: true, prompt: longLine, transport: fake.transport });
+  try {
+    (f.config.jev as any).sessionReadings = false;
+    const readings = new Readings(f.config, f.key, f.manager, { titleFromPrompt: async () => ({ text: "Importer branch", model: "m" }) } as any, fake.transport);
+    await readings.tick();
+    const merged = readings.merge([f.row]);
+    await new Promise(resolve => setTimeout(resolve, 50));
+    const again = readings.merge([f.row]);
+    assert.equal(fake.calls.length, 0);
+    assert.equal(merged[0].reading?.now, undefined);
+    assert.equal(again[0].reading?.now, undefined);
+    assert.equal((await readings.requestTitle(longLine))?.text, "Importer branch");
+    assert.equal(fake.calls.length, 0, "requestTitle goes straight to the writer");
+  } finally { f.dispose(); }
+});
+
+test("sessionReadings false still reads the intake route", async () => {
+  const calls: any[] = [];
+  const transport = { systemOne: async (request: any) => { calls.push(request); return { model: "jev-latest", answers: { route: { type: "choice", choice: "answer", confidence: 0.9, probabilities: {} } } }; } } as unknown as JevTransport;
+  const f = setup({ transport });
+  try {
+    (f.config.jev as any).sessionReadings = false;
+    assert.deepEqual(await f.readings.requestRoute("How does the importer pick a branch?"), { route: "answer", confidence: 0.9 });
+    assert.equal(calls.length, 1);
+    assert.deepEqual(Object.keys(calls[0].state), ["request"]);
+  } finally { f.dispose(); }
+});
+
+test("sessionReadings false starts no timer", async () => {
+  const f = setup({ transport: responding({}).transport });
+  try {
+    (f.config.jev as any).sessionReadings = false;
+    let listCalls = 0, intervalCalls = 0;
+    f.manager.list = async () => { listCalls++; return [f.row]; };
+    const original = globalThis.setInterval;
+    globalThis.setInterval = ((...args: Parameters<typeof setInterval>) => { intervalCalls++; return original(...args); }) as typeof setInterval;
+    try { f.readings.start(); await new Promise(resolve => setTimeout(resolve, 30)); }
+    finally { globalThis.setInterval = original; f.readings.stop(); }
+    assert.equal(intervalCalls, 0);
+    assert.equal(listCalls, 0);
+  } finally { f.dispose(); }
 });

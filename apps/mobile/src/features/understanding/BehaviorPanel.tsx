@@ -19,7 +19,6 @@ function canonicalJson(value: unknown): string {
   return `{${Object.keys(object).sort().map(key => `${JSON.stringify(key)}:${canonicalJson(object[key])}`).join(",")}}`;
 }
 
-/** Renders finite-state model evidence for one component. Starting a check is always an explicit owner action. */
 export function BehaviorPanel({ connection, workspaceId, componentId, currentSourceSnapshotId, currentSourceState, behaviors, canRun, onAccessDenied }: {
   connection: Connection; workspaceId: string; componentId: string; currentSourceSnapshotId: string; currentSourceState: KnowledgeComponent["current"]["state"];
   behaviors?: KnowledgeBehavior[]; canRun: boolean; onAccessDenied: () => void;

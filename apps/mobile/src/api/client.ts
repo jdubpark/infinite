@@ -1,5 +1,5 @@
 import type { Attention, Provider } from "@infinite/attention";
-import { createRemoteClient, RemoteError, type RemoteAccessToken, type RemoteEvents, type RemoteRequestOptions } from "@infinite/remote";
+import { createRemoteClient, RemoteError, sessionListReader, type RemoteAccessToken, type RemoteEvents, type RemoteRequestOptions } from "@infinite/remote";
 import * as Crypto from "expo-crypto";
 import { loadClientId } from "../store/connection";
 import type { TeamLineup, TeamProject, TeamRole, TeamStatus } from "../features/teams/model";
@@ -7,13 +7,14 @@ import { APP_BACKGROUND_GRACE_MS, inForeground, onForegroundChange } from "./for
 
 export type Connection = { id?: string; machineId?: string; label?: string; url: string; token: string; relay?: { machineId: string }; access?: RemoteAccessToken };
 export const connectionKey = (connection: Connection) => connection.id ?? `${connection.url}/${connection.relay?.machineId ?? "direct"}`;
-/** `calls` counts api() requests in flight on this channel. */
 type Remote = { secrets: string; client: ReturnType<typeof createRemoteClient>; calls: number };
 const remotes = new Map<string, Remote>();
+const sessionReaders = new Map<string, ReturnType<typeof sessionListReader<SessionRow>>>();
 const remoteKey = (connection: Connection) => `${connectionKey(connection)}/${connection.url}/${connection.relay?.machineId ?? "direct"}`;
 export function closeConnection(connection: Connection) {
   remotes.get(remoteKey(connection))?.client.close();
   remotes.delete(remoteKey(connection));
+  sessionReaders.delete(remoteKey(connection));
 }
 function remote(connection: Connection) {
   const key = remoteKey(connection);
@@ -30,7 +31,6 @@ function drop(key: string, entry: Remote) {
   if (remotes.get(key) === entry) remotes.delete(key);
   entry.client.close();
 }
-/** Replace idle channels after the same grace used by the live stream. */
 let backgroundedAt = 0;
 let backgroundResetTimer: ReturnType<typeof setTimeout> | undefined;
 onForegroundChange((foreground) => {
@@ -69,10 +69,6 @@ export class ApiError extends Error {
 }
 
 export type ControlCode = "control-busy" | "control-lost";
-/**
- * The host refused input before anything was typed: another device holds control
- * (`control-busy`), or this phone's lease changed or expired (`control-lost`).
- */
 export class ControlRefusal extends ApiError {
   constructor(
     message: string,
@@ -88,16 +84,13 @@ export async function api<T>(
   init: {
     method?: "GET" | "POST" | "PUT" | "DELETE";
     body?: unknown;
-    /** The lease id this phone holds; the host refuses input without it. */
     control?: string;
-    /** Abort after this many milliseconds. Defaults to 12 seconds. */
     timeoutMs?: number;
   } = {},
 ): Promise<T> {
   const { timeoutMs = 12000, ...options } = init;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
-  // Only reads (GET without a body) are retried or dropped on timeout; mutations never are.
   const read = (init.method ?? "GET") === "GET" && init.body === undefined;
   let saved: Remote | undefined;
   try {
@@ -106,14 +99,11 @@ export async function api<T>(
       ...(init.control ? { "X-Infinite-Control": init.control } : {}),
     };
     const request = { ...options, headers, signal: controller.signal };
-    // Both direct and relayed connections use the authenticated encrypted
-    // channel. An unavailable endpoint never falls back to plaintext API calls.
     saved = remote(connection);
     try {
       try {
         return await call<T>(saved, path, request);
       } catch (error) {
-        // A backgrounded app does not reconnect; its return poll recovers instead.
         if (!read || !(error instanceof RemoteError) || error.code !== "disconnected" || !inForeground()) throw error;
         return await call<T>(saved, path, request);
       }
@@ -127,7 +117,6 @@ export async function api<T>(
       throw error;
     }
   } catch (error) {
-    // A timed-out read may have left the channel unusable; don't drop it under another call.
     if (read && controller.signal.aborted && saved && saved.calls === 0) drop(remoteKey(connection), saved);
     if ((error as Error).name === "AbortError")
       throw new ApiError(
@@ -140,6 +129,13 @@ export async function api<T>(
   }
 }
 
+export function listSessions(connection: Connection): Promise<SessionRow[]> {
+  const key = remoteKey(connection);
+  let read = sessionReaders.get(key);
+  if (!read) sessionReaders.set(key, read = sessionListReader<SessionRow>());
+  return read(path => api(connection, path));
+}
+
 export function openEvents(connection: Connection, options: {
   topics: string[];
   after?: number;
@@ -149,7 +145,6 @@ export function openEvents(connection: Connection, options: {
   return remote(connection).client.openEvents(options);
 }
 
-/** One device's input lease; the host refuses input from every other device while it lasts. */
 export type ControlLease = { id: string; label: string; expiresAt: number };
 export type SessionRow = {
   id: string;
@@ -157,12 +152,9 @@ export type SessionRow = {
   executionLocation?: "cloud" | "laptop";
   backend?: "infinite" | "cmux";
   projectId?: string;
-  /** Present on a team member; the team scheduler owns its lifecycle. */
   team?: { runId: string; memberId: string; revision: number; role: TeamRole; taskId?: string };
-  /** Set on a session a mission coordinator runs (its coordinator or a subteam member). The host refuses input, stop, resume and control for it. */
   managedBy?: { kind: "mission"; missionId: string; teamId?: string };
   resumable?: boolean;
-  /** Set once the owner archived this exited session; it leaves the live lists but keeps its record. */
   archivedAt?: string;
   title: string;
   reading?: {
@@ -175,9 +167,9 @@ export type SessionRow = {
   createdAt: string;
   pid?: number;
   exitCode?: number;
+  outputTailIncomplete?: true;
   seq: number;
   attention: Attention;
-  /** Present on workers that enforce input control; older workers take shared input. */
   capabilities?: { terminalSnapshot?: 1; inputControl?: 1 };
   control?: ControlLease | null;
   execution?: { location: "laptop" | "cloud"; state: "connecting" | "online" | "offline" | "preparing" | "paused"; cloudReady: boolean; checkpoint?: { id: string; capturedAt: string }; reason?: string; reconciliation?: "available" };
@@ -188,7 +180,6 @@ export type SessionDetail = SessionRow & {
   contextVersion: number;
   initialPrompt: string;
 };
-/** `POST /sessions/:id/answer` receipt; refusals arrive as HTTP 409 instead. */
 export type AnswerReceipt = {
   requestId: string;
   state: "delivered" | "uncertain";
@@ -209,10 +200,8 @@ export type Me = {
   usage?: { enabled: boolean; budgets?: Record<string, unknown> };
 };
 
-/** Project contract mirrored from the host (`project-group-types.ts`): a project holds repositories, each made of checkouts. */
 export type ProjectGroupKind = "owner" | "repository" | "implicit";
 export type ProjectGroupCheckout = { projectId: string; name: string; path: string; primary: boolean; teamReady: boolean; identityFrom?: "source" | "host-scan" };
-/** `projectId`, `name`, and `path` describe the primary checkout. */
 export type ProjectGroupRepo = { projectId: string; name: string; path: string; key?: string; checkouts: ProjectGroupCheckout[] };
 export type ProjectGroup = {
   id: string; name: string; kind: ProjectGroupKind; hidden: boolean; repos: ProjectGroupRepo[]; implicit: boolean; revision: number;
@@ -222,18 +211,14 @@ export type ProjectGroupSuggestion = { name: string; repos: string[]; groupIds: 
 export type ProjectGroupList = { groups: ProjectGroup[]; suggestions: ProjectGroupSuggestion[] };
 export type ProjectGroupUpdateRequest = { requestId: string; revision: number; name?: string; repos?: string[]; hidden?: boolean; primary?: string[] };
 export type MissionStatus = "planning" | "working" | "needs-input" | "paused" | "blocked" | "ready-for-review" | "cancelled";
-export type CreateMissionRequest = {
-  requestId: string; groupId: string; title?: string; objective: string; maxSubtasks?: number; maxMinutes?: number;
-};
-export type MissionActionRequest = { requestId: string; revision: number };
-export type MissionTextRequest = MissionActionRequest & { text: string };
 export type MissionSubtask = {
   id: string; repoProjectId: string; title: string; objective: string; size: "solo" | "team"; parallelism: number;
   dependsOn: string[]; status: "queued" | "running" | "done" | "cancelled" | "blocked"; teamId?: string; teamStatus?: TeamStatus;
 };
 export type MissionDecision = {
   id: string; question: string; options: string[]; createdAt: string; subtaskId?: string; childDecisionId?: string;
-  answer?: string; answeredAt?: string; answeredBy?: "owner" | "coordinator";
+  answer?: string; answeredAt?: string; answeredBy?: "owner" | "coordinator" | "connector"; source?: { kind: "connector"; id: string; name: string };
+  recommendation?: { answers: string[]; reason: string; outcome?: "matched" | "different" | "other" };
 };
 export type MissionUsageTotals = {
   cost: number; tokens: { input: number; output: number; reasoning: number; cacheRead: number; cacheWrite: number };
@@ -246,18 +231,23 @@ export type MissionUsage = {
 export type Mission = {
   id: string; groupId: string; groupName: string; repoProjectIds: string[]; title: string; objective: string;
   maxSubtasks: number; maxMinutes: number; deadlineAt: string; revision: number; status: MissionStatus;
-  reason?: string; createdAt: string; updatedAt: string; lineup: TeamLineup;
+  reason?: string;
+  stopReason?: "deadline";
+  clockStoppedAt?: string;
+  createdAt: string; updatedAt: string; lineup: TeamLineup;
   coordinator?: { memberId: string; sessionId: string; status: "running" | "waiting" | "stopped" };
   dispatchSummary?: string; subtasks: MissionSubtask[]; decisions: MissionDecision[];
-  steering: { text: string; revision: number; at: string }[]; events: { at: string; text: string }[];
+  steering: { text: string; revision: number; at: string; source?: { kind: "connector" | "github-review"; id: string; name: string } | "coordinator" | "slack" }[]; events: { at: string; text: string }[];
   result?: { summary: string; revision: number; at: string };
   usage?: MissionUsage;
 };
 export type BoardColumn = "needs-input" | "working" | "review" | "ended";
+export type BoardAttempt = { workId: string; number: number; of: number; superseded: boolean };
 export type BoardItem = {
   kind: "mission" | "team" | "goal"; id: string; title: string; groupId?: string; projectName: string;
-  column: BoardColumn; status: string; detail: string; updatedAt: string;
+  column: BoardColumn; status: string; detail: string; stopReason?: "deadline"; createdAt?: string; updatedAt: string;
   subtasks?: { total: number; running: number; done: number };
+  attempt?: BoardAttempt;
 };
 export type Board = { items: BoardItem[] };
 
@@ -273,7 +263,6 @@ export type MessagesPage = { messages: ChatMessage[]; cursor: string | number; m
 export type ProjectFile = { path: string; name: string; text?: string; mimeType: string; size: number; modifiedAt: string; base64?: string };
 export type PendingGeneration = { id: string; capturedAt: string; receivedAt: string; reason: "session-running" | "cloud-changed" | "apply-failed" | "awaiting-apply"; category?: string; message?: string };
 export type ProjectSyncStatus = { projectId: string; lastSyncedAt?: string; appliedAt?: string; appliedManifest?: string; pendingGeneration?: PendingGeneration };
-/** Why a laptop generation waits, in the words the Create screen shows. */
 export function pendingLabel(pending: PendingGeneration) {
   if (pending.reason === "session-running") return "a session is running";
   if (pending.reason === "cloud-changed") return "cloud files changed";
@@ -281,10 +270,8 @@ export function pendingLabel(pending: PendingGeneration) {
   return "no session is running; ready to apply";
 }
 export type SourcePendingStatus = { reason: "session-running" | "fetch-failed" | "diverged" | "apply-failed"; category?: string; message?: string; since: string };
-/** Where a workspace's files come from: the laptop, or a GitHub base branch the host mirrors. */
 export type ProjectSourceStatus = { mode: "github" | "laptop"; repository?: string; baseBranch?: string; mirrorHead?: string; appliedHead?: string; fetchedAt?: string; appliedAt?: string; pending?: SourcePendingStatus; savedBranches?: string[] };
 export type ProjectDetail = { id: string; name: string; sync: ProjectSyncStatus; source?: ProjectSourceStatus };
-/** One line for a GitHub-tracked workspace, worded like the CLI status line and the web Create screen. */
 export function sourceLabel(source: ProjectSourceStatus, now = Date.now()) {
   const head = source.appliedHead ? source.appliedHead.slice(0, 8) : "none";
   const parts = [`Follows GitHub ${source.repository}@${source.baseBranch} · host ${head} · fetched ${ago(source.fetchedAt, now)}`];
@@ -301,4 +288,151 @@ export function ago(iso?: string, now = Date.now()) {
   if (!iso) return "never";
   const s = Math.max(0, Math.floor((now - Date.parse(iso)) / 1000));
   return s < 60 ? `${s}s ago` : s < 3600 ? `${Math.floor(s / 60)}m ago` : `${Math.floor(s / 3600)}h ago`;
+}
+
+export type AssessedState = "met" | "not-met" | "inconclusive";
+export type ComposedState = AssessedState | "pending-owner";
+export type VerdictCounts = { met: number; notMet: number; inconclusive: number; pendingOwner: number };
+export type GoalAssessment = {
+  verdictId: string; revision: number; head: string; kind: "reviewed" | "no-change";
+  result: AssessedState; evaluatorResult?: AssessedState;
+  reason?: "no-independent-evaluator" | "evaluator-unavailable" | "record-unavailable" | "context-too-large";
+  counts: VerdictCounts; criteria: { id: string; state: ComposedState }[]; at: string; progress: number;
+};
+export type GoalVerdictView = {
+  cycle: number; teamId: string; verdictId: string; kind: "reviewed" | "no-change"; head: string; at: string;
+  label: "Agent assessment, provisional";
+  result: AssessedState; evaluatorResult?: AssessedState; differs: boolean; reason?: string; counts: VerdictCounts; progress: number;
+  owner?: { result: "achieved" | "not-achieved" | "inconclusive"; agrees?: boolean };
+  criteria: { id: string; producer: "host" | "evaluator" | "owner"; state: ComposedState; label: "host receipt" | "agent assessment" | "waiting for you" | "your rating";
+    reason?: string; evaluatorState?: AssessedState; receipt?: { handle: string; outcome: "pass" | "fail" | "unknown" }; handles?: string[]; note?: string }[];
+  evaluator?: { profileId: string; family: string; sharedFamily: boolean; alsoReviewed: boolean };
+  detail: "available" | "expired";
+};
+
+export const TEAM_ENTRY_KINDS = ["contract", "finding", "blocker", "handoff", "report", "integration", "check", "direction"] as const;
+export type TeamEntryKind = (typeof TEAM_ENTRY_KINDS)[number];
+export type TeamEntryAuthority = "receipt" | "claim" | "direction";
+export type TeamEntryState = "active" | "superseded" | "withdrawn";
+export type TeamEntryAuthorKind = "host" | "member" | "owner";
+export type TeamEntryHead = {
+  entryId: string;
+  seq: number;
+  scope?: "run" | "mission";
+  runId?: string;
+  revision: number;
+  at: string;
+  kind: TeamEntryKind;
+  author: TeamEntryAuthorKind;
+  authority: TeamEntryAuthority;
+  authorRole?: TeamRole | "mission-coordinator";
+  authorMemberId?: string;
+  taskId?: string;
+  supersedes?: string;
+  headCommit?: string;
+  paths?: string[];
+  subtaskIds?: string[];
+  unreadRequired?: string[];
+  summary: string;
+  bodyBytes: number;
+  state: TeamEntryState;
+};
+export type TeamEntryPage = { entries: TeamEntryHead[]; cursor: number; more: boolean };
+export type TeamEntryDetail = { head: TeamEntryHead; body: unknown };
+export type TeamEntryQuery = { kinds?: TeamEntryKind[]; taskId?: string; since?: number; limit?: number };
+
+export type MissionProgressWorkerStatus = "starting" | "running" | "exited" | "unavailable" | "recording-error" | "unknown" | "mismatched" | "not-sampled";
+export type MissionProgressMember = {
+  runId: string;
+  memberId: string;
+  sessionId: string;
+  revision: number;
+  role: TeamRole;
+  taskId?: string;
+  recordedStatus: "queued" | "running" | "waiting" | "reported" | "stopped" | "unavailable";
+  exitConfirmedAt?: string;
+  workerStatus: MissionProgressWorkerStatus;
+};
+export type MissionProgressCheck = {
+  revision: number;
+  round?: number;
+  headCommit?: string;
+  status: "running" | "passed" | "failed" | "interrupted";
+  startedAt: string;
+  finishedAt?: string;
+  exitCode?: number | null;
+};
+export type MissionProgressLinkedChild = {
+  kind: "linked";
+  runId: string;
+  missionId: string;
+  projectId: string;
+  revision: number;
+  status: TeamStatus;
+  assignments: MissionProgressMember[];
+  checks: MissionProgressCheck[];
+  assignmentsTruncated?: true;
+  checksTruncated?: true;
+};
+export type MissionProgressChild = { kind: "not-created" } | { kind: "missing" } | { kind: "mismatched" } | MissionProgressLinkedChild;
+export type MissionProgressSnapshot = {
+  mission: {
+    id: string;
+    title: string;
+    status: MissionStatus;
+    revision: number;
+    coordinator?: {
+      runId: string;
+      memberId: string;
+      sessionId: string;
+      revision: number;
+      role: "mission-coordinator";
+      recordedStatus: "queued" | "running" | "reported" | "stopped";
+      workerStatus: MissionProgressWorkerStatus;
+    };
+  };
+  subtasks: {
+    id: string;
+    title: string;
+    repoProjectId: string;
+    status: MissionSubtask["status"];
+    replacesSubtaskId?: string;
+    child: MissionProgressChild;
+  }[];
+  subtasksTruncated?: true;
+};
+export type MissionProgressObservation = {
+  cursor: string;
+  sequence: number;
+  observedAt: string;
+  snapshot: MissionProgressSnapshot;
+};
+export type MissionProgressResyncReason = "initial" | "invalid-cursor" | "host-restarted" | "mission-mismatch" | "history-evicted" | "retention-gap" | "cursor-ahead";
+export type MissionProgressPage = {
+  missionId: string;
+  generation: string;
+  cursor: string;
+  observedAt: string;
+  resync: { required: false } | { required: true; reason: MissionProgressResyncReason };
+  observations: MissionProgressObservation[];
+  snapshot: MissionProgressSnapshot;
+};
+
+export function listTeamEntries(connection: Connection, teamId: string, query: TeamEntryQuery = {}): Promise<TeamEntryPage> {
+  const params = new URLSearchParams();
+  if (query.kinds) for (const kind of query.kinds) params.append("kind", kind);
+  if (query.taskId) params.set("task", query.taskId);
+  if (query.since !== undefined) params.set("since", String(query.since));
+  if (query.limit !== undefined) params.set("limit", String(query.limit));
+  const suffix = params.toString();
+  return api<TeamEntryPage>(connection, `/teams/${teamId}/entries${suffix ? `?${suffix}` : ""}`);
+}
+
+export function getTeamEntry(connection: Connection, teamId: string, entryId: string): Promise<TeamEntryDetail> {
+  return api<TeamEntryDetail>(connection, `/teams/${teamId}/entries/${entryId}`);
+}
+
+export function getMissionProgress(connection: Connection, missionId: string, cursor?: string): Promise<MissionProgressPage> {
+  const suffix = cursor ? `?cursor=${encodeURIComponent(cursor)}` : "";
+  return api<MissionProgressPage>(connection, `/missions/${missionId}/progress${suffix}`);
 }

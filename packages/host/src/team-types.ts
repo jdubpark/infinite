@@ -1,58 +1,80 @@
+import type { ConnectorSource } from "./mcp-types.js";
 import { z } from "zod";
 import { featureMapSchema, TASK_KINDS } from "./task-features.js";
+import { MAX_TASK_LIMITATION_CHARS, MAX_TASK_LIMITATIONS } from "./team-task-limitations.js";
+import { evalProjectSchema, CANDIDATE_PROFILES_MAX } from "./eval-config.js";
+import type { TrialEnding } from "./eval-types.js";
+import { POINTS_ALGORITHM_VERSION, teamRoutingSchema } from "./routing-policy.js";
+import { intentCheckReportSchema } from "./intent-report.js";
+import { judgementReportSchema, type Judgement, type JudgeEnding } from "./judge-types.js";
+import { verdictReportSchema, type RunAssessment } from "./verdict-types.js";
+import {
+  CRITERIA_LABEL_BYTES,
+  CRITERIA_ROWS_MAX,
+  ID_RE,
+  SHARED_INPUT_LIMITS,
+  criteriaRowsSchema,
+  idSchema,
+  ownedPathSchema,
+} from "./schema-primitives.js";
+import { questionRecommendationSchema, refineQuestion, requiredQuestionRecommendationSchema } from "./question-recommendation.js";
+import type { RoutingKnobs, TeamRunRouting } from "./routing-types.js";
 import type { Prompt, AnswerResult } from "@infinite/attention";
-import type { Receipt } from "./types.js";
-import type { Provider } from "./types.js";
+import type { Receipt, Provider } from "./types.js";
 import type { LinearTrackingView } from "./linear-types.js";
 import type { UsageTotals } from "./usage.js";
 import type { UsageRollup } from "./team-usage.js";
 import type { ProviderLimit } from "./provider-limits.js";
+import type { AutonomyMode } from "./autonomy.js";
+import {
+  commitHashSchema,
+  deliveryReconciliationReportSchema,
+  gitBranchSchema,
+  githubRepositorySchema,
+  permissionDecisionReportSchema,
+  teamCommandSchema,
+  type DeliveryReconciliationReport,
+  type PermissionDecisionReport,
+  type TeamCheck,
+  type TeamCommand,
+  type TeamDecision,
+  type TeamLeftoverProcesses,
+  type TeamMemberSavedWork,
+  type TeamPendingOperation,
+  type TeamPermissionAgentDecision,
+  type TeamPublication,
+  type TeamRole,
+} from "./team-state-schemas.js";
 
-export const teamCommandSchema = z.object({
-  command: z.string().min(1).max(4096).refine(value => !value.includes("\0")),
-  args: z.array(z.string().max(4096).refine(value => !value.includes("\0"))).max(64).default([]),
-}).strict();
-export type TeamCommand = z.infer<typeof teamCommandSchema>;
+export * from "./team-state-schemas.js";
 
-/** How long finished work keeps its clones. Records and events outlive every workspace; cancelled runs are deleted whole. */
 export const teamRetentionSchema = z.object({
-  /** Minutes after a run reaches merged or no-change, with every member stopped, before its clones are removed. Runs owned by a live goal, mission or handoff wait for that owner to finish. */
   finishedMinutes: z.number().int().min(0).max(10080).default(60),
-  /** Minutes after a run is cancelled and its members have stopped before its clones and its record are deleted. */
   cancelledMinutes: z.number().int().min(0).max(10080).default(60),
-  /** Hours a ready-for-review run keeps its clones; the reviewed branch is already published for review. */
   reviewHours: z.number().int().min(1).max(720).default(24),
-  /** Hours a blocked run keeps its clones; after removal the run stays blocked and cannot resume. */
   blockedHours: z.number().int().min(1).max(720).default(72),
-  /** Minutes a stopped member whose result was integrated keeps its clone while the run continues; recovery briefs list these clones for read-only inspection. */
   memberMinutes: z.number().int().min(0).max(10080).default(60),
 }).strict();
 export type TeamRetention = z.infer<typeof teamRetentionSchema>;
 export const DEFAULT_TEAM_RETENTION: TeamRetention = teamRetentionSchema.parse({});
+export function hostClosedBlockedReason(hours: number, lastBlocker?: string) {
+  const blocker = lastBlocker?.trim();
+  return `Closed by the host after ${hours} ${hours === 1 ? "hour" : "hours"} blocked without owner action.${blocker ? ` Last blocker: ${blocker.length > 500 ? `${blocker.slice(0, 500)}…` : blocker}` : ""}`;
+}
 
-/** Free space the workspace volume must keep for a new run to start. */
 export const storageFloorSchema = z.object({
   inodes: z.number().int().min(0).default(300_000),
   bytes: z.number().int().min(0).default(2 * 1024 ** 3),
 }).strict();
 export type StorageFloor = z.infer<typeof storageFloorSchema>;
 export const DEFAULT_STORAGE_FLOOR: StorageFloor = storageFloorSchema.parse({});
-export const githubRepositorySchema = z.string().regex(/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?\/[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/);
 const githubRepository = githubRepositorySchema;
-export const gitBranchSchema = z.string().min(1).max(255).refine(value =>
-  value !== "@" && !value.startsWith("-") && !value.startsWith("/") && !value.endsWith("/") && !value.endsWith(".") && !value.includes("..") && !value.includes("@{") &&
-  !value.includes("//") && !value.includes("\\") && !/[~^:?*\s\x00-\x1f\x7f]/.test(value) &&
-  !value.includes("[") && !value.includes("]") &&
-  value.split("/").every(part => part.length > 0 && !part.startsWith(".") && !part.endsWith(".lock")),
-"Use a safe Git branch name");
 const gitBranch = gitBranchSchema;
-/** Where the host's copy of a project comes from. `github`: the host follows the base branch itself; `laptop`: workspace sync from the owner's computer. */
 export const projectSourceSchema = z.discriminatedUnion("mode", [
   z.object({ mode: z.literal("github"), repository: githubRepository, baseBranch: gitBranch }).strict(),
   z.object({ mode: z.literal("laptop") }).strict(),
 ]);
 export type ProjectSource = z.infer<typeof projectSourceSchema>;
-/** `merge`: the delivery member merges the reviewed head itself. `pr`: it pushes the branch and opens a pull request, and the owner merges on GitHub. */
 export const teamDeliverySchema = z.discriminatedUnion("mode", [
   z.object({
     mode: z.literal("merge"),
@@ -63,24 +85,14 @@ export const teamDeliverySchema = z.discriminatedUnion("mode", [
   z.object({ mode: z.literal("pr"), repository: githubRepository, baseBranch: gitBranch }).strict(),
 ]);
 export type TeamDelivery = z.infer<typeof teamDeliverySchema>;
-export type TeamPublicationCategory = "auth" | "network" | "not-found" | "rejected" | "other";
-export type TeamPublication = {
-  repository: string;
-  branch: string;
-  commit?: string;
-  publishedAt?: string;
-  failure?: { commit: string; category: TeamPublicationCategory; attempts: number; at: string; retryAt: string };
-};
 export const nativeContinuationSchema = z.object({
   nativeSessionId: z.string().uuid(),
   mode: z.enum(["start", "resume"]),
 }).strict();
 export type NativeContinuation = z.infer<typeof nativeContinuationSchema>;
-/** The owner's default delegation: routine development work is the coordinator's to approve; release actions stay with the owner. */
 export const DEFAULT_PERMISSION_SCOPE = "Approve one-time development operations that an engineer would routinely run for the accepted objective and assigned role inside the assigned workspace: repository inspection and fetch, scoped edits and staging, dependency installation from the repository's declared manifests and lockfiles, test planning, builds, tests, scripts, local listeners and local browser checks. These may run outside the provider sandbox and use network access, local sockets, IPC and task-owned temporary files while preserving the assigned repository and path scope. Delivery operations require the run's separate pinned delivery policy. Escalate only production or staging actions such as deploy, promote, roll out, release or publish, new or external credentials, other repositories, global or account settings, destructive operations outside the assigned workspace, persistent approvals, permission bypasses, and commands whose effect is unrelated to the task or appears malicious.";
 export const DEFAULT_PERMISSION_LIMIT = 25;
 export const MAX_PERMISSION_LIMIT = 50;
-/** Earlier host defaults. A saved policy that still reads exactly like one was never customised by the owner. */
 export const LEGACY_DEFAULT_PERMISSION_SCOPES: readonly string[] = [
   "Approve one-time repository read, edit, build and test operations required by the accepted task within its assigned workspace, including a one-time run of the task's tests or accepted checks outside the provider sandbox. Delivery operations require the run's separate pinned delivery policy. Escalate new credentials, other repositories, global settings, deployment, destructive operations, persistent approvals, other permission bypasses and unclear effects.",
   "Approve one-time development operations required by the accepted objective and assigned role, including repository inspection and fetch, scoped edits and staging, test planning, builds, tests and local browser checks. These may run outside the provider sandbox and use task-owned temporary files while preserving the assigned repository and path scope. Delivery operations require the run's separate pinned delivery policy. Escalate new credentials, other repositories, global settings, deployment, destructive operations, persistent approvals, permission bypasses and unclear effects.",
@@ -91,10 +103,6 @@ export const teamPermissionsSchema = z.object({
   maxDecisions: z.number().int().min(1).max(MAX_PERMISSION_LIMIT).default(DEFAULT_PERMISSION_LIMIT),
 }).strict();
 export type TeamPermissions = z.infer<typeof teamPermissionsSchema>;
-/**
- * The policy a new run pins. An enrollment saved with an earlier host default follows the current
- * default scope and limit; a scope the owner wrote, or a limit the owner lowered, is kept as saved.
- */
 export function currentPermissions(saved: TeamPermissions): TeamPermissions {
   if (!LEGACY_DEFAULT_PERMISSION_SCOPES.includes(saved.scope)) return saved;
   return { ...saved, scope: DEFAULT_PERMISSION_SCOPE, maxDecisions: saved.maxDecisions === 10 ? DEFAULT_PERMISSION_LIMIT : saved.maxDecisions };
@@ -109,30 +117,25 @@ export interface TeamPermissionDecision {
   promptId: number;
   promptHash: string;
   evidenceHash: string;
-  /** Absent only when the target workspace or changed paths could not be inspected. */
   reuseKey?: string;
   reusedFromDecisionId?: string;
   verdict?: "approve-once" | "escalate";
-  /** Binds inspected command sources and changed paths to this exact review. */
   workspaceEvidenceHash?: string;
-  /** Pins the owner policy, steering and answers in force when this decision was assigned. */
   authorityHash?: string;
-  /** Pins the reviewer profile selected when this decision was assigned. */
   reviewerProfileId?: string;
   reviewerProfileHash?: string;
   prompt: Prompt;
   option: number;
   expiresAt: string;
   coordinatorMemberId?: string;
-  /** Host session that handled this decision on a sticky reviewer member. */
   coordinatorSessionId?: string;
   answerRequestId: string;
-  /** Absent on old records; diagnostic reviews can request evidence but can never answer a prompt. */
   purpose?: "answer" | "diagnose";
   recoveryRequestId?: string;
   requestedPaths?: string[];
   status: "pending" | "reviewing" | "approved" | "answering" | "answered" | "escalated" | "stale" | "uncertain";
   reason?: string;
+  promptClosedAt?: string;
   receipt?: Receipt & { result?: AnswerResult };
 }
 export interface TeamPermissionRecoveryStep {
@@ -176,7 +179,6 @@ export interface TeamPermissionRecoveryRequest {
   rounds: number;
   latestDecisionId?: string;
   requestedPaths?: string[];
-  /** Persisted before Ctrl+A is sent; an unresolved intent is never replayed after restart. */
   expansion?: { requestId: string; promptId: number; promptHash: string; status: "intent" | "expanded" | "uncertain" | "refused"; at: string;
     observedPromptId?: number; observedPromptHash?: string; rereads?: number; receipt?: Receipt };
 }
@@ -196,32 +198,60 @@ export const teamProjectSchema = z.object({
   handoffMinutes: z.number().int().min(5).max(1440).optional(),
   handoffExtendMinutes: z.number().int().min(0).max(240).optional(),
   handoffMaxTotalMinutes: z.number().int().min(5).max(1440).optional(),
-  /** The private feature map. Read at acceptance; never sent to a member. No default, so the authority digest is unchanged when unset. */
   features: featureMapSchema.optional(),
+  eval: evalProjectSchema.extend({ candidateProfiles: z.lazy(() => z.array(teamModelProfileSchema).max(CANDIDATE_PROFILES_MAX)).optional() }).optional(),
+  routing: teamRoutingSchema.optional(),
+  objective: z.strictObject({ prompts: z.enum(["on", "off"]).optional(), intentCheck: z.enum(["on", "off"]).optional(), register: z.enum(["on", "off"]).optional(), evaluator: z.enum(["on", "off"]).optional() }).optional(),
+  mainCheck: z.strictObject({ minutes: z.number().int().min(1).max(240).optional() }).optional(),
 }).strict().superRefine((project, context) => {
   if (project.establishChecks ? project.checks.length > 0 : project.checks.length === 0)
     context.addIssue({ code: "custom", path: ["checks"], message: "Configure required checks, or explicitly authorize the team to establish them with an empty checks array." });
+  if (project.mainCheck && project.establishChecks)
+    context.addIssue({ code: "custom", path: ["mainCheck"], message: "The main check runs the configured checks, and a project that lets the team establish its own checks has none to run." });
   if (project.handoffMaxTotalMinutes !== undefined && project.handoffMaxTotalMinutes < (project.handoffMinutes ?? 60))
     context.addIssue({ code: "custom", path: ["handoffMaxTotalMinutes"], message: "The handoff ceiling cannot be shorter than its time limit." });
 });
 export type TeamProject = z.infer<typeof teamProjectSchema>;
+export type ConfiguredTeamProject = Omit<TeamProject, "checks" | "establishChecks" | "mainCheck"> & {
+  checks: [TeamCommand, ...TeamCommand[]];
+  establishChecks?: never;
+  mainCheck?: { minutes?: number };
+};
+export type EstablishChecksTeamProject = Omit<TeamProject, "checks" | "establishChecks" | "mainCheck"> & {
+  checks: [];
+  establishChecks: true;
+  mainCheck?: never;
+};
+export type TeamProjectState = ConfiguredTeamProject | EstablishChecksTeamProject;
+export function isEstablishChecksProject(project: TeamProject): project is EstablishChecksTeamProject {
+  return project.establishChecks === true && project.checks.length === 0 && project.mainCheck === undefined;
+}
+export function isConfiguredChecksProject(project: TeamProject): project is ConfiguredTeamProject {
+  return project.establishChecks === undefined && project.checks.length > 0;
+}
+export function projectTeamProject(project: TeamProject): TeamProjectState {
+  if (isEstablishChecksProject(project)) return project;
+  if (isConfiguredChecksProject(project)) return project;
+  throw new Error("Invalid team project state: configure checks or set establishChecks with empty checks and no mainCheck.");
+}
 export const teamVerificationSchema = z.object({
   setup: teamCommandSchema.optional(),
   checks: z.array(teamCommandSchema).min(1).max(8),
 }).strict();
 export type TeamVerification = z.infer<typeof teamVerificationSchema>;
 const modelProfileFields = {
-  id: z.string().regex(/^[a-z][a-z0-9-]{0,39}$/),
+  id: z.string().regex(ID_RE),
   label: z.string().trim().min(1).max(100),
   model: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,119}$/),
   tier: z.enum(["light", "strong"]).optional(),
   dataUse: z.enum(["standard", "contributor"]).optional(),
-  limitFallback: z.string().regex(/^[a-z][a-z0-9-]{0,39}$/).optional(),
+  limitFallback: z.string().regex(ID_RE).optional(),
 };
 const effort = z.enum(["low", "medium", "high", "xhigh", "max"]);
+export const claudeTeamModelProfileSchema = z.object({ id: modelProfileFields.id, label: modelProfileFields.label, provider: z.literal("claude"), model: modelProfileFields.model, effort, tier: modelProfileFields.tier, dataUse: modelProfileFields.dataUse, limitFallback: modelProfileFields.limitFallback }).strict();
+export type ClaudeTeamModelProfile = z.infer<typeof claudeTeamModelProfileSchema>;
 export const teamModelProfileSchema = z.discriminatedUnion("provider", [
-  // Preserve legacy parsed key order: session request fingerprints include these objects.
-  z.object({ id: modelProfileFields.id, label: modelProfileFields.label, provider: z.literal("claude"), model: modelProfileFields.model, effort, tier: modelProfileFields.tier, dataUse: modelProfileFields.dataUse, limitFallback: modelProfileFields.limitFallback }).strict(),
+  claudeTeamModelProfileSchema,
   z.object({ id: modelProfileFields.id, label: modelProfileFields.label, provider: z.literal("codex"), model: modelProfileFields.model, effort, tier: modelProfileFields.tier, dataUse: modelProfileFields.dataUse, limitFallback: modelProfileFields.limitFallback }).strict(),
   z.object({ id: modelProfileFields.id, label: modelProfileFields.label, provider: z.literal("opencode"), model: z.string().max(180).regex(/^[A-Za-z0-9][A-Za-z0-9._-]*\/[A-Za-z0-9][A-Za-z0-9._:/-]{0,119}$/), variant: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/).optional(), tier: modelProfileFields.tier, dataUse: modelProfileFields.dataUse, limitFallback: modelProfileFields.limitFallback }).strict(),
 ]);
@@ -233,12 +263,17 @@ export const teamLineupSchema = z.object({
   implementers: z.array(teamModelProfileSchema).min(1).max(8),
   escalations: z.array(teamModelProfileSchema).min(1).max(8).optional(),
   fallbacks: z.array(teamModelProfileSchema).min(1).max(8).optional(),
-  // Keep this last: lineup fingerprints include the parsed object's key order.
   permissionReviewer: teamModelProfileSchema.optional(),
+  evaluators: z.array(teamModelProfileSchema).min(1).max(4).optional(),
+  judge: teamModelProfileSchema.optional(),
 }).strict().superRefine((lineup, context) => {
+  for (const [index, profile] of (lineup.evaluators ?? []).entries()) {
+    if (profile.tier !== "strong") context.addIssue({ code: "custom", path: ["evaluators", index, "tier"], message: "An evaluator must be a strong profile" });
+  }
+  if (lineup.judge?.limitFallback !== undefined) context.addIssue({ code: "custom", path: ["judge", "limitFallback"], message: "A judge profile cannot have a limit fallback" });
   if (lineup.permissionReviewer && lineup.permissionReviewer.provider !== "claude")
     context.addIssue({ code: "custom", path: ["permissionReviewer", "provider"], message: "The permission reviewer profile must use Claude Code." });
-  for (const pool of ["implementers", "escalations", "fallbacks"] as const) {
+  for (const pool of ["implementers", "escalations", "fallbacks", "evaluators"] as const) {
     const ids = new Set<string>();
     for (const [index, profile] of (lineup[pool] ?? []).entries()) {
       if (ids.has(profile.id)) context.addIssue({ code: "custom", path: [pool, index, "id"], message: "Profile IDs must be unique within a pool" });
@@ -247,7 +282,7 @@ export const teamLineupSchema = z.object({
   }
   const identities = new Map<string, string>();
   const profiles = lineupProfiles(lineup);
-  for (const profile of profiles) {
+  for (const profile of [...profiles, ...(lineup.judge ? [lineup.judge] : [])]) {
     const identity = JSON.stringify([profile.provider, profile.model, profile.provider === "opencode" ? profile.variant : profile.effort, profile.tier, profile.dataUse ?? "standard", profile.limitFallback ?? null]);
     if (identities.has(profile.id) && identities.get(profile.id) !== identity)
       context.addIssue({ code: "custom", message: "A profile ID must identify the same provider, model, and effort throughout a lineup" });
@@ -282,20 +317,82 @@ export const teamLineupSchema = z.object({
   }
 });
 export type TeamLineup = z.infer<typeof teamLineupSchema>;
-type LineupShape = Pick<TeamLineup, "coordinator" | "integrator" | "reviewer" | "implementers" | "escalations" | "fallbacks" | "permissionReviewer">;
+type LineupShape = Pick<TeamLineup, "coordinator" | "integrator" | "reviewer" | "implementers" | "escalations" | "fallbacks" | "permissionReviewer" | "evaluators">;
 export function lineupProfiles(lineup: LineupShape): TeamModelProfile[] {
-  return [lineup.coordinator, lineup.integrator, lineup.reviewer, ...lineup.implementers, ...(lineup.escalations ?? []), ...(lineup.fallbacks ?? []), ...(lineup.permissionReviewer ? [lineup.permissionReviewer] : [])];
+  return [lineup.coordinator, lineup.integrator, lineup.reviewer, ...lineup.implementers, ...(lineup.escalations ?? []), ...(lineup.fallbacks ?? []), ...(lineup.permissionReviewer ? [lineup.permissionReviewer] : []), ...(lineup.evaluators ?? [])];
 }
-/** First profile reachable within two `limitFallback` hops whose provider is not limited. */
-export function resolveLimitFallback(lineup: LineupShape, profileId: string, limited: Set<Provider>): TeamModelProfile | undefined {
+export function fixedRuleFailure(lineup: Pick<TeamLineup, "reviewer">, knobs: Pick<RoutingKnobs, "allowContributor">, profile: TeamModelProfile): "contributor" | "reviewer-model" | undefined {
+  if (profile.dataUse === "contributor" && !knobs.allowContributor) return "contributor";
+  if (profile.model === lineup.reviewer.model) return "reviewer-model";
+  return undefined;
+}
+export function autoPinned(run: Pick<TeamRun, "routing">): boolean {
+  return run.routing?.mode === "auto";
+}
+export function autoRouted(run: Pick<TeamRun, "routing" | "routingRevokedAt">): boolean {
+  return autoPinned(run) && run.routingRevokedAt === undefined;
+}
+export function eligibleImplementers(run: Pick<TeamRun, "routing" | "lineup">): TeamModelProfile[] {
+  const { routing, lineup } = run;
+  if (!lineup) return [];
+  if (routing?.mode !== "auto") return lineup.implementers;
+  return lineup.implementers.filter(profile => fixedRuleFailure(lineup, routing.knobs, profile) === undefined);
+}
+export function scoutPool(run: Pick<TeamRun, "routing" | "lineup">): TeamModelProfile[] {
+  const { routing, lineup } = run;
+  if (!lineup) return [];
+  if (routing?.mode !== "auto") return lineup.implementers;
+  return lineup.implementers.filter(profile => fixedRuleFailure(lineup, routing.knobs, profile) !== "contributor");
+}
+export function escalationPool(run: Pick<TeamRun, "routing" | "lineup">): TeamModelProfile[] {
+  const { routing, lineup } = run;
+  const pool = lineup?.escalations ?? [];
+  if (!lineup || routing?.mode !== "auto") return pool;
+  return pool.filter(profile => fixedRuleFailure(lineup, routing.knobs, profile) !== "contributor");
+}
+export function escalationCandidates(lineup: TeamLineup, knobs: Pick<RoutingKnobs, "allowContributor">, ownProfileId?: string): TeamModelProfile[] {
+  return (lineup.escalations ?? []).filter(profile => profile.id !== ownProfileId && fixedRuleFailure(lineup, knobs, profile) === undefined);
+}
+export function scoutCandidates(lineup: TeamLineup, knobs: Pick<RoutingKnobs, "allowContributor">): TeamModelProfile[] {
+  return lineup.implementers.filter(profile => profile.tier !== "strong" && fixedRuleFailure(lineup, knobs, profile) === undefined);
+}
+export function coversPoint(run: Pick<TeamRun, "routing" | "lineup">, point: "escalation" | "scout", ownProfileId?: string): boolean {
+  const { routing, lineup } = run;
+  if (!lineup || !routing || routing.mode !== "auto" || routing.algorithmVersion < POINTS_ALGORITHM_VERSION || !routing.knobs.points.includes(point)) return false;
+  return point === "scout" ? scoutCandidates(lineup, routing.knobs).length > 0 : escalationCandidates(lineup, routing.knobs, ownProfileId).length > 0;
+}
+export function hostSelects(run: Pick<TeamRun, "routing" | "routingRevokedAt" | "lineup">, point: "escalation" | "scout", ownProfileId?: string): boolean {
+  return run.routingRevokedAt === undefined && coversPoint(run, point, ownProfileId);
+}
+export function hostProfilesFor(run: Pick<TeamRun, "routing" | "lineup">, role: TeamRole, ownProfileId?: string): boolean {
+  if (role === "implementer") return coversPoint(run, "escalation", ownProfileId);
+  if (role === "project-manager") return coversPoint(run, "scout");
+  return false;
+}
+export const PLAN_VERIFICATION_REFUSAL = "Plan rejected: this run uses the project's configured checks. Remove verification and submit a corrected plan. If the checks seem insufficient, explain that in the summary and assign tasks to run additional commands themselves and report results.";
+export const PROFILE_REQUIRED_REFUSAL = "Report rejected: name an approved agentProfileId for the escalation and for every scout, then submit the corrected report.";
+export function reportRefusal(team: TeamAssignment, report: TeamReport): string | undefined {
+  if (team.role === "project-manager" && report.kind === "plan" && report.verification && team.verificationRefused) return PLAN_VERIFICATION_REFUSAL;
+  const missingProfile = (report.kind === "escalate" && report.agentProfileId === undefined)
+    || (report.kind === "explore" && report.tasks.some(task => task.agentProfileId === undefined));
+  if (team.hostProfiles !== true && missingProfile) return PROFILE_REQUIRED_REFUSAL;
+  return undefined;
+}
+export function memberLimit(run: Pick<TeamRun, "goal" | "handoff">): number {
+  return (run.goal ?? run.handoff)?.maxMembers ?? 60;
+}
+export function resolveLimitFallback(lineup: LineupShape, profileId: string, limited: Set<Provider>, eligible?: (profile: TeamModelProfile) => boolean): TeamModelProfile | undefined {
   const profiles = lineupProfiles(lineup);
   let current = profiles.find(profile => profile.id === profileId);
   for (let hop = 0; hop < 2 && current?.limitFallback; hop++) {
     const next = profiles.find(profile => profile.id === current!.limitFallback);
-    if (next && !limited.has(next.provider)) return next;
+    if (next && !limited.has(next.provider) && (eligible?.(next) ?? true)) return next;
     current = next;
   }
   return undefined;
+}
+export function switchFallback(lineup: TeamLineup, profileId: string, provider: Provider, limited: Set<Provider>, eligible?: (profile: TeamModelProfile) => boolean): TeamModelProfile | undefined {
+  return resolveLimitFallback(lineup, profileId, new Set([...limited, provider]), eligible);
 }
 export const createTeamSchema = z.object({
   requestId: z.uuid(),
@@ -303,48 +400,106 @@ export const createTeamSchema = z.object({
   provider: z.enum(["claude", "codex", "grok", "opencode", "demo"]),
   useConfiguredLineup: z.boolean().optional(),
   title: z.string().trim().min(1).max(100),
-  objective: z.string().trim().min(1).max(24000),
-  /** Legacy request field. Capacity is selected by the project manager after planning. */
+  objective: z.string().trim().min(1).max(SHARED_INPUT_LIMITS.runObjectiveChars),
   parallelism: z.number().int().min(1).max(4).default(2),
 }).strict();
 export type CreateTeam = z.infer<typeof createTeamSchema>;
-export const teamMutationSchema = z.object({ requestId: z.uuid(), revision: z.number().int().min(1), text: z.string().trim().min(1).max(8000) }).strict();
+export const teamMutationSchema = z.object({ requestId: z.uuid(), revision: z.number().int().min(1), text: z.string().trim().min(1).max(SHARED_INPUT_LIMITS.steeringChars) }).strict();
 export const teamDeliveryReconcileSchema = z.object({
-  requestId: z.uuid(), revision: z.number().int().min(1), text: z.string().trim().min(1).max(8000),
-  failedOperation: z.object({ pendingId: z.uuid(), headCommit: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i),
+  requestId: z.uuid(), revision: z.number().int().min(1), text: z.string().trim().min(1).max(SHARED_INPUT_LIMITS.steeringChars),
+  failedOperation: z.object({ pendingId: z.uuid(), headCommit: commitHashSchema,
     attestation: z.object({ boundary: z.literal("delivery-preparation"), processesStopped: z.literal(true), text: z.string().trim().min(1).max(4000) }).strict() }).strict().optional(),
 }).strict();
 export type TeamDeliveryReconcile = z.infer<typeof teamDeliveryReconcileSchema>;
 export const teamVerificationReconcileSchema = z.object({ requestId: z.uuid(), revision: z.number().int().min(1), pendingId: z.uuid(),
-  headCommit: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i),
+  headCommit: commitHashSchema,
   attestation: z.object({ boundary: z.literal("check-only"), processesStopped: z.literal(true), text: z.string().trim().min(1).max(4000) }).strict() }).strict();
 export type TeamVerificationReconcile = z.infer<typeof teamVerificationReconcileSchema>;
 export const teamMemberRetireSchema = z.object({ requestId: z.uuid(), revision: z.number().int().min(1), sessionId: z.uuid(),
   identity: z.string().regex(/^[a-f0-9]{64}$/), text: z.string().trim().min(1).max(4000) }).strict();
 export type TeamMemberRetire = z.infer<typeof teamMemberRetireSchema>;
 export const teamActionSchema = z.object({ requestId: z.uuid(), revision: z.number().int().min(1) }).strict();
-export const teamContinueSchema = z.object({ requestId: z.uuid(), revision: z.number().int().min(1), text: z.string().trim().min(1).max(8000).optional() }).strict();
+export const teamProcessesEndedSchema = z.object({ requestId: z.uuid() }).strict();
+export type TeamProcessesEnded = z.infer<typeof teamProcessesEndedSchema>;
+export const teamContinueSchema = z.object({ requestId: z.uuid(), revision: z.number().int().min(1), text: z.string().trim().min(1).max(SHARED_INPUT_LIMITS.steeringChars).optional() }).strict();
 export type TeamContinue = z.infer<typeof teamContinueSchema>;
 export const teamTaskRatingSchema = z.object({ requestId: z.uuid(), score: z.number().int().min(1).max(5), note: z.string().trim().max(1000).optional() }).strict();
 export const teamParallelismSchema = z.object({ requestId: z.uuid(), revision: z.number().int().min(1), parallelism: z.number().int().min(1).max(4) }).strict();
 export type TeamParallelism = z.infer<typeof teamParallelismSchema>;
-const taskId = z.string().regex(/^[a-z][a-z0-9-]{0,39}$/);
-const ownedPath = z.string().min(1).max(300).refine(value => !value.startsWith("/") && !value.includes("\\") && !value.includes("\0") && !value.split("/").some(part => part === ".." || part === ".git" || part === "." || part === ""), "Use a repository-relative file or directory without glob syntax").refine(value => !/[*?\[\]:]/.test(value));
+const taskId = idSchema;
+export const taskIdSchema = taskId;
+export { ownedPathSchema };
+export const RECORD_DIGEST_BYTES = 6 * 1024;
+export const RECORD_REGISTER_BYTES = 6 * 1024;
+export const registerDigestSchema = z.strictObject({
+  assumptions: z.array(z.strictObject({
+    id: z.string().regex(ID_RE),
+    status: z.enum(["refuted", "unchecked", "assumed", "verified"]),
+    criticality: z.enum(["outcome", "plan", "detail"]),
+    statement: z.string(),
+  })).max(32),
+  questions: z.array(z.strictObject({ id: z.string().regex(ID_RE), text: z.string() })).max(8),
+  omitted: z.number().int().min(1).max(40).optional(),
+}).superRefine((register, context) => {
+  register.assumptions.forEach((item, index) => {
+    const bytes = Buffer.byteLength(item.statement);
+    if (bytes < 1 || bytes > 500) context.addIssue({ code: "custom", path: ["assumptions", index, "statement"], message: "An assumption statement is 1 to 500 bytes." });
+  });
+  register.questions.forEach((item, index) => {
+    const bytes = Buffer.byteLength(item.text);
+    if (bytes < 1 || bytes > 1000) context.addIssue({ code: "custom", path: ["questions", index, "text"], message: "A question is 1 to 1,000 bytes." });
+  });
+  if (registerDigestBytes(register) > RECORD_REGISTER_BYTES) context.addIssue({ code: "custom", path: ["assumptions"], message: "The register digest is over 6 KiB." });
+});
+export type RegisterDigest = z.infer<typeof registerDigestSchema>;
+export function registerDigestBytes(register: RegisterDigest): number { return Buffer.byteLength(JSON.stringify(register)); }
+export const RECORD_LABEL_BYTES = CRITERIA_LABEL_BYTES;
+export const recordDigestSchema = z.strictObject({
+  version: z.number().int().min(1).max(1_000_000),
+  criteria: z.array(z.strictObject({
+    id: z.string().regex(ID_RE),
+    statement: z.string(),
+    check: z.string(),
+    producer: z.enum(["host", "evaluator", "owner"]),
+    derived: z.literal(true).optional(),
+  })).min(1).max(CRITERIA_ROWS_MAX),
+  register: registerDigestSchema.optional(),
+}).superRefine((digest, context) => {
+  const [first, ...rest] = digest.criteria;
+  if (first?.id !== "c0" || rest.some(criterion => criterion.id === "c0")) context.addIssue({ code: "custom", path: ["criteria"], message: "The record digest must start with c0 and hold it once." });
+  if (first && first.statement !== "") context.addIssue({ code: "custom", path: ["criteria", 0, "statement"], message: "c0 carries its text in the goal context, so its statement is empty." });
+  rest.forEach((criterion, index) => {
+    const bytes = Buffer.byteLength(criterion.statement);
+    if (bytes < 1 || bytes > 1000) context.addIssue({ code: "custom", path: ["criteria", index + 1, "statement"], message: "A criterion statement is 1 to 1,000 bytes." });
+  });
+  digest.criteria.forEach((criterion, index) => {
+    const bytes = Buffer.byteLength(criterion.check);
+    if (bytes < 1 || bytes > RECORD_LABEL_BYTES) context.addIssue({ code: "custom", path: ["criteria", index, "check"], message: "A check label is 1 to 120 bytes." });
+  });
+  if (recordDigestBytes(digest) > RECORD_DIGEST_BYTES) context.addIssue({ code: "custom", path: ["criteria"], message: "The record digest is over 6 KiB." });
+});
+export type RecordDigest = z.infer<typeof recordDigestSchema>;
+export function recordDigestBytes(digest: RecordDigest): number { return Buffer.byteLength(JSON.stringify({ version: digest.version, criteria: digest.criteria })); }
 export const teamGoalContextSchema = z.object({
   id: z.uuid(), revision: z.number().int().min(1), cycle: z.number().int().min(1),
-  successCriteria: z.string().trim().min(1).max(8000),
-  nonGoals: z.array(z.string().trim().min(1).max(1000)).max(20),
-  allowedPaths: z.array(z.union([z.literal("."), ownedPath])).min(1).max(32),
-  evidence: z.array(z.string().trim().min(1).max(2000)).max(20),
+  successCriteria: z.string().trim().min(1).max(SHARED_INPUT_LIMITS.goalContextSuccessCriteriaChars),
+  nonGoals: z.array(z.string().trim().min(1).max(SHARED_INPUT_LIMITS.nonGoalChars)).max(SHARED_INPUT_LIMITS.nonGoals),
+  allowedPaths: z.array(z.union([z.literal("."), ownedPathSchema])).min(1).max(SHARED_INPUT_LIMITS.allowedPaths),
+  evidence: z.array(z.string().trim().min(1).max(SHARED_INPUT_LIMITS.evidenceChars)).max(SHARED_INPUT_LIMITS.evidence),
   sourceIssue: z.object({ id: z.uuid(), identifier: z.string().max(100), url: z.url(), title: z.string().max(1000), description: z.string().max(24000).nullable() }).strict().optional(),
   previousWork: z.array(z.string().trim().min(1).max(2000)).max(16),
   deadlineAt: z.iso.datetime(), maxMembers: z.number().int().min(1).max(60), parentRunId: z.uuid().optional(),
-  /** Owner-approved automatic extension; absent when the goal has no extension policy. */
   extendMinutes: z.number().int().min(0).max(240).optional(), ceilingAt: z.iso.datetime().optional(),
-  /** Set only after an explicit owner extension to distinguish it from an unapproved deadline mismatch. */
   ownerExtendedDeadlineAt: z.iso.datetime().optional(),
+  record: recordDigestSchema.optional(),
+  criteria: criteriaRowsSchema.optional(),
 }).strict();
 export type TeamGoalContext = z.infer<typeof teamGoalContextSchema>;
+export function withoutCriteria(goal: TeamGoalContext): TeamGoalContext {
+  if (!goal.criteria) return goal;
+  const { criteria: _criteria, ...rest } = goal;
+  return rest;
+}
 export const teamEvidenceSchema = z.object({ source: z.string().trim().min(1).max(1000), observation: z.string().trim().min(1).max(2000) }).strict();
 export type TeamEvidence = z.infer<typeof teamEvidenceSchema>;
 export const teamBriefSchema = z.object({
@@ -354,110 +509,149 @@ export const teamBriefSchema = z.object({
   expectedOutcome: z.string().trim().min(1).max(2000), uiChanges: z.boolean(),
 }).strict();
 export type TeamBrief = z.infer<typeof teamBriefSchema>;
-export const teamScoutPlanSchema = z.object({ id: taskId, title: z.string().trim().min(1).max(100), instructions: z.string().trim().min(1).max(4000), agentProfileId: z.string().regex(/^[a-z][a-z0-9-]{0,39}$/) }).strict();
+export const teamAcceptanceEvidenceSchema = z.object({
+  criterion: z.number().int().min(1).max(8), verdict: z.enum(["verified", "not-verified", "inconclusive"]),
+  evidence: z.string().trim().min(1).max(600),
+}).strict();
+export type TeamAcceptanceEvidence = z.infer<typeof teamAcceptanceEvidenceSchema>;
+export const teamScoutPlanSchema = z.object({ id: taskId, title: z.string().trim().min(1).max(100), instructions: z.string().trim().min(1).max(4000), agentProfileId: z.string().regex(ID_RE).optional() }).strict();
 export type TeamScoutPlan = z.infer<typeof teamScoutPlanSchema>;
+export const teamTaskCriterionRefsSchema = z.strictObject({
+  objectiveVersion: z.number().int().min(1).max(1_000_000),
+  criteria: z.array(z.string().regex(ID_RE)).min(1).max(CRITERIA_ROWS_MAX),
+}).superRefine((refs, context) => {
+  if (new Set(refs.criteria).size !== refs.criteria.length)
+    context.addIssue({ code: "custom", path: ["criteria"], message: "A task may name each objective criterion only once." });
+});
+export type TeamTaskCriterionRefs = z.infer<typeof teamTaskCriterionRefsSchema>;
+export type TeamGoalCriteriaPlanPin = { objectiveVersion: number };
 export const teamTaskPlanSchema = z.object({
   id: taskId,
   title: z.string().trim().min(1).max(100),
   instructions: z.string().trim().min(1).max(8000),
-  agentProfileId: z.string().regex(/^[a-z][a-z0-9-]{0,39}$/).optional(),
-  paths: z.array(ownedPath).min(1).max(32),
+  agentProfileId: z.string().regex(ID_RE).optional(),
+  paths: z.array(ownedPathSchema).min(1).max(SHARED_INPUT_LIMITS.allowedPaths),
   dependsOn: z.array(taskId).max(12),
-  /** Optional labels. A model may label, and `risk` may only be raised. No default. */
+  criterionRefs: teamTaskCriterionRefsSchema.optional(),
   kind: z.enum(TASK_KINDS).optional(),
   risk: z.literal("elevated").optional(),
 }).strict();
 export type TeamTaskPlan = z.infer<typeof teamTaskPlanSchema>;
-export const teamReportSchema = z.discriminatedUnion("kind", [
-  z.object({ kind: z.literal("permission-decision"), decisionId: z.uuid(), verdict: z.enum(["approve-once", "request-evidence", "escalate"]), summary: z.string().trim().min(1).max(2000), requestedPaths: z.array(z.string().trim().min(1).max(512)).max(8).optional() }).strict().superRefine((report, context) => {
-    if (report.verdict === "request-evidence" && !report.requestedPaths?.length)
-      context.addIssue({ code: "custom", path: ["requestedPaths"], message: "Request evidence with at least one repository-relative or approved scratch path." });
-    if (report.verdict !== "request-evidence" && report.requestedPaths !== undefined)
-      context.addIssue({ code: "custom", path: ["requestedPaths"], message: "Only an evidence request may name paths." });
-  }),
+export const blockerEvidenceSchema = z.object({
+  cause: z.object({ status: z.enum(["observed", "hypothesis", "unknown"]), detail: z.string().trim().min(1).max(1200) }).strict(),
+  issueRefs: z.array(z.string().trim().min(1).max(300)).max(8).optional(),
+  sourceRefs: z.array(z.string().trim().min(1).max(500)).max(12).optional(),
+  attemptedFixes: z.array(z.object({ fix: z.string().trim().min(1).max(800), outcome: z.string().trim().min(1).max(800) }).strict()).max(8).optional(),
+  proposedRecovery: z.string().trim().min(1).max(1200),
+  prevention: z.string().trim().min(1).max(1200),
+  validationEvidence: z.array(z.object({ sourceRef: z.string().trim().min(1).max(500), observation: z.string().trim().min(1).max(1000) }).strict()).min(1).max(8),
+}).strict().superRefine((evidence, context) => {
+  if (Buffer.byteLength(JSON.stringify(evidence), "utf8") > 12 * 1024)
+    context.addIssue({ code: "custom", message: "Blocker evidence must fit within 12 KiB of UTF-8 JSON" });
+});
+export type BlockerEvidence = z.infer<typeof blockerEvidenceSchema>;
+const questionReportShape = { kind: z.literal("question"), question: z.string().min(1).max(4000), options: z.array(z.string().min(1).max(500)).max(4).default([]), answerMode: z.enum(["approval", "single", "multiple"]).optional() };
+const recordedDeliveryReconciliationReportSchema = z.object({ kind: z.literal("delivery-reconciliation"), headCommit: commitHashSchema, repository: githubRepository, branch: gitBranch, baseHeadCommit: commitHashSchema, disposition: z.enum(["no-publication", "owned-branch", "pull-request"]), remoteHeadCommit: commitHashSchema.optional(), pullRequestUrl: z.string().trim().min(1).max(500).optional(), summary: z.string().trim().min(1).max(4000) }).strict();
+export const strictDeliveryReconciliationReportSchema = deliveryReconciliationReportSchema;
+export const taskLimitationsSchema = z.array(z.string().trim().min(1).max(MAX_TASK_LIMITATION_CHARS)).max(MAX_TASK_LIMITATIONS)
+  .describe("Optional list of concrete limitations or unverified gaps.");
+const sharedTeamReportVariants = [
+  permissionDecisionReportSchema,
   z.object({ kind: z.literal("plan"), summary: z.string().min(1).max(4000), parallelism: z.number().int().min(1).max(4).optional(), brief: teamBriefSchema.optional(), tasks: z.array(teamTaskPlanSchema).min(1).max(12), verification: teamVerificationSchema.optional() }).strict(),
   z.object({ kind: z.literal("explore"), summary: z.string().min(1).max(4000), parallelism: z.number().int().min(1).max(4).optional(), tasks: z.array(teamScoutPlanSchema).min(1).max(3) }).strict(),
   z.object({ kind: z.literal("findings"), summary: z.string().min(1).max(4000), evidence: z.array(teamEvidenceSchema).min(1).max(12) }).strict(),
   z.object({ kind: z.literal("no-change"), summary: z.string().min(1).max(4000), evidence: z.array(teamEvidenceSchema).min(1).max(12) }).strict(),
-  z.object({ kind: z.literal("escalate"), agentProfileId: z.string().regex(/^[a-z][a-z0-9-]{0,39}$/), reason: z.string().min(1).max(4000) }).strict(),
-  z.object({ kind: z.literal("result"), summary: z.string().min(1).max(8000) }).strict(),
-  z.object({ kind: z.literal("review"), verdict: z.enum(["approved", "changes-requested"]), summary: z.string().min(1).max(8000), uiEvidence: z.string().trim().min(1).max(4000).optional(), rubric: z.array(z.object({ taskId, correctness: z.object({ score: z.number().int().min(1).max(5), why: z.string().trim().min(1).max(300) }).strict(), cleanliness: z.object({ score: z.number().int().min(1).max(5), why: z.string().trim().min(1).max(300) }).strict(), extensibility: z.object({ score: z.number().int().min(1).max(5), why: z.string().trim().min(1).max(300) }).strict(), docs: z.object({ score: z.number().int().min(1).max(5), why: z.string().trim().min(1).max(300) }).strict() }).strict()).max(12).optional() }).strict(),
-  z.object({ kind: z.literal("delivery"), headCommit: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i), pullRequestUrl: z.string().trim().min(1).max(500), mergeCommit: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i), summary: z.string().trim().min(1).max(4000) }).strict(),
-  z.object({ kind: z.literal("delivery-repair"), headCommit: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i), summary: z.string().trim().min(1).max(4000) }).strict(),
-  z.object({ kind: z.literal("delivery-reconciliation"), headCommit: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i), repository: githubRepository, branch: gitBranch, baseHeadCommit: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i), disposition: z.enum(["no-publication", "owned-branch", "pull-request"]), remoteHeadCommit: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i).optional(), pullRequestUrl: z.string().trim().min(1).max(500).optional(), summary: z.string().trim().min(1).max(4000) }).strict(),
-  z.object({ kind: z.literal("pull-request"), headCommit: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i), pullRequestUrl: z.string().trim().min(1).max(500), summary: z.string().trim().min(1).max(4000) }).strict(),
-  z.object({ kind: z.literal("question"), question: z.string().min(1).max(4000), options: z.array(z.string().min(1).max(500)).max(4).default([]) }).strict(),
-  z.object({ kind: z.literal("blocked"), summary: z.string().min(1).max(4000) }).strict(),
-]);
-export type TeamReport = z.infer<typeof teamReportSchema>;
-export const teamReportEnvelopeSchema = z.object({ requestId: z.uuid(), runId: z.uuid(), memberId: z.uuid(), revision: z.number().int().min(1), report: teamReportSchema }).strict();
-export type TeamReportEnvelope = z.infer<typeof teamReportEnvelopeSchema>;
-export type TeamRole = "permission-coordinator" | "project-manager" | "scout" | "implementer" | "integrator" | "reviewer" | "delivery";
-/** A mission coordinator's assignment carries the mission ID as `runId`; it reports `MissionReport`s. */
-export type TeamAssignment = { runId: string; memberId: string; revision: number; role: TeamRole | "mission-coordinator"; taskId?: string; verificationRefused?: true };
-/** `merged` is set only from an explicit delivery report; it is not host verification. */
+  z.object({ kind: z.literal("escalate"), agentProfileId: z.string().regex(ID_RE).optional(), reason: z.string().min(1).max(4000) }).strict(),
+  z.object({ kind: z.literal("result"), summary: z.string().min(1).max(8000), limitations: taskLimitationsSchema.optional() }).strict(),
+  z.object({ kind: z.literal("review"), verdict: z.enum(["approved", "changes-requested"]), summary: z.string().min(1).max(8000), uiEvidence: z.string().trim().min(1).max(4000).optional(), acceptance: z.array(teamAcceptanceEvidenceSchema).max(8).optional(), rubric: z.array(z.object({ taskId, correctness: z.object({ score: z.number().int().min(1).max(5), why: z.string().trim().min(1).max(300) }).strict(), cleanliness: z.object({ score: z.number().int().min(1).max(5), why: z.string().trim().min(1).max(300) }).strict(), extensibility: z.object({ score: z.number().int().min(1).max(5), why: z.string().trim().min(1).max(300) }).strict(), docs: z.object({ score: z.number().int().min(1).max(5), why: z.string().trim().min(1).max(300) }).strict() }).strict()).max(12).optional() }).strict(),
+  z.object({ kind: z.literal("delivery"), headCommit: commitHashSchema, pullRequestUrl: z.string().trim().min(1).max(500), mergeCommit: commitHashSchema, summary: z.string().trim().min(1).max(4000) }).strict(),
+  z.object({ kind: z.literal("delivery-repair"), headCommit: commitHashSchema, summary: z.string().trim().min(1).max(4000) }).strict(),
+  z.object({ kind: z.literal("pull-request"), headCommit: commitHashSchema, pullRequestUrl: z.string().trim().min(1).max(500), summary: z.string().trim().min(1).max(4000) }).strict(),
+  z.object({ kind: z.literal("blocked"), summary: z.string().min(1).max(4000), blocker: blockerEvidenceSchema.optional() }).strict(),
+  intentCheckReportSchema,
+  verdictReportSchema,
+  judgementReportSchema,
+] as const;
+const liveTeamReportSchema = z.discriminatedUnion("kind", [...sharedTeamReportVariants,
+  strictDeliveryReconciliationReportSchema,
+  z.object({ ...questionReportShape, recommendation: questionRecommendationSchema.optional() }).strict().superRefine(refineQuestion)]);
+export const teamReportSchema = z.discriminatedUnion("kind", [...sharedTeamReportVariants,
+  strictDeliveryReconciliationReportSchema,
+  z.object({ ...questionReportShape, recommendation: requiredQuestionRecommendationSchema }).strict().superRefine(refineQuestion)]);
+export const recordedTeamReportSchema = z.discriminatedUnion("kind", [...sharedTeamReportVariants,
+  recordedDeliveryReconciliationReportSchema,
+  z.object({ ...questionReportShape, recommendation: questionRecommendationSchema.optional() }).strict().superRefine(refineQuestion)]);
+export type LiveTeamReport =
+  | Exclude<z.infer<typeof liveTeamReportSchema>, { kind: "delivery-reconciliation" | "permission-decision" }>
+  | DeliveryReconciliationReport
+  | PermissionDecisionReport;
+export type TeamReport = z.infer<typeof recordedTeamReportSchema>;
+export const teamReportEnvelopeSchema = z.object({ requestId: z.uuid(), runId: z.uuid(), memberId: z.uuid(), revision: z.number().int().min(1), report: liveTeamReportSchema }).strict();
+export const recordedTeamReportEnvelopeSchema = z.object({ requestId: z.uuid(), runId: z.uuid(), memberId: z.uuid(), revision: z.number().int().min(1), report: recordedTeamReportSchema }).strict();
+export interface TeamReportEnvelope {
+  requestId: string;
+  runId: string;
+  memberId: string;
+  revision: number;
+  report: LiveTeamReport;
+}
+export type RecordedTeamReportEnvelope = z.infer<typeof recordedTeamReportEnvelopeSchema>;
+export type TeamAssignment = { runId: string; memberId: string; revision: number; role: TeamRole | "mission-coordinator"; taskId?: string; verificationRefused?: true; entryTools?: true; hostProfiles?: true };
 export type TeamStatus = "planning" | "discovering" | "implementing" | "integrating" | "verifying" | "reviewing" | "delivering" | "merged" | "needs-input" | "paused" | "blocked" | "ready-for-review" | "no-change" | "cancelled";
 export interface TeamMember extends TeamAssignment {
+  goalCriteriaPlan?: TeamGoalCriteriaPlanPin;
   role: TeamRole;
-  /** Absent on legacy runs; their members use the run's original provider. */
   provider?: Provider;
   modelProfile?: TeamModelProfile;
   sessionId: string;
-  /** Claude conversation resumed for successive permission review turns. */
   nativeSessionId?: string;
-  /** Native conversation launch used for the current or most recent turn. */
   continuation?: NativeContinuation;
-  /** Permission decisions handled by this reviewer member, in order. */
   turns?: { sessionId: string; decisionId: string; startedAt: string; mode: "start" | "resume" }[];
-  /** Full evidence for rebuilding the original prompt if native resume fails. */
   pendingFeedback?: string;
   title: string;
   status: "queued" | "running" | "waiting" | "reported" | "stopped" | "unavailable";
   cwd: string;
-  /** Host-assigned external directory for this member's temporary development files. */
   scratchDirectory?: string;
   baseCommit: string;
   prompt: string;
-  /** Full assignment feedback for the private context file; omitted from client views. */
   contextFeedback?: string;
   startedAt?: string;
   reportedAt?: string;
-  /** The latest attention activity the host observed for this member while it had no report. */
   lastActivityAt?: string;
-  /** A provider limit was observed but the member has not yet been switched or stopped. */
+  spinnerOnlySince?: string;
   pendingLimit?: boolean;
-  /** Set when the member stopped for lack of activity; its replacement continues the same assignment. */
+  pendingCapacity?: boolean;
   stalledAt?: string;
+  stalledSourceMemberId?: string;
   report?: TeamReport;
   cursor: number;
+  entryCursor?: number;
   stopRequestId: string;
-  /** Why the host stopped this member without a report, such as a provider usage limit. */
   stoppedReason?: string;
-  /** The member clone was removed under the retention policy after its result was integrated or its run settled. */
+  permissionBlocked?: { code: "locked"; at: string };
   workspaceRemovedAt?: string;
-  /** Confirmed process retirement for a recording-failed reviewer; its original journal remains sealed. */
+  savedWork?: TeamMemberSavedWork;
   retirement?: { requestId: string; at: string; identity: string; seq: number; processes: number; unsignalable: number };
-  /** Set only after stopped() confirms exit while the member waits for serialized integration. */
   exitConfirmedAt?: string;
-  /** Computed on read for members whose provider reports usage; never stored. */
   usage?: UsageTotals;
 }
+export const ACTIVE_MEMBER_STATUSES: readonly TeamMember["status"][] = ["queued", "running", "reported", "unavailable"];
+export type TaskRouting = { profileId: string; by: "router" | "fallback" };
 export interface TeamTask extends TeamTaskPlan {
-  /** Run revision whose plan created this task. */
   revision: number;
   status: "pending" | "running" | "waiting" | "integrated" | "blocked";
   memberId?: string;
   commit?: string;
   summary?: string;
+  limitations?: string[];
   rubric?: { version: 1; correctness: { score: number; why: string }; cleanliness: { score: number; why: string }; extensibility: { score: number; why: string }; docs: { score: number; why: string }; reviewerProfileId: string };
   ownerRating?: { score: 1 | 2 | 3 | 4 | 5; note?: string; at: string };
   diffStat?: { added: number; removed: number; files: number; docs: boolean; tests: boolean };
-  /** Paths this task's own member diff touched (base to its commit), bounded to 200; absent when Git refused the read. */
   changedPaths?: { paths: string[]; truncated: boolean };
   reviewRounds?: number;
   escalation?: { fromProfileId?: string; toProfileId: string; reason: string; memberId: string; at: string };
-  /** Each provider-limit switch of this task's member; a replacement can itself be switched. */
   limitSwitches?: { fromProfileId?: string; toProfileId: string; reason: string; resetsAt?: string; memberId: string; at: string }[];
+  routing?: TaskRouting;
 }
 export interface TeamContinuation {
   revision: number;
@@ -467,69 +661,48 @@ export interface TeamContinuation {
   baseCommit?: string;
   headCommit: string;
   tasks: TeamTask[];
-  review?: { verdict: "approved" | "changes-requested"; summary: string; revision: number; uiEvidence?: string };
+  review?: { verdict: "approved" | "changes-requested"; summary: string; revision: number; uiEvidence?: string; acceptance?: TeamAcceptanceEvidence[] };
   brief?: TeamBrief;
 }
 export interface TeamScout extends TeamScoutPlan {
   status: "pending" | "running" | "waiting" | "complete";
+  routing?: TaskRouting;
   memberId?: string;
   summary?: string;
   evidence?: TeamEvidence[];
 }
-export interface TeamDecision {
-  id: string;
-  memberId: string;
-  revision: number;
-  question: string;
-  options: string[];
-  createdAt: string;
-  answer?: string;
-  answeredBy?: "owner" | "coordinator";
-  answeredAt?: string;
-}
-export interface TeamCheck {
-  command: TeamCommand;
-  phase?: "setup";
-  headCommit?: string;
-  status: "running" | "passed" | "failed" | "interrupted";
-  startedAt: string;
-  finishedAt?: string;
-  exitCode?: number | null;
-  output: string;
-  revision: number;
-  /** Correction round that launched this verification attempt. */
-  round?: number;
-}
+export type ReplayLink = { jobId: string; trialId: string; purpose: "replay" | "gate" | "duel"; ending?: TrialEnding | JudgeEnding; resultCommit?: string; resetsAt?: string; judgement?: Judgement; judgeMinutes?: number; pairedProviders?: Provider[]; launchWait?: string };
 export interface TeamRun {
-  /** Explicit owner delegation pinned at creation. Old runs remain opted out. */
+  blackboard?: { tools: true };
+  routing?: TeamRunRouting;
+  routingRevokedAt?: string;
+  autonomy?: AutonomyMode;
+  intentCheck?: "on" | "off";
+  register?: "on";
+  verdicts?: "on";
+  assessment?: RunAssessment;
   permissions?: TeamPermissions;
   permissionsRevokedAt?: string;
   permissionDecisions?: TeamPermissionDecision[];
-  /** Bounded diagnostic recovery records. These never confer permission authority. */
   permissionRecovery?: TeamPermissionRecoveryState;
-  /** Owner opt-in is pinned at creation; accepted commands cannot change within this run. */
+  permissionAgentDecisions?: TeamPermissionAgentDecision[];
   establishChecks?: true;
   verification?: TeamVerification;
-  /** Revisions where an unauthorized verification plan already received its one correction. */
   verificationCorrections?: number[];
+  reviewCorrections?: number[];
   verificationReconciliations?: { requestId: string; pendingId: string; revision: number; round: number; headCommit: string; interruptedChecks: number; attestation: string; at: string }[];
-  /** Changed files from the run's base to its recorded head, bounded to 400; absent when Git refused the read. */
   changes?: { headCommit: string; recordedAt: string; files: { path: string; status: "added" | "modified" | "removed" | "renamed"; added: number | null; removed: number | null }[]; truncated: boolean };
-  /** Owner-authorized repository delivery policy pinned when this run starts. */
   delivery?: TeamDelivery;
-  /** Host publication state for the current integration head. */
   publication?: TeamPublication;
-  /** Agent-reported delivery evidence; this is not independently verified by the host. */
   deliveryReceipt?: { revision: number; headCommit: string; pullRequestUrl: string; mergeCommit: string; summary: string; reportedAt: string };
-  /** Agent-reported open pull request for a `pr` delivery; the owner merges it on GitHub. Not host verification. */
-  pullRequest?: { revision: number; headCommit: string; pullRequestUrl: string; summary: string; reportedAt: string };
-  /** Bounded PM recovery of routine report/protocol failures; member reports remain the evidence source. */
+  pullRequest?: { revision: number; headCommit: string; pullRequestUrl: string; summary: string; reportedAt: string; branch?: string };
+  deliveryRecoveryAttempts?: number;
+  reviewFeedback?: ReviewFeedbackEntry[];
   recovery?: {
     attempts: number;
     status: "stopping" | "planning" | "complete" | "exhausted";
     source: { code: string; memberId: string; revision: number; reportKind?: TeamReport["kind"]; reason: string; at: string };
   };
-  /** Bounded delivery inspection and baseline recovery; provider observations remain agent claims. */
   deliveryRecovery?: {
     attempts: number;
     status: "stopping" | "planning" | "replanning" | "complete" | "exhausted";
@@ -543,28 +716,23 @@ export interface TeamRun {
     integratedHeadCommit?: string;
     disposition?: "no-publication" | "owned-branch" | "pull-request";
   };
-  /** Durable evidence that an owner cleared an attributed failed delivery-preparation gate. */
   deliveryOperationReconciliations?: { requestId: string; pendingId: string; pendingKind: "result"; revision: number; headCommit: string;
     source: { memberId: string; role: "delivery" }; failure: { code: string; reason: string; at: string };
     report: Extract<TeamReport, { kind: "delivery-reconciliation" }> & { disposition: "no-publication" }; recoveryAttempts: number;
     attestation: { boundary: "delivery-preparation"; processesStopped: true; text: string }; at: string }[];
-  /** The base came from the host mirror while the latest fetch from GitHub failed. */
   baseStale?: { fetchedAt?: string; reason: "fetch-failed"; category: "auth" | "network" | "not-found" | "other" };
-  /** A continuation kept its parent's base while the mirror already holds a newer base-branch head. */
   baseBehind?: { mirrorHead: string };
-  /** Whether the current run title came from its request, a naming model, or the coordinator brief. */
   titleSource?: "request" | "model" | "brief";
   linearTracking?: boolean;
   linear?: LinearTrackingView;
   id: string;
   projectId: string;
   provider: Provider;
-  /** Immutable model choices; current provider credentials and permissions are not copied here. */
   lineup?: TeamLineup;
   goal?: TeamGoalContext;
-  /** Set when a mission started this run as one of its subteams; the board shows it only inside that mission. */
   missionId?: string;
-  /** The integration and member clones were removed under the retention policy; the record, events and evidence remain. */
+  replay?: ReplayLink;
+  requestSource?: ConnectorSource;
   workspaceRemovedAt?: string;
   handoff?: import("./handoff-types.js").TeamHandoffContext;
   brief?: TeamBrief;
@@ -573,13 +741,13 @@ export interface TeamRun {
   stopReason?: "deadline" | "member-limit";
   title: string;
   objective: string;
-  /** Maximum worker slots allowed for this run; absent on legacy records. */
   parallelismCeiling?: number;
   parallelism: number;
   revision: number;
   status: TeamStatus;
   createdAt: string;
   updatedAt: string;
+  lastActivityAt?: string;
   workspace: string;
   branch: string;
   baseCommit: string;
@@ -589,24 +757,60 @@ export interface TeamRun {
   members: TeamMember[];
   decisions: TeamDecision[];
   checks: TeamCheck[];
-  steering: { text: string; revision: number; at: string }[];
+  steering: { text: string; revision: number; at: string; source?: SteeringSource }[];
   events: { at: string; text: string }[];
   reason?: string;
-  /** TeamError.code for the current blocked state; absent on legacy records. */
   blockCode?: string;
-  review?: { verdict: "approved" | "changes-requested"; summary: string; revision: number; uiEvidence?: string };
+  review?: { verdict: "approved" | "changes-requested"; summary: string; revision: number; uiEvidence?: string; acceptance?: TeamAcceptanceEvidence[] };
   round: number;
 }
-/** `providerLimits` is the host's active limit memory at read time, shared by every run. */
+export type TeamWaitReasonKind =
+  | "worker-slot"
+  | "dependency"
+  | "owner-decision"
+  | "provider-prompt"
+  | "provider-limit"
+  | "integration-order"
+  | "linear-sync"
+  | "spinner-only"
+  | "stalled";
+
+export interface TeamWaitReason {
+  kind: TeamWaitReasonKind;
+  summary: string;
+  taskId?: string;
+  memberId?: string;
+  decisionId?: string;
+  blockedByTaskIds?: string[];
+  since?: string;
+  resetsAt?: string;
+}
+
 export type TeamView = Omit<TeamRun, "members" | "permissionDecisions" | "permissionRecovery"> & {
-  pendingOperation?: { id: string; kind: "prepare" | "member" | "result" | "check"; revision: number; failed: boolean;
-    failureCode?: string; sourceMemberId?: string; sourceRole?: TeamMember["role"] };
-  members: Omit<TeamMember, "prompt" | "contextFeedback" | "nativeSessionId" | "continuation" | "turns" | "pendingFeedback">[];
+  lastActivityAt: string;
+  pendingOperation?: TeamPendingOperation;
+  leftoverProcesses?: TeamLeftoverProcesses;
+  publishing?: boolean;
+  members: Omit<TeamMember, "prompt" | "contextFeedback" | "nativeSessionId" | "continuation" | "turns" | "pendingFeedback" | "goalCriteriaPlan">[];
   permissionDecisions?: Omit<TeamPermissionDecision, "prompt" | "coordinatorSessionId">[];
   permissionRecovery?: { outcomes: TeamPermissionRecoveryView[] };
   usage: UsageRollup;
   providerLimits: ProviderLimit[];
   workers: { limit: number; max: number; running: number; ready: number };
+  waitReasons?: TeamWaitReason[];
   resumable: boolean;
   continuable: boolean;
 };
+
+export type GithubReviewSource = { kind: "github-review"; id: string; name: string };
+export type SteeringSource = ConnectorSource | GithubReviewSource | "coordinator";
+export const githubReviewSource = (reviewId: string): GithubReviewSource => ({ kind: "github-review", id: reviewId, name: "Your GitHub review" });
+export type ReviewFeedbackOutcome = "accepted" | "applied" | "approved-seen" | "dismissed" | "stale-head" | "no-text" | "before-enable" | "limit" | "superseded" | "refused";
+export type ReviewFeedbackEntry = { reviewId: string; state: "CHANGES_REQUESTED" | "APPROVED" | "DISMISSED"; submittedAt: string; receivedAt: string; outcome: ReviewFeedbackOutcome };
+export const ownerSteering = (item: { source?: SteeringSource }) => !item.source || typeof item.source === "object" && item.source.kind === "github-review";
+export const inputSourceLabel = (source?: SteeringSource | "slack") =>
+  typeof source === "object" ? (source.kind === "github-review" ? "Owner (GitHub review)" : `Connector (${source.name})`) : source === "coordinator" ? "Mission coordinator" : "Owner";
+export const decisionAnswerLabel = (decision: Pick<TeamDecision, "answeredBy" | "source">) =>
+  decision.answeredBy === "connector" ? (decision.source ? inputSourceLabel(decision.source) : "Connector") : decision.answeredBy === "coordinator" ? "Mission coordinator" : "User";
+export const decisionAuthorityQuestion = (decision: Pick<TeamDecision, "question" | "intentQuestions">) =>
+  decision.intentQuestions ? `The intent check's questions ${decision.intentQuestions.join(", ")}` : decision.question;

@@ -1,0 +1,463 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { spawnSync, type ChildProcess } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { captureGit, patchArgs } from "../packages/host/src/eval-git.js";
+import { teamGitArgs } from "../packages/host/src/team-workspace.js";
+import type { TeamCommand } from "../packages/host/src/team-types.js";
+
+const FAKE_HEX = "a".repeat(39);
+
+function run(cwd: string, ...args: string[]) {
+  const result = spawnSync("git", ["-c", "commit.gpgsign=false", ...args], { cwd, encoding: "utf8" });
+  if (result.status !== 0) throw new Error(`git ${args[0]} failed`);
+  return result.stdout.trim();
+}
+
+function makeRepo() {
+  const dir = mkdtempSync(join(tmpdir(), "eval-git-"));
+  run(dir, "init", "-q", "--template=");
+  run(dir, "config", "user.name", "Placeholder Author");
+  run(dir, "config", "user.email", "placeholder@example.invalid");
+  return dir;
+}
+
+function commit(dir: string, write: (dir: string) => void, message: string) {
+  write(dir);
+  run(dir, "add", "-A");
+  run(dir, "commit", "-q", "--allow-empty", "-m", message);
+  return run(dir, "rev-parse", "HEAD");
+}
+
+function writeFiles(files: Record<string, string | Buffer>) {
+  return (dir: string) => {
+    for (const [name, content] of Object.entries(files)) writeFileSync(join(dir, name), content);
+  };
+}
+
+function recordingPrefix(dir: string): { prefix: TeamCommand; record: string } {
+  const record = join(dir, "argv.txt");
+  const script = join(dir, "prefix.sh");
+  writeFileSync(script, `#!/bin/sh\nprintf '%s\\n' "$@" > "${record}"\nshift\nexec git "$@"\n`);
+  return { prefix: { command: "/bin/sh", args: [script] }, record };
+}
+
+function sleepingPrefix(dir: string): { prefix: TeamCommand; marker: string } {
+  const marker = join(dir, "started.txt");
+  const script = join(dir, "sleep.sh");
+  writeFileSync(script, `#!/bin/sh\necho $$ > "${marker}"\nsleep 10\n`);
+  return { prefix: { command: "/bin/sh", args: [script] }, marker };
+}
+
+async function assertSleeperGone(marker: string) {
+  const written = () => /^(\d+)\n$/.exec(existsSync(marker) ? readFileSync(marker, "utf8") : "")?.[1];
+  const until = Date.now() + 5000;
+  while (Date.now() < until && written() === undefined) await new Promise(resolve => setTimeout(resolve, 20));
+  const text = written();
+  if (text === undefined) return;
+  const pid = Number(text);
+  const gone = () => { try { process.kill(pid, 0); return false; } catch { return true; } };
+  const stop = Date.now() + 2000;
+  while (Date.now() < stop && !gone()) await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(gone(), true, "the stopped read left its process running");
+}
+
+function failingPrefix(dir: string): TeamCommand {
+  const script = join(dir, "fail.sh");
+  writeFileSync(script, "#!/bin/sh\nexit 1\n");
+  return { command: "/bin/sh", args: [script] };
+}
+
+test("the patch form is exact and checked", async () => {
+  const dir = makeRepo();
+  try {
+    const from = commit(dir, writeFiles({ "a.txt": "one\n" }), "from");
+    const to = commit(dir, writeFiles({ "a.txt": "two\n" }), "to");
+    const { prefix, record } = recordingPrefix(dir);
+    const git = captureGit(() => prefix);
+
+    assert.equal((await git.patch(dir, from, to)).state, "read");
+    assert.deepEqual(
+      readFileSync(record, "utf8").split("\n").filter(Boolean),
+      ["git", ...teamGitArgs(dir, ["diff", "--no-ext-diff", "--no-textconv", "--no-color", "--binary", "--default-prefix", "--no-renames", "--submodule=short", "--ignore-submodules=none", "--unified=3", "--inter-hunk-context=0", from, to, "--"])],
+    );
+
+    for (const bad of ["HEAD", "-x", FAKE_HEX]) {
+      rmSync(record, { force: true });
+      assert.throws(() => patchArgs(bad, to), TypeError);
+      assert.throws(() => patchArgs(from, bad), TypeError);
+      assert.deepEqual(await git.patch(dir, bad, to), { state: "failed" });
+      assert.equal(existsSync(record), false);
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a binary patch reproduces the reference tree", async () => {
+  const dir = makeRepo();
+  const clone = makeRepo();
+  try {
+    const from = commit(dir, writeFiles({ "a.txt": "keep\n", "c.txt": "gone\n" }), "from");
+    const to = commit(dir, (root) => {
+      writeFileSync(join(root, "b.txt"), "added\n");
+      writeFileSync(join(root, "bin.dat"), randomBytes(4096));
+      rmSync(join(root, "c.txt"));
+    }, "to");
+    const read = await captureGit(() => undefined).patch(dir, from, to);
+    assert.equal(read.state, "read");
+    if (read.state !== "read") return;
+
+    const patchFile = join(clone, "change.patch");
+    writeFileSync(patchFile, read.bytes);
+    run(clone, "fetch", "-q", dir, "HEAD");
+    run(clone, "checkout", "-q", "--detach", from);
+    run(clone, "apply", "--index", patchFile);
+    assert.equal(run(clone, "write-tree"), run(dir, "rev-parse", `${to}^{tree}`));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(clone, { recursive: true, force: true });
+  }
+});
+
+test("an over-limit patch is refused, never cut", async () => {
+  const dir = makeRepo();
+  try {
+    const from = commit(dir, () => {}, "from");
+    const to = commit(dir, writeFiles({ "big.bin": randomBytes(1_200_000) }), "to");
+    const started = Date.now();
+    const read = await captureGit(() => undefined).patch(dir, from, to);
+    assert.equal(read.state, "too-large");
+    assert.ok(Date.now() - started < 5000);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("names and the base check", async () => {
+  const dir = makeRepo();
+  try {
+    const base = commit(dir, writeFiles({ "a.txt": "a\n" }), "base");
+    const three = commit(dir, writeFiles({ "a.txt": "a2\n", "b.txt": "b\n", "c.txt": "c\n" }), "three");
+    const wide = commit(dir, (root) => {
+      for (let index = 0; index < 501; index++) writeFileSync(join(root, `f${String(index).padStart(3, "0")}.txt`), "x\n");
+    }, "wide");
+    const git = captureGit(() => undefined);
+
+    assert.deepEqual(await git.names(dir, base, three, 500), { state: "read", names: ["a.txt", "b.txt", "c.txt"] });
+    assert.deepEqual(await git.names(dir, base, wide, 500), { state: "too-wide" });
+
+    assert.equal(await git.onBaseBranch(dir, base, three), "proven");
+    assert.equal(await git.onBaseBranch(dir, three, base), "not-proven");
+    assert.equal(await git.onBaseBranch(dir, "0".repeat(40), three), "not-proven");
+
+    run(dir, "checkout", "-q", "--detach", base);
+    const side = commit(dir, writeFiles({ "side.txt": "s\n" }), "side");
+    assert.equal(await git.onBaseBranch(dir, side, three), "not-proven");
+
+    const refused = captureGit(() => failingPrefix(dir));
+    assert.equal(await refused.onBaseBranch(dir, base, three), "not-proven");
+    assert.deepEqual(await refused.names(dir, base, three, 500), { state: "failed" });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a refused patch is failed, and a cut name list is too-wide", async () => {
+  const dir = makeRepo();
+  try {
+    const from = commit(dir, writeFiles({ "a.txt": "one\n" }), "from");
+    const to = commit(dir, writeFiles({ "a.txt": "two\n" }), "to");
+    const refused = captureGit(() => failingPrefix(dir));
+    assert.deepEqual(await refused.patch(dir, from, to), { state: "failed" });
+
+    const wide = commit(dir, (root) => {
+      for (let index = 0; index < 400; index++) {
+        writeFileSync(join(root, `n${String(index).padStart(3, "0")}-${"x".repeat(170)}.txt`), "x\n");
+      }
+    }, "wide names");
+    assert.deepEqual(await captureGit(() => undefined).names(dir, from, wide, 500), { state: "too-wide" });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a name list cut where a leftover held the output is failed, not too-wide", { skip: process.platform === "win32" && "process groups are POSIX" }, async () => {
+  const dir = makeRepo();
+  const leftFile = join(dir, "left.pid");
+  try {
+    const from = commit(dir, writeFiles({ "a.txt": "one\n" }), "from");
+    const to = commit(dir, writeFiles({ "a.txt": "two\n" }), "to");
+    const script = join(dir, "leave.sh");
+    writeFileSync(script, `#!/bin/sh\nsleep 30 &\necho $! > "${leftFile}"\nexec "$@"\n`);
+    assert.deepEqual(await captureGit(() => ({ command: "/bin/sh", args: [script] })).names(dir, from, to, 500), { state: "failed" });
+    const plain = join(dir, "plain.sh");
+    writeFileSync(plain, `#!/bin/sh\nexec "$@"\n`);
+    assert.deepEqual(await captureGit(() => ({ command: "/bin/sh", args: [plain] })).names(dir, from, to, 500), { state: "read", names: ["a.txt"] });
+  } finally {
+    const left = Number.parseInt(existsSync(leftFile) ? readFileSync(leftFile, "utf8") : "", 10);
+    if (Number.isSafeInteger(left) && left > 1) { try { process.kill(left, "SIGKILL"); } catch { } }
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a read that cannot end", async () => {
+  const dir = makeRepo();
+  try {
+    const from = commit(dir, writeFiles({ "a.txt": "one\n" }), "from");
+    const to = commit(dir, writeFiles({ "a.txt": "two\n" }), "to");
+    const { prefix, marker } = sleepingPrefix(dir);
+    const git = captureGit(() => prefix, 200);
+
+    let started = Date.now();
+    assert.deepEqual(await git.patch(dir, from, to), { state: "failed" });
+    let took = Date.now() - started;
+    assert.ok(took >= 180, "the read ran until its limit: it did not fail at once");
+    assert.ok(took < 2000, "and it ended there");
+    await assertSleeperGone(marker);
+
+    rmSync(marker, { force: true });
+    started = Date.now();
+    assert.deepEqual(await git.names(dir, from, to, 500), { state: "failed" });
+    took = Date.now() - started;
+    assert.ok(took >= 180, "the read ran until its limit: it did not fail at once");
+    assert.ok(took < 2000, "and it ended there");
+    await assertSleeperGone(marker);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a replace ref changes no capture read", async () => {
+  const dir = makeRepo();
+  const clone = makeRepo();
+  try {
+    const base = commit(dir, writeFiles({ "a.txt": "one\n", "b.txt": "one\n" }), "base");
+    const to = commit(dir, writeFiles({ "a.txt": "two\n" }), "to");
+    run(dir, "checkout", "-q", "--detach", base);
+    const other = commit(dir, writeFiles({ "b.txt": "two\n" }), "other");
+    run(dir, "checkout", "-q", "--detach", to);
+    run(dir, "replace", to, other);
+    const git = captureGit(() => undefined);
+
+    assert.deepEqual(await git.names(dir, base, to, 500), { state: "read", names: ["a.txt"] });
+
+    run(clone, "fetch", "-q", dir, "HEAD");
+    run(clone, "checkout", "-q", "--detach", base);
+    const read = await git.patch(dir, base, to);
+    assert.equal(read.state, "read");
+    if (read.state !== "read") return;
+    const patchFile = join(clone, "change.patch");
+    writeFileSync(patchFile, read.bytes);
+    run(clone, "apply", "--index", patchFile);
+    assert.equal(run(clone, "write-tree"), run(dir, "--no-replace-objects", "rev-parse", `${to}^{tree}`));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(clone, { recursive: true, force: true });
+  }
+});
+
+test("a copy's diff settings change no patch", async () => {
+  const dir = makeRepo();
+  const clone = makeRepo();
+  try {
+    run(dir, "config", "diff.context", "1000");
+    run(dir, "config", "diff.interHunkContext", "1000");
+    const lines = (changed: number[] = []) => Array.from({ length: 400 }, (_, index) => (changed.includes(index + 1) ? "changed\n" : `line ${index + 1}\n`)).join("");
+    const from = commit(dir, writeFiles({ "long.txt": lines() }), "from");
+    const to = commit(dir, writeFiles({ "long.txt": lines([200, 210]) }), "to");
+
+    run(clone, "fetch", "-q", dir, "HEAD");
+    const inCopy = await captureGit(() => undefined).patch(dir, from, to);
+    const plain = await captureGit(() => undefined).patch(clone, from, to);
+    assert.equal(inCopy.state, "read");
+    assert.equal(plain.state, "read");
+    if (inCopy.state !== "read" || plain.state !== "read") return;
+    assert.ok(inCopy.bytes.length < 1000);
+    assert.deepEqual(inCopy.bytes, plain.bytes);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(clone, { recursive: true, force: true });
+  }
+});
+
+test("a copy's submodule setting hides no name", async () => {
+  const dir = makeRepo();
+  try {
+    const from = commit(dir, writeFiles({ "a.txt": "one\n" }), "from");
+    writeFileSync(join(dir, "a.txt"), "two\n");
+    run(dir, "add", "a.txt");
+    run(dir, "update-index", "--add", "--cacheinfo", `160000,${from},sub`);
+    run(dir, "commit", "-q", "-m", "to");
+    const to = run(dir, "rev-parse", "HEAD");
+    run(dir, "update-index", "--cacheinfo", `160000,${to},sub`);
+    run(dir, "commit", "-q", "-m", "later");
+    const later = run(dir, "rev-parse", "HEAD");
+    run(dir, "config", "diff.ignoreSubmodules", "all");
+    const git = captureGit(() => undefined);
+
+    assert.deepEqual(await git.names(dir, from, to, 500), { state: "read", names: ["a.txt", "sub"] });
+    assert.deepEqual(await git.names(dir, to, later, 2000), { state: "read", names: ["sub"] });
+
+    const { prefix, record } = recordingPrefix(dir);
+    assert.equal((await captureGit(() => prefix).names(dir, from, to, 500)).state, "read");
+    assert.deepEqual(
+      readFileSync(record, "utf8").split("\n").filter(Boolean),
+      ["git", ...teamGitArgs(dir, ["diff", "--no-ext-diff", "--no-textconv", "--name-only", "--no-renames", "--ignore-submodules=none", "-z", from, to, "--"])],
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a patch child that cannot be stopped counts until it exits", async () => {
+  const dir = makeRepo();
+  try {
+    const from = commit(dir, writeFiles({ "a.txt": "one\n" }), "from");
+    const to = commit(dir, writeFiles({ "a.txt": "two\n" }), "to");
+    const script = join(dir, "slow.sh");
+    writeFileSync(script, "#!/bin/sh\nsleep 2\nexit 0\n");
+    const seen: ChildProcess[] = [];
+    let stoppedAt = 0, releasedAt = 0;
+    const git = captureGit(() => ({ command: "/bin/sh", args: [script] }), 100, child => {
+      seen.push(child);
+      stoppedAt = Date.now();
+      const unref = child.unref.bind(child);
+      child.unref = () => { releasedAt = Date.now(); unref(); };
+      return false;
+    }, 200);
+    const started = Date.now();
+    const pending = git.patch(dir, from, to);
+    const keep = setInterval(() => undefined, 1_000);
+    try {
+      const until = Date.now() + 1_500;
+      while (releasedAt === 0 && Date.now() < until) await new Promise(resolve => setTimeout(resolve, 20));
+      assert.equal(seen.length, 1);
+      assert.ok(releasedAt > 0, "the handle is released while the child still runs");
+      assert.ok(releasedAt - stoppedAt >= 150, "the handle is not released at the refused stop");
+      assert.equal(seen[0]!.stdout?.destroyed, true);
+      assert.equal(seen[0]!.stderr?.destroyed, true);
+      const probe = await Promise.race([
+        pending.then(() => "settled"),
+        new Promise(resolve => setTimeout(() => resolve("pending"), 10)),
+      ]);
+      assert.equal(probe, "pending");
+      assert.deepEqual(await pending, { state: "failed" });
+      assert.ok(Date.now() - started >= 1_500, "the read settles only when the child has ended");
+    } finally {
+      clearInterval(keep);
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a refused stop of a child that has already ended still settles the read", async () => {
+  const dir = makeRepo();
+  try {
+    const from = commit(dir, writeFiles({ "a.txt": "one\n" }), "from");
+    const big = commit(dir, writeFiles({ "big.bin": randomBytes(1_200_000) }), "big");
+    const git = captureGit(() => undefined, 10_000, child => {
+      try { if (child.pid) process.kill(child.pid, "SIGKILL"); } catch { }
+      return false;
+    });
+    assert.equal((await git.patch(dir, from, big)).state, "too-large");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("close stops the reads in flight", async () => {
+  const dir = makeRepo();
+  try {
+    const from = commit(dir, writeFiles({ "a.txt": "one\n" }), "from");
+    const to = commit(dir, writeFiles({ "a.txt": "two\n" }), "to");
+    const { prefix, marker } = sleepingPrefix(dir);
+    const git = captureGit(() => prefix, 10_000);
+    const patch = git.patch(dir, from, to);
+    const names = git.names(dir, from, to, 500);
+
+    const waited = Date.now();
+    while (!existsSync(marker) && Date.now() - waited < 2000) await new Promise(resolve => setTimeout(resolve, 20));
+    assert.equal(existsSync(marker), true);
+
+    git.close?.();
+    const both = Promise.all([patch, names]);
+    let timer: NodeJS.Timeout | undefined;
+    const late = new Promise<string>(resolve => { timer = setTimeout(() => resolve("late"), 2000); });
+    const settled = await Promise.race([both, late]);
+    clearTimeout(timer);
+    assert.deepEqual(settled, [{ state: "failed" }, { state: "failed" }]);
+
+    rmSync(marker, { force: true });
+    assert.deepEqual(await git.patch(dir, from, to), { state: "failed" });
+    assert.deepEqual(await git.names(dir, from, to, 500), { state: "failed" });
+    assert.equal(await git.onBaseBranch(dir, from, to), "not-proven");
+    assert.equal(existsSync(marker), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("patch reads distinguish empty diffs, missing refs, and repository errors", async () => {
+  const dir = makeRepo();
+  const nonRepo = mkdtempSync(join(tmpdir(), "eval-git-nonrepo-"));
+  try {
+    const from = commit(dir, writeFiles({ "a.txt": "one\n" }), "from");
+    const equalTree = commit(dir, () => {}, "equal tree");
+    const to = commit(dir, writeFiles({ "a.txt": "two\n" }), "to");
+    const missingSha = "0".repeat(40);
+    const git = captureGit(() => undefined);
+
+    assert.deepEqual(await git.patch(dir, from, equalTree), { state: "empty" });
+    assert.deepEqual(await git.patch(dir, missingSha, to), { state: "missing" });
+    assert.deepEqual(await git.patch(dir, from, missingSha), { state: "missing" });
+    assert.deepEqual(await git.patch(nonRepo, from, to), { state: "failed" });
+
+    assert.equal(await git.sameTree(dir, from, equalTree), "same");
+    assert.equal(await git.sameTree(dir, from, to), "different");
+    assert.equal(await git.sameTree(dir, missingSha, to), "missing");
+    assert.equal(await git.sameTree(dir, from, missingSha), "missing");
+    assert.equal(await git.sameTree(nonRepo, from, to), "failed");
+
+    const silentScript = join(dir, "silent.sh");
+    writeFileSync(silentScript, "#!/bin/sh\nexit 0\n");
+    const silent = captureGit(() => ({ command: "/bin/sh", args: [silentScript] }));
+    assert.deepEqual(await silent.patch(dir, from, to), { state: "empty" });
+    assert.equal(await silent.sameTree(dir, from, equalTree), "failed");
+
+    const noisyScript = join(dir, "noisy-stderr.sh");
+    writeFileSync(noisyScript, `#!/bin/sh\ni=0\nwhile [ "$i" -lt 120 ]; do\n  printf 'prefix-log-line-0123456789012345678901234567890123456789\\n' >&2\n  i=$((i + 1))\ndone\nshift\nexec git "$@"\n`);
+    const noisy = captureGit(() => ({ command: "/bin/sh", args: [noisyScript] }));
+    assert.deepEqual(await noisy.patch(dir, missingSha, to), { state: "missing" });
+    assert.equal(await noisy.sameTree(dir, missingSha, to), "missing");
+
+    const warnOnlyScript = join(dir, "warn-only.sh");
+    writeFileSync(warnOnlyScript, `#!/bin/sh\nprintf 'warning: path bad revision %s\\n' '${from}' >&2\nexit 128\n`);
+    const warnOnly = captureGit(() => ({ command: "/bin/sh", args: [warnOnlyScript] }));
+    assert.deepEqual(await warnOnly.patch(dir, from, to), { state: "failed" });
+
+    const warnBeforeFatalScript = join(dir, "warn-before-fatal.sh");
+    writeFileSync(warnBeforeFatalScript, `#!/bin/sh\nprintf 'warning: bad revision %s\\nfatal: not a git repository\\n' '${from}' >&2\nexit 128\n`);
+    const warnBeforeFatal = captureGit(() => ({ command: "/bin/sh", args: [warnBeforeFatalScript] }));
+    assert.deepEqual(await warnBeforeFatal.patch(dir, from, to), { state: "failed" });
+
+    const unrelatedFatalScript = join(dir, "unrelated-fatal.sh");
+    writeFileSync(unrelatedFatalScript, "#!/bin/sh\nprintf \"fatal: bad revision 'HEAD'\\n\" >&2\nexit 128\n");
+    const unrelatedFatal = captureGit(() => ({ command: "/bin/sh", args: [unrelatedFatalScript] }));
+    assert.deepEqual(await unrelatedFatal.patch(dir, from, to), { state: "failed" });
+    assert.equal(await unrelatedFatal.sameTree(dir, from, to), "failed");
+
+    const unattributedScript = join(dir, "unattributed-fatal.sh");
+    writeFileSync(unattributedScript, "#!/bin/sh\nprintf 'fatal: Needed a single revision\\n' >&2\nexit 128\n");
+    const unattributed = captureGit(() => ({ command: "/bin/sh", args: [unattributedScript] }));
+    assert.equal(await unattributed.sameTree(dir, from, to), "failed");
+    assert.deepEqual(await unattributed.patch(dir, from, to), { state: "failed" });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(nonRepo, { recursive: true, force: true });
+  }
+});

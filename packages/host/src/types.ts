@@ -1,4 +1,6 @@
+import { isAbsolute } from "node:path";
 import type { Attention } from "@infinite/attention";
+import { z } from "zod";
 export type Role = "owner" | "controller" | "viewer";
 export type Provider = "claude" | "codex" | "grok" | "opencode" | "demo";
 export type Status =
@@ -16,6 +18,15 @@ export interface ControlLease {
   label: string;
   expiresAt: number;
 }
+export interface TerminalSize {
+  cols: number;
+  rows: number;
+}
+export interface TerminalOpen {
+  cursor: number;
+  cols?: number;
+  rows?: number;
+}
 export interface TerminalSnapshot {
   ansi: string;
   seq: number;
@@ -23,52 +34,196 @@ export interface TerminalSnapshot {
   rows: number;
   capturedAt: string;
 }
-export interface SessionRuntime {
+interface SessionRuntimeBase {
   id: string;
   location: "local" | "cloud";
-  transport: "pty" | "cmux";
-  nativeUi?: "codex" | "opencode";
 }
+export type SessionRuntime =
+  | (SessionRuntimeBase & {
+      transport: "pty";
+      nativeUi?: "codex" | "opencode";
+    })
+  | (SessionRuntimeBase & {
+      transport: "cmux";
+      nativeUi?: never;
+    });
+export const sessionRuntimeSchema: z.ZodType<SessionRuntime> = z.discriminatedUnion("transport", [
+  z.object({
+    id: z.string().min(1),
+    location: z.enum(["local", "cloud"]),
+    transport: z.literal("pty"),
+    nativeUi: z.enum(["codex", "opencode"]).optional(),
+  }).strict(),
+  z.object({
+    id: z.string().min(1),
+    location: z.enum(["local", "cloud"]),
+    transport: z.literal("cmux"),
+  }).strict(),
+]);
 export interface LaptopWorkspace {
   cwd: string;
   roots: string[];
 }
-export interface ExecutionState {
-  location: "laptop" | "cloud";
-  state: "connecting" | "online" | "offline" | "preparing" | "paused";
-  cloudReady: boolean;
-  checkpoint?: { id: string; capturedAt: string };
-  reason?: string;
-  reconciliation?: "available";
+export interface ExecutionCheckpoint {
+  id: string;
+  capturedAt: string;
+}
+interface ExecutionStateBase {
+  checkpoint?: ExecutionCheckpoint;
+}
+export type ExecutionState =
+  | (ExecutionStateBase & {
+      location: "cloud";
+      state: "online";
+      cloudReady: true;
+      reason?: never;
+      reconciliation?: "available";
+    })
+  | (ExecutionStateBase & {
+      location: "cloud";
+      state: "paused";
+      cloudReady: false;
+      reason: string;
+      reconciliation?: "available";
+    })
+  | (ExecutionStateBase & {
+      location: "laptop";
+      state: "connecting" | "online" | "offline" | "preparing" | "paused";
+      cloudReady: boolean;
+      reason?: string;
+      reconciliation?: never;
+    });
+const executionCheckpointSchema = z.object({
+  id: z.string().min(1),
+  capturedAt: z.string().refine(value => Number.isFinite(Date.parse(value)), { message: "Invalid checkpoint timestamp" }),
+}).strict();
+export const executionStateSchema: z.ZodType<ExecutionState> = z.union([
+  z.object({
+    location: z.literal("cloud"),
+    state: z.literal("online"),
+    cloudReady: z.literal(true),
+    checkpoint: executionCheckpointSchema.optional(),
+    reconciliation: z.literal("available").optional(),
+  }).strict(),
+  z.object({
+    location: z.literal("cloud"),
+    state: z.literal("paused"),
+    cloudReady: z.literal(false),
+    checkpoint: executionCheckpointSchema.optional(),
+    reason: z.string().min(1),
+    reconciliation: z.literal("available").optional(),
+  }).strict(),
+  z.object({
+    location: z.literal("laptop"),
+    state: z.enum(["connecting", "online", "offline", "preparing", "paused"]),
+    cloudReady: z.boolean(),
+    checkpoint: executionCheckpointSchema.optional(),
+    reason: z.string().min(1).optional(),
+  }).strict(),
+]);
+export type SessionHeadless =
+  | { channel: true; reason?: never; allowlist?: string[] }
+  | { channel: false; reason: string; allowlist?: string[] };
+export const sessionHeadlessSchema: z.ZodType<SessionHeadless> = z.discriminatedUnion("channel", [
+  z.object({
+    channel: z.literal(true),
+    allowlist: z.array(z.string().min(1)).optional(),
+  }).strict(),
+  z.object({
+    channel: z.literal(false),
+    reason: z.string().min(1),
+    allowlist: z.array(z.string().min(1)).optional(),
+  }).strict(),
+]);
+export type SessionPurpose = "work" | "duel" | "replay" | "gate";
+export const SESSION_PURPOSES: readonly SessionPurpose[] = ["work", "duel", "replay", "gate"];
+export type ExecutionIdentity = "production" | "eval";
+export const EXECUTION_IDENTITIES: readonly ExecutionIdentity[] = ["production", "eval"];
+const LEGACY_EVAL_PURPOSES: readonly SessionPurpose[] = ["replay", "gate", "duel"];
+export function sessionExecutionIdentity(
+  session: { executionIdentity?: ExecutionIdentity; purpose?: SessionPurpose } | undefined,
+): ExecutionIdentity {
+  if (session?.executionIdentity === "eval") return "eval";
+  if (session?.executionIdentity === "production") {
+    return session.purpose === "replay" || session.purpose === "gate" ? "eval" : "production";
+  }
+  return session?.purpose !== undefined && LEGACY_EVAL_PURPOSES.includes(session.purpose) ? "eval" : "production";
+}
+export function isEvalSession(
+  session: { executionIdentity?: ExecutionIdentity; purpose?: SessionPurpose } | undefined,
+): boolean {
+  return sessionExecutionIdentity(session) === "eval";
+}
+export function resolveLaunchExecutionIdentity(
+  header: { purpose?: SessionPurpose; executionIdentity?: ExecutionIdentity },
+): { ok: true; identity: ExecutionIdentity } | { ok: false; message: string } {
+  if (header.purpose !== undefined && !SESSION_PURPOSES.includes(header.purpose))
+    return { ok: false, message: "The session purpose is not recognized" };
+  if (header.executionIdentity !== undefined && !EXECUTION_IDENTITIES.includes(header.executionIdentity))
+    return { ok: false, message: "The session execution identity is not recognized" };
+  if (header.purpose === "replay" || header.purpose === "gate") {
+    if (header.executionIdentity === "production")
+      return { ok: false, message: "Replay and gate sessions must use the eval execution identity" };
+    return { ok: true, identity: "eval" };
+  }
+  if (header.purpose === "work") {
+    if (header.executionIdentity === "eval")
+      return { ok: false, message: "Work sessions must use the production execution identity" };
+    return { ok: true, identity: "production" };
+  }
+  if (header.purpose === "duel") {
+    if (header.executionIdentity === undefined)
+      return { ok: false, message: "Duel sessions must specify an explicit execution identity" };
+    return { ok: true, identity: header.executionIdentity };
+  }
+  return { ok: true, identity: header.executionIdentity ?? "production" };
+}
+export function resolveBootstrapExecutionIdentity(
+  bootstrap: Pick<Bootstrap, "session"> & { executionIdentity?: ExecutionIdentity },
+): ExecutionIdentity {
+  if (bootstrap.executionIdentity !== undefined && !EXECUTION_IDENTITIES.includes(bootstrap.executionIdentity))
+    throw new Error("Invalid session execution identity in worker bootstrap");
+  if (bootstrap.session.executionIdentity !== undefined && !EXECUTION_IDENTITIES.includes(bootstrap.session.executionIdentity))
+    throw new Error("Invalid session execution identity on session metadata");
+  if (bootstrap.executionIdentity !== undefined && bootstrap.session.executionIdentity !== undefined && bootstrap.executionIdentity !== bootstrap.session.executionIdentity)
+    throw new Error("Mismatched execution identity between worker bootstrap and session metadata");
+  const resolved = bootstrap.executionIdentity ?? bootstrap.session.executionIdentity;
+  if (resolved !== undefined) {
+    if (resolved === "production" && (bootstrap.session.purpose === "replay" || bootstrap.session.purpose === "gate"))
+      throw new Error("Replay and gate sessions cannot run under the production execution identity");
+    if (resolved === "eval" && bootstrap.session.purpose === "work")
+      throw new Error("Work sessions cannot run under the eval execution identity");
+    return resolved;
+  }
+  return sessionExecutionIdentity(bootstrap.session);
 }
 export interface Session {
+  purpose?: SessionPurpose;
+  executionIdentity?: ExecutionIdentity;
+  configId?: string;
+  codeMode?: boolean;
   handoff?: { policy?: import("./handoff-types.js").HandoffPolicy; reason?: string };
   id: string;
   managedBy?: { kind: "mission"; missionId: string; teamId?: string };
-  /** Host-owned assignment; ordinary session creation cannot supply this. */
   team?: import("./team-types.js").TeamAssignment;
   teamModelProfile?: import("./team-types.js").TeamModelProfile;
-  /** Host-owned: this member folder lies under a team root the owner trusts. */
   workspaceTrusted?: true;
   backend?: "infinite" | "cmux";
   machineId?: string;
-  /** Where this session's tools run. Laptop execution is the explicit --laptop mode. */
   executionLocation?: "cloud" | "laptop";
   resumedFrom?: string;
   resumeNativeSession?: { id: string; source: "hook" | "protocol" };
   provider: Provider;
   title: string;
-  /** Host-only marker for a title supplied by a CLI default, never a person. */
   generatedTitle?: true;
   projectId: string;
   cwd: string;
   createdAt: string;
   status: Status;
-  /** Host-owned: set when the owner archived this exited session */
   archivedAt?: string;
   pid?: number;
   exitCode?: number;
-  /** Canonical source checkout at creation; never inferred from a Linear mapping. */
+  outputTailIncomplete?: true;
   projectRoot?: string;
   contextSources?: import("./project-context.js").ContextSource[];
   contextLinksVersion?: number;
@@ -78,11 +233,66 @@ export interface Session {
   nativeArgs?: string[];
   runtime?: SessionRuntime;
   workspace?: LaptopWorkspace;
+  headless?: SessionHeadless;
+}
+export interface PermissionChannelWaiting {
+  interruptClass: string;
+  tool: string;
+  since: string;
+  expiresAt: string;
+}
+export interface PermissionChannelNotice {
+  id: string;
+  interruptClass?: string;
+  at: string;
+}
+export interface PermissionChannelView {
+  served: boolean;
+  waiting?: PermissionChannelWaiting;
+  notice?: PermissionChannelNotice;
+}
+export type PermissionChannelViewState =
+  | { served: false; waiting?: never; notice?: PermissionChannelNotice }
+  | { served: true; waiting?: PermissionChannelWaiting; notice?: PermissionChannelNotice };
+const permissionChannelWaitingSchema = z.object({
+  interruptClass: z.string().min(1),
+  tool: z.string().min(1),
+  since: z.iso.datetime(),
+  expiresAt: z.iso.datetime(),
+}).strict();
+const permissionChannelNoticeSchema = z.object({
+  id: z.string().min(1),
+  interruptClass: z.string().min(1).optional(),
+  at: z.iso.datetime(),
+}).strict();
+export const permissionChannelViewSchema: z.ZodType<PermissionChannelViewState> = z.discriminatedUnion("served", [
+  z.object({
+    served: z.literal(false),
+    notice: permissionChannelNoticeSchema.optional(),
+  }).strict(),
+  z.object({
+    served: z.literal(true),
+    waiting: permissionChannelWaitingSchema.optional(),
+    notice: permissionChannelNoticeSchema.optional(),
+  }).strict(),
+]);
+export function projectPermissionChannelView(view: PermissionChannelView): PermissionChannelViewState {
+  if (view.served) {
+    return {
+      served: true,
+      ...(view.waiting ? { waiting: view.waiting } : {}),
+      ...(view.notice ? { notice: view.notice } : {}),
+    };
+  }
+  return {
+    served: false,
+    ...(view.notice ? { notice: view.notice } : {}),
+  };
 }
 export interface Event {
   seq: number;
   at: string;
-  type: "output" | "lifecycle" | "input-intent" | "input-result" | "signal" | "team-report" | "mission-report" | "team-handoff" | "usage" | "usage-coverage" | "message";
+  type: "output" | "lifecycle" | "input-intent" | "input-result" | "signal" | "team-report" | "mission-report" | "team-handoff" | "team-entry" | "team-entry-read" | "usage" | "usage-coverage" | "message";
   data: Record<string, unknown>;
 }
 export interface Project {
@@ -91,62 +301,60 @@ export interface Project {
   path: string;
   team?: import("./team-types.js").TeamProject;
   linear?: { teamId: string; projectId?: string };
-  /** Absolute host directory that holds this project's team runs, outside every project root. */
   teamworkDir?: string;
-  /** Where the host's copy of this project comes from: GitHub (followed by the host) or laptop workspace sync. Absent means laptop. */
   source?: import("./team-types.js").ProjectSource;
+  autonomy?: import("./autonomy.js").AutonomyMode;
 }
-export interface AgentProfile {
-  command: string;
-  args: string[];
-  /** Optional qualified standalone Codex app-server; the regular command remains the TUI. */
-  appServerCommand?: string;
-  appServerArgs?: string[];
-  /** Optional data root outside private control state for a separate execution identity. */
-  workspaceDir?: string;
-  sharedWorkspace?: boolean;
-}
+export const agentProfileSchema = z.object({
+  command: z.string(),
+  args: z.array(z.string()),
+  appServerCommand: z.string().optional(),
+  appServerArgs: z.array(z.string()).optional(),
+  workspaceDir: z.string().refine(isAbsolute, "Workspace directory must be absolute").optional(),
+  sharedWorkspace: z.boolean().optional(),
+});
+export type AgentProfile = z.infer<typeof agentProfileSchema>;
 export interface Config {
-  /** Host-only credential; never copied into provider environment variables or prompts. */
-  linear?: { apiKeyFile: string; endpoint?: string };
-  /** Separate working copies, writable by the host and selected provider execution account. */
+  linear?: { apiKeyFile: string; endpoint?: string; reportName?: string };
+  hostLoad?: { minAvailableMemoryGiB: number; maxLoadPerCpu: number };
+  intake?: import("./intake-types.js").IntakeConfig;
+  mcp?: import("./mcp-types.js").McpConfig;
+  codeMode?: { claude: "off" | "headless" | "all" };
   teams?: {
-    workspaceDir: string; commandPrefix?: import("./team-types.js").TeamCommand; lineup?: import("./team-types.js").TeamLineup;
-    /** Owner trust in every team root: Claude and Codex members start trusted in their own folders. */
+    workspaceDir: string;
+    commandPrefix?: import("./team-types.js").TeamCommand;
+    lineup?: import("./team-types.js").TeamLineup;
     trustWorkspaces?: boolean;
-    /** Minutes without attention activity before a member without a report is stopped and replaced. */
     stallMinutes?: number;
-    /** Minutes each configured verification command may run before the host stops it (default 60). */
     checkMinutes?: number;
-    /** How long finished, cancelled, reviewed and blocked runs keep their clones; see docs/teams.md "Workspace retention". */
     retention?: import("./team-types.js").TeamRetention;
-    /** Free inodes and bytes the workspace volume must keep for a new run to start. */
     storageFloor?: import("./team-types.js").StorageFloor;
+    outcomes?: { holdDays?: number; retentionDays?: number };
+    blackboard?: { tools?: boolean };
+    memberTraces?: import("./member-traces.js").MemberTraceSettings;
   };
   machine?: { id: string; label: string };
+  permissionAgent?: import("./permission-agent-config.js").PermissionAgentConfig;
+  autonomy?: { defaultMode?: import("./autonomy.js").AutonomyMode; fuse?: import("./config.js").FuseConfig; continuity?: import("./config.js").ContinuityConfig; boundary?: { egress?: import("./egress.js").EgressConfig; github?: import("./github-grants.js").GithubBoundary } };
   cmux?: { enabled: boolean; command?: string; hooksDir?: string };
   remote?: { enabled: boolean; relay?: { url: string; tokenFile: string } };
-  /** Token prices (USD per million) and per-provider spend budgets for the usage ledger. */
   usage?: import("./config.js").UsageConfig;
   deployment?: import("./deployment.js").Deployment;
-  /** Workspace sync. `homeDir` overrides the server home used for folder mapping; `sharedGroup` permits a separate agent account. */
   sync?: { sharedGroup?: boolean; homeDir?: string };
-  /** GitHub-tracked project sources: mirror directory, refresh period, and test-only remote overrides (refused on cloud hosts). */
   source?: { mirrorDir?: string; refreshMinutes?: number; remoteOverrides?: Record<string, string> };
-  /** Chat digests written by a hosted model through an OpenAI-compatible Responses API. */
+  github?: { reviewFeedback?: { enabled?: boolean; ownerLogin?: string; pollMinutes?: number } };
+  eval?: import("./eval-config.js").EvalHostConfig;
   summaries?: { model: string; apiKeyFile: string; baseUrl: string };
-  /** Optional Jev readings for turn-finished lines and generated session titles. */
-  jev?: { apiKeyFile: string; model: string; baseUrl: string };
-  /** Optional cleanup for dictated text through an OpenAI-compatible Responses API. */
+  jev?: { apiKeyFile: string; model: string; baseUrl: string; sessionReadings?: boolean };
   dictation?: { model: string; apiKeyFile: string; baseUrl: string };
-  /** Read-only repository briefs produced by an administrator-configured host wrapper. */
   repositoryBriefings?: { command: string; args: string[]; runner?: "muse" | "deepseek" | "codex"; model?: string; automatic: boolean; intervalMs: number; cooldownMs: number; timeoutMs: number };
-  /** Optional code-only repository graph refreshes. Cache paths are assigned per project and lane. */
   repositoryGraphs?: { command: string; args: string[]; graphifyCommand: string; cacheDir: string; projectIds?: string[]; timeoutMs: number; debounceMs: number; intervalMs: number };
   port: number;
   origin: string;
+  browserSessions?: boolean;
   stateDir: string;
   runDir: string;
+  socketDir?: string;
   keyFile: string;
   tokens: { id: string; label: string; role: Role; hash: string }[];
   projects: Project[];
@@ -164,7 +372,7 @@ export interface Config {
     accessTokenFile?: string;
     endpoint: string;
     detail: "minimal" | "full";
-    events: ("needs-you" | "turn-finished" | "exited" | "recording-error" | "goal-started" | "goal-finished" | "goal-stuck" | "goal-cancelled" | "team-started" | "team-finished" | "team-stuck" | "team-cancelled" | "team-blocked" | "host-storage")[];
+    events: ("needs-you" | "turn-finished" | "exited" | "recording-error" | "goal-started" | "goal-finished" | "goal-stuck" | "goal-cancelled" | "team-started" | "team-finished" | "team-stuck" | "team-cancelled" | "team-blocked" | "host-storage" | "autonomy-interrupt" | "main-check")[];
   };
 }
 export interface Receipt {
@@ -176,24 +384,27 @@ export interface WorkerState {
   handoffQuiescence?: { requestId: string; verifiedAt: string; scope: "process-group-and-observed-descendants" };
   status: Status;
   pid?: number;
-  /** Written to the sealed status only; a row carries it when the worker did not answer. */
   workerPid?: number;
+  socketPath?: string;
+  permissionSocketPath?: string;
   exitCode?: number;
+  outputTailIncomplete?: true;
   seq: number;
   screen: string;
   attention: Attention;
-  /** `transcript` means chat messages come from the provider's own conversation record. */
   capabilities?: { terminalSnapshot?: 1; inputControl?: 1; nativeUi?: "codex" | "opencode"; transcript?: 1 };
   control?: ControlLease | null;
   runtime?: SessionRuntime;
+  terminalSize?: TerminalSize;
+  sizeIndexCoveredSeq?: number;
   nativeSession?: { id: string; source: "hook" | "protocol" };
   execution?: ExecutionState;
+  permissionChannel?: PermissionChannelView;
 }
 export interface InputControl {
   actor?: ControlActor;
   leaseId?: string;
 }
-/** Exact screen and assignment identity for a display-only Codex prompt expansion. */
 export interface TeamPermissionExpansionExpectation {
   promptId: number;
   promptHash: string;
@@ -201,27 +412,187 @@ export interface TeamPermissionExpansionExpectation {
   targetCwd: string;
   expiresAt: string;
 }
+export type TeamMemberAssignment = Omit<import("./team-types.js").TeamAssignment, "role"> & {
+  role: import("./team-types.js").TeamRole;
+};
+interface TeamAnswerWorkerRequestBase {
+  op: "team-answer";
+  requestId: string;
+  decisionId: string;
+  targetSessionId: string;
+  assignment: TeamMemberAssignment;
+  targetCwd: string;
+  expiresAt: string;
+  policyHash: string;
+  promptId: number;
+  promptHash: string;
+  evidenceHash: string;
+  option: number;
+  actor: ControlActor;
+  leaseId: string;
+}
+export type TeamAnswerWorkerRequest =
+  | (TeamAnswerWorkerRequestBase & {
+      coordinatorMemberId: string;
+      choice?: never;
+      text?: never;
+    })
+  | (TeamAnswerWorkerRequestBase & {
+      coordinatorMemberId?: never;
+      choice: "accept";
+      text?: never;
+    })
+  | (TeamAnswerWorkerRequestBase & {
+      coordinatorMemberId?: never;
+      choice: "reject";
+      text?: string;
+    });
+const noControlChars = /^[^\x00-\x1f\x7f]*$/;
+const uuidString = /^[a-f0-9-]{36}$/i;
+const sha256Hex = /^[a-f0-9]{64}$/i;
+const lowercaseSha256Hex = /^[0-9a-f]{64}$/;
+const controlActorSchema = z.object({
+  id: z.string().min(1).max(128).regex(noControlChars),
+  label: z.string().min(1).max(120).regex(noControlChars),
+}).strict();
+const teamMemberAssignmentSchema = z.object({
+  runId: z.string().regex(uuidString),
+  memberId: z.string().regex(uuidString),
+  revision: z.number().int().min(1),
+  role: z.enum([
+    "permission-coordinator",
+    "project-manager",
+    "scout",
+    "implementer",
+    "integrator",
+    "reviewer",
+    "delivery",
+    "intent-checker",
+    "evaluator",
+    "judge",
+  ]),
+  taskId: z.string().optional(),
+  verificationRefused: z.literal(true).optional(),
+  entryTools: z.literal(true).optional(),
+  hostProfiles: z.literal(true).optional(),
+}).strict();
+const teamAnswerBaseShape = {
+  op: z.literal("team-answer"),
+  requestId: z.string().min(1).max(80),
+  decisionId: z.string().regex(uuidString),
+  targetSessionId: z.string().min(1),
+  assignment: teamMemberAssignmentSchema,
+  targetCwd: z.string().min(1).max(4096),
+  expiresAt: z.string().refine(value => Number.isInteger(Date.parse(value)), { message: "Invalid expiration timestamp" }),
+  policyHash: z.string().regex(sha256Hex),
+  promptId: z.number().int().min(1),
+  promptHash: z.string().regex(sha256Hex),
+  evidenceHash: z.string().regex(sha256Hex),
+  option: z.number().int().min(0),
+  actor: controlActorSchema,
+  leaseId: z.string().min(1).max(80),
+};
+export const teamAnswerWorkerRequestSchema: z.ZodType<TeamAnswerWorkerRequest> = z.union([
+  z.object({
+    ...teamAnswerBaseShape,
+    coordinatorMemberId: z.string().regex(uuidString),
+  }).strict(),
+  z.object({
+    ...teamAnswerBaseShape,
+    choice: z.literal("accept"),
+  }).strict(),
+  z.object({
+    ...teamAnswerBaseShape,
+    choice: z.literal("reject"),
+    text: z.string().min(1).max(2000).regex(noControlChars).optional(),
+  }).strict(),
+]);
+export type WorkerControlRequestState =
+  | { op: "control"; action: "claim"; actor: ControlActor; leaseId?: string; takeover?: boolean }
+  | { op: "control"; action: "renew" | "release"; actor: ControlActor; leaseId: string; takeover?: never };
+export const workerControlRequestSchema: z.ZodType<WorkerControlRequestState> = z.discriminatedUnion("action", [
+  z.object({
+    op: z.literal("control"),
+    action: z.literal("claim"),
+    actor: controlActorSchema,
+    leaseId: z.string().min(1).max(80).optional(),
+    takeover: z.boolean().optional(),
+  }).strict(),
+  z.object({
+    op: z.literal("control"),
+    action: z.literal("renew"),
+    actor: controlActorSchema,
+    leaseId: z.string().min(1).max(80),
+  }).strict(),
+  z.object({
+    op: z.literal("control"),
+    action: z.literal("release"),
+    actor: controlActorSchema,
+    leaseId: z.string().min(1).max(80),
+  }).strict(),
+]);
+export const httpControlRequestSchema = z.discriminatedUnion("action", [
+  z.object({ action: z.literal("claim"), leaseId: z.uuid().optional(), takeover: z.boolean().optional() }).strict(),
+  z.object({ action: z.literal("renew"), leaseId: z.uuid().optional(), takeover: z.literal(false).optional() }).strict(),
+  z.object({ action: z.literal("release"), leaseId: z.uuid().optional(), takeover: z.literal(false).optional() }).strict(),
+]);
+export type NormalizedControlRequest =
+  | { ok: true; request: WorkerControlRequestState }
+  | { ok: false; code: "control-lost" };
+export function normalizeControlRequest(
+  body: z.infer<typeof httpControlRequestSchema>,
+  actor: ControlActor,
+): NormalizedControlRequest {
+  if (body.action === "claim") {
+    return {
+      ok: true,
+      request: {
+        op: "control",
+        action: "claim",
+        actor,
+        ...(body.leaseId !== undefined ? { leaseId: body.leaseId } : {}),
+        ...(body.takeover !== undefined ? { takeover: body.takeover } : {}),
+      },
+    };
+  }
+  if (body.leaseId === undefined) return { ok: false, code: "control-lost" };
+  return { ok: true, request: { op: "control", action: body.action, actor, leaseId: body.leaseId } };
+}
+export function normalizeWorkerControlRequest(request: WorkerControlRequestState): WorkerControlRequestState {
+  if (request.action !== "claim" && (request as { takeover?: unknown }).takeover === false) {
+    const { takeover: _takeover, ...rest } = request as WorkerControlRequestState & { takeover?: unknown };
+    return rest as WorkerControlRequestState;
+  }
+  return request;
+}
+export type WorkerWorkspaceExportRequestState =
+  | { op: "workspace-export"; method: "sync/export"; hash?: never }
+  | { op: "workspace-export"; method: "sync/blob"; hash: string };
+export const workerWorkspaceExportRequestSchema: z.ZodType<WorkerWorkspaceExportRequestState> = z.discriminatedUnion("method", [
+  z.object({
+    op: z.literal("workspace-export"),
+    method: z.literal("sync/export"),
+  }).strict(),
+  z.object({
+    op: z.literal("workspace-export"),
+    method: z.literal("sync/blob"),
+    hash: z.string().regex(lowercaseSha256Hex),
+  }).strict(),
+]);
 export type WorkerRequest =
   | { op: "state"; screen?: boolean }
   | { op: "native-info" }
   | { op: "executor-connect"; token: string }
-  | { op: "workspace-export"; method: "sync/export" | "sync/blob"; hash?: string }
+  | WorkerWorkspaceExportRequestState
   | ({ op: "native-connect" } & InputControl)
   | { op: "snapshot" }
   | { op: "handoff-stop"; requestId: string }
-  | {
-      op: "control";
-      action: "claim" | "renew" | "release";
-      actor: ControlActor;
-      leaseId?: string;
-      takeover?: boolean;
-    }
+  | WorkerControlRequestState
   | ({
       op: "input";
       requestId: string;
       text: string;
       submit: boolean;
-      /** Type even over an open dialog; only terminal surfaces send it. */
       force?: boolean;
     } & InputControl)
   | ({ op: "raw"; requestId: string; text: string } & InputControl)
@@ -232,33 +603,14 @@ export type WorkerRequest =
     } & InputControl)
   | ({
       op: "answer";
-      /** Set by the host only for owner-authorized answers on mission-managed sessions. */
       missionManaged?: true;
       requestId: string;
       promptId: number;
       option?: number;
       text?: string;
     } & InputControl)
+  | TeamAnswerWorkerRequest
   | ({
-      /** Host-only delegated one-shot permission answer over the private worker socket. */
-      op: "team-answer";
-      requestId: string;
-      decisionId: string;
-      coordinatorMemberId: string;
-      targetSessionId: string;
-      assignment: import("./team-types.js").TeamAssignment;
-      targetCwd: string;
-      expiresAt: string;
-      policyHash: string;
-      promptId: number;
-      promptHash: string;
-      evidenceHash: string;
-      option: number;
-      actor: ControlActor;
-      leaseId: string;
-    })
-  | ({
-      /** Host-only expansion of a verified, collapsed Codex command dialog; sends Ctrl+A only. */
       op: "team-permission-expand";
       requestId: string;
       targetSessionId: string;
@@ -267,17 +619,38 @@ export type WorkerRequest =
       actor: ControlActor;
       leaseId: string;
     })
+  | ({
+      op: "session-permission-answer";
+      requestId: string;
+      decisionId: string;
+      targetSessionId: string;
+      targetCwd: string;
+      promptId: number;
+      promptHash: string;
+      evidenceHash: string;
+      option: number;
+      text?: string;
+      actor: ControlActor;
+      leaseId: string;
+    })
   | { op: "team-answer-invalidate"; decisionId: string }
+  | { op: "session-permission-invalidate"; decisionId: string }
   | ({ op: "resize"; cols: number; rows: number } & InputControl)
   | ({ op: "stop"; requestId: string } & InputControl);
 export interface Bootstrap {
   session: Session;
+  executionIdentity: ExecutionIdentity;
   profile: AgentProfile;
   stateDir: string;
   runDir: string;
+  socketDir?: string;
   key: string;
   prompt: string;
+  codeMode: boolean;
   executorTokenHash?: string;
+  permissionChannel?: { socket: string };
+  github?: { proxy: string; grant: string };
+  codexTraceRoot?: string;
   attention: {
     hooks: { claude: boolean; codex: boolean };
     idleAfterMs: number;

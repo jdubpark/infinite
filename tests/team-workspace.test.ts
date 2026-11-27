@@ -190,7 +190,6 @@ test("moved-base recovery copies from a source mirror through the restricted lau
     const moved = commit(source, "move the base");
     git(mirror, "fetch", "--no-tags", "--", source, "+refs/heads/main:refs/heads/main");
 
-    // The restriction is real: the mirror refuses object inspection but accepts the pinned fetch and rev-parse.
     const inspected = await teamCommand({ command: "git", args: teamGitArgs(mirror, ["cat-file", "-t", moved]) }, mirror, undefined, 30000, prefix);
     assert.equal(inspected.exitCode, 126);
     assert.match(inspected.output, /only the pinned base-branch fetch and rev-parse are permitted/);
@@ -227,4 +226,25 @@ test("moved-base recovery copies from a source mirror through the restricted lau
     assert.equal(git(team.workspace, "rev-parse", "HEAD"), moved);
     assert.equal(git(team.workspace, "status", "--porcelain"), "");
   } finally { rmSync(sandbox, { recursive: true, force: true }); }
+});
+
+test("a Git command keeps the grant of its operation and still ignores replace refs", async () => {
+  const { root } = repository();
+  try {
+    const grant = { INFINITE_GITHUB_GRANT: "grant-for-one-push" };
+    const viaGit = await teamCommand({ command: "git", args: teamGitArgs(root, ["-c", "alias.environment=!env", "environment"]) }, root, undefined, 30000, undefined, undefined, grant);
+    assert.equal(viaGit.exitCode, 0);
+    const gitLines = viaGit.stdout.split("\n");
+    assert.ok(gitLines.includes("INFINITE_GITHUB_GRANT=grant-for-one-push"));
+    assert.ok(gitLines.includes("GIT_NO_REPLACE_OBJECTS=1"));
+
+    const unpinned = await teamCommand({ command: "git", args: teamGitArgs(root, ["-c", "alias.environment=!env", "environment"]) }, root, undefined, 30000, undefined, undefined, { GIT_NO_REPLACE_OBJECTS: "0" });
+    assert.ok(unpinned.stdout.split("\n").includes("GIT_NO_REPLACE_OBJECTS=1"));
+
+    const other = await teamCommand({ command: "env", args: [] }, root, undefined, 30000, undefined, undefined, grant);
+    assert.equal(other.exitCode, 0);
+    const otherLines = other.stdout.split("\n");
+    assert.ok(otherLines.includes("INFINITE_GITHUB_GRANT=grant-for-one-push"));
+    assert.ok(!otherLines.some(line => line.startsWith("GIT_NO_REPLACE_OBJECTS=")));
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });

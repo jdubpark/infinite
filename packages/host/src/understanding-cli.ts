@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
-import type { BehaviorCheckResult, BehaviorDefinition, BehaviorList, BehaviorModel, BehaviorPropertyResult, BehaviorRun, BehaviorSuite, KnowledgeBehavior, KnowledgeCatalog, KnowledgeClaim, KnowledgeComponent, KnowledgeMaintenance, KnowledgeRelationship, WorkspaceKnowledge } from "@infinite/remote";
+import type { BehaviorCheckResult, BehaviorDefinition, BehaviorList, BehaviorModel, BehaviorSuite, KnowledgeBehavior, KnowledgeCatalog, KnowledgeClaim, KnowledgeComponent, KnowledgeMaintenance, KnowledgeRelationship, WorkspaceKnowledge } from "@infinite/remote";
 import type { ProjectGroupList } from "./project-group-types.js";
 import type { DiagramGraph, GeneratedCatalogPage, KnowledgeRepositoryBrief, WorkspaceUnderstanding, UnderstandingArtifact, UnderstandingPlan, UnderstandingWork } from "@infinite/remote";
 import { behaviorDefinitionHash, validateBehaviorDefinition, checkBehaviorModel } from "./behavior-checker.js";
@@ -18,8 +18,15 @@ const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-
 
 function artifactLines(artifact: UnderstandingArtifact): string[] {
   const lines = [`    Brief ${artifact.id} · ${artifact.sourceKind} ${artifact.sourceProjectId} · session ${artifact.sessionId}`,
-    `      generated ${artifact.generatedAt} · retained ${artifact.retainedAt} · head ${artifact.head ?? "unborn"} · base ${artifact.base ?? "unborn"}`,
-    `      ${artifact.brief.summary}`];
+    `      generated ${artifact.generatedAt} · retained ${artifact.retainedAt} · head ${artifact.head ?? "unborn"} · base ${artifact.base ?? "unborn"}`];
+  if (artifact.pinnedSources) {
+    const pinned = Object.entries(artifact.pinnedSources)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([projectId, source]) => `${projectId}@${source.head ?? "unborn"}`)
+      .join(", ");
+    lines.push(`      pinned ${pinned}`);
+  }
+  lines.push(`      ${artifact.brief.summary}`);
   for (const claim of artifact.brief.architecture) lines.push(`      Current: ${claim.text}${claim.citations.length ? ` [${claim.citations.map(c => `${c.source}:${c.line}`).join(", ")}]` : ""}`);
   for (const claim of artifact.brief.changes) lines.push(`      Change: ${claim.text}${claim.citations.length ? ` [${claim.citations.map(c => `${c.source}:${c.line}`).join(", ")}]` : ""}`);
   for (const claim of artifact.brief.checks) lines.push(`      Check: ${claim.text}${claim.citations.length ? ` [${claim.citations.map(c => `${c.source}:${c.line}`).join(", ")}]` : ""}`);
@@ -43,7 +50,6 @@ function workLines(work: UnderstandingWork): string[] {
 type PlannedByRepository = Record<string, UnderstandingPlan[]>;
 const maxPages = 200;
 
-/** Follows `next` cursors until null; a repeated cursor or more than 200 pages is an error, not a silent truncation. */
 async function allPages<T extends { next: string | null }>(api: Api, path: string, merge: (page: T) => void) {
   const seen = new Set<string>();
   let cursor: string | null = null;
@@ -437,7 +443,6 @@ export async function handleUnderstandingCommand(positional: string[], options: 
   throw new Error(`Unknown understand command: ${clean(command)}`);
 }
 
-/** Local model checking runs before the CLI attempts to load a paired client configuration. */
 export async function handleLocalBehaviorCheckCommand(argv: string[]): Promise<boolean> {
   if (argv[0] !== "understand" || argv[1] !== "check") return false;
   const options: Options = {};

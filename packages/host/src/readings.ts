@@ -2,9 +2,10 @@ import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { choice, noul } from "@typesafe-ai/sdk";
-import type { Questions, RequestOptions, SystemOneRequest, SystemOneResult, TypeSafeClient } from "@typesafe-ai/sdk";
+import type { Questions, RequestOptions, SystemOneRequest, SystemOneResult } from "@typesafe-ai/sdk";
 import { firstSentence } from "@infinite/attention";
 import type { Attention, Provider } from "@infinite/attention";
+import { ROUTE_INPUT_LIMIT, type RouteReading } from "./intake-route.js";
 import type { Summarizer } from "./summary.js";
 import type { Manager } from "./manager.js";
 import type { Config, Session } from "./types.js";
@@ -36,7 +37,6 @@ const FILLER_LINE = /^(?:done|all set|summary|changes made|i['’]ve made the fo
 
 export function messageHash(text: string) { return createHash("sha256").update(text).digest("hex"); }
 
-/** Removes Markdown framing while preserving the agent's sentence words and order. */
 export function candidateSentences(message: string): string[] {
   const cleaned = message
     .replace(/```[\s\S]*?```/g, "\n")
@@ -62,15 +62,13 @@ export function clipTitle(line: string, max = 60) {
   return (boundary > 0 ? prefix.slice(0, boundary) : firstLine.slice(0, max)).trimEnd();
 }
 
-function defaultTitle(title: string, provider: Provider, generatedTitle?: boolean) {
+function defaultTitle(title: string, generatedTitle?: boolean) {
   return generatedTitle === true || (generatedTitle === undefined && title === "");
 }
 function keyOf(id: string, type: Key, hash: string) { return `${id}:${type}:${hash}`; }
 function pairOf(id: string, type: Key) { return `${id}:${type}`; }
 function firstLine(prompt: string) { return prompt.split(/\r?\n/, 1)[0]?.trim() ?? ""; }
 
-// Team requests can name private files; strip file URLs and absolute or quoted paths before any model sees them.
-// An unquoted path with spaces is cut at each space, so later fragments that still contain a separator are removed too.
 export function titleInput(value: string) {
   const omitted = "[local path omitted]";
   return value.replace(/(["'`])([^\r\n]*?)\1/g, (quoted, _quote, path: string) =>
@@ -78,7 +76,6 @@ export function titleInput(value: string) {
     .replace(/(?<![\w./:\\~-])(?:file:\/\/[^\s<>"'`]*|\/[^\s<>"'`]+|~\/[^\s<>"'`]*|[A-Za-z]:[\\/][^\s<>"'`]*)(?:[ \t]+[^\s<>"'`]*[\\/][^\s<>"'`]*)*/gi, omitted);
 }
 
-/** True only when the rule-based turn line is likely to be unhelpful on the phone. */
 export function isWeakRuleLine(message: string): boolean {
   const firstRawLine = message.split(/\r?\n/).find(line => line.trim() !== "")?.trim() ?? "";
   const rawRuleLine = firstSentence(message) || "Finished a turn";
@@ -88,10 +85,6 @@ export function isWeakRuleLine(message: string): boolean {
   return structured || rawRuleLine.length > 140 || displayLine.length < 25 || displayLine.endsWith(":") || FILLER_LINE.test(filler);
 }
 
-/**
- * Optional, asynchronous phone readings. The cache is the only path used by list
- * requests; model work is queued in the background and never awaited by merge().
- */
 export class Readings {
   private readonly file: string;
   private readonly evaluationsFile: string;
@@ -101,6 +94,7 @@ export class Readings {
   private readonly active = new Map<string, string>();
   private readonly latestRows = new Map<string, LatestRow>();
   private readonly latestSessions = new Map<string, LatestSession>();
+  private readonly settledSessions = new Map<string, { title: string; revision: string; latest: LatestSession }>();
   private observationRevision = 0;
   private timer?: ReturnType<typeof setInterval>;
   private readonly apiKey?: string;
@@ -108,7 +102,7 @@ export class Readings {
   constructor(
     private readonly config: Config,
     private readonly key: Buffer,
-    private readonly manager: Pick<Manager, "list" | "meta">,
+    private readonly manager: Pick<Manager, "list" | "meta" | "metaRevision">,
     private readonly writer?: Pick<Summarizer, "titleFromPrompt">,
     private readonly transport?: JevTransport,
   ) {
@@ -120,18 +114,17 @@ export class Readings {
     }
     this.restore();
   }
+  private get sessionJev(): boolean { return Boolean(this.config.jev && this.config.jev.sessionReadings !== false); }
   start() {
-    if (!this.config.jev) return;
+    if (!this.sessionJev) return;
     void this.tick();
     this.timer = setInterval(() => void this.tick(), 2000);
     this.timer.unref();
   }
   stop() { clearInterval(this.timer); }
 
-  /** Synchronous cache merge; stale message hashes and owner titles are omitted. */
-  merge<T extends ReadingRow>(rows: T[]): T[] {
-    const completeSnapshot = rows.length === 0 || rows.every(row => row.backend !== undefined);
-    this.observeRows(rows, completeSnapshot ? "snapshot" : "partial", (row, session) => this.queueTitleReading(row, session));
+  merge<T extends ReadingRow>(rows: T[], complete = rows.length === 0 || rows.every(row => row.backend !== undefined)): T[] {
+    this.observeRows(rows, complete ? "snapshot" : "partial", (row, session) => this.queueTitleReading(row, session));
     const merged = rows.map(row => {
       const reading: SessionReading = {};
       const message = row.attention.lastMessage ?? "";
@@ -150,17 +143,16 @@ export class Readings {
           const value = this.cached(row.id, "title", session.promptHash);
           reading.title = value?.title ?? fallback;
         }
-      } catch { /* Native cmux rows have no Infinite metadata. */ }
-      if (this.config.jev) this.queueTurnReading(row);
+      } catch {}
+      if (this.sessionJev) this.queueTurnReading(row);
       return Object.keys(reading).length ? { ...row, reading } : row;
     });
-    if (this.config.jev) this.drain();
+    if (this.sessionJev) this.drain();
     return merged;
   }
 
-  /** Captures session inputs and queues gated work. Repeated polls deduplicate pending calls. */
   async tick() {
-    if (!this.config.jev) return;
+    if (!this.sessionJev) return;
     const revision = this.observationRevision;
     let rows: ReadingRow[];
     try { rows = await this.manager.list({ includeFullMessage: true }) as ReadingRow[]; } catch { return; }
@@ -170,6 +162,17 @@ export class Readings {
       this.queueTurnReading(row);
     }
     this.drain();
+  }
+
+  private titleDue(sessionId: string, latest: LatestSession): boolean {
+    const hash = latest.promptHash;
+    if (!this.sessionJev || !this.writer || !latest.defaultTitle || latest.promptLineLength <= 60 || !hash) return false;
+    if (this.cached(sessionId, "title", hash)) return false;
+    const evaluation = this.evaluations.get(sessionId)?.title;
+    if (evaluation?.hash === hash && evaluation.outcome.kind === "failure" && evaluation.outcome.failedUntil > Date.now()) return false;
+    const pair = pairOf(sessionId, "title");
+    if (this.active.get(pair) === hash || this.queue.get(pair)?.hash === hash) return false;
+    return this.queue.size < MAX_PENDING;
   }
 
   private observeRows(rows: ReadingRow[], source: "partial" | "snapshot" | "tick", onSession?: (row: ReadingRow, session: Session) => void) {
@@ -182,20 +185,36 @@ export class Readings {
       this.latestRows.clear();
       this.latestSessions.clear();
       for (const [id, row] of retainedExternal) this.latestRows.set(id, row);
+      for (const id of this.settledSessions.keys()) if (!incoming.has(id)) this.settledSessions.delete(id);
     }
     for (const row of rows) {
       const lastMessage = row.attention.lastMessage ?? "";
       this.latestRows.set(row.id, { backend: row.backend, state: row.attention.state,
         lastMessageHash: "", lastMessageLength: lastMessage.length });
+      const revision = source === "partial" ? undefined : this.manager.metaRevision(row.id);
+      const settled = source === "partial" ? undefined : this.settledSessions.get(row.id);
+      if (settled && revision !== undefined && settled.revision === revision && settled.title === row.title && !this.titleDue(row.id, settled.latest)) {
+        this.latestSessions.set(row.id, settled.latest);
+        continue;
+      }
       let session: Session;
       try { session = this.manager.meta(row.id).session; }
-      catch { this.latestSessions.delete(row.id); continue; }
+      catch {
+        this.latestSessions.delete(row.id);
+        if (source !== "partial") this.settledSessions.delete(row.id);
+        continue;
+      }
       const prompt = session.initialPrompt ?? "";
-      const titleIsDefault = defaultTitle(session.title, session.provider, session.generatedTitle);
+      const titleIsDefault = defaultTitle(session.title, session.generatedTitle);
       const line = titleIsDefault && prompt ? firstLine(prompt) : "";
-      this.latestSessions.set(row.id, { defaultTitle: titleIsDefault,
+      const latest: LatestSession = { defaultTitle: titleIsDefault,
         promptLine: line.length <= 60 ? line : clipTitle(line), promptLineLength: line.length,
-        ...(titleIsDefault && prompt ? { promptHash: messageHash(prompt) } : {}) });
+        ...(titleIsDefault && prompt ? { promptHash: messageHash(prompt) } : {}) };
+      this.latestSessions.set(row.id, latest);
+      if (source !== "partial") {
+        if (revision === undefined) this.settledSessions.delete(row.id);
+        else this.settledSessions.set(row.id, { title: row.title, revision, latest });
+      }
       onSession?.(row, session);
     }
     if (source === "partial") return;
@@ -216,7 +235,7 @@ export class Readings {
   }
 
   private queueTitleReading(row: ReadingRow, session: Session) {
-    if (!this.config.jev || !this.writer || !defaultTitle(session.title, session.provider, session.generatedTitle)) return;
+    if (!this.sessionJev || !this.writer || !defaultTitle(session.title, session.generatedTitle)) return;
     const prompt = session.initialPrompt ?? "";
     if (!prompt) return;
     const line = firstLine(prompt);
@@ -269,7 +288,7 @@ export class Readings {
       return row.lastMessageHash === job.hash && row.state === "turn-finished" && row.lastMessageLength > 200;
     }
     const session = this.latestSessions.get(job.sessionId);
-    return Boolean(this.writer && this.config.jev && session?.defaultTitle && row.backend !== "cmux" &&
+    return Boolean(this.writer && this.sessionJev && session?.defaultTitle && row.backend !== "cmux" &&
       session.promptLineLength > 60 && session.promptHash === job.hash);
   }
 
@@ -314,14 +333,10 @@ export class Readings {
     if (!title?.text?.trim()) throw new Error("Title writer returned no text");
     if (stillCurrent()) this.recordResult(row.id, "title", hash, { title: { text: title.text.trim().slice(0, 100), source: "writer", model: title.model } });
   }
-  /**
-   * A concise team run title, or undefined to keep the request's first line. A line of 60 characters or fewer is
-   * kept as is; Jev, when configured, keeps a clear clipped line; otherwise the writer names the path-redacted request.
-   */
   async requestTitle(prompt: string): Promise<{ text: string; model?: string } | undefined> {
     if (!this.writer || firstLine(prompt).length <= 60) return undefined;
     const input = titleInput(prompt), clipped = clipTitle(firstLine(input));
-    if (this.config.jev) {
+    if (this.sessionJev) {
       const result = await this.ask({
         state: { clipped },
         questions: { clear: noul("Is `clipped` a clear title for the requested work?", { true: "The clipped first line clearly identifies the requested work.", false: "The clipped first line is not a clear title." }) },
@@ -333,6 +348,23 @@ export class Readings {
     const title = await this.writer.titleFromPrompt(input);
     const text = title.text.trim().slice(0, 100);
     return text ? { text, model: title.model } : undefined;
+  }
+  async requestRoute(text: string): Promise<RouteReading | undefined> {
+    if (!this.config.jev) return undefined;
+    try {
+      const result = await this.ask({
+        state: { request: text.slice(0, ROUTE_INPUT_LIMIT) },
+        questions: { route: choice("Choose what `request` asks for.", {
+          answer: "A question, explanation, investigation, review or status request that reading code and documents can satisfy. Nothing needs to change.",
+          work: "A request to change, fix, add, remove, build, write, update, migrate or deploy something. It needs a tracked issue.",
+        }) },
+      }, () => true);
+      const answer = result?.answers.route;
+      if (answer?.type !== "choice" || (answer.choice !== "answer" && answer.choice !== "work")) return undefined;
+      const confidence = Number(answer.confidence);
+      if (!Number.isFinite(confidence)) return undefined;
+      return { route: answer.choice, confidence: Math.min(1, Math.max(0, confidence)) };
+    } catch { return undefined; }
   }
   private async ask(request: Omit<SystemOneRequest<Questions>, "model">, stillCurrent: () => boolean) {
     const client = this.transport ?? await this.createTransport();
@@ -355,7 +387,7 @@ export class Readings {
           if (item.outcome.kind === "failure" && item.outcome.failedUntil <= Date.now()) continue;
           this.evaluations.set(item.sessionId, { ...this.evaluations.get(item.sessionId), [item.type]: { hash: item.hash, outcome: item.outcome } });
         }
-      } catch { /* A damaged evaluation cache is ignored; it never blocks session lists. */ }
+      } catch {}
     }
     if (existsSync(this.file)) try {
       const stored = unseal<StoredEntry[]>(this.key, "readings", readFileSync(this.file, "utf8"));
@@ -375,7 +407,7 @@ export class Readings {
         }
       }
       while (this.entries.size > CACHE_LIMIT) this.entries.delete(this.entries.keys().next().value!);
-    } catch { /* A damaged reading cache is ignored; it never blocks session lists. */ }
+    } catch {}
   }
 
   private cached(sessionId: string, type: Key, hash: string) {
@@ -411,13 +443,13 @@ export class Readings {
       const evaluation = byType[type];
       if (evaluation) stored.push({ sessionId, type, hash: evaluation.hash, outcome: evaluation.outcome });
     }
-    try { writeSealed(this.evaluationsFile, this.key, "reading-evaluations", stored); } catch { /* Backoff persistence is best effort. */ }
+    try { writeSealed(this.evaluationsFile, this.key, "reading-evaluations", stored); } catch {}
   }
 
   private put(entry: StoredEntry) {
     if (!entry.value) return;
     this.entries.delete(entry.key); this.entries.set(entry.key, entry);
     while (this.entries.size > CACHE_LIMIT) this.entries.delete(this.entries.keys().next().value!);
-    try { writeSealed(this.file, this.key, "readings", [...this.entries.values()]); } catch { /* Cache persistence is best effort. */ }
+    try { writeSealed(this.file, this.key, "readings", [...this.entries.values()]); } catch {}
   }
 }

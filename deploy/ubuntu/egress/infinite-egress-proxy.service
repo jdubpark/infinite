@@ -1,0 +1,46 @@
+[Unit]
+Description=Infinite agent egress proxy (loopback only; see deploy/ubuntu/egress.md)
+After=network-online.target nss-lookup.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=infinite-egress
+Group=infinite-egress
+WorkingDirectory=/opt/infinite-egress
+Environment=NODE_ENV=production
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment=UV_THREADPOOL_SIZE=16
+ExecStart=/usr/local/bin/node /opt/infinite-egress/egress-proxy.mjs --config /etc/infinite-egress/proxy.json
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=2
+StateDirectory=infinite-egress
+StateDirectoryMode=0750
+UMask=0027
+LimitCORE=0
+LimitNOFILE=16384
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+IPAddressDeny=link-local multicast
+
+[Install]
+WantedBy=multi-user.target

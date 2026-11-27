@@ -1,9 +1,54 @@
 import { createHash } from "node:crypto";
-import type { Prompt } from "@infinite/attention";
+import { accountSettingPrompt, dialogCommand, hasTruncatedEvidence, oneShotPermissionOption, type Prompt } from "@infinite/attention";
 import type { WorkerError } from "./ipc.js";
+import type { PermissionRequestShape } from "./permission-agent-types.js";
 import { ContentError } from "./session-content.js";
 
 export { oneShotPermissionOption } from "@infinite/attention";
+
+const PERSISTENT_LABEL = /always|trust|workspace|project|folder|remember|future|session|don't ask|do not ask|never ask/i;
+
+export function agentAcceptOption(prompt: Prompt): number | undefined {
+  return oneShotPermissionOption({ ...prompt, destructive: undefined });
+}
+
+export function oneShotRejectOption(prompt: Prompt): number | undefined {
+  if (accountSettingPrompt(prompt) || prompt.kind !== "permission" || !["screen", "hook"].includes(prompt.source) || !prompt.hash || prompt.multiSelect ||
+      prompt.options.length < 2) return undefined;
+  const rejects = prompt.options.filter(option => (option.role === "reject" || option.role === "reject-with-feedback") &&
+    !PERSISTENT_LABEL.test(option.label));
+  return rejects.length === 1 ? rejects[0].index : undefined;
+}
+
+const TRUST_TITLE = /\btrust\b.*\b(?:folder|files|workspace|project|directory)\b|\b(?:folder|files|workspace|project|directory)\b.*\btrust\b/i;
+
+export function permissionRequestShape(prompt: Prompt): PermissionRequestShape {
+  const accountSetting = accountSettingPrompt(prompt);
+  const accept = agentAcceptOption(prompt);
+  const oneShotAccept = !accountSetting && prompt.options.filter(option => option.role === "accept" && !PERSISTENT_LABEL.test(option.label)).length === 1;
+  const persistent = prompt.options.some(option => option.role === "accept-always" || option.role === "accept" && PERSISTENT_LABEL.test(option.label));
+  const trustPrompt = TRUST_TITLE.test(prompt.title) || prompt.options.some(option => /\btrust\b/i.test(option.label));
+  return {
+    completeEvidence: accept !== undefined || completeDialogEvidence(prompt),
+    oneShotAccept: !accountSetting && !trustPrompt && oneShotAccept,
+    oneShotReject: !accountSetting && oneShotRejectOption(prompt) !== undefined,
+    persistentOnly: accountSetting || !oneShotAccept && persistent,
+    trustPrompt,
+  };
+}
+
+function completeDialogEvidence(prompt: Prompt): boolean {
+  if (prompt.kind !== "permission" || !prompt.hash || hasTruncatedEvidence(prompt.detail)) return false;
+  if (prompt.tool) return Boolean(prompt.tool.name) && prompt.tool.inputComplete === true &&
+    Object.keys(prompt.tool.input).length > 0 && !hasTruncatedEvidence(prompt.tool.input);
+  return prompt.source === "screen" && prompt.pinned === true && dialogCommand(prompt) !== undefined;
+}
+
+export function permissionAction(prompt: Prompt): string {
+  const command = typeof prompt.tool?.input.command === "string" ? prompt.tool.input.command : undefined;
+  const text = dialogCommand(prompt) ?? command ?? [prompt.title, prompt.detail].filter(Boolean).join("\n");
+  return [...text].slice(0, 2000).join("");
+}
 
 const COLLAPSED_LINES = /^\[?\s*(?:…|\.\.\.)\s*\+?\d+\s+lines?\s*\]?$/i;
 const CODEX_COMMAND_PROMPT = /^would you like to run the following command\?$/i;
@@ -11,11 +56,6 @@ const VIEW_ALL = /^(?:press\s+)?(?:\^a|ctrl(?:\+|-)?a|control(?:\+|-)?a|⌃a)(?:
 const COLLAPSED_AND_VIEW_ALL = /^\[?\s*(?:…|\.\.\.)\s*\+?\d+\s+lines?\s*\]?(?:\s*[|·—-]\s*|\s+)(?:press\s+)?(?:\^a|ctrl(?:\+|-)?a|control(?:\+|-)?a|⌃a)(?:\s+to)?\s+view all$/i;
 const TRUST_LANGUAGE = /always|trust|workspace|project|session|folder|remember|future/i;
 
-/**
- * A Codex command dialog whose command is still collapsed on the pinned screen.
- * This predicate only admits the narrow display-expansion case; it does not
- * authorize a prompt or establish what the hidden command will do.
- */
 export function isCollapsedPermissionPrompt(prompt: Prompt): boolean {
   if (!["permission", "menu"].includes(prompt.kind) || !["screen", "hook"].includes(prompt.source) ||
       !/^[a-f0-9]{64}$/i.test(prompt.hash ?? "") || prompt.pinned !== true || prompt.multiSelect || prompt.acceptsText !== true ||
@@ -42,7 +82,6 @@ export function isCollapsedPermissionPrompt(prompt: Prompt): boolean {
     (index + 2 === lines.length && COLLAPSED_LINES.test(line) && VIEW_ALL.test(lines[index + 1]))));
 }
 
-/** Hash every prompt field that can change what a one-shot answer means. */
 export function permissionEvidenceHash(prompt: Prompt): string {
   const evidence = {
     id: prompt.id,
@@ -60,7 +99,6 @@ export function permissionEvidenceHash(prompt: Prompt): string {
   return createHash("sha256").update(JSON.stringify(evidence)).digest("hex");
 }
 
-/** Hash the semantic authority for a one-shot request, excluding assignment and prompt identity. */
 export function permissionReuseKey(input: {
   policyHash: string;
   prompt: Prompt;
@@ -90,22 +128,12 @@ export function permissionReuseKey(input: {
   return createHash("sha256").update(JSON.stringify(semantic)).digest("hex");
 }
 
-/**
- * Hash of the owner authority a permission decision was made under: the pinned policy plus the
- * owner's steering and answers. A later owner answer changes it, so an earlier verdict cannot be
- * reused and an approved decision is rechecked before delivery.
- */
 export function permissionAuthorityHash(permissions: unknown, ownerDirection: string[]): string {
   return createHash("sha256").update(JSON.stringify({ permissions: permissions ?? null, ownerDirection })).digest("hex");
 }
 
-/** Worker refusal codes. A delegated answer refused with one of these wrote no key. */
 const ANSWER_REFUSALS = new Set(["prompt-changed", "unsupported", "invalid-option", "text-not-accepted", "control-busy", "control-lost"]);
 
-/**
- * Whether a delegated answer failed before its first key: a manager preflight refusal or a named
- * worker refusal. A transport error can follow a delivered key, so it never qualifies.
- */
 export function refusedBeforeSend(error: unknown): boolean {
   return error instanceof ContentError || ANSWER_REFUSALS.has((error as WorkerError | undefined)?.code ?? "");
 }

@@ -2,9 +2,6 @@ import SwiftUI
 import AppKit
 import InfiniteCore
 
-/// Liquid Glass for controls that act on the whole window: the start box, composers, status chips, and
-/// the connection footer. Content (rows, records, terminals) stays flat beneath them. Before macOS 26 the
-/// same shape gets a thin material and a light rim.
 extension View {
     @ViewBuilder func glassSurface<S: Shape>(in shape: S, tint: Color? = nil) -> some View {
         if #available(macOS 26.0, *) {
@@ -21,8 +18,6 @@ extension View {
             if prominent { buttonStyle(.borderedProminent) } else { buttonStyle(.bordered) }
         }
     }
-    /// The window title repeats what the sidebar already selects, so it is hidden where macOS allows,
-    /// and the window and toolbar share the page's dark ground.
     @ViewBuilder func quietWindow() -> some View {
         if #available(macOS 15.0, *) {
             toolbar(removing: .title).toolbarBackground(Palette.background, for: .windowToolbar).containerBackground(Palette.background, for: .window)
@@ -35,13 +30,10 @@ private func liquidGlass(tint: Color?) -> Glass {
     tint.map { Glass.regular.tint($0.opacity(0.35)) } ?? .regular
 }
 
-/// The app's palette, after the ayu dark theme: near-black grounds, warm text, and one amber accent.
-/// The app is always dark; the colors carry state, so each one stays beside words.
 enum Palette {
     private static func hex(_ value: UInt32) -> Color {
         Color(red: Double((value >> 16) & 0xff) / 255, green: Double((value >> 8) & 0xff) / 255, blue: Double(value & 0xff) / 255)
     }
-    /// The page ground, the sidebar beside it, and a raised surface for inset panels.
     static let background = hex(0x0D1017)
     static let sidebar = hex(0x0B0E14)
     static let surface = hex(0x131721)
@@ -57,9 +49,6 @@ enum Palette {
     static let muted = hex(0x565B66)
 }
 
-/// Linear-style work states: a ring that fills by quarters while work runs, a check ring for review, a
-/// filled check for done, and filled marks for attention, stuck, and cancelled. Words beside the
-/// glyph carry the meaning; a full ring is not completion.
 struct StatusGlyph: View {
     enum Kind: Equatable { case todo, progress(Double), review, done, attention, paused, blocked, cancelled, stopped, error }
     let kind: Kind
@@ -77,8 +66,42 @@ struct StatusGlyph: View {
         case .aborted: kind = .stopped
         }
     }
-    /// A board row by its column; a working mission's ring fills with its finished subtasks.
+    init(teamSeed: TeamSeed, size: CGFloat = 14) {
+        self.size = size
+        switch teamSeed.typedStatus {
+        case .unknown(let raw) where raw.isEmpty:
+            kind = teamSeed.column == BoardColumn.needsInput.rawValue ? .attention : .todo
+        case .cancelled: kind = .cancelled
+        case .noChange: kind = .stopped
+        case .merged: kind = .done
+        case .paused: kind = .paused
+        case .blocked: kind = .blocked
+        case .needsInput: kind = .attention
+        case .readyForReview: kind = .review
+        case .planning, .discovering, .implementing, .integrating, .verifying, .reviewing, .delivering, .unknown:
+            kind = teamSeed.column == BoardColumn.needsInput.rawValue ? .attention : .progress(teamSeed.progressFraction)
+        }
+    }
+    init(teamLoadState: TeamLoadState, size: CGFloat = 14) {
+        switch teamLoadState {
+        case .loading(let seed, _): self.init(teamSeed: seed, size: size)
+        case .listSeed(let run, _), .loaded(let run, _): self.init(team: run, size: size)
+        }
+    }
     init(item: BoardItem, size: CGFloat = 14) { self.init(Self.board(item.column, item.status, item.progressFraction), size: size) }
+    init(missionSeed: MissionSeed, size: CGFloat = 14) {
+        if missionSeed.status.isEmpty {
+            self.init(.todo, size: size)
+        } else {
+            self.init(Self.board(missionSeed.column, missionSeed.status, missionSeed.progressFraction), size: size)
+        }
+    }
+    init(missionLoadState: MissionLoadState, size: CGFloat = 14) {
+        switch missionLoadState {
+        case .loading(let seed, _): self.init(missionSeed: seed, size: size)
+        case .loaded(let mission): self.init(mission: mission, size: size)
+        }
+    }
     init(mission: Mission, size: CGFloat = 14) {
         let (done, total) = mission.progress
         self.init(Self.board(mission.column, mission.status, total > 0 ? max(0.25, Double(done) / Double(total)) : 0.25), size: size)
@@ -116,7 +139,6 @@ struct StatusGlyph: View {
             if filled { Circle().fill(color) } else { Circle().strokeBorder(color, lineWidth: line) }
             switch kind {
             case .progress(let fraction):
-                // Quarter steps, clockwise from twelve; any started work shows one quarter.
                 let quarters = fraction <= 0 ? 0 : min(4, max(1, Int((fraction * 4).rounded())))
                 Pie(fraction: Double(quarters) / 4).fill(color).padding(line * 2)
             case .done, .review: mark("checkmark", filled ? .white : color, 0.5)
@@ -151,7 +173,6 @@ private struct Pie: Shape {
 }
 
 private let plainISO: ISO8601DateFormatter = { let f = ISO8601DateFormatter(); f.formatOptions = [.withInternetDateTime]; return f }()
-/// A compact age such as "now", "12m", "3h", or "5d", measured from an ISO time the host reported.
 func shortAge(_ iso: String, now: Date = Date()) -> String {
     guard let date = ISO8601DateFormatter.flexible.date(from: iso) ?? plainISO.date(from: iso) else { return "" }
     return shortAge(date, now: now)

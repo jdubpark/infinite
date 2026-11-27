@@ -6,7 +6,6 @@ export type Body = Record<string, unknown>;
 export const str = (v: unknown, max = 4000) => (typeof v === "string" ? cut(v, max) : undefined);
 export const obj = (v: unknown): Body => (v && typeof v === "object" && !Array.isArray(v) ? (v as Body) : {});
 
-/** Matches against the full command so truncation can never hide a destructive tail. */
 export function destructiveOf(input: Body): { pattern: string } | undefined {
   const pattern = typeof input.command === "string" ? matchDestructive(input.command) : null;
   return pattern ? { pattern } : undefined;

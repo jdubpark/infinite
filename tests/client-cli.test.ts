@@ -122,8 +122,6 @@ test("team pull refuses a lifecycle run before review", { timeout: 60000 }, asyn
   writeFileSync(clientFile, JSON.stringify({ origin: run.host.origin, token: run.host.tokens.owner }), { mode: 0o600 });
   const entry = [process.execPath, "--import", import.meta.resolve("tsx"), resolve("packages/host/src/client-entry.ts"), "--client-config", clientFile];
   try {
-    // Readiness is checked before the repository binding, so no enrollment is needed;
-    // enrolling would also replace the fixture's held check.
     await exec("git", ["clone", "--no-hardlinks", run.source, checkout]);
     const created = await run.host.fetchApi("/teams", "owner", run.create());
     assert.ok([200, 201].includes(created.status));
@@ -383,8 +381,6 @@ test("repo init keeps directory Linear defaults local, inherits the nearest mapp
   const otherPairingTeam = randomUUID(), otherPairingProject = randomUUID();
   let hostStopped = false;
   try {
-    // Both defaults are saved while the host is unreachable. A parent folder must not resolve,
-    // upload, or enroll anything on the host.
     await run.host.stopApi(); hostStopped = true;
     const parentResult = JSON.parse((await invoke(ownerConfig, [parent, "--linear-team", parentTeam, "--linear-project", parentProject])).stdout);
     assert.equal(parentResult.kind, "directory");
@@ -423,7 +419,6 @@ test("repo init keeps directory Linear defaults local, inherits the nearest mapp
     assert.deepEqual((await run.host.fetchApi("/projects/descendant-target/team")).body.linear, { teamId: nestedTeam, projectId: nestedProject });
     assert.equal((await run.host.fetchApi("/projects/isolated-target/team")).body.linear, undefined);
 
-    // Editing the directory default later does not rebind an already-enrolled repository.
     const changedParentProject = randomUUID();
     await invoke(ownerConfig, [nested, "--linear-team", nestedTeam, "--linear-project", changedParentProject]);
     rmSync(childDescendant, { recursive: true, force: true });
@@ -521,8 +516,6 @@ test("a lost child enrollment receipt preserves concurrent defaults and requires
     assert.deepEqual(currentParent.linear, { teamId: teamAfter, projectId: projectAfter }, "the successful child save merges with the latest parent defaults");
     assert.deepEqual((await run.host.fetchApi("/projects/race-target/team")).body.linear, { teamId: teamBefore, projectId: projectBefore });
 
-    // A first inherited request can commit even though its response is lost. Natural retry resumes
-    // that uncertain request under its own ID instead of creating another mutation.
     const lostArgs = [lostChild, "--project", "lost-target", "--check-json", JSON.stringify([{ command: "node", args: ["-e", "process.exit(0)"] }])];
     dropNextPut = true;
     let lostError: { stderr?: string } | undefined;
@@ -941,11 +934,8 @@ test("native cloud CLI preserves argv, enforces monitor mode, and reconnects wit
   let app = createApp(config, key);
   let server = app.server.listen(0, "127.0.0.1"); await new Promise<void>(r => server.once("listening", r));
   config.port = (server.address() as { port: number }).port; config.origin = `http://127.0.0.1:${config.port}`;
-  // Recreate after selecting a port so the Host/Origin policy uses the real origin.
   await new Promise<void>(r => server.close(() => r()));
   app = createApp(config, key); server = app.server.listen(config.port, "127.0.0.1"); await new Promise<void>(r => server.once("listening", r));
-  // A real transport proxy delays only acknowledgments. Provider input and
-  // output remain live, exposing accidental per-key round-trip serialization.
   let holdReceipts = false;
   const held: (() => void)[] = [];
   const relaySockets = new Set<WebSocket>();
@@ -984,7 +974,7 @@ test("native cloud CLI preserves argv, enforces monitor mode, and reconnects wit
   const call = async (path: string, role: keyof typeof tokens, body?: unknown, cookie?: string) => fetch(config.origin + "/api" + path, { method: body === undefined ? "GET" : "POST", headers: { ...(cookie ? { Cookie: cookie, Origin: config.origin } : { Authorization: `Bearer ${tokens[role]}` }), "Content-Type": "application/json" }, body: body === undefined ? undefined : JSON.stringify(body) });
   try {
     await exec(process.execPath, [...cli, "pair", clientOrigin, "--token-file", tokenFile]);
-    app.manager.setContext("project", "Do not append me to native argv", 0);
+    app.manager.projectContexts.setContext("project", "Do not append me to native argv", 0);
     const nativeArgs = ["--model", "example/model", "--config", "literal=value", "--", "spaces, $HOME and `printf literal`", "line\nbreak"];
     const launched = await exec(process.execPath, [...cli, "--project", "project", "--cloud", "--detach", "codex", ...nativeArgs]);
     const sid = launched.stdout.trim(); assert.match(sid, /^[a-f0-9-]{36}$/);
@@ -1020,15 +1010,37 @@ test("native cloud CLI preserves argv, enforces monitor mode, and reconnects wit
     const list = JSON.parse((await exec(process.execPath, [...cli, "list", "--json"])).stdout);
     assert.equal(list[0].id, sid); assert.equal(list[0].nativeArgs, undefined);
     const monitor = start(["monitor", sid.slice(0, 8)]);
+    const pressUntil = async (client: ReturnType<typeof start>, key: string, done: string, busy: string) => {
+      let from = client.output().length;
+      client.process.write(key);
+      await wait(() => {
+        const seen = client.output().slice(from);
+        if (seen.includes(done)) return true;
+        if (!seen.includes(busy)) return false;
+        from = client.output().length;
+        client.process.write(key);
+        return false;
+      });
+    };
+    const enterControl = () => pressUntil(monitor, "\r", "Interactive. Ctrl+G", "Waiting for control acknowledgement");
+    const openDraft = (client: ReturnType<typeof start>) => pressUntil(client, "\x05", "Local draft", "Waiting for draft insertion");
+    const closeDraft = async (client: ReturnType<typeof start>) => {
+      const from = client.output().length;
+      client.process.write("\x18");
+      await wait(() => client.output().slice(from).includes("\x1b[?1049l"));
+    };
     await wait(() => monitor.output().includes("NATIVE READY"));
     monitor.process.write("ignored"); await new Promise(r => setTimeout(r, 200));
     assert.equal(readFileSync(join(workspace, "input.txt"), "utf8"), "");
     monitor.process.write("\r"); await wait(() => monitor.output().includes("Interactive. Ctrl+G"));
     monitor.process.write("steer\x1b[A\r");
     await wait(() => readFileSync(join(workspace, "input.txt"), "utf8") === "steer\x1b[A\r");
-    monitor.process.write("\x07ignored again"); await wait(() => monitor.output().includes("Monitoring. Enter enables interaction;")); await new Promise(r => setTimeout(r, 200));
+    const monitoringFrom = monitor.output().length;
+    monitor.process.write("\x07ignored again");
+    await wait(() => monitor.output().slice(monitoringFrom).includes("Ctrl+T takes over"));
+    await new Promise(r => setTimeout(r, 200));
     assert.equal(readFileSync(join(workspace, "input.txt"), "utf8"), "steer\x1b[A\r");
-    monitor.process.write("\r"); await new Promise(r => setTimeout(r, 100));
+    await enterControl();
     monitor.process.write("\x05"); await wait(() => monitor.output().includes("Local draft"), 25000);
     monitor.process.write("preserve this unsent draft"); await wait(() => monitor.output().includes("preserve this unsent draft"));
     app.closeConnections(); await new Promise<void>(r => server.close(() => r()));
@@ -1038,10 +1050,11 @@ test("native cloud CLI preserves argv, enforces monitor mode, and reconnects wit
     await wait(() => monitor.output().includes("Reconnected to the same session"));
     assert.equal((await app.manager.state(sid)).pid, before.pid);
     assert.equal((await app.manager.list()).length, 1);
-    monitor.process.write("\r"); await new Promise(r => setTimeout(r, 120));
+    await enterControl();
     const draftOffset = monitor.output().length;
     monitor.process.write("\x05"); await wait(() => monitor.output().slice(draftOffset).includes("preserve this unsent draft"));
-    monitor.process.write("\x18"); await new Promise(r => setTimeout(r, 100)); monitor.process.write("after");
+    await closeDraft(monitor);
+    monitor.process.write("after");
     await wait(() => readFileSync(join(workspace, "input.txt"), "utf8").endsWith("after"));
     assert.equal(readFileSync(join(workspace, "input.txt"), "utf8"), "steer\x1b[A\rafter");
     monitor.process.write("\x1d"); await wait(monitor.exited);
@@ -1051,20 +1064,20 @@ test("native cloud CLI preserves argv, enforces monitor mode, and reconnects wit
     resumed.process.write("A");
     await wait(() => held.length > 0 && readFileSync(join(workspace, "input.txt"), "utf8").endsWith("A"));
     resumed.process.write("B");
-    await wait(() => readFileSync(join(workspace, "input.txt"), "utf8").endsWith("AB"), 1000);
+    await wait(() => readFileSync(join(workspace, "input.txt"), "utf8").endsWith("AB"));
     holdReceipts = false; held.splice(0).forEach(deliver => deliver());
     const inputBeforeDraft = readFileSync(join(workspace, "input.txt"), "utf8");
     resumed.process.write("\x05"); await wait(() => resumed.output().includes("Local draft"));
-    resumed.process.write("instant local text"); await wait(() => resumed.output().includes("instant local text"), 500);
+    resumed.process.write("instant local text"); await wait(() => resumed.output().includes("instant local text"));
     assert.equal(readFileSync(join(workspace, "input.txt"), "utf8"), inputBeforeDraft, "editing stays entirely local");
-    resumed.process.write("\x18"); await new Promise(r => setTimeout(r, 100));
+    await closeDraft(resumed);
+    await new Promise(r => setTimeout(r, 100));
     assert.equal(readFileSync(join(workspace, "input.txt"), "utf8"), inputBeforeDraft, "cancelling never sends a draft");
-    resumed.process.write("\x05"); await new Promise(r => setTimeout(r, 100));
+    await openDraft(resumed);
     resumed.process.write("draft first\rdraft second"); await wait(() => resumed.output().includes("draft second"));
     resumed.process.write("\x13");
     await wait(() => readFileSync(join(workspace, "input.txt"), "utf8") === inputBeforeDraft + "\x1b[200~draft first\ndraft second\x1b[201~");
-    await new Promise(r => setTimeout(r, 100));
-    resumed.process.write("\x05"); await new Promise(r => setTimeout(r, 100));
+    await openDraft(resumed);
     resumed.process.write("survive a killed client"); await wait(() => resumed.output().includes("survive a killed client"));
     const saved = () => readdirSync(join(root, "drafts"), { recursive: true }).map(String).filter(p => p.endsWith(".sealed")).map(p => join(root, "drafts", p));
     await wait(() => { try { return saved().length === 1; } catch { return false; } });
@@ -1118,9 +1131,6 @@ test("a new API lists and streams a pre-attention worker without replacing it", 
   const dir = join(config.stateDir, "sessions", id); mkdirSync(dir, { recursive: true }); mkdirSync(config.runDir);
   writeSealed(join(dir, "meta.sealed"), key, `${id}:meta`, { session: { id, provider: "codex", title: "Older session", projectId: "old", createdAt: new Date().toISOString(), status: "running", context: "", contextVersion: 0, initialPrompt: "", cwd: root }, fingerprint: "old" });
   const journal = new Journal(join(dir, "events"), key, id); journal.append("output", { text: "older-worker-output" });
-  // This is the actual pre-attention IPC response shape: the worker sends no attention block.
-  // Pre-control workers fingerprint the complete IPC input shape. Seed a
-  // delivered request from before upgrade, then retry it through the new API.
   const oldInput = { op: "input", requestId: randomUUID(), text: "before-upgrade", submit: true };
   const oldDigest = createHash("sha256").update(JSON.stringify(oldInput)).digest("hex");
   const oldReceipt = { requestId: oldInput.requestId, state: "delivered", seq: 3 };
@@ -1142,7 +1152,6 @@ test("a new API lists and streams a pre-attention worker without replacing it", 
     assert.equal(response.status, 200);
     const list = (await response.json() as { sessions: { id: string; pid: number; status: string; attention?: { state: string; now: string } }[] }).sessions;
     assert.equal(list.length, 1); assert.equal(list[0].pid, 12345); assert.equal(list[0].status, "running");
-    // The API fills the missing block so clients never break, but invents no idle or finished state.
     assert.equal(list[0].attention?.state, "unavailable"); assert.equal(list[0].attention?.now, "");
     const { op: _op, ...retry } = oldInput;
     const receipt = await fetch(origin + `/api/sessions/${id}/input`, { method: "POST", headers: { ...headers, "Content-Type": "application/json" }, body: JSON.stringify(retry) });
@@ -1226,8 +1235,6 @@ test("snapshot attachments and fenced device takeover preserve one live process 
     const retry = await host.fetchApi(path + "/input", "controller", phoneInput, sendHeaders);
     assert.equal(first.body.state, "delivered"); assert.deepEqual(first.body, retry.body);
     await host.fetchApi(path + "/control", "controller", { action: "release", leaseId: phoneLease.body.control.id }, phoneHeaders);
-    // Device labels were always free-form configuration. Display sanitization
-    // must not turn an accepted key into one that can no longer steer a worker.
     for (const label of ["", "long-label-".repeat(20)]) {
       host.config.tokens.find(t => t.role === "owner")!.label = label;
       await host.stopApi();
@@ -1276,8 +1283,10 @@ test("repository CLI pins, preserves and removes owner permission delegation", {
   const enroll = (...extra: string[]) => exec(process.execPath, [...args, ...extra], { cwd: checkout });
   try {
     await exec("git", ["clone", "--no-hardlinks", run.source, checkout]);
-    const first = JSON.parse((await enroll()).stdout);
+    const firstRun = await enroll();
+    const first = JSON.parse(firstRun.stdout);
     assert.deepEqual(first.team.permissions, { mode: "coordinator", scope: DEFAULT_PERMISSION_SCOPE, maxDecisions: DEFAULT_PERMISSION_LIMIT });
+    assert.match(firstRun.stderr, /Permission agent: this project is covered in workspace \S+\./, "the first onboarding covers the project");
     const delegated = JSON.parse((await enroll("--permissions", "coordinator", "--permission-scope", "Read files and run the configured check only.", "--permission-limit", "3")).stdout);
     assert.deepEqual(delegated.team.permissions, { mode: "coordinator", scope: "Read files and run the configured check only.", maxDecisions: 3 });
     const retained = JSON.parse((await enroll()).stdout);
@@ -1288,9 +1297,53 @@ test("repository CLI pins, preserves and removes owner permission delegation", {
       requestId: randomUUID(), revision: retained.revision, team: { ...retained.team, permissions: { ...delegated.team.permissions, scope: "Broaden scope" } },
     }, undefined, "PUT");
     assert.equal(forbidden.status, 403);
-    const removed = JSON.parse((await enroll("--permissions", "off")).stdout);
+    const removedRun = await enroll("--permissions", "off");
+    const removed = JSON.parse(removedRun.stdout);
     assert.equal(removed.team.permissions, undefined);
-    const retainedOff = JSON.parse((await enroll()).stdout);
+    assert.match(removedRun.stderr, /Permission agent: this project is opted out\./, "an explicit off on a repeat onboarding records an opt-out");
+    const retainedOffRun = await enroll();
+    const retainedOff = JSON.parse(retainedOffRun.stdout);
     assert.equal(retainedOff.team.permissions, undefined, "plain repo init preserves an explicitly saved off policy");
+    assert.match(retainedOffRun.stderr, /Permission agent: a repeat onboarding leaves this project's delegation unchanged\./);
+    assert.equal((await run.host.fetchApi("/permissions/status", "owner")).body.workspaces
+      .flatMap((view: { projects: { projectId: string; state: string }[] }) => view.projects).find((project: { projectId: string }) => project.projectId === "rehearsal")?.state, "opt-out");
+  } finally { await run.close(); rmSync(localRoot, { recursive: true, force: true }); }
+});
+
+test("repo init keeps the team settings it does not own when it runs again", { timeout: 120000 }, async () => {
+  const run = await teamFixture("success");
+  const localRoot = mkdtempSync(join(tmpdir(), "infinite-carry-cli-"));
+  const checkout = join(localRoot, "checkout");
+  const configFile = join(localRoot, "client.json");
+  writeFileSync(configFile, JSON.stringify({ origin: run.host.origin, token: run.host.tokens.owner }), { mode: 0o600 });
+  const firstChecks = JSON.stringify([{ command: process.execPath, args: ["check.mjs", "--prefix"] }]);
+  const secondChecks = JSON.stringify([{ command: process.execPath, args: ["check.mjs", "--suffix"] }]);
+  const enroll = (checks: string) => exec(process.execPath, ["--import", import.meta.resolve("tsx"), resolve("packages/host/src/client-entry.ts"), "--client-config", configFile,
+    "repo", "init", "--project", "rehearsal", "--check-json", checks], { cwd: checkout });
+  try {
+    await exec("git", ["clone", "--no-hardlinks", run.source, checkout]);
+    await enroll(firstChecks);
+    const enrolled = (await run.host.fetchApi("/projects/rehearsal/team")).body;
+    const features = { areas: [{ id: "host", paths: ["src"] }] };
+    const saved = await run.host.fetchApi("/projects/rehearsal/team", "owner", {
+      requestId: randomUUID(), revision: enrolled.revision, team: { ...enrolled.team, handoffMinutes: 30, features, eval: { capture: true }, objective: { prompts: "on" } },
+    }, undefined, "PUT");
+    assert.equal(saved.status, 200);
+    const before = (await run.host.fetchApi("/projects/rehearsal/team")).body.team;
+    await enroll(firstChecks);
+    const rerun = (await run.host.fetchApi("/projects/rehearsal/team")).body.team;
+    assert.equal(JSON.stringify(rerun), JSON.stringify(before));
+    assert.equal(rerun.handoffMinutes, 30);
+    assert.deepEqual(rerun.eval, { capture: true });
+    assert.deepEqual(rerun.features, features);
+    assert.deepEqual(rerun.objective, { prompts: "on" });
+    assert.deepEqual(rerun.checks, JSON.parse(firstChecks));
+    await enroll(secondChecks);
+    const changed = (await run.host.fetchApi("/projects/rehearsal/team")).body.team;
+    assert.deepEqual(changed.checks, JSON.parse(secondChecks));
+    assert.equal(changed.handoffMinutes, 30);
+    assert.deepEqual(changed.eval, { capture: true });
+    assert.deepEqual(changed.features, features);
+    assert.deepEqual(changed.objective, { prompts: "on" });
   } finally { await run.close(); rmSync(localRoot, { recursive: true, force: true }); }
 });

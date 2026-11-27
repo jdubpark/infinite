@@ -1,9 +1,5 @@
 import { randomBytes, randomUUID as nodeUUID } from "node:crypto";
 
-/**
- * Stands in for `react-native`, `expo-crypto` and `expo-secure-store` so phone modules
- * run under Node. Tests move the app between states with `setAppState`.
- */
 type AppStateStatus = "active" | "inactive" | "background";
 const listeners = new Set<(state: AppStateStatus) => void>();
 
@@ -50,7 +46,6 @@ function eventCursor(event: Event) {
   return typeof data?.cursor === "number" ? data.cursor : undefined;
 }
 
-/** Test double used only by `useLive`; protocol tests use the real remote client. */
 export async function openEvents(_connection: unknown, options: EventOptions) {
   eventOpenAttempts++;
   eventOpenOptions.push(options);

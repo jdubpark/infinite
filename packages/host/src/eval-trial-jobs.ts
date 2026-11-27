@@ -1,0 +1,744 @@
+import { createHash, randomUUID } from "node:crypto";
+import type { SQLInputValue } from "node:sqlite";
+import { z } from "zod";
+import { promptVersion } from "./config-identity.js";
+import { canonicalJson } from "./evidence/crypto.js";
+import type { EvidenceStore } from "./evidence/store.js";
+import type { EvidenceDb, EvidenceTx } from "./evidence/types.js";
+import {
+  hasTrialBudgetFor, isEvalProvider, providerBudgetConstraints, trialSettings, validationSettings, TRIAL_MINUTES_DEFAULT, type TrialSettings,
+} from "./eval-config.js";
+import { evaluateFuse, evaluateProviderBudget, type EvalBudgetSource } from "./eval-budget.js";
+import type { GraderProbe } from "./eval-grader.js";
+import type { EvalProbe } from "./eval-identity.js";
+import { ACTIVE_PROJECT_JOBS_SQL, inWindow, JOB_EXPIRY_DAYS_MAX, JOB_TASKS_MAX, type EvalJobRow } from "./eval-jobs.js";
+import { applyComparison, comparisonJobSchema, pinsChanged, planComparison } from "./eval-compare-jobs.js";
+import { TRIAL_TASKS_SQL, type TrialTaskRow } from "./eval-sets.js";
+import { configRef, nextSlot, TRIAL_RELEASES, VOID_STREAK_PAUSE } from "./eval-trial-rules.js";
+import {
+  advanceTask, dropTrial, jobSlots, jobTrialCount, openTrialCounts, releaseRunningTrial, trialCounts, trialsSince, TRIAL_KEEP_DAYS_DEFAULT, type TrialCounts,
+} from "./eval-trial-store.js";
+import {
+  evalConfigurationSchema, evalTaskIdSchema, evalWindowSchema, VOID_ENDINGS,
+  type BaselineJobRequest, type BaselineJobView, type ComparisonJobRequest, type ComparisonJobView,
+  type EvalJobReason, type EvalJobWait, type EvalRefusal, type TrialConfiguration, type TrialEnding, type TrialJobPayload,
+} from "./eval-types.js";
+import { ID_RE } from "./schema-primitives.js";
+import { lineupProfiles, type TeamModelProfile } from "./team-types.js";
+import type { Config, Provider } from "./types.js";
+
+export const TRIAL_CONFIGURATIONS_MAX = 4, TRIALS_PER_TASK_DEFAULT = 3, TRIALS_PER_TASK_MAX = 5, TRIAL_TASKS_DEFAULT = 20,
+  TRIAL_TASKS_MAX = 200, MAX_TRIALS_MAX = 1_000, TRIAL_SLOTS_FREE_MIN = 4, BASELINE_JOBS_MAX = 100;
+export const BASELINE_JOBS_SQL = "SELECT * FROM eval_jobs WHERE status = ? AND kind != 'validate' ORDER BY created_at, job_id LIMIT ?";
+
+const TASK_PAGE = 200;
+const DAY_MS = 86_400_000;
+
+export type TrialGates = {
+  identity: EvalProbe; grader: GraderProbe; hostLoadHeld: boolean; halted: (projectId: string) => boolean;
+  limited: ReadonlySet<Provider>;
+  freeSlots: () => Promise<number>; trialLive: boolean;
+};
+export type NextTrial =
+  | { kind: "trial"; jobId: string; projectId: string; taskId: string; configuration: TrialConfiguration; configRef: string;
+      slot: number; attempt: number; settings: TrialSettings; pairedProviders?: Provider[] }
+  | { kind: "wait"; jobId: string; waiting: EvalJobWait } | { kind: "none" };
+
+type JobRequest = BaselineJobRequest | ComparisonJobRequest;
+type JobView = BaselineJobView | ComparisonJobView;
+type ReportedRow = EvalJobRow & { reported_at?: string | null };
+type CandidateRow = Pick<TrialTaskRow, "task_id" | "origin" | "area_ref" | "holdout">;
+type Filter = { origins?: Set<string>; areas?: Set<string>; ids?: Set<string> };
+type Project = Config["projects"][number];
+type Pass = NextTrial | { kind: "slots" };
+
+const WAITS_ONLY: ReadonlySet<EvalJobWait> = new Set<EvalJobWait>([
+  "mirror", "halt", "spend-fuse", "provider-limit", "provider-budget", "budget-unmeasurable", "daily-cap",
+]);
+
+const NONE: NextTrial = { kind: "none" };
+const EMPTY_COUNTS: TrialCounts = { plannedTasks: 0, plannedTrials: 0, tasks: 0, skipped: 0, started: 0, graded: 0, resolved: 0, ended: 0, void: 0, voidStreak: 0, reused: 0 };
+
+export const baselineJobSchema = z.object({
+  kind: z.literal("baseline"),
+  configurations: z.array(evalConfigurationSchema).min(1).max(TRIAL_CONFIGURATIONS_MAX)
+    .refine(list => new Set(list.map(item => configRef(item as unknown as TrialConfiguration))).size === list.length, "Two configurations name one configRef"),
+  taskFilter: z.object({
+    taskIds: z.array(evalTaskIdSchema).max(JOB_TASKS_MAX).optional(),
+    origins: z.array(z.enum(["captured", "mined"])).max(2).optional(),
+    areas: z.array(z.string().regex(ID_RE)).max(32).optional(),
+    maxTasks: z.number().int().min(1).max(TRIAL_TASKS_MAX).optional(),
+  }).strict().optional(),
+  trialsPerTask: z.number().int().min(1).max(TRIALS_PER_TASK_MAX).optional(),
+  limits: z.object({
+    maxTrials: z.number().int().min(1).max(MAX_TRIALS_MAX),
+    maxWallMinutes: z.number().int().min(10).max(43_200),
+  }).strict(),
+  windows: z.array(evalWindowSchema).min(1).max(4).optional(),
+  expiresAt: z.iso.datetime().optional(),
+}).strict() as unknown as z.ZodType<BaselineJobRequest>;
+
+export function trialJobDigest(project: Project, config: Pick<Config, "eval">, configurations: readonly TrialConfiguration[]): string {
+  const validation = validationSettings(project);
+  return sha256(canonicalJson({
+    settings: "missing" in validation ? null : validation.settings,
+    trialMinutes: project.team?.eval?.trialMinutes ?? TRIAL_MINUTES_DEFAULT,
+    grader: config.eval?.grader ?? null,
+    member: config.eval?.member ?? null,
+    prompts: configurations.map(configuration => {
+      const profile = JSON.parse(canonicalJson(configuration.profile)) as TeamModelProfile;
+      return promptVersion("implementer", profile.provider, profile, false, false, false);
+    }),
+    permissions: project.team?.permissions ?? null,
+  }));
+}
+
+export class TrialJobs {
+  private readonly store: EvidenceStore;
+  private readonly config: Pick<Config, "projects" | "eval" | "teams" | "usage">;
+  private readonly now: () => string;
+  private readonly budget: EvalBudgetSource | undefined;
+  private readonly released = new Map<string, { key: string; count: number }>();
+
+  constructor(options: { store: EvidenceStore; config: Pick<Config, "projects" | "eval" | "teams" | "usage">; now?: () => string; budget?: EvalBudgetSource }) {
+    this.store = options.store;
+    this.config = options.config;
+    this.now = options.now ?? (() => new Date().toISOString());
+    this.budget = options.budget;
+  }
+
+  create(projectId: string, request: JobRequest, requestId: string): { created: boolean; job: JobView } | EvalRefusal {
+    const parsed = request.kind === "baseline" ? baselineJobSchema.safeParse(request) : comparisonJobSchema.safeParse(request);
+    if (!parsed.success) return refusal(400, "invalid-eval-request");
+    const project = this.projectOf(projectId);
+    if (project === undefined) return refusal(404, "unknown-project");
+    const nowMs = Date.parse(this.now());
+    const expiresMs = parsed.data.expiresAt === undefined ? nowMs + JOB_EXPIRY_DAYS_MAX * DAY_MS : Date.parse(parsed.data.expiresAt);
+    if (expiresMs > nowMs + JOB_EXPIRY_DAYS_MAX * DAY_MS) return refusal(400, "invalid-eval-request");
+    const normalized = {
+      ...parsed.data,
+      taskFilter: { ...parsed.data.taskFilter, maxTasks: parsed.data.taskFilter?.maxTasks ?? TRIAL_TASKS_DEFAULT },
+      trialsPerTask: parsed.data.trialsPerTask ?? TRIALS_PER_TASK_DEFAULT,
+      expiresAt: new Date(expiresMs).toISOString(),
+    } as JobRequest;
+    const requestDigest = sha256(canonicalJson({ projectId, request: parsed.data }));
+    return this.store.write(tx => {
+      const existing = tx.get<EvalJobRow>("SELECT * FROM eval_jobs WHERE request_id = ?", requestId);
+      if (existing !== undefined) {
+        const payload = tx.open<TrialJobPayload>("eval_jobs", existing.job_id, existing.payload);
+        if (payload.requestDigest !== requestDigest) return refusal(409, "request-conflict");
+        return { created: false, job: this.viewOf(tx, existing) };
+      }
+      const found = trialSettings(project, this.config.usage?.budgets);
+      if ("missing" in found) return refusal(409, "eval-config-incomplete");
+      const approval = this.profileRefusal(project, normalized.configurations, found.settings.candidateProfiles);
+      if (approval !== undefined) return approval;
+      if (!this.providersCovered(found.settings, normalized.configurations)) return refusal(409, "eval-config-incomplete");
+      const ref = tx.index("project", projectId);
+      if (tx.get(ACTIVE_PROJECT_JOBS_SQL, ref, normalized.kind) !== undefined) return refusal(409, "job-active");
+      const jobId = randomUUID();
+      const at = this.now();
+      const comparison = normalized.kind === "baseline" ? undefined : planComparison(tx, { projectId, request: normalized, at });
+      if (comparison !== undefined && "code" in comparison) return comparison;
+      if (comparison === undefined || comparison.planned.trials > 0) {
+        const budgetRefusal = this.creationRefusal(projectId, found.settings, normalized.configurations, new Date(at));
+        if (budgetRefusal !== undefined) return budgetRefusal;
+      }
+      const payload: TrialJobPayload = {
+        projectId,
+        request: normalized,
+        requestDigest,
+        jobDigest: trialJobDigest(project, this.config, normalized.configurations),
+        ...(comparison === undefined ? {} : { tasks: comparison.tasks, pins: comparison.pins }),
+        ...(comparison?.subject === undefined ? {} : { subject: comparison.subject }),
+      };
+      tx.run(
+        "INSERT INTO eval_jobs (job_id, project_ref, kind, status, reason, waiting, request_id, created_at, started_at, "
+        + "expires_at, finished_at, updated_at, payload) VALUES (?, ?, ?, 'scheduled', NULL, NULL, ?, ?, NULL, ?, NULL, ?, ?)",
+        jobId,
+        ref,
+        normalized.kind,
+        requestId,
+        at,
+        normalized.expiresAt ?? at,
+        at,
+        tx.seal("eval_jobs", jobId, payload),
+      );
+      if (comparison === undefined) {
+        openTrialCounts(tx, jobId, this.plan(tx, ref, normalized));
+      } else {
+        openTrialCounts(tx, jobId, comparison.planned);
+        const outcome = applyComparison(tx, {
+          jobId, projectId, request: normalized as ComparisonJobRequest, plan: comparison, keepDays: TRIAL_KEEP_DAYS_DEFAULT, at,
+        });
+        if (outcome === "complete") finish(tx, jobId, at, "completed", "done");
+      }
+      return { created: true, job: this.viewOf(tx, this.rowOf(tx, jobId) as EvalJobRow) };
+    });
+  }
+
+  views(db: EvidenceDb, rows: readonly EvalJobRow[]): Map<string, JobView> {
+    const baseline = rows.filter(row => row.kind !== "validate");
+    const counts = trialCounts(db, baseline.map(row => row.job_id));
+    const refs = this.refsOf(db);
+    const states = reportStates(db, baseline.filter(row => row.kind !== "baseline").map(row => row.job_id));
+    const views = new Map<string, JobView>();
+    for (const row of baseline) {
+      const projectId = refs.get(row.project_ref) ?? null;
+      const project = projectId === null ? undefined : this.projectOf(projectId);
+      const count = counts.get(row.job_id) ?? EMPTY_COUNTS;
+      const common = {
+        jobId: row.job_id,
+        projectId,
+        status: row.status,
+        reason: row.reason,
+        waiting: row.waiting,
+        createdAt: row.created_at,
+        startedAt: row.started_at,
+        expiresAt: row.expires_at,
+        finishedAt: row.finished_at,
+        tasks: { planned: count.plannedTasks, reached: count.tasks, skipped: count.skipped },
+        dailyCap: project?.team?.eval?.trialsPerDay ?? null,
+      };
+      const trials = { planned: count.plannedTrials, started: count.started, graded: count.graded, resolved: count.resolved, ended: count.ended, void: count.void };
+      if (row.kind === "baseline") {
+        views.set(row.job_id, { ...common, kind: "baseline", trials });
+        continue;
+      }
+      const reported = (row as ReportedRow).reported_at != null;
+      views.set(row.job_id, {
+        ...common,
+        kind: row.kind === "confirm" ? "confirm" : "compare",
+        set: row.kind === "confirm" ? "holdout" : "dev",
+        trials: { ...trials, resolved: reported ? count.resolved : null, reused: count.reused },
+        report: reported ? states.get(row.job_id) ?? "ready" : row.finished_at === null ? null : "pending",
+      });
+    }
+    return views;
+  }
+
+  async next(gates: TrialGates): Promise<NextTrial> {
+    let free: number | undefined;
+    for (;;) {
+      const pass = this.store.write(tx => this.pass(tx, gates, free));
+      if (pass.kind !== "slots") return pass;
+      free = await gates.freeSlots();
+    }
+  }
+
+  skip(jobId: string, taskId: string): void {
+    this.store.write(tx => {
+      if (this.rowOf(tx, jobId) === undefined) return;
+      setJob(tx, jobId, this.now(), { cursor: taskId });
+      advanceTask(tx, jobId, true);
+    });
+  }
+
+  record(jobId: string, ending: TrialEnding): void {
+    this.store.write(tx => {
+      const row = this.rowOf(tx, jobId);
+      if (row === undefined || (row.status !== "scheduled" && row.status !== "running")) return;
+      const counts = trialCounts(tx, [jobId]).get(jobId);
+      if (counts === undefined || !VOID_ENDINGS.includes(ending) || counts.voidStreak < VOID_STREAK_PAUSE) return;
+      setJob(tx, jobId, this.now(), { status: "paused", reason: "trial-voids", waiting: null });
+    });
+  }
+
+  release(trial: Pick<Extract<NextTrial, { kind: "trial" }>, "jobId" | "taskId" | "configRef" | "slot" | "attempt"> & { trialId: string },
+    waiting: EvalJobWait): "released" | "exhausted" {
+    return this.store.write(tx => {
+      const row = this.rowOf(tx, trial.jobId);
+      if (row === undefined || (row.status !== "scheduled" && row.status !== "running")) {
+        this.released.delete(trial.jobId);
+        dropTrial(tx, trial.trialId);
+        return "released";
+      }
+      const key = JSON.stringify([trial.taskId, trial.configRef, trial.slot, trial.attempt]);
+      const last = this.released.get(trial.jobId);
+      const count = WAITS_ONLY.has(waiting) ? 0 : last?.key === key ? last.count + 1 : 1;
+      if (count >= TRIAL_RELEASES) {
+        this.released.delete(trial.jobId);
+        return "exhausted";
+      }
+      if (count === 0) this.released.delete(trial.jobId);
+      else this.released.set(trial.jobId, { key, count });
+      dropTrial(tx, trial.trialId);
+      if (row.waiting !== waiting) setJob(tx, row.job_id, this.now(), { waiting });
+      return "released";
+    });
+  }
+
+  block(jobId: string, reason: "eval-processes-alive" | "configuration-changed"): void {
+    this.store.write(tx => {
+      const row = this.rowOf(tx, jobId);
+      if (row === undefined || (row.status !== "scheduled" && row.status !== "running")) return;
+      setJob(tx, jobId, this.now(), { status: "blocked", reason, waiting: null });
+    });
+  }
+
+  releaseRunning(jobId: string, trialId: string, waiting: EvalJobWait | "configuration-changed"): void {
+    this.store.write(tx => {
+      releaseRunningTrial(tx, trialId);
+      const row = this.rowOf(tx, jobId);
+      if (row === undefined || (row.status !== "scheduled" && row.status !== "running")) return;
+      if (waiting === "configuration-changed") {
+        setJob(tx, jobId, this.now(), { status: "blocked", reason: "configuration-changed", waiting: null });
+        return;
+      }
+      if (row.waiting !== waiting) setJob(tx, jobId, this.now(), { waiting });
+    });
+  }
+
+  digest(projectId: string, jobId: string): string | undefined {
+    return this.store.read(db => {
+      const row = db.get<{ payload: string }>("SELECT payload FROM eval_jobs WHERE job_id = ?", jobId);
+      if (row === undefined) return undefined;
+      const payload = db.open<TrialJobPayload>("eval_jobs", jobId, row.payload);
+      return this.pinned(projectId, payload.request.configurations)?.digest;
+    });
+  }
+
+  running(): string[] {
+    return this.store.read(db => db.all<EvalJobRow>(BASELINE_JOBS_SQL, "running", BASELINE_JOBS_MAX).map(row => row.job_id));
+  }
+
+  expireIdle(): number {
+    return this.store.write(tx => this.expireIdleIn(tx));
+  }
+
+  launchWait(
+    projectId: string,
+    provider: Provider,
+    limited?: ReadonlySet<Provider>,
+    excludeTrialId?: string,
+    pairedProviders?: readonly Provider[],
+  ): EvalJobWait | "configuration-changed" | undefined {
+    const nowMs = Date.parse(this.now());
+    const project = this.projectOf(projectId);
+    if (project === undefined) return "configuration-changed";
+    const found = trialSettings(project, this.config.usage?.budgets);
+    if ("missing" in found) return "configuration-changed";
+    const activeSettings = found.settings;
+    const checked = pairedProviders && pairedProviders.length > 0
+      ? [...new Set([provider, ...pairedProviders])]
+      : [provider];
+    for (const candidate of checked) {
+      if (!isEvalProvider(candidate) || !hasTrialBudgetFor(candidate, activeSettings, this.config.usage?.budgets)) {
+        return "configuration-changed";
+      }
+    }
+    const fuse = evaluateFuse(this.budget?.fuseCheck, projectId);
+    if (fuse.state === "halted") return "halt";
+    if (fuse.state === "open") return "spend-fuse";
+    const blocks = new Map<Provider, "provider-limit" | "provider-budget" | "budget-unmeasurable">();
+    for (const candidate of checked) {
+      const block = this.providerBlock(projectId, candidate, activeSettings, limited, new Date(nowMs));
+      if (block !== undefined) blocks.set(candidate, block);
+    }
+    for (const reason of ["provider-limit", "provider-budget", "budget-unmeasurable"] as const) {
+      if (checked.some(candidate => blocks.get(candidate) === reason)) return reason;
+    }
+    if (activeSettings.trialsPerDay !== null) {
+      try {
+        if (this.store.read(db => trialsSince(db, projectId, utcDayStart(nowMs), excludeTrialId)) >= activeSettings.trialsPerDay) return "daily-cap";
+      } catch {
+        return "budget-unmeasurable";
+      }
+    }
+    return undefined;
+  }
+
+  private expireIdleIn(tx: EvidenceTx): number {
+    const at = this.now();
+    let ended = 0;
+    for (const status of ["paused", "blocked"]) {
+      for (const row of tx.all<EvalJobRow>(BASELINE_JOBS_SQL, status, BASELINE_JOBS_MAX)) {
+        if (Date.parse(row.expires_at) > Date.parse(at)) continue;
+        if (tx.get("SELECT 1 AS live FROM eval_trials WHERE job_id = ? AND state IN ('preparing', 'running', 'grading') LIMIT 1", row.job_id) !== undefined) continue;
+        finish(tx, row.job_id, at, "expired", "expired");
+        ended += 1;
+      }
+    }
+    return ended;
+  }
+
+  private pass(tx: EvidenceTx, gates: TrialGates, free: number | undefined): Pass {
+    this.expireIdleIn(tx);
+    const refs = this.refsOf(tx);
+    const rows = [
+      ...tx.all<EvalJobRow>(BASELINE_JOBS_SQL, "scheduled", BASELINE_JOBS_MAX),
+      ...tx.all<EvalJobRow>(BASELINE_JOBS_SQL, "running", BASELINE_JOBS_MAX),
+    ]
+      .sort((a, b) => compareText(a.created_at, b.created_at) || compareText(a.job_id, b.job_id))
+      .slice(0, BASELINE_JOBS_MAX);
+    let wait: NextTrial | undefined;
+    for (const row of rows) {
+      const step = this.step(tx, row, refs, gates, free);
+      if (step.kind === "slots" || step.kind === "trial") return step;
+      if (step.kind === "wait" && wait === undefined) wait = step;
+    }
+    return wait ?? NONE;
+  }
+
+  private step(tx: EvidenceTx, row: EvalJobRow, refs: Map<string, string>, gates: TrialGates, free: number | undefined): Pass {
+    const at = this.now();
+    const nowMs = Date.parse(at);
+    const projectId = refs.get(row.project_ref);
+    if (projectId === undefined) {
+      setJob(tx, row.job_id, at, { status: "blocked", reason: "configuration-changed", waiting: null });
+      return NONE;
+    }
+    const payload = tx.open<TrialJobPayload>("eval_jobs", row.job_id, row.payload);
+    const request = payload.request;
+    if (Date.parse(row.expires_at) <= nowMs) {
+      finish(tx, row.job_id, at, "expired", "expired");
+      return NONE;
+    }
+    const wallSpent = row.started_at !== null && nowMs - Date.parse(row.started_at) >= request.limits.maxWallMinutes * 60_000;
+    if (jobTrialCount(tx, row.job_id) >= request.limits.maxTrials || wallSpent) {
+      finish(tx, row.job_id, at, "completed", "limit-reached");
+      return NONE;
+    }
+    if (row.kind !== "baseline" && payload.pins !== undefined && pinsChanged(tx, request.configurations, payload.pins, at)) {
+      finish(tx, row.job_id, at, "completed", "identity-changed");
+      return NONE;
+    }
+    const pinned = this.pinned(projectId, request.configurations);
+    if (pinned === undefined || pinned.digest !== payload.jobDigest) {
+      setJob(tx, row.job_id, at, { status: "blocked", reason: "configuration-changed", waiting: null });
+      return NONE;
+    }
+    if (gates.halted(projectId)) return this.waitOn(tx, row, "halt");
+    const fuse = evaluateFuse(this.budget?.fuseCheck, projectId);
+    if (fuse.state === "halted") return this.waitOn(tx, row, "halt");
+    if (request.windows !== undefined && !inWindow(request.windows, nowMs)) return this.waitOn(tx, row, "window");
+    if (gates.hostLoadHeld) return this.waitOn(tx, row, "host-load");
+    const agents = this.config.eval?.member?.agents;
+    const agentsReady = request.configurations.every(configuration => agents?.[configuration.profile.provider] !== undefined);
+    if (gates.identity.state !== "ready" || !agentsReady) return this.waitOn(tx, row, "eval-identity");
+    if (gates.grader.state !== "ready" || (gates.grader.version ?? 0) < 2) return this.waitOn(tx, row, "grader");
+    if (gates.grader.storage !== true || gates.identity.storage !== true) return this.waitOn(tx, row, "storage");
+    if (gates.trialLive) return this.waitOn(tx, row, "another-job");
+    if (row.kind !== "baseline") return this.scanFixed(tx, row, projectId, payload, pinned.settings, gates, fuse.state === "open", free, nowMs);
+    return this.scan(tx, row, projectId, request as BaselineJobRequest, pinned.settings, gates, fuse.state === "open", free, nowMs);
+  }
+
+  private scan(
+    tx: EvidenceTx,
+    row: EvalJobRow,
+    projectId: string,
+    request: BaselineJobRequest,
+    settings: TrialSettings,
+    gates: TrialGates,
+    fuseOpen: boolean,
+    free: number | undefined,
+    nowMs: number,
+  ): Pass {
+    const at = this.now();
+    const filter = filterOf(tx, request);
+    const maxTasks = request.taskFilter?.maxTasks ?? TRIAL_TASKS_DEFAULT;
+    const trialsPerTask = request.trialsPerTask ?? TRIALS_PER_TASK_DEFAULT;
+    const configRefs = request.configurations.map(configuration => configRef(configuration));
+    let reached = (trialCounts(tx, [row.job_id]).get(row.job_id) ?? EMPTY_COUNTS).tasks;
+    let cursor = row.cursor;
+    for (;;) {
+      if (reached >= maxTasks) {
+        finish(tx, row.job_id, at, "completed", "done");
+        return NONE;
+      }
+      const page = tx.all<TrialTaskRow>(TRIAL_TASKS_SQL, row.project_ref, cursor ?? "");
+      const index = page.findIndex(candidate => selected(candidate, filter));
+      if (index === -1) {
+        if (page.length === TASK_PAGE) {
+          setJob(tx, row.job_id, at, { cursor: page[page.length - 1].task_id });
+          return NONE;
+        }
+        finish(tx, row.job_id, at, "completed", "done");
+        return NONE;
+      }
+      if (index > 0) cursor = page[index - 1].task_id;
+      const candidate = page[index];
+      const rows = jobSlots(tx, row.job_id, candidate.task_id);
+      const allPick = nextSlot({
+        tasks: [candidate.task_id], configRefs, trialsPerTask, rows,
+      });
+      if (allPick === undefined) {
+        advanceTask(tx, row.job_id, false);
+        reached += 1;
+        cursor = candidate.task_id;
+        setJob(tx, row.job_id, at, { cursor });
+        continue;
+      }
+      if (index > 0) setJob(tx, row.job_id, at, { cursor });
+      if (fuseOpen) return this.waitOn(tx, row, "spend-fuse");
+      const blocks = this.providerBlocks(projectId, request.configurations, settings, gates.limited, new Date(nowMs));
+      const jobWait = this.jobProviderWait(request.configurations, blocks, false);
+      if (jobWait !== undefined) return this.waitOn(tx, row, jobWait);
+      const eligibleRefs = configRefs.filter((_, i) => !blocks.has(request.configurations[i]!.profile.provider));
+      const pick = eligibleRefs.length === configRefs.length
+        ? allPick
+        : nextSlot({ tasks: [candidate.task_id], configRefs: eligibleRefs, trialsPerTask, rows });
+      if (pick === undefined) {
+        const blocked = request.configurations.find(item => configRef(item) === allPick.configRef);
+        const wait = blocked === undefined ? "budget-unmeasurable" : (blocks.get(blocked.profile.provider) ?? "budget-unmeasurable");
+        return this.waitOn(tx, row, wait);
+      }
+      return this.handOut(tx, row, projectId, request.configurations, settings, free, nowMs, candidate.task_id, pick);
+    }
+  }
+
+  private scanFixed(
+    tx: EvidenceTx,
+    row: EvalJobRow,
+    projectId: string,
+    payload: TrialJobPayload,
+    settings: TrialSettings,
+    gates: TrialGates,
+    fuseOpen: boolean,
+    free: number | undefined,
+    nowMs: number,
+  ): Pass {
+    const at = this.now();
+    const tasks = payload.tasks ?? [];
+    const request = payload.request;
+    const trialsPerTask = request.trialsPerTask ?? TRIALS_PER_TASK_DEFAULT;
+    const configRefs = request.configurations.map(configuration => configRef(configuration));
+    const after = row.cursor;
+    const first = after === null ? 0 : tasks.findIndex(taskId => compareText(taskId, after) > 0);
+    if (first === -1) {
+      finish(tx, row.job_id, at, "completed", "done");
+      return NONE;
+    }
+    const last = Math.min(tasks.length, first + TASK_PAGE);
+    for (let index = first; index < last; index += 1) {
+      const taskId = tasks[index] as string;
+      const valid = tx.get("SELECT 1 FROM eval_tasks WHERE task_id = ? AND state = 'valid'", taskId) !== undefined;
+      const pick = valid ? nextSlot({ tasks: [taskId], configRefs, trialsPerTask, rows: jobSlots(tx, row.job_id, taskId) }) : undefined;
+      if (pick !== undefined) {
+        if (fuseOpen) return this.waitOn(tx, row, "spend-fuse");
+        const blocks = this.providerBlocks(projectId, request.configurations, settings, gates.limited, new Date(nowMs));
+        const jobWait = this.jobProviderWait(request.configurations, blocks, true);
+        if (jobWait !== undefined) return this.waitOn(tx, row, jobWait);
+        return this.handOut(tx, row, projectId, request.configurations, settings, free, nowMs, taskId, pick);
+      }
+      advanceTask(tx, row.job_id, !valid);
+      setJob(tx, row.job_id, at, { cursor: taskId });
+    }
+    if (last === tasks.length) finish(tx, row.job_id, at, "completed", "done");
+    return NONE;
+  }
+
+  private handOut(
+    tx: EvidenceTx,
+    row: EvalJobRow,
+    projectId: string,
+    configurations: readonly TrialConfiguration[],
+    settings: TrialSettings,
+    free: number | undefined,
+    nowMs: number,
+    taskId: string,
+    pick: { configRef: string; slot: number; attempt: number },
+  ): Pass {
+    const at = this.now();
+    if (free === undefined) return { kind: "slots" };
+    if (free < TRIAL_SLOTS_FREE_MIN) return this.waitOn(tx, row, "session-slots");
+    if (settings.trialsPerDay !== null && trialsSince(tx, projectId, utcDayStart(nowMs)) >= settings.trialsPerDay) return this.waitOn(tx, row, "daily-cap");
+    const configuration = configurations.find(item => configRef(item) === pick.configRef);
+    if (configuration === undefined) return NONE;
+    const started: Record<string, SQLInputValue> = row.status === "scheduled" ? { status: "running", started_at: at } : {};
+    if (row.waiting !== null) started.waiting = null;
+    if (Object.keys(started).length > 0) setJob(tx, row.job_id, at, started);
+    const pairedProviders = row.kind === "baseline" ? undefined : [...new Set(configurations.map(item => item.profile.provider))];
+    return {
+      kind: "trial", jobId: row.job_id, projectId, taskId, configuration,
+      configRef: pick.configRef, slot: pick.slot, attempt: pick.attempt, settings,
+      ...(pairedProviders === undefined ? {} : { pairedProviders }),
+    };
+  }
+
+  private pinned(projectId: string, configurations: readonly TrialConfiguration[]): { settings: TrialSettings; digest: string } | undefined {
+    const project = this.projectOf(projectId);
+    if (project === undefined) return undefined;
+    const found = trialSettings(project, this.config.usage?.budgets);
+    if ("missing" in found) return undefined;
+    if (!this.providersCovered(found.settings, configurations)) return undefined;
+    return { settings: found.settings, digest: trialJobDigest(project, this.config, configurations) };
+  }
+
+  private providersCovered(settings: TrialSettings, configurations: readonly TrialConfiguration[]): boolean {
+    return configurations.every(configuration =>
+      isEvalProvider(configuration.profile.provider)
+      && hasTrialBudgetFor(configuration.profile.provider, settings, this.config.usage?.budgets));
+  }
+
+  private providerBlock(
+    projectId: string,
+    provider: Provider,
+    settings: TrialSettings,
+    limited: ReadonlySet<Provider> | undefined,
+    now: Date,
+  ): "provider-limit" | "provider-budget" | "budget-unmeasurable" | undefined {
+    if (limited?.has(provider)) return "provider-limit";
+    if (!isEvalProvider(provider)) return "budget-unmeasurable";
+    const constraints = providerBudgetConstraints(provider, settings.providerBudgets, this.config.usage?.budgets);
+    const verdict = evaluateProviderBudget(provider, projectId, constraints, this.budget?.providerSpend, now);
+    if (verdict.state === "exceeded") return "provider-budget";
+    if (verdict.state === "unmeasurable") return "budget-unmeasurable";
+    if (verdict.state === "unconfigured" && settings.trialsPerDay === null) return "budget-unmeasurable";
+    return undefined;
+  }
+
+  private providerBlocks(
+    projectId: string,
+    configurations: readonly TrialConfiguration[],
+    settings: TrialSettings,
+    limited: ReadonlySet<Provider>,
+    now: Date,
+  ): Map<Provider, "provider-limit" | "provider-budget" | "budget-unmeasurable"> {
+    const blocks = new Map<Provider, "provider-limit" | "provider-budget" | "budget-unmeasurable">();
+    for (const provider of new Set(configurations.map(configuration => configuration.profile.provider))) {
+      const block = this.providerBlock(projectId, provider, settings, limited, now);
+      if (block !== undefined) blocks.set(provider, block);
+    }
+    return blocks;
+  }
+
+  private jobProviderWait(
+    configurations: readonly TrialConfiguration[],
+    blocks: ReadonlyMap<Provider, "provider-limit" | "provider-budget" | "budget-unmeasurable">,
+    requireAll: boolean,
+  ): "provider-limit" | "provider-budget" | "budget-unmeasurable" | undefined {
+    if (blocks.size === 0) return undefined;
+    if (!requireAll && configurations.some(configuration => !blocks.has(configuration.profile.provider))) return undefined;
+    for (const reason of ["provider-limit", "provider-budget", "budget-unmeasurable"] as const) {
+      if (configurations.some(configuration => blocks.get(configuration.profile.provider) === reason)) return reason;
+    }
+    return undefined;
+  }
+
+  private creationRefusal(
+    projectId: string,
+    settings: TrialSettings,
+    configurations: readonly TrialConfiguration[],
+    now: Date,
+  ): EvalRefusal | undefined {
+    const fuse = evaluateFuse(this.budget?.fuseCheck, projectId);
+    if (fuse.state === "open") return refusal(409, "spend-fuse-open");
+    let unmeasurable = false;
+    for (const provider of new Set(configurations.map(configuration => configuration.profile.provider))) {
+      const block = this.providerBlock(projectId, provider, settings, undefined, now);
+      if (block === "provider-budget") return refusal(409, "provider-budget-exceeded");
+      if (block === "budget-unmeasurable") unmeasurable = true;
+    }
+    if (unmeasurable) return refusal(409, "provider-budget-unmeasurable");
+    return undefined;
+  }
+
+  private profileRefusal(project: Project, configurations: readonly TrialConfiguration[], candidates: readonly TeamModelProfile[]): EvalRefusal | undefined {
+    const lineup = this.config.teams?.lineup;
+    const pool = new Set([...(lineup ? lineupProfiles(lineup) : []), ...candidates].map(profile => canonicalJson(profile)));
+    for (const { profile } of configurations) {
+      const provider: string = profile.provider;
+      if (provider !== "claude" && provider !== "codex" && provider !== "opencode") return refusal(409, "profile-not-approved");
+      if (!pool.has(canonicalJson(profile))) return refusal(409, "profile-not-approved");
+      if (profile.dataUse === "contributor" && project.team?.routing?.allowContributor !== true) return refusal(409, "profile-not-approved");
+    }
+    return undefined;
+  }
+
+  private plan(db: EvidenceDb, ref: string, request: JobRequest): { tasks: number; trials: number } {
+    const filter = filterOf(db, request);
+    const maxTasks = request.taskFilter?.maxTasks ?? TRIAL_TASKS_DEFAULT;
+    let tasks = 0;
+    let after = "";
+    let page: CandidateRow[];
+    do {
+      page = db.all<TrialTaskRow>(TRIAL_TASKS_SQL, ref, after);
+      for (const row of page) {
+        after = row.task_id;
+        if (tasks < maxTasks && selected(row, filter)) tasks += 1;
+      }
+    } while (page.length === TASK_PAGE && tasks < maxTasks);
+    const trialsPerTask = request.trialsPerTask ?? TRIALS_PER_TASK_DEFAULT;
+    return { tasks, trials: Math.min(request.limits.maxTrials, tasks * request.configurations.length * trialsPerTask) };
+  }
+
+  private waitOn(tx: EvidenceTx, row: EvalJobRow, waiting: EvalJobWait): Pass {
+    if (row.waiting !== waiting) setJob(tx, row.job_id, this.now(), { waiting });
+    return { kind: "wait", jobId: row.job_id, waiting };
+  }
+
+  private viewOf(db: EvidenceDb, row: EvalJobRow): JobView {
+    const view = this.views(db, [row]).get(row.job_id);
+    if (view === undefined) throw new Error("A trial job row has no view.");
+    return view;
+  }
+
+  private rowOf(db: EvidenceDb, jobId: string): EvalJobRow | undefined {
+    return db.get<EvalJobRow>("SELECT * FROM eval_jobs WHERE job_id = ?", jobId);
+  }
+
+  private projectOf(projectId: string): Project | undefined {
+    return this.config.projects.find(project => project.id === projectId);
+  }
+
+  private refsOf(db: EvidenceDb): Map<string, string> {
+    return new Map(this.config.projects.map(project => [db.index("project", project.id), project.id]));
+  }
+}
+
+function refusal(status: EvalRefusal["status"], code: EvalRefusal["code"]): EvalRefusal {
+  return { status, code };
+}
+
+function filterOf(db: EvidenceDb, request: JobRequest): Filter {
+  const filter = request.taskFilter;
+  return {
+    origins: filter?.origins === undefined ? undefined : new Set(filter.origins),
+    areas: filter?.areas === undefined ? undefined : new Set(filter.areas.map(area => db.index("area", area))),
+    ids: filter?.taskIds === undefined ? undefined : new Set(filter.taskIds),
+  };
+}
+
+function selected(candidate: CandidateRow, filter: Filter): boolean {
+  if (candidate.holdout === 1) return false;
+  if (filter.origins !== undefined && !filter.origins.has(candidate.origin)) return false;
+  if (filter.areas !== undefined && (candidate.area_ref === null || !filter.areas.has(candidate.area_ref))) return false;
+  if (filter.ids !== undefined && !filter.ids.has(candidate.task_id)) return false;
+  return true;
+}
+
+function setJob(tx: EvidenceTx, jobId: string, at: string, values: Record<string, SQLInputValue>): void {
+  const entries = Object.entries(values);
+  tx.run(
+    `UPDATE eval_jobs SET ${entries.map(([column]) => `${column} = ?`).join(", ")}, updated_at = ? WHERE job_id = ?`,
+    ...entries.map(([, value]) => value),
+    at,
+    jobId,
+  );
+}
+
+function reportStates(db: EvidenceDb, jobIds: readonly string[]): Map<string, "ready" | "unreadable"> {
+  if (jobIds.length === 0) return new Map();
+  const marks = jobIds.map(() => "?").join(", ");
+  const rows = db.all<{ job_id: string; state: "ready" | "unreadable" }>(`SELECT job_id, state FROM eval_reports WHERE job_id IN (${marks})`, ...jobIds);
+  return new Map(rows.map(row => [row.job_id, row.state]));
+}
+
+function finish(tx: EvidenceTx, jobId: string, at: string, status: "completed" | "expired", reason: Extract<EvalJobReason, "done" | "limit-reached" | "expired" | "identity-changed">): void {
+  setJob(tx, jobId, at, { status, reason, waiting: null, finished_at: at });
+}
+
+function utcDayStart(nowMs: number): string {
+  const day = new Date(nowMs);
+  day.setUTCHours(0, 0, 0, 0);
+  return day.toISOString();
+}
+
+function sha256(text: string): string {
+  return createHash("sha256").update(text, "utf8").digest("hex");
+}
+
+function compareText(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}

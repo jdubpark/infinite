@@ -3,13 +3,16 @@ import { execFileSync } from "node:child_process";
 import { chmodSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { randomBytes, randomUUID } from "node:crypto";
-import { startHost, stopSessionWorkers, waitFor, type Host } from "./helpers.js";
+import { endSessionWorkers, startHost, waitFor, type Host } from "./helpers.js";
 import type { Config } from "../packages/host/src/types.js";
 import type { CreateTeam, TeamLineup, TeamView } from "../packages/host/src/team-types.js";
 import type { ProjectSourceService } from "../packages/host/src/project-source.js";
 import type { RepositoryGraphs } from "../packages/host/src/repository-graphs.js";
 import { Manager } from "../packages/host/src/manager.js";
 import { TeamService } from "../packages/host/src/teams.js";
+import type { EventOutbox } from "../packages/host/src/evidence/outbox.js";
+import type { Blackboard } from "../packages/host/src/evidence/blackboard.js";
+import type { CaptureSink } from "../packages/host/src/eval-types.js";
 
 export const git = (cwd: string, ...args: string[]) => execFileSync("git", ["-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", ...args], {
   cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" },
@@ -38,7 +41,11 @@ export const limitLineup: TeamLineup = {
   ],
 };
 
-/** `trustWorkspaces` also gives the host its own HOME, where a Claude member's trust is recorded. */
+export const independentDeliveryLineup: TeamLineup = {
+  ...structuredClone(limitLineup),
+  reviewer: { id: "muse-reviewer", label: "Muse reviewer", provider: "opencode", model: "meta/muse-spark-1.3-contributor", variant: "high", tier: "strong" },
+};
+
 export async function fixture(scenario = "success", lineup?: TeamLineup, config: Partial<Config> = {}, options: { trustWorkspaces?: boolean; env?: NodeJS.ProcessEnv; parallelism?: number; deliveryMode?: "merge" | "pr"; noServer?: boolean } = {}) {
   const root = realpathSync(mkdtempSync("/tmp/inf-team-"));
   const home = join(root, "home");
@@ -117,12 +124,13 @@ process.exit(child.status ?? 1);
   const hostConfig: Partial<Config> = {
     remote: { enabled: true },
     projects: [{ id: "rehearsal", name: "Rehearsal", path: source,
-      team: { ...(scenario.startsWith("delivery") ? { delivery: options.deliveryMode === "pr" ? { mode: "pr" as const, repository: "example/app", baseBranch: "main" } : { mode: "merge" as const, repository: "example/app", baseBranch: "main", mergeMethod: "squash" as const } } : {}), ...(scenario.startsWith("permissions") || scenario === "check-mutates" ? { setup: { command: process.execPath, args: [resolve("tests/fixtures/team-agent.mjs"), "--permission-setup", receipts] } } : {}), ...(scenario.startsWith("permissions") && scenario !== "permissions-off" ? { permissions: { mode: "coordinator" as const, scope: "Approve only read access needed to inspect this project for the stated objective.", maxDecisions: 2 } } : {}), checks: [], ...(scenario !== "bootstrap-override" && bootstrap ? { establishChecks: true } : {}), ...(bootstrap && scenario !== "bootstrap-override" ? {} : { checks: [
+      team: { ...(scenario.startsWith("delivery") ? { delivery: options.deliveryMode === "pr" ? { mode: "pr" as const, repository: "example/app", baseBranch: "main" } : { mode: "merge" as const, repository: "example/app", baseBranch: "main", mergeMethod: "squash" as const } } : {}), ...(scenario.startsWith("permissions") || scenario === "check-mutates" ? { setup: { command: process.execPath, args: [resolve("tests/fixtures/team-agent.mjs"), "--permission-setup", receipts] } } : {}), ...(scenario.startsWith("permissions") && !scenario.startsWith("permissions-off") ? { permissions: { mode: "coordinator" as const, scope: "Approve only read access needed to inspect this project for the stated objective.", maxDecisions: 2 } } : {}), checks: [], ...(scenario !== "bootstrap-override" && bootstrap ? { establishChecks: true } : {}), ...(bootstrap && scenario !== "bootstrap-override" ? {} : { checks: [
         { command: process.execPath, args: ["check.mjs", ...(scenario.endsWith("failed-check") ? ["--fail"] : []), ...(scenario === "success" ? ["--prefix"] : [])] },
         ...(scenario === "lifecycle" ? [{ command: process.execPath, args: [resolve("tests/fixtures/team-agent.mjs"), "--hold-check", receipts] }] : []),
+        ...(scenario === "check-leftover" ? [{ command: process.execPath, args: [resolve("tests/fixtures/team-agent.mjs"), "--leave-check", receipts] }] : []),
       ] }) } }],
     ...config,
-    // Head publication pushes to GitHub, so only tests with a local remote override turn it on.
+    agents: { ...agents, ...(config.agents ?? {}) },
     teams: { workspaceDir: join(root, "teams"), publishHeads: false, ...(lineup ? { lineup } : {}), ...(options.trustWorkspaces ? { trustWorkspaces: true } : {}), ...(scenario === "success" || scenario === "reviewer-recording-error" ? {
       commandPrefix: { command: process.execPath, args: [resolve("tests/fixtures/team-agent.mjs"), "--command-prefix", receipts] },
     } : scenario === "result-operation-fails-once" ? {
@@ -141,7 +149,7 @@ process.exit(child.status ?? 1);
       host = { root, config: directConfig, origin: directConfig.origin, tokens: {} as Host["tokens"],
         fetchApi: async () => { throw new Error("The no-server fixture does not expose an API client."); },
         start: async () => {}, stopApi: async () => {},
-        stop: async () => { await stopSessionWorkers(directConfig); await new Promise(resolve => setTimeout(resolve, 1700)); rmSync(root, { recursive: true, force: true }); } };
+        stop: async () => { const floor = new Promise(resolve => setTimeout(resolve, 1700)); try { await endSessionWorkers(directConfig); await floor; } finally { rmSync(root, { recursive: true, force: true }); } } };
     } else {
       host = await startHost({ agents, config: hostConfig,
         ...(options.trustWorkspaces ? { env: { HOME: home } } : {}),
@@ -159,13 +167,14 @@ process.exit(child.status ?? 1);
   };
   const settled = (id: string) => waitFor(() => get(id), run => ["ready-for-review", "merged", "blocked"].includes(run.status), 90000);
   const directServices: TeamService[] = [];
-  const openTeamService = async (serviceOptions: { source?: Pick<ProjectSourceService, "refresh" | "mirrorPath" | "isGithub" | "status">; graphs?: Pick<RepositoryGraphs, "refresh">; onMerged?: (projectId: string) => void; start?: boolean } = {}) => {
+  const openTeamService = async (serviceOptions: { source?: Pick<ProjectSourceService, "refresh" | "mirrorPath" | "isGithub" | "status">; graphs?: Pick<RepositoryGraphs, "refresh">; onMerged?: (projectId: string) => void; start?: boolean; events?: EventOutbox; capture?: CaptureSink; entries?: Blackboard; manager?: (manager: Manager) => void } = {}) => {
     await host.stopApi();
     if (serviceOptions.source) host.config.projects.find(project => project.id === "rehearsal")!.source = { mode: "github", repository: "example/app", baseBranch: "main" };
     const key = readFileSync(host.config.keyFile);
     const manager = new Manager(host.config, key);
+    serviceOptions.manager?.(manager);
     const service = new TeamService(host.config, key, manager, (_projectId, start) => start(), undefined, undefined,
-      { ...(serviceOptions.source ? { source: serviceOptions.source } : {}), ...(serviceOptions.graphs ? { graphs: serviceOptions.graphs } : {}), ...(serviceOptions.onMerged ? { onMerged: serviceOptions.onMerged } : {}) });
+      { ...(serviceOptions.source ? { source: serviceOptions.source } : {}), ...(serviceOptions.graphs ? { graphs: serviceOptions.graphs } : {}), ...(serviceOptions.onMerged ? { onMerged: serviceOptions.onMerged } : {}), ...(serviceOptions.events ? { events: serviceOptions.events } : {}), ...(serviceOptions.capture ? { capture: serviceOptions.capture } : {}), ...(serviceOptions.entries ? { entries: serviceOptions.entries } : {}) });
     if (serviceOptions.start !== false) service.start();
     directServices.push(service);
     return service;
@@ -180,9 +189,8 @@ process.exit(child.status ?? 1);
           if (!["ready-for-review", "merged", "cancelled"].includes(run.status))
             await host.fetchApi(`/teams/${run.id}/cancel`, "owner", { requestId: randomUUID(), revision: run.revision });
       }
-    } finally { await host.stop(); rmSync(root, { recursive: true, force: true }); }
+    } finally { try { await host.stop(); } finally { rmSync(root, { recursive: true, force: true }); } }
   };
-  /** Serve the fixture's parent folder as the sync home and enroll a sibling teamwork folder through the API. */
   const enrollTeamwork = async (sync: Partial<NonNullable<Config["sync"]>> = {}, teamwork = "teamwork") => {
     const home = realpathSync(dirname(source));
     host.config.sync = { homeDir: home, ...sync };

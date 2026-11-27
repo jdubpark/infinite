@@ -2,7 +2,6 @@ export type CatalogPrice = { input: number; output: number; cacheRead?: number; 
 const deepseekPeak = { days: [1, 2, 3, 4, 5], hoursUtc: [[1, 4], [6, 10]] as [number, number][], multiplier: 2 };
 const ds: CatalogPrice = { input: 0.15, cacheRead: 0.003, output: 0.6, peak: deepseekPeak, source: "https://api-docs.deepseek.com/quick_start/pricing", asOf: "2026-10-19" };
 const meta = (input: number, cacheRead: number, output: number): CatalogPrice => ({ input, cacheRead, output, source: "https://dev.meta.ai/docs/pricing-rate-limits.md", asOf: "2026-10-19" });
-// Chinese public holidays are not modelled; the catalog applies the published weekday UTC windows.
 export const PRICE_CATALOG: Record<string, CatalogPrice> = {
   "deepseek/deepseek-flash": ds,
   "deepseek/deepseek-v4-flash": ds,

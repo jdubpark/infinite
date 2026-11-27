@@ -5,33 +5,32 @@ import { PROVIDER_NAMES, groupSessions, type InboxGroup } from "@infinite/attent
 import {
   api,
   connectionKey,
+  listSessions,
   type Connection,
   type Me,
   type SessionRow,
 } from "../../api/client";
 import { usePoll } from "../../api/usePoll";
 import { useLive } from "../../api/useLive";
+import { useClock } from "../../api/useClock";
 import { Avatar } from "../../components/Avatar";
 import { Button } from "../../components/Button";
 import { GlassButton, GroupHeader, LiveStatus, Segmented, Sheet, SheetRow } from "../../components/Glass";
 import { Glyph, StatusIcon } from "../../components/Icon";
 import { FloatingNotice } from "../../components/FloatingNotice";
+import { HaltBanner } from "../halt/HaltBanner";
 import { age, SESSION_KIND, SESSION_LABELS, type StatusKind } from "../../status";
 import { theme } from "../../theme";
-import { goalGroup, pendingApprovals, ROLE_NAMES, teamGroup, type ProductGoal, type TeamView } from "../teams/model";
+import { goalGroup, pendingApprovals, ROLE_NAMES, teamGroup, type ProductGoal, type TeamListItem } from "../teams/model";
 import { GoalList, listStyles, TeamList } from "../teams/RunLists";
+import { decisionLogAvailable } from "../permissions/model";
 
 export type InboxView = "sessions" | "teams" | "goals";
 
 const GROUP_KIND: Record<InboxGroup, StatusKind> = { "Needs you": "attention", Working: "progress", Finished: "review", Exited: "stopped", Archived: "backlog" };
-/** Closed records start folded so live work stays on the first screen. */
 const FOLDED: InboxGroup[] = ["Exited", "Archived"];
 const machineName = (connection: Connection) => connection.label || new URL(connection.url).host;
 
-/**
- * The machine's work in one place. The active machine's name opens a sheet to switch, add or remove
- * machines; Sessions, Teams and Goals sit in a floating capsule above the list.
- */
 export function Inbox({
   connection,
   machines,
@@ -60,15 +59,14 @@ export function Inbox({
     deps: [],
     load: async () => {
       const [list, me] = await Promise.all([
-        api<{ sessions: SessionRow[] }>(connection, "/sessions"),
+        listSessions(connection),
         api<Me>(connection, "/me"),
       ]);
       return {
-        sessions: [...list.sessions].sort((a, b) =>
+        sessions: [...list].sort((a, b) =>
           b.createdAt.localeCompare(a.createdAt),
         ),
         me,
-        // Ages advance with each poll instead of reading the clock while rendering.
         at: Date.now(),
       };
     },
@@ -78,15 +76,14 @@ export function Inbox({
       return { ...previous, sessions: [...list.sessions].sort((a, b) => b.createdAt.localeCompare(a.createdAt)), at: Date.now() };
     },
   });
-  // Hosts that predate teams advertise no `teams` field and have no team routes to poll.
   const hasTeams = Boolean(data?.me.teams), hasGoals = Boolean(data?.me.goals);
-  // Full run records are large, so only the visible tab polls quickly; the others refresh their counts slowly.
   const focused = useIsFocused();
+  const clock = useClock(15_000, focused);
   const pace = (tab: InboxView) => focused && view === tab ? 4000 : 20000;
-  const teamsPoll = useLive<TeamView[] | null>(connection, {
+  const teamsPoll = useLive<TeamListItem[] | null>(connection, {
     topics: ["teams"], intervalMs: pace("teams"), deps: [hasTeams],
-    load: () => hasTeams ? api<{ teams: TeamView[] }>(connection, "/teams").then(value => value.teams) : Promise.resolve(null),
-    select: (topic, payload) => topic === "teams" && Array.isArray((payload as { teams?: unknown }).teams) ? (payload as { teams: TeamView[] }).teams : undefined,
+    load: () => hasTeams ? api<{ teams: TeamListItem[] }>(connection, "/teams?view=list").then(value => value.teams) : Promise.resolve(null),
+    select: (topic, payload) => topic === "teams" && Array.isArray((payload as { teams?: unknown }).teams) ? (payload as { teams: TeamListItem[] }).teams : undefined,
   });
   const goalsPoll = usePoll(() => hasGoals ? api<{ goals: ProductGoal[] }>(connection, "/goals").then(value => value.goals) : Promise.resolve(null), pace("goals"), [connection, hasGoals]);
   const teams = teamsPoll.data ?? [];
@@ -96,10 +93,9 @@ export function Inbox({
   const refreshAll = () => { refresh(); teamsPoll.refresh(); goalsPoll.refresh(); };
   const runs = shown === "goals" ? goalsPoll : teamsPoll;
   const all = data?.sessions ?? [];
-  // Team agents are the coordinator's to steer; they appear under their team and in search.
   const sessions = all.filter(session => !session.team);
   const teamAgents = all.length - sessions.length;
-  const now = data?.at ?? 0;
+  const now = Math.max(data?.at ?? 0, clock);
   const waiting = {
     sessions: sessions.filter(session => session.attention.state === "needs-you").length,
     teams: teams.filter(team => teamGroup(team, pendingApprovals(team, all).length) === "attention").length,
@@ -119,6 +115,7 @@ export function Inbox({
           <View style={s.toggle}><Glyph name={machineSheet ? "up" : "down"} size={11} color={theme.colors.secondaryInk} /></View>
         </Pressable>
         <View style={s.headerRight}>
+          {data && decisionLogAvailable(data.me) ? <GlassButton glyph="check" label="Permission decisions" size={36} onPress={() => router.push({ pathname: "/permissions", params: { machine: connectionKey(connection) } })} /> : null}
           {data?.me.usage?.enabled ? <GlassButton glyph="chart" label="Cost" size={36} onPress={() => router.push({ pathname: "/cost", params: { machine: connectionKey(connection) } })} /> : null}
           <LiveStatus online={online} loading={loading} seen={seen} stale={stale} />
         </View>
@@ -129,6 +126,7 @@ export function Inbox({
       <ScrollView contentContainerStyle={s.list} keyboardShouldPersistTaps="handled"
         refreshControl={<RefreshControl refreshing={refreshing || runs.refreshing} onRefresh={refreshAll} tintColor={theme.colors.forest} colors={[theme.colors.forest]} />}>
         <Text style={s.title} accessibilityRole="header">{shown === "teams" ? "Teams" : shown === "goals" ? "Goals" : "Sessions"}</Text>
+        <HaltBanner connection={connection} place="screen" names={id => data?.me.projects?.find(project => project.id === id)?.name} style={s.halt} />
         {shown === "teams" && data ? <TeamList connection={connection} me={data.me} teams={teams} sessions={all} now={now} />
           : shown === "goals" && data ? <GoalList connection={connection} me={data.me} goals={goals} now={now} /> : <>
             {all.length > 4 || query ? <View style={s.search}>
@@ -223,6 +221,7 @@ const s = StyleSheet.create({
   list: { paddingHorizontal: 16, paddingBottom: 120 },
   title: { fontSize: 28, lineHeight: 34, fontWeight: "700", color: theme.colors.ink, letterSpacing: -0.6, marginTop: 4 },
   summary: { fontSize: 13, color: theme.colors.mutedInk, marginTop: 2, marginBottom: 4 },
+  halt: { marginTop: 10 },
   search: { flexDirection: "row", alignItems: "center", gap: 8, height: 40, marginTop: 10, paddingHorizontal: 12, borderRadius: theme.radius.capsule, backgroundColor: theme.colors.secondarySurface },
   searchInput: { flex: 1, fontSize: 15, color: theme.colors.ink, paddingVertical: 0 },
   now: { flex: 1, fontSize: 13, lineHeight: 18, color: theme.colors.mutedInk },

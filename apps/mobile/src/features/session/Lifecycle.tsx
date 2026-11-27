@@ -7,10 +7,6 @@ import { Button } from "../../components/Button";
 import { theme } from "../../theme";
 import { lifecycles } from "../../store/requests";
 
-/**
- * The owner's actions on the process itself: end it, resume it, and once it has exited, archive the
- * record out of the live lists or delete it from the machine. Archive is reversible; delete asks first.
- */
 export function Lifecycle({ connection, session, role, online, control, refresh }: {
   connection: Connection; session: SessionDetail; role?: Me["role"]; online: boolean; control?: string; refresh: () => void;
 }) {
@@ -60,7 +56,6 @@ export function Lifecycle({ connection, session, role, online, control, refresh 
     }
     if (mounted.current) setRecord({ busy: null, error: "" });
   }
-  /** Whether the host still has this session; a lost delete response is settled by its absence. */
   async function stillRecorded() {
     try {
       await api(connection, `/sessions/${session.id}`);

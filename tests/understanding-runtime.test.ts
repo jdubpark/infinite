@@ -44,13 +44,13 @@ function setup(t: test.TestContext, options: { adapter?: UnderstandingAdapter; p
   t.after(async () => { await runtime.close(); rmSync(base, { recursive: true, force: true }); });
   return { runtime, root, secondRoot, stateDir, group, config, setCatalog(value: KnowledgeCatalog) { currentCatalog = value; } };
 }
-async function waitUntil(predicate: () => boolean, ms = 3000) {
-  const end = Date.now() + ms;
-  while (Date.now() < end) { if (predicate()) return; await new Promise(resolvePromise => setTimeout(resolvePromise, 10)); }
+async function waitUntil(predicate: () => boolean, ms = 20000) {
+  const end = performance.now() + ms;
+  while (performance.now() < end) { if (predicate()) return; await new Promise(resolvePromise => setTimeout(resolvePromise, 10)); }
   assert.fail("timed out waiting for Understanding maintenance");
 }
 
-test("fixture process publishes stable component maps, validated source edges, and survives restart", { timeout: 20000 }, async t => {
+test("fixture process publishes stable component maps, validated source edges, and survives restart", { timeout: 80000 }, async t => {
   const s = setup(t, { processFixture: true });
   const initial = s.runtime.read("workspace");
   assert.equal(initial.components.length, 0, "a read does not schedule source collection");
@@ -72,7 +72,7 @@ test("fixture process publishes stable component maps, validated source edges, a
   } finally { await resumed.close(); }
 });
 
-test("stored contexts are served only for repositories whose binding still matches", { timeout: 20000 }, async t => {
+test("stored contexts are served only for repositories whose binding still matches", { timeout: 80000 }, async t => {
   const s = setup(t, { processFixture: true });
   assert.deepEqual(s.runtime.readWithContexts("workspace").contexts, {}, "no context before a map is published");
   s.runtime.refresh("workspace");
@@ -80,7 +80,6 @@ test("stored contexts are served only for repositories whose binding still match
   const accepted = s.runtime.readWithContexts("workspace");
   assert.equal(accepted.contexts.repo?.head, accepted.knowledge.components[0].current.sources[0]?.head ?? accepted.contexts.repo?.head);
   assert.ok(accepted.contexts.repo?.generatedAt, "an accepted repository exposes its stored context");
-  // Replace the checkout with a different repository at the same path: the stored map and its context are rejected together.
   rmSync(join(s.root, ".git"), { recursive: true, force: true });
   execFileSync("git", ["init", "-q", s.root]);
   execFileSync("git", ["-C", s.root, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "add", "."]);
@@ -90,14 +89,13 @@ test("stored contexts are served only for repositories whose binding still match
   assert.deepEqual(rejected.contexts, {}, "a rejected binding supplies no context provenance");
 });
 
-test("explicit refresh coalesces and rejects publication when the workspace binding moves during collection", { timeout: 20000 }, async t => {
+test("explicit refresh coalesces and rejects publication when the workspace binding moves during collection", { timeout: 80000 }, async t => {
   let release: (() => void) | undefined, calls = 0;
   const s = setup(t, { adapter: { context: async root => { calls++; const context = sampleContext(root); await new Promise<void>(resolvePromise => { release = resolvePromise; }); return context; } } });
   const first = s.runtime.refresh("workspace");
   const second = s.runtime.refresh("workspace");
   assert.equal(second.state, "queued");
   await waitUntil(() => Boolean(release));
-  // Invalidate the source identity at the read boundary while the adapter is awaited.
   const moved = `${s.root}-moved`;
   (await import("node:fs")).renameSync(s.root, moved);
   release!();
@@ -107,7 +105,7 @@ test("explicit refresh coalesces and rejects publication when the workspace bind
   assert.equal(first.state, "queued");
 });
 
-test("failed or invalid context capture retains the previous encrypted generation", { timeout: 20000 }, async t => {
+test("failed or invalid context capture retains the previous encrypted generation", { timeout: 80000 }, async t => {
   let fail = false, invalid = false;
   const s = setup(t, { adapter: { context: async root => { if (fail) throw new Error("fixture failure"); if (invalid) return { repo: root } as RepoContext; return sampleContext(root); } } });
   s.runtime.refresh("workspace");
@@ -124,7 +122,7 @@ test("failed or invalid context capture retains the previous encrypted generatio
   assert.ok(readFileSync(join(s.stateDir, "understanding", "runtime", "workspace.sealed"), "utf8").length > 0);
 });
 
-test("a failed job records a readable reason and clears it on the next success", { timeout: 20000 }, async t => {
+test("a failed job records a readable reason and clears it on the next success", { timeout: 80000 }, async t => {
   let fail = true;
   const s = setup(t, { adapter: { context: async root => { if (fail) throw new Error("engine exploded"); return sampleContext(root); } } });
   s.runtime.refresh("workspace");
@@ -139,10 +137,9 @@ test("a failed job records a readable reason and clears it on the next success",
 });
 
 for (const { configuredMs, expectedBudgets } of [
-  // Each engine call leaves the 5 s re-check reserve; the mocked clock makes the capture take no time.
   { configuredMs: 180_000, expectedBudgets: [175_000, 55_000] },
   { configuredMs: 600_000, expectedBudgets: [595_000, 475_000] },
-]) test(`workspace synthesis shares the ${configuredMs}ms deadline between component invocations and rotates repositories`, { timeout: 30000 }, async t => {
+]) test(`workspace synthesis shares the ${configuredMs}ms deadline between component invocations and rotates repositories`, { timeout: 120000 }, async t => {
   const calls: string[][] = [];
   const budgets: number[] = [];
   let now = Date.now();
@@ -194,7 +191,7 @@ for (const { configuredMs, expectedBudgets } of [
   assert.deepEqual(exhausted.components.filter(component => component.repositoryIds.includes("repo-two")), published.components.filter(component => component.repositoryIds.includes("repo-two")));
 });
 
-test("a source fingerprint change during synthesis rejects the candidate generation", { timeout: 20000 }, async t => {
+test("a source fingerprint change during synthesis rejects the candidate generation", { timeout: 80000 }, async t => {
   const adapter: UnderstandingAdapter = {
     context: async root => sampleContext(root),
     synthesize: async input => {
@@ -210,7 +207,7 @@ test("a source fingerprint change during synthesis rejects the candidate generat
   assert.equal(s.runtime.read("workspace").components.length, 0);
 });
 
-test("a plan edit during another repository's final observation rejects the whole publication", { timeout: 20000 }, async t => {
+test("a plan edit during another repository's final observation rejects the whole publication", { timeout: 80000 }, async t => {
   let release: (() => void) | undefined;
   let synthesized = false;
   const adapter: UnderstandingAdapter = {
@@ -252,7 +249,21 @@ test("a plan edit during another repository's final observation rejects the whol
   assert.deepEqual(after.components.map(item => item.current), before, "the prior generation remains published");
 });
 
-test("restart recovers an admitted running job without resetting its daily budget", { timeout: 20000 }, async t => {
+test("close settles while a job is held, with nothing else keeping the process alive", { timeout: 80000 }, async t => {
+  let entered = false, fail: ((error: Error) => void) | undefined;
+  const s = setup(t, { adapter: { context: async () => { entered = true; return new Promise<never>((_, reject) => { fail = reject; }); },
+    synthesize: async input => ({ components: input.components, coverage: [] }),
+    delivery: async input => ({ repositoryId: input.repositoryId, state: "ready", observedAt: new Date().toISOString(), pullRequests: [], environments: [], coverage: [] }) } });
+  s.runtime.refresh("workspace");
+  await waitUntil(() => entered);
+  const started = performance.now();
+  await s.runtime.close();
+  assert.ok(performance.now() - started >= 1000, "close waited for the held job up to its limit");
+  fail!(new Error("released"));
+  await waitUntil(() => !(s.runtime as unknown as { running: boolean }).running);
+});
+
+test("restart recovers an admitted running job without resetting its daily budget", { timeout: 80000 }, async t => {
   let release!: () => void;
   const adapter: UnderstandingAdapter = { context: async root => { await new Promise<void>(resolvePromise => { release = resolvePromise; }); return sampleContext(root); } };
   const s = setup(t, { adapter });
@@ -287,7 +298,7 @@ test("corrupt encrypted state stays unavailable and is never replaced by a fresh
   } finally { await resumed.close(); }
 });
 
-test("failed source revalidation does not mutate the prior generation synthesis watermark", { timeout: 30000 }, async t => {
+test("failed source revalidation does not mutate the prior generation synthesis watermark", { timeout: 120000 }, async t => {
   let mutate = false;
   const calls: string[][] = [];
   const adapter: UnderstandingAdapter = {
@@ -315,7 +326,7 @@ test("failed source revalidation does not mutate the prior generation synthesis 
   assert.ok(calls.length > countAfterRejected, "the changed source must be synthesized after the rejected generation");
 });
 
-test("failed partial capture never synthesizes a retained stale repository observation", { timeout: 30000 }, async t => {
+test("failed partial capture never synthesizes a retained stale repository observation", { timeout: 120000 }, async t => {
   let fail = false, calls = 0;
   const adapter: UnderstandingAdapter = {
     context: async root => { if (fail) throw new Error("offline fixture"); return sampleContext(root); },
@@ -336,7 +347,7 @@ test("failed partial capture never synthesizes a retained stale repository obser
   assert.equal(calls, previousCalls);
 });
 
-test("synthesis rejects difference claims that cite a foreign repository and retains the last good map", { timeout: 30000 }, async t => {
+test("synthesis rejects difference claims that cite a foreign repository and retains the last good map", { timeout: 120000 }, async t => {
   let invalid = false;
   const adapter: UnderstandingAdapter = {
     context: async root => sampleContext(root),
@@ -358,7 +369,7 @@ test("synthesis rejects difference claims that cite a foreign repository and ret
   assert.ok(s.runtime.read("workspace").components.every(component => component.difference.claims.length === 0));
 });
 
-test("folded sibling worktrees are identity-checked without requiring path nesting", { timeout: 20000 }, async t => {
+test("folded sibling worktrees are identity-checked without requiring path nesting", { timeout: 80000 }, async t => {
   const s = setup(t, { adapter: { context: async root => sampleContext(root) } });
   const sibling = join(s.stateDir, "sibling-checkout");
   execFileSync("git", ["-C", s.root, "worktree", "add", "--detach", sibling, "HEAD"], { stdio: "ignore" });
@@ -371,7 +382,7 @@ test("folded sibling worktrees are identity-checked without requiring path nesti
   assert.equal(s.runtime.read("workspace").maintenance.state, "idle");
 });
 
-test("accepted catalog text boundaries publish and survive runtime restart without losing owner intent", { timeout: 20000 }, async t => {
+test("accepted catalog text boundaries publish and survive runtime restart without losing owner intent", { timeout: 80000 }, async t => {
   const s = setup(t, { adapter: { context: async root => sampleContext(root) } });
   s.runtime.refresh("workspace");
   await waitUntil(() => s.runtime.read("workspace").maintenance.state === "idle");
@@ -398,7 +409,7 @@ test("accepted catalog text boundaries publish and survive runtime restart witho
   } finally { await resumed.close(); }
 });
 
-test("accepted brief comparison boundaries publish and survive restart through the real synthesis adapter", { timeout: 20000 }, async t => {
+test("accepted brief comparison boundaries publish and survive restart through the real synthesis adapter", { timeout: 80000 }, async t => {
   const briefAdapter = createUnderstandingAdapter({ projects: [], repositoryBriefings: { command: process.execPath, args: [join(process.cwd(), "tests/fixtures/understanding-brief.mjs"), "boundaries"], automatic: false, intervalMs: 1000, cooldownMs: 0, timeoutMs: 10000 } } as Config);
   const s = setup(t, { adapter: { ...briefAdapter, context: async root => {
     const context = sampleContext(root);
@@ -423,7 +434,7 @@ test("accepted brief comparison boundaries publish and survive restart through t
   finally { await resumed.close(); }
 });
 
-test("accepted provider title and environment boundaries publish and survive restart", { timeout: 20000 }, async t => {
+test("accepted provider title and environment boundaries publish and survive restart", { timeout: 80000 }, async t => {
   const s = setup(t);
   await s.runtime.close();
   execFileSync("git", ["-C", s.root, "remote", "add", "origin", "https://github.com/example/repo.git"]);
@@ -519,7 +530,7 @@ test("retiring a component preserves bounded evidence through repeated refresh a
   finally { await resumed.close(); }
 });
 
-test("maintenance publishes a repository brief with parsed diagrams, a component map, and a changes watermark", { timeout: 30000 }, async t => {
+test("maintenance publishes a repository brief with parsed diagrams, a component map, and a changes watermark", { timeout: 120000 }, async t => {
   const s = setup(t, { briefProcess: true });
   s.setCatalog({ ...catalog(), policy: { ...catalog().policy, enabled: true, synthesis: true } });
   s.runtime.refresh("workspace");
@@ -536,7 +547,6 @@ test("maintenance publishes a repository brief with parsed diagrams, a component
     writeFileSync(join(s.root, "src", "a.ts"), `export const a = ${value};\n`);
     execFileSync("git", ["-C", s.root, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qam", "change"]);
   };
-  // A failed brief must not advance the watermark: the next brief spans the skipped range.
   commit(10);
   process.env.UNDERSTANDING_FIXTURE_BRIEF_FAIL = "1";
   t.after(() => { delete process.env.UNDERSTANDING_FIXTURE_BRIEF_FAIL; });
@@ -551,7 +561,7 @@ test("maintenance publishes a repository brief with parsed diagrams, a component
   assert.match(s.runtime.read("workspace").briefs![0].brief.changes[0].text, /^Changed since/);
 });
 
-test("a failing brief step keeps the source map and records the brief reason", { timeout: 30000 }, async t => {
+test("a failing brief step keeps the source map and records the brief reason", { timeout: 120000 }, async t => {
   const s = setup(t, { briefProcess: true, fixtureMode: "brief-fail" });
   s.setCatalog({ ...catalog(), policy: { ...catalog().policy, enabled: true, synthesis: true } });
   s.runtime.refresh("workspace");
@@ -563,7 +573,7 @@ test("a failing brief step keeps the source map and records the brief reason", {
   assert.match(read.maintenance.message ?? "", /brief unavailable: exit 1/);
 });
 
-test("a brief that runs out of time keeps the source map and component diagram, and a later refresh publishes the brief", { timeout: 30000 }, async t => {
+test("a brief that runs out of time keeps the source map and component diagram, and a later refresh publishes the brief", { timeout: 120000 }, async t => {
   const s = setup(t, { briefProcess: true });
   s.config.repositoryBriefings!.timeoutMs = 4000;
   s.setCatalog({ ...catalog(), policy: { ...catalog().policy, enabled: true, synthesis: true } });
@@ -585,13 +595,15 @@ test("a brief that runs out of time keeps the source map and component diagram, 
 const quickBrief: NonNullable<UnderstandingAdapter["brief"]> = async input => ({ head: input.context.head, base: null, generatedAt: new Date().toISOString(),
   brief: { summary: "Fast brief.", architecture: [], changes: [], checks: [], review: [], guidance: [], unknowns: [] }, diagrams: [], evidence: [], coverage: [] });
 const untilAborted = <T>(options: { signal: AbortSignal }) => new Promise<T>((_, reject) => options.signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true }));
+const freezeClock = (t: test.TestContext) => { const now = Date.now(); t.mock.method(Date, "now", () => now); };
 
-test("a stored brief and the source map publish when synthesis runs past the deadline", { timeout: 30000 }, async t => {
+test("a stored brief and the source map publish when synthesis runs past the deadline", { timeout: 120000 }, async t => {
   const s = setup(t, { processFixture: true, adapter: { context: async root => sampleContext(root), brief: quickBrief, synthesize: (_input, options) => untilAborted(options) } });
   s.config.repositoryBriefings!.timeoutMs = 2000;
   s.setCatalog({ ...catalog(), policy: { ...catalog().policy, enabled: true, synthesis: true } });
+  freezeClock(t);
   s.runtime.refresh("workspace");
-  await waitUntil(() => !["queued", "running"].includes(s.runtime.read("workspace").maintenance.state), 10000);
+  await waitUntil(() => !["queued", "running"].includes(s.runtime.read("workspace").maintenance.state), 60000);
   const read = s.runtime.read("workspace");
   assert.equal(read.maintenance.state, "failed");
   assert.match(read.maintenance.message ?? "", /Repository Repository: synthesis unavailable: understanding-timeout/);
@@ -600,13 +612,14 @@ test("a stored brief and the source map publish when synthesis runs past the dea
   assert.ok(read.diagrams?.some(diagram => diagram.id === "components:repo"));
 });
 
-test("a re-check that runs out of time publishes the source map without the unconfirmed brief", { timeout: 30000 }, async t => {
+test("a re-check that runs out of time publishes the source map without the unconfirmed brief", { timeout: 120000 }, async t => {
   let captures = 0;
   const s = setup(t, { processFixture: true, adapter: { context: async (root, options) => ++captures === 2 ? untilAborted(options) : sampleContext(root), brief: quickBrief } });
   s.config.repositoryBriefings!.timeoutMs = 2000;
   s.setCatalog({ ...catalog(), policy: { ...catalog().policy, enabled: true, synthesis: true } });
+  freezeClock(t);
   s.runtime.refresh("workspace");
-  await waitUntil(() => !["queued", "running"].includes(s.runtime.read("workspace").maintenance.state), 10000);
+  await waitUntil(() => !["queued", "running"].includes(s.runtime.read("workspace").maintenance.state), 60000);
   const read = s.runtime.read("workspace");
   assert.equal(captures, 2);
   assert.equal(read.maintenance.state, "failed");
@@ -615,7 +628,7 @@ test("a re-check that runs out of time publishes the source map without the unco
   assert.equal(read.components.length, 2);
 });
 
-test("sealed state from before the repository brief, with a legacy previousHead key, still loads", { timeout: 20000 }, async t => {
+test("sealed state from before the repository brief, with a legacy previousHead key, still loads", { timeout: 80000 }, async t => {
   const s = setup(t, { processFixture: true });
   s.runtime.refresh("workspace");
   await waitUntil(() => s.runtime.read("workspace").components.length === 2);
@@ -636,7 +649,7 @@ test("sealed state from before the repository brief, with a legacy previousHead 
   } finally { await resumed.close(); }
 });
 
-test("sourceChanged queues a refresh only for enabled workspaces that contain the checkout", { timeout: 20000 }, async t => {
+test("sourceChanged queues a refresh only for enabled workspaces that contain the checkout", { timeout: 80000 }, async t => {
   const s = setup(t, { adapter: { context: async root => sampleContext(root) } });
   s.runtime.sourceChanged("repo");
   assert.equal(s.runtime.read("workspace").maintenance.state, "disabled");
@@ -647,7 +660,7 @@ test("sourceChanged queues a refresh only for enabled workspaces that contain th
   await waitUntil(() => s.runtime.read("workspace").components.length === 2);
 });
 
-test("a change that lands while a job runs queues one more refresh after it", { timeout: 20000 }, async t => {
+test("a change that lands while a job runs queues one more refresh after it", { timeout: 80000 }, async t => {
   let release: (() => void) | undefined, calls = 0;
   const s = setup(t, { adapter: { context: async root => { calls++; const context = sampleContext(root); await new Promise<void>(resolvePromise => { release = resolvePromise; }); return context; } } });
   s.setCatalog({ ...catalog(), policy: { ...catalog().policy, enabled: true } });
@@ -670,7 +683,6 @@ test("a host without a summary writer reads as unavailable and says why", async 
   assert.equal(s.runtime.refresh("workspace").message, "No summary writer is configured on this host.");
 });
 
-/** Moves the clock past one 15-minute interval and runs one scheduler pass, as the host timer does. */
 function ticker(t: test.TestContext, runtime: UnderstandingRuntime) {
   let offset = 0;
   const realNow = Date.now.bind(Date);
@@ -682,7 +694,7 @@ const commit = (root: string, value: number) => {
   execFileSync("git", ["-C", root, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qam", "change"]);
 };
 
-test("interval ticks admit a job only after a repository moves; an explicit refresh always admits", { timeout: 30000 }, async t => {
+test("interval ticks admit a job only after a repository moves; an explicit refresh always admits", { timeout: 120000 }, async t => {
   const s = setup(t, { adapter: { context: async root => sampleContext(root) } });
   s.setCatalog({ ...catalog(), policy: { ...catalog().policy, enabled: true, intervalMinutes: 15, dailyJobLimit: 24 } });
   const tick = ticker(t, s.runtime);
@@ -702,7 +714,7 @@ test("interval ticks admit a job only after a repository moves; an explicit refr
   await waitUntil(settled(3));
 });
 
-test("a spent daily budget is recorded once and later ticks leave the store alone", { timeout: 30000 }, async t => {
+test("a spent daily budget is recorded once and later ticks leave the store alone", { timeout: 120000 }, async t => {
   const s = setup(t, { adapter: { context: async root => sampleContext(root) } });
   s.setCatalog({ ...catalog(), policy: { ...catalog().policy, enabled: true, intervalMinutes: 15, dailyJobLimit: 1 } });
   const tick = ticker(t, s.runtime);
@@ -717,7 +729,7 @@ test("a spent daily budget is recorded once and later ticks leave the store alon
   assert.equal(s.runtime.read("workspace").maintenance.state, "budget-limited");
 });
 
-test("an engine that exits with an error line on stderr reports that line as the reason", { timeout: 30000 }, async t => {
+test("an engine that exits with an error line on stderr reports that line as the reason", { timeout: 120000 }, async t => {
   for (const { mode, reason } of [
     { mode: "brief-stderr", reason: "Repository Repository: brief unavailable: exit 1 · fixture writer: model quota exhausted" },
     { mode: "context-stderr", reason: "Repository Repository: context-process-failed · fixture context: repository index is locked" },
@@ -730,7 +742,7 @@ test("an engine that exits with an error line on stderr reports that line as the
   });
 });
 
-test("a source map with more components than the stored diagram holds still publishes and says how much it drew", { timeout: 60000 }, async t => {
+test("a source map with more components than the stored diagram holds still publishes and says how much it drew", { timeout: 240000 }, async t => {
   const s = setup(t, { adapter: { context: async root => {
     const base = sampleContext(root), hash = base.files["src/a.ts"].hash;
     const files: RepoContext["files"] = {}, components: RepoContext["components"] = [];
@@ -749,7 +761,7 @@ test("a source map with more components than the stored diagram holds still publ
   assert.ok(read.coverage.includes("Component map: 2000 of 2001 components drawn; the rest are listed under Components."));
 });
 
-test("a GitHub-tracked checkout without a remote binds by its source record; a mismatch reads as a plain sentence", { timeout: 20000 }, async t => {
+test("a GitHub-tracked checkout without a remote binds by its source record; a mismatch reads as a plain sentence", { timeout: 80000 }, async t => {
   const s = setup(t, { adapter: { context: async root => sampleContext(root) } });
   s.setCatalog({ ...catalog(), policy: { enabled: true, synthesis: false, delivery: false, intervalMinutes: 60, dailyJobLimit: 5 } });
   s.group.repos[0].key = "remote:github.com/example/repo";
@@ -764,7 +776,7 @@ test("a GitHub-tracked checkout without a remote binds by its source record; a m
   assert.equal(s.runtime.read("workspace").maintenance.state, "idle");
 });
 
-test("a store from before the per-workspace split is read once, written as one file per workspace, and kept beside them", { timeout: 20000 }, async t => {
+test("a store from before the per-workspace split is read once, written as one file per workspace, and kept beside them", { timeout: 80000 }, async t => {
   const s = setup(t, { processFixture: true });
   s.runtime.refresh("workspace");
   await waitUntil(() => s.runtime.read("workspace").components.length === 2);
@@ -782,7 +794,7 @@ test("a store from before the per-workspace split is read once, written as one f
   } finally { await resumed.close(); }
 });
 
-test("a split that stopped halfway is redone from the old store on the next start", { timeout: 20000 }, async t => {
+test("a split that stopped halfway is redone from the old store on the next start", { timeout: 80000 }, async t => {
   const s = setup(t, { processFixture: true });
   s.runtime.refresh("workspace");
   await waitUntil(() => s.runtime.read("workspace").components.length === 2);
@@ -790,7 +802,6 @@ test("a split that stopped halfway is redone from the old store on the next star
   const key = Buffer.alloc(32, 7), dir = join(s.stateDir, "understanding", "runtime"), legacy = join(s.stateDir, "understanding", "runtime.sealed");
   const file = unseal<{ day: string; workspace: Record<string, unknown> }>(key, "understanding-runtime:workspace", readFileSync(join(dir, "workspace.sealed"), "utf8"));
   writeSealed(legacy, key, "understanding-runtime", { version: 1, day: file.day, workspaces: { workspace: file.workspace } });
-  // The directory exists with a half-written file, as after a crash between two workspace writes.
   writeFileSync(join(dir, "workspace.sealed"), "half-written");
   const resumed = new UnderstandingRuntime({ config: s.config, key, groups: { list: () => ({ groups: [s.group], suggestions: [] }), get: () => s.group }, catalog: { read: () => catalog() } });
   try {

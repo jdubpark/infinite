@@ -93,7 +93,6 @@ function jsonValue(value: unknown, depth = 0): void {
   for (const item of Object.values(objectValue)) jsonValue(item, depth + 1);
 }
 
-/** Canonical JSON uses ECMAScript JSON strings/numbers and UTF-16 key ordering. */
 export function canonicalMemoryJson(value: unknown): string {
   if (value === null || typeof value === "string" || typeof value === "boolean") return JSON.stringify(value);
   if (typeof value === "number") {
@@ -274,7 +273,6 @@ export function validateFoundationMutation(value: unknown): MemoryMutation {
   return { requestId, expectedRevision: Number(mutation.expectedRevision), expectedBindingEpoch: Number(mutation.expectedBindingEpoch), op };
 }
 
-export function isMemoryDigest(value: string): boolean { return DIGEST.test(value); }
 
 export function canonicalMemoryDigest(value: unknown): string {
   return createHash("sha256").update(canonicalMemoryJson(value), "utf8").digest("hex");

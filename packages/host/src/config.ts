@@ -2,20 +2,25 @@ import { readFileSync, realpathSync, statSync } from "node:fs";
 import { resolve, relative, isAbsolute } from "node:path";
 import { createHash } from "node:crypto";
 import { z } from "zod";
-import type { Config } from "./types.js";
-import { assertRunnerDeployment, parseDeployment } from "./deployment.js";
+import { agentProfileSchema, type Config } from "./types.js";
+import { assertRunnerDeployment, parseDeployment, runtimeSecurity } from "./deployment.js";
 import { machineIdentity } from "./machine.js";
+import { autonomyModeSchema } from "./autonomy.js";
 import { projectSourceSchema, teamProjectSchema, teamCommandSchema, teamRetentionSchema, storageFloorSchema, teamLineupSchema } from "./team-types.js";
+import { intakeConfigSchema } from "./intake-types.js";
+import { missionLineupSchema } from "./mission-types.js";
+import { evalHostSchema } from "./eval-config.js";
+import { permissionAgentConfigSchema } from "./permission-agent-config.js";
+import { mcpConfigSchema } from "./mcp-types.js";
+import { egressConfigSchema } from "./egress.js";
+import { MirroredProjects } from "./mirrored-projects.js";
+import { memberTraceSettingsSchema } from "./member-traces.js";
 
-/**
- * Provider hooks injected at launch when the config does not say. Codex hooks stay off: spike S2
- * (2026-11-13) showed that `--dangerously-bypass-hook-trust`, which the injected `-c hooks.*` need,
- * also lets hooks defined in the working directory run without review.
- */
 export const DEFAULT_HOOKS = { claude: true, codex: false } as const;
+export const DEFAULT_REPORT_NAME = "Infinite";
+export const reportName = (config: Config): string => config.linear?.reportName ?? DEFAULT_REPORT_NAME;
 const nonNegative = z.number().min(0).finite();
 export const usageConfigSchema = z.object({
-  /** USD per million tokens, keyed `provider/model`. */
   prices: z.record(z.string().min(1), z.object({ input: nonNegative, output: nonNegative, cacheRead: nonNegative.optional(), cacheWrite: nonNegative.optional() }).strict()).default({}),
   accounts: z.record(z.string().min(1), z.object({ kind: z.enum(["metered", "subscription"]), match: z.array(z.string().min(1)).default([]), planUsd: nonNegative.optional(), balance: z.object({ source: z.literal("deepseek"), apiKeyFile: z.string().refine(isAbsolute, "Balance key file must be absolute") }).strict().optional() }).strict()).default({}),
   budgets: z.partialRecord(z.enum(["claude", "codex", "grok", "opencode", "demo"]), z.object({ usd: nonNegative, period: z.enum(["day", "week", "month"]).default("month") }).strict()).default({}),
@@ -23,18 +28,60 @@ export const usageConfigSchema = z.object({
 export type UsageConfig = z.infer<typeof usageConfigSchema>;
 export const machineLabelSchema = z.string().trim().min(1).max(80);
 
+const fuseCeilingsSchema = z.object({ launchesPerHour: z.number().int().min(1).max(1000).optional() }).strict();
+export const fuseConfigSchema = z.object({
+  project: fuseCeilingsSchema.optional(),
+  host: fuseCeilingsSchema.optional(),
+  projects: z.record(z.string().min(1), fuseCeilingsSchema).optional(),
+}).strict();
+export type FuseConfig = z.infer<typeof fuseConfigSchema>;
+export const continuityConfigSchema = z.object({
+  wakeMinGapMinutes: z.number().int().min(0).max(1440).optional(),
+  rotateIdleMinutes: z.number().int().min(0).max(10080).optional(),
+  rotateContextTokens: z.number().int().min(0).max(10_000_000).optional(),
+  rotateAttempts: z.number().int().min(0).max(1000).optional(),
+}).strict();
+export type ContinuityConfig = z.infer<typeof continuityConfigSchema>;
+export const outcomeSettingsSchema = z.object({
+  holdDays: z.number().int().min(1).max(365).optional(),
+  retentionDays: z.number().int().min(30).max(3650).optional(),
+}).strict();
+
+export const githubBoundarySchema = z.object({
+  proxyUrl: z.string().refine(value => {
+    try {
+      const url = new URL(value);
+      return ["http:", "https:"].includes(url.protocol) && ["127.0.0.1", "[::1]", "localhost"].includes(url.hostname) && value.replace(/\/$/, "") === url.origin;
+    } catch { return false; }
+  }, "The GitHub proxy URL must be a bare loopback origin"),
+  keyPath: z.string().refine(isAbsolute, "The GitHub grant key path must be absolute"),
+}).strict();
+
+export const reviewFeedbackConfigSchema = z.object({
+  enabled: z.boolean().default(false),
+  ownerLogin: z.string().regex(/^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}$/, "Use a GitHub login").optional(),
+  pollMinutes: z.number().int().min(1).max(1440).default(5),
+}).strict().refine(value => !value.enabled || value.ownerLogin !== undefined, { message: "Review feedback needs the owner's GitHub login", path: ["ownerLogin"] });
+
 const schema = z
   .object({
-    linear: z.object({ apiKeyFile: z.string().refine(isAbsolute), endpoint: z.url().optional() }).strict().optional(),
-    teams: z.object({ workspaceDir: z.string().refine(isAbsolute), commandPrefix: teamCommandSchema.optional(), lineup: teamLineupSchema.optional(), trustWorkspaces: z.boolean().optional(), publishHeads: z.boolean().default(true), stallMinutes: z.number().int().min(5).max(1440).optional(), checkMinutes: z.number().positive().max(240).optional(), retention: teamRetentionSchema.optional(), storageFloor: storageFloorSchema.optional() }).strict().optional(),
+    linear: z.object({ apiKeyFile: z.string().refine(isAbsolute), endpoint: z.url().optional(), reportName: z.string().trim().min(1).max(40).regex(/^[A-Za-z][A-Za-z0-9 -]*$/).optional() }).strict().optional(),
+    hostLoad: z.object({ minAvailableMemoryGiB: z.number().min(0).max(4096), maxLoadPerCpu: z.number().positive().max(64) }).strict().optional(),
+    intake: intakeConfigSchema.optional(),
+    mcp: mcpConfigSchema.optional(),
+    codeMode: z.object({ claude: z.enum(["off", "headless", "all"]) }).strict().optional(),
+    teams: z.object({ workspaceDir: z.string().refine(isAbsolute), commandPrefix: teamCommandSchema.optional(), lineup: teamLineupSchema.optional(), trustWorkspaces: z.boolean().optional(), publishHeads: z.boolean().default(true), stallMinutes: z.number().int().min(5).max(1440).optional(), checkMinutes: z.number().positive().max(240).optional(), retention: teamRetentionSchema.optional(), storageFloor: storageFloorSchema.optional(), outcomes: outcomeSettingsSchema.optional(), blackboard: z.object({ tools: z.boolean().optional() }).strict().optional(), memberTraces: memberTraceSettingsSchema.optional() }).strict().optional(),
     machine: z.object({ id: z.uuid(), label: machineLabelSchema }).strict().optional(),
+    permissionAgent: permissionAgentConfigSchema.optional(),
+    autonomy: z.object({ defaultMode: autonomyModeSchema.optional(), fuse: fuseConfigSchema.optional(), continuity: continuityConfigSchema.optional(), boundary: z.object({ egress: egressConfigSchema.optional(), github: githubBoundarySchema.optional() }).strict().optional() }).strict().optional(),
     cmux: z.object({ enabled: z.boolean(), command: z.string().min(1).optional(), hooksDir: z.string().refine(isAbsolute).optional() }).strict().optional(),
     remote: z.object({ enabled: z.boolean(), relay: z.object({ url: z.url(), tokenFile: z.string().refine(isAbsolute) }).strict().optional() }).strict().optional(),
     deployment: z.unknown().optional(),
     usage: usageConfigSchema.optional(),
     sync: z.object({ sharedGroup: z.boolean().optional(), homeDir: z.string().refine(isAbsolute).optional() }).strict().optional(),
     source: z.object({ mirrorDir: z.string().refine(isAbsolute).optional(), refreshMinutes: z.number().int().min(1).max(1440).optional(), remoteOverrides: z.record(z.string(), z.string()).optional() }).strict().optional(),
-    // Model-written chat digests. The key file is read once at startup and never logged.
+    github: z.object({ reviewFeedback: reviewFeedbackConfigSchema.optional() }).strict().optional(),
+    eval: evalHostSchema.optional(),
     summaries: z.object({
       model: z.string().min(1).max(100),
       apiKeyFile: z.string().refine(isAbsolute, "Summary key file must be absolute"),
@@ -44,8 +91,8 @@ const schema = z
       apiKeyFile: z.string().refine(isAbsolute, "Jev key file must be absolute"),
       model: z.string().min(1).max(100).default("jev-latest"),
       baseUrl: z.url().default("https://api.typesafe.ai"),
+      sessionReadings: z.boolean().default(true),
     }).strict().optional(),
-    // Optional cleanup for platform-generated speech transcripts. The key is read once at startup.
     dictation: z.object({
       model: z.string().min(1).max(100).default("gpt-6-luna"),
       apiKeyFile: z.string().refine(isAbsolute, "Dictation key file must be absolute"),
@@ -73,8 +120,10 @@ const schema = z
     }).strict().optional(),
     port: z.number().int().min(0).max(65535),
     origin: z.url(),
+    browserSessions: z.boolean().default(true),
     stateDir: z.string(),
     runDir: z.string(),
+    socketDir: z.string().min(1).optional(),
     keyFile: z.string(),
     environment: z.enum(["local", "cloud"]),
     enableDemo: z.boolean().default(false),
@@ -104,8 +153,7 @@ const schema = z
     agents: z
       .partialRecord(
         z.enum(["claude", "codex", "grok", "opencode", "demo"]),
-        z.object({ command: z.string(), args: z.array(z.string()), appServerCommand: z.string().optional(), appServerArgs: z.array(z.string()).optional(),
-          workspaceDir: z.string().refine(isAbsolute, "Workspace directory must be absolute").optional(), sharedWorkspace: z.boolean().optional() }),
+        agentProfileSchema,
       )
       .default({}),
     attention: z
@@ -127,8 +175,8 @@ const schema = z
         endpoint: z.url().default("https://exp.host/--/api/v2/push/send"),
         detail: z.enum(["minimal", "full"]).default("minimal"),
         events: z
-          .array(z.enum(["needs-you", "turn-finished", "exited", "recording-error", "goal-started", "goal-finished", "goal-stuck", "goal-cancelled", "team-started", "team-finished", "team-stuck", "team-cancelled", "team-blocked", "host-storage"]))
-          .default(["needs-you", "recording-error", "goal-started", "goal-finished", "goal-stuck", "goal-cancelled", "team-started", "team-finished", "team-stuck", "team-cancelled", "host-storage"]),
+          .array(z.enum(["needs-you", "turn-finished", "exited", "recording-error", "goal-started", "goal-finished", "goal-stuck", "goal-cancelled", "team-started", "team-finished", "team-stuck", "team-cancelled", "team-blocked", "host-storage", "autonomy-interrupt", "main-check"]))
+          .default(["needs-you", "recording-error", "goal-started", "goal-finished", "goal-stuck", "goal-cancelled", "team-started", "team-finished", "team-stuck", "team-cancelled", "host-storage", "autonomy-interrupt", "main-check"]),
       })
       .strict()
       .optional(),
@@ -136,6 +184,18 @@ const schema = z
   .strict();
 export const hashToken = (token: string) =>
   createHash("sha256").update(token).digest("hex");
+export function assertPrivateCredentialFile(config: Config, file: string, message: string): void {
+  try {
+    if (!isAbsolute(file) || (statSync(file).mode & 0o777) !== 0o600 || !statSync(file).isFile()) throw new Error();
+    const actual = realpathSync(file);
+    for (const directory of [config.stateDir, config.runDir, config.socketDir, config.teams?.workspaceDir, ...config.projects.flatMap(project => [project.path, project.teamworkDir])].filter((value): value is string => Boolean(value))) {
+      let base: string;
+      try { base = realpathSync(directory); } catch { base = resolve(directory); }
+      const rel = relative(base, actual);
+      if (rel !== ".." && !rel.startsWith("../") && !isAbsolute(rel)) throw new Error();
+    }
+  } catch { throw new Error(message); }
+}
 export function validateLinearConfig(config: Config) {
   if (config.projects.some(project => project.linear) && !config.linear)
     throw new Error("Linear projects require a host credential configuration");
@@ -144,28 +204,81 @@ export function validateLinearConfig(config: Config) {
   const local = config.environment === "local" && endpoint.protocol === "http:" && ["127.0.0.1", "localhost", "[::1]"].includes(endpoint.hostname);
   if ((!local && endpoint.href !== "https://api.linear.app/graphql") || endpoint.username || endpoint.password || endpoint.search || endpoint.hash || endpoint.pathname !== "/graphql")
     throw new Error("Linear requires its official HTTPS endpoint; loopback HTTP is allowed for local development");
+  const message = "Linear API key must be a nonempty private 0600 file outside runtime state and project workspaces";
   try {
-    const file = config.linear.apiKeyFile;
-    if (!isAbsolute(file) || (statSync(file).mode & 0o777) !== 0o600 || !statSync(file).isFile()) throw new Error();
-    const actual = realpathSync(file);
-    for (const directory of [config.stateDir, config.runDir, config.teams?.workspaceDir, ...config.projects.flatMap(project => [project.path, project.teamworkDir])].filter((value): value is string => Boolean(value))) {
-      let base: string;
-      try { base = realpathSync(directory); } catch { base = resolve(directory); }
-      const rel = relative(base, actual);
-      if (rel !== ".." && !rel.startsWith("../") && !isAbsolute(rel)) throw new Error();
-    }
-    const credential = readFileSync(file, "utf8").trim();
+    assertPrivateCredentialFile(config, config.linear.apiKeyFile, message);
+    const credential = readFileSync(config.linear.apiKeyFile, "utf8").trim();
     if (!credential || credential.length > 4096 || /\s/.test(credential)) throw new Error();
-  } catch { throw new Error("Linear API key must be a nonempty private 0600 file outside runtime state and project workspaces"); }
+  } catch { throw new Error(message); }
+}
+const SLACK_OFFICIAL_ENDPOINT = "https://slack.com/api";
+export function validateIntakeConfig(config: Config): void {
+  const intake = config.intake;
+  if (!intake) return;
+  if (!config.linear) throw new Error("Intake requires a host Linear credential");
+  if (intake.requireSlackThread && !intake.slack) throw new Error("requireSlackThread needs intake.slack");
+  if (intake.linear.commentsMirrorToSlack && !intake.slack) throw new Error("commentsMirrorToSlack needs intake.slack");
+  const slack = intake.slack;
+  if (intake.linear.admitIssues === false && !slack?.directRequests && !config.mcp) throw new Error("admitIssues false needs intake.slack.directRequests or mcp");
+  if (slack?.answerQuestions && !slack.directRequests) throw new Error("answerQuestions needs intake.slack.directRequests");
+  if (slack?.requestChannelIds?.length && !slack.directRequests) throw new Error("requestChannelIds needs intake.slack.directRequests");
+  if (slack?.ownerOnlyInJoinedChannels && !slack.directRequests) throw new Error("ownerOnlyInJoinedChannels needs intake.slack.directRequests");
+  if (slack?.classify && !slack.answerQuestions) throw new Error("classify needs intake.slack.answerQuestions");
+  if (slack?.classify && !config.jev) throw new Error("classify needs the jev block");
+  if (slack) {
+    if (intake.requireSlackThread && intake.linear.admitIssues !== false && !slack.linearAgentUserId) throw new Error("requireSlackThread needs intake.slack.linearAgentUserId");
+    if (slack.bindByMention && intake.requireSlackThread) throw new Error("bindByMention cannot be used with requireSlackThread");
+    const tokenMessage = "Slack token must be a nonempty private 0600 file outside runtime state and project workspaces";
+    for (const file of [slack.appTokenFile, slack.botTokenFile]) {
+      assertPrivateCredentialFile(config, file, tokenMessage);
+      try {
+        const token = readFileSync(file, "utf8").trim();
+        if (!token || token.length > 4096 || /\s/.test(token)) throw new Error();
+      } catch { throw new Error(tokenMessage); }
+    }
+    const endpoint = new URL(slack.endpoint ?? SLACK_OFFICIAL_ENDPOINT);
+    const local = config.environment === "local" && endpoint.protocol === "http:" && ["127.0.0.1", "localhost", "[::1]"].includes(endpoint.hostname);
+    if ((!local && endpoint.href !== SLACK_OFFICIAL_ENDPOINT) || endpoint.username || endpoint.password || endpoint.search || endpoint.hash)
+      throw new Error("Slack requires its official HTTPS endpoint; loopback HTTP is allowed for local development");
+  }
+  const answerProjectId = intake.mission.answerProjectId;
+  if (answerProjectId && !config.projects.some(project => project.id === answerProjectId))
+    throw new Error("intake.mission.answerProjectId must name a configured project");
+  if (config.teams?.lineup) {
+    const lineup = missionLineupSchema.safeParse(config.teams.lineup);
+    if (!lineup.success) throw new Error(lineup.error.issues[0]?.message ?? "Intake requires a strong Claude Code coordinator and strong reviewer");
+  }
+}
+function validateMcpCredentials(config: Config): void {
+  if (!config.mcp) return;
+  mcpConfigSchema.parse(config.mcp);
+  if (!config.linear || !config.intake) throw new Error("MCP requires host Linear and intake configuration");
+  if (config.mcp.port !== 0 && config.mcp.port === config.port) throw new Error("MCP requires a separate port");
+  for (const connector of config.mcp.connectors) {
+    if (config.tokens.some(token => token.hash === connector.tokenHash)) throw new Error("MCP credentials must differ from device credentials");
+  }
+}
+export function validateMcpConfig(config: Config): void {
+  validateMcpCredentials(config);
+  for (const connector of config.mcp?.connectors ?? []) {
+    if (connector.projectIds.some(id => !config.projects.some(project => project.id === id))) throw new Error("MCP grants must name configured projects");
+  }
 }
 export function readConfig(file: string): { config: Config; key: Buffer } {
-  const config = schema.parse(JSON.parse(readFileSync(file, "utf8"))) as Config;
+  const parsed = schema.parse(JSON.parse(readFileSync(file, "utf8")));
+  for (const id of Object.keys(parsed.autonomy?.fuse?.projects ?? {})) {
+    if (!parsed.projects.some(project => project.id === id)) throw new Error("Fuse limits name a project that is not configured");
+  }
+  const config = parsed as Config;
   config.deployment = parseDeployment(config.deployment);
   validateLinearConfig(config);
+  validateMcpCredentials(config);
+  validateIntakeConfig(config);
   assertRunnerDeployment(config);
   for (const path of [
     config.stateDir,
     config.runDir,
+    ...(config.socketDir !== undefined ? [config.socketDir] : []),
     config.keyFile,
     ...config.projects.map((p) => p.path),
   ]) {
@@ -198,7 +311,7 @@ export function readConfig(file: string): { config: Config; key: Buffer } {
     const info = statSync(file);
     if (!info.isFile() || (info.mode & 0o777) !== 0o600) throw new Error(message);
     const actual = realpathSync(file);
-    for (const directory of [config.stateDir, config.runDir, config.teams?.workspaceDir, ...config.projects.flatMap(project => [project.path, project.teamworkDir])].filter((value): value is string => Boolean(value))) {
+    for (const directory of [config.stateDir, config.runDir, config.socketDir, config.teams?.workspaceDir, ...config.projects.flatMap(project => [project.path, project.teamworkDir])].filter((value): value is string => Boolean(value))) {
       let base: string;
       try { base = realpathSync(directory); } catch { base = resolve(directory); }
       const rel = relative(base, actual);
@@ -236,5 +349,10 @@ export function readConfig(file: string): { config: Config; key: Buffer } {
     throw new Error("Origin must be a bare HTTP(S) origin");
   if (!["http:", "https:"].includes(origin.protocol))
     throw new Error("Invalid origin protocol");
+  if (config.mcp) {
+    const effective = structuredClone(config);
+    if (runtimeSecurity(effective.deployment).tenancy === "single-tenant") new MirroredProjects(effective, key);
+    validateMcpConfig(effective);
+  }
   return { config, key };
 }

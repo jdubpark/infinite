@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { Pressable, StyleSheet, Text, TextInput, View } from "react-native";
-import type { Prompt } from "@infinite/attention";
+import { terminalOnlyPrompt, type Prompt } from "@infinite/attention";
 import { theme } from "../theme";
 import { Button } from "./Button";
 
@@ -13,10 +13,6 @@ export type DecisionStatus =
 
 const READ_ONLY_TEXT = "This device key can view but not steer.";
 
-/**
- * The pending dialog with its options in display order. Nothing is sent
- * until the person taps an option, "Send reply" or "Retry".
- */
 export function DecisionCard({
   prompt,
   backend,
@@ -31,11 +27,8 @@ export function DecisionCard({
   prompt: Prompt;
   backend?: "infinite" | "cmux";
   status: DecisionStatus;
-  /** Options and reply are enabled: permitted, online and running. */
   canAnswer: boolean;
-  /** This key may not answer at all (viewer role or no answer capability). */
   readOnly: boolean;
-  /** Why a permitted device cannot answer yet, such as not holding control. */
   gate?: string;
   onAnswer: (option?: number, text?: string) => void;
   onRetry: () => void;
@@ -44,11 +37,8 @@ export function DecisionCard({
   const [reply, setReply] = useState("");
   const busy = status.kind === "sending" || status.kind === "sent";
   const enabled = canAnswer && !busy;
-  const feedText = backend === "cmux" && prompt.source === "protocol" && prompt.acceptsText && Boolean(prompt.hash);
-  const needsTerminal = !feedText && (prompt.multiSelect || !prompt.hash || prompt.options.length === 0);
+  const needsTerminal = terminalOnlyPrompt(prompt, backend);
   const textReply = prompt.acceptsText && prompt.kind !== "yes-no" && (backend !== "cmux" || prompt.source === "protocol");
-  // Status sits right under the options, where the person just tapped.
-  // Outcomes that outlive the prompt ("changed", refusals) are the Brief's notice.
   const statusLine = (
     <View style={s.statusSlot}>
       {busy ? (

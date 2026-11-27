@@ -1,5 +1,6 @@
 import type { PromptKind, PromptOption, Provider } from "./types.js";
 import { roleForLabel } from "./roles.js";
+import { accountSettingPrompt } from "./delegation.js";
 
 export interface DetectedPrompt {
   kind: PromptKind;
@@ -9,7 +10,6 @@ export interface DetectedPrompt {
   highlighted?: number;
   acceptsText: boolean;
   multiSelect: boolean;
-  /** Only blank lines and key hints follow the options: the block is the screen's bottom-most UI, not transcript text. */
   pinned: boolean;
   fingerprint: string;
   blockStart: number;
@@ -20,10 +20,6 @@ const OPTION = /^([❯›>]\s*)?(\d{1,2})\.\s+(.+?)$/;
 const RULE = /^[\s─━═│┃┌┐└┘├┤╭╮╰╯\-_=*·]*$/;
 const BOX_TOP = /[╭┌]/;
 const PERMISSION = /do you want to (proceed|make this edit|create|run)|would you like to (run|make)|approve network access|needs your approval|permission/i;
-/**
- * A dialog whose title sits above its detail, as Codex draws its command and edit dialogs. The
- * header is complete once this line is reached; whatever stands above it is transcript.
- */
 const HEADER_TITLE = /^would you like to (run|make) .*\?$/i;
 const HEADER_LIMIT = 12;
 const DETAIL_LIMIT = 2000;
@@ -31,51 +27,45 @@ const QUESTION_OPTION = /^(chat about this|other|skip|type something)/i;
 const MULTI = /a to select all|n to select none/i;
 const YES_NO = /(\[(y\/N|Y\/n|y\/n)\]|\((y\/n|yes\/no)\))\s*:?\s*$/i;
 const KEY_HINT = /^(Enter to|Esc to|Press )/i;
+const CODE_MODE_FOOTER = /^(Tellushowitgoeswith\/feedback)?(Entertoconfirm·?Esctostartwithoutit)?$/i;
 
-/** The non-empty lines of `text`, each with its whitespace runs collapsed to one space. */
 export function normalisedLines(text?: string): string[] {
   return (text ?? "").split("\n").map((l) => l.replace(/\s+/g, " ").trim()).filter(Boolean);
 }
 
-/** Strip box-drawing borders and surrounding whitespace. */
 export function cleanLine(line: string): string {
   return line.replace(/^[\s│┃]+|[\s│┃]+$/g, "");
 }
 
 export function detectPrompt(lines: string[], provider: Provider): DetectedPrompt | null {
   const clean = lines.map(cleanLine);
+  const codeMode = detectCodeModeConfirmation(clean);
+  if (codeMode) return codeMode;
   const block = lastOptionBlock(clean, lines);
   if (block) {
     const { start, end, options, highlighted } = block;
     const above: string[] = [];
     for (let i = start - 1; i >= 0 && above.length < HEADER_LIMIT; i--) {
-      // A box's top edge ends the dialog: transcript lines above it are not its header.
       if (OPTION.test(clean[i]) || BOX_TOP.test(clean[i])) break;
       if (clean[i] === "" || RULE.test(clean[i])) continue;
       above.unshift(clean[i]);
       if (HEADER_TITLE.test(clean[i])) break;
     }
-    // The dialog's own title wins over a reason or description that happens to end with "?":
-    // a top-anchored title first, then the last permission question, then the last question.
     const headerTitle = above.findIndex((l) => HEADER_TITLE.test(l));
     const permissionQuestion = findLastIndex(above, (l) => l.endsWith("?") && PERMISSION.test(l));
     const titleIndex = headerTitle >= 0 ? headerTitle : permissionQuestion >= 0 ? permissionQuestion : findLastIndex(above, (l) => l.endsWith("?"));
     const title = titleIndex >= 0 ? above[titleIndex] : above.at(-1) ?? "";
     const detailLines = above.filter((_, i) => i !== titleIndex && above[i] !== title);
-    // A cut must be visible: delegation treats "… [+N chars]" as incomplete evidence, so a dialog
-    // whose command runs past the cap can never qualify as a complete one-shot request.
-    const joined = detailLines.join("\n");
-    const detail = !detailLines.length ? undefined : joined.length > DETAIL_LIMIT ? `${joined.slice(0, DETAIL_LIMIT)}… [+${joined.length - DETAIL_LIMIT} chars]` : joined;
+    const detail = boundedDetail(detailLines);
     const footer = clean.slice(end + 1, end + 3).join(" ");
     const multiSelect = MULTI.test(footer);
-    const pinned = clean.slice(end + 1).every((l) => l === "" || RULE.test(l) || KEY_HINT.test(l));
+    const pinned = pinnedAfter(clean, end);
     let kind: PromptKind = "menu";
     if (PERMISSION.test(title)) kind = "permission";
     else if (options.some((o) => QUESTION_OPTION.test(o.label))) kind = "question";
     const acceptsText = options.some((o) => o.role === "reject-with-feedback");
     return {
       kind, title, detail, options, highlighted, acceptsText, multiSelect, pinned,
-      // The detail (the command, path or question body) is part of the dialog's identity.
       fingerprint: [title, ...normalisedLines(detail), ...options.map((o) => o.label)].join("\n"),
       blockStart: start, blockEnd: end,
     };
@@ -98,11 +88,6 @@ export function detectPrompt(lines: string[], provider: Provider): DetectedPromp
   return null;
 }
 
-/**
- * Find the lowest block of consecutively numbered options. A wrapped option label continues on
- * the next line when that raw line is indented past the option number column, is not itself an
- * option, a question, or a key hint. A block counts only when an option carries a selection marker.
- */
 function lastOptionBlock(clean: string[], raw: string[]) {
   const firstTextCol = (line: string) => line.search(/[^\s│┃]/);
   const numberCol = (line: string) => line.search(/\d{1,2}\.\s/);
@@ -138,9 +123,84 @@ function lastOptionBlock(clean: string[], raw: string[]) {
   return best;
 }
 
-const compact = (line: string) => line.replace(/[^a-z0-9]/gi, "").toLowerCase();
+function compact(line: string): string {
+  return line.replace(/[^a-z0-9]/gi, "").toLowerCase();
+}
 
-/** Claude's first-run folder question is an unnumbered two-option menu, not `1. Yes`. */
+function boundedDetail(lines: string[]): string | undefined {
+  if (!lines.length) return undefined;
+  const joined = lines.join("\n");
+  return joined.length > DETAIL_LIMIT ? `${joined.slice(0, DETAIL_LIMIT)}… [+${joined.length - DETAIL_LIMIT} chars]` : joined;
+}
+
+function pinnedAfter(clean: string[], end: number): boolean {
+  return clean.slice(end + 1).every(line => line === "" || RULE.test(line) || KEY_HINT.test(line));
+}
+
+function compactedOptionAt(clean: string[], start: number, expected: string) {
+  let accumulated = "";
+  for (let end = start; end < Math.min(clean.length, start + 4); end++) {
+    const part = compact(clean[end].replace(/^[❯›>]\s*/, "").trim());
+    if (!part || !expected.startsWith(accumulated + part)) return undefined;
+    accumulated += part;
+    if (accumulated === expected) {
+      const line = clean[start];
+      return { start, end, highlighted: line.includes("❯") || line.includes("›") || line.trimStart().startsWith(">") };
+    }
+  }
+  return undefined;
+}
+
+function detectCodeModeConfirmation(clean: string[]): DetectedPrompt | null {
+  const titleIndex = findLastIndex(clean, line => accountSettingPrompt({ title: line }));
+  if (titleIndex < 0) return null;
+  let firstOption: ReturnType<typeof compactedOptionAt>;
+  let secondOption: ReturnType<typeof compactedOptionAt>;
+  let firstRole: "reject" | "accept" | undefined;
+  for (let start = titleIndex + 1; start < clean.length; start++) {
+    const noFirst = compactedOptionAt(clean, start, "nostartwithoutit");
+    const yesFirst = noFirst ? undefined : compactedOptionAt(clean, start, "yesturnoncodemode");
+    const first = noFirst ?? yesFirst;
+    if (!first) continue;
+    const otherRole = noFirst ? "accept" : "reject";
+    const second = compactedOptionAt(clean, first.end + 1, otherRole === "accept" ? "yesturnoncodemode" : "nostartwithoutit");
+    if (!second) continue;
+    const tail = clean.slice(second.end + 1).filter(line => !RULE.test(line)).join("").replace(/\s+/g, "");
+    if (!CODE_MODE_FOOTER.test(tail)) continue;
+    firstOption = first;
+    secondOption = second;
+    firstRole = noFirst ? "reject" : "accept";
+    break;
+  }
+  if (!firstOption || !secondOption || firstOption.highlighted === secondOption.highlighted) return null;
+  const end = secondOption.end;
+  const options = firstRole === "reject"
+    ? [
+        { index: 0, label: "No, start without it", role: "reject" as const },
+        { index: 1, label: "Yes, turn on Code Mode", role: "accept" as const },
+      ]
+    : [
+        { index: 0, label: "Yes, turn on Code Mode", role: "accept" as const },
+        { index: 1, label: "No, start without it", role: "reject" as const },
+      ];
+  const marked = firstOption.highlighted ? 0 : 1;
+  const detailLines = clean.slice(titleIndex + 1, firstOption.start).filter(line => line !== "" && !RULE.test(line));
+  const detail = boundedDetail(detailLines);
+  return {
+    kind: "permission",
+    title: clean[titleIndex],
+    detail,
+    options,
+    highlighted: marked,
+    acceptsText: false,
+    multiSelect: false,
+    pinned: true,
+    fingerprint: [clean[titleIndex], ...normalisedLines(detail), ...options.map(option => option.label)].join("\n"),
+    blockStart: firstOption.start,
+    blockEnd: end,
+  };
+}
+
 function detectWorkspaceTrust(clean: string[]): DetectedPrompt | null {
   let yes = -1;
   let no = -1;
@@ -177,7 +237,7 @@ function detectWorkspaceTrust(clean: string[]): DetectedPrompt | null {
     highlighted: marked,
     acceptsText: false,
     multiSelect: false,
-    pinned: clean.slice(end + 1).every((line) => line === "" || RULE.test(line) || KEY_HINT.test(line)),
+    pinned: pinnedAfter(clean, end),
     fingerprint: [title, ...normalisedLines(detail), ...options.map((option) => option.label)].join("\n"),
     blockStart: start,
     blockEnd: end,

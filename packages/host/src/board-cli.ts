@@ -1,16 +1,16 @@
 import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import type { Board, BoardItem, Mission } from "./mission-types.js";
+import type { MissionProgressPage } from "./mission-progress.js";
 import type { ProjectGroup, ProjectGroupList } from "./project-group-types.js";
 import type { TeamRun } from "./team-types.js";
+import { recommendationLine } from "./question-recommendation.js";
+import type { ClientApi as Api } from "./client-api.js";
 import { boundTeamProject } from "./team-cli.js";
 import { teamWatchFrame } from "./team-watch.js";
+import { runMissionWatch } from "./mission-watch.js";
 
 type ClientConfig = { origin: string; token: string };
-type Api = {
-  request(path: string, body?: unknown, signal?: AbortSignal, headers?: Record<string, string>, method?: string): Promise<Response>;
-  json<T>(path: string, body?: unknown, signal?: AbortSignal, headers?: Record<string, string>, method?: string): Promise<T>;
-};
 type Options = Record<string, string | boolean>;
 const safe = (value: unknown) => String(value ?? "").replace(/[\x00-\x1f\x7f-\x9f]/g, " ").trim();
 const short = (value: unknown, max: number) => {
@@ -152,7 +152,6 @@ export function appendBoardComposer(composer: string, text: string): string {
   return composer + text;
 }
 
-/** A group holds a host project when the project is a repository's primary or any of its checkouts. */
 function groupHoldsCheckout(group: ProjectGroup, projectId: string): boolean {
   return group.repos.some(repo => repo.projectId === projectId || repo.checkouts.some(checkout => checkout.projectId === projectId));
 }
@@ -181,7 +180,6 @@ export function resolveMissionProject(
 
 const shellQuote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
 
-/** Lines for `infinite projects`: groups, their repositories and checkouts, hidden groups, then suggestions. */
 export function projectsLines(list: ProjectGroupList, syncOf: (projectId: string) => string | undefined = () => undefined): string[] {
   const lines: string[] = [];
   const suffix = (projectId: string) => {
@@ -307,6 +305,10 @@ async function answerSelected(
 
 async function openItem(item: BoardItem, api: Api, config: ClientConfig, configPath: string) {
   if (item.kind === "mission") {
+    if (process.stdout.isTTY && process.stdin.isTTY) {
+      await runMissionWatch(api, item.id);
+      return;
+    }
     const mission = await api.json<Mission>(`/missions/${item.id}`);
     const lines = [`${mission.title}  ${mission.id}`, `${mission.groupName}  · ${mission.status}  · revision ${mission.revision}`];
     if (mission.reason) lines.push(`Reason: ${safe(mission.reason)}`);
@@ -314,7 +316,10 @@ async function openItem(item: BoardItem, api: Api, config: ClientConfig, configP
     const decisions = mission.decisions.filter(decision => !decision.answer);
     if (decisions.length) {
       lines.push("", "Open decisions");
-      for (const decision of decisions) lines.push(`  ${decision.id}  ${safe(decision.question)}`);
+      for (const decision of decisions) {
+        lines.push(`  ${decision.id}  ${safe(decision.question)}`);
+        if (decision.recommendation) lines.push(`    ${safe(recommendationLine(decision.recommendation))}`);
+      }
     }
     if (mission.subtasks.length) {
       lines.push("", "Subtasks");
@@ -329,6 +334,26 @@ async function openItem(item: BoardItem, api: Api, config: ClientConfig, configP
   } else {
     console.log(`${item.title}  ${item.id}\n${item.status}  · ${item.projectName}\n${item.detail}`);
   }
+}
+
+function formatMissionProgress(page: MissionProgressPage): string {
+  const { mission, subtasks } = page.snapshot;
+  const lines = [`${safe(mission.title)}  ${safe(mission.id)}  ·  ${safe(mission.status)}  ·  revision ${mission.revision}`];
+  if (page.resync.required) lines.push(`Current snapshot (${safe(page.resync.reason)})`);
+  else lines.push(`Retained observations since your cursor: ${page.observations.length}`);
+  if (mission.coordinator) lines.push(`Coordinator  ${safe(mission.coordinator.recordedStatus)}  ·  worker ${safe(mission.coordinator.workerStatus)}`);
+  for (const subtask of subtasks) {
+    const { child } = subtask;
+    lines.push(`${safe(subtask.title)}  ·  ${safe(subtask.status)}  ·  ${child.kind === "linked" ? safe(child.runId) : child.kind}`);
+    if (child.kind !== "linked") continue;
+    for (const member of child.assignments)
+      lines.push(`  ${safe(member.role)} ${safe(member.taskId)}  ${safe(member.recordedStatus)}  ·  worker ${safe(member.workerStatus)}`);
+    for (const check of child.checks)
+      lines.push(`  Check  ${safe(check.status)}${check.headCommit ? ` at ${safe(check.headCommit)}` : ""}`);
+    if (child.assignmentsTruncated || child.checksTruncated) lines.push("  Additional assignments or checks are available in the team record.");
+  }
+  lines.push(`Cursor  ${safe(page.cursor)}`);
+  return lines.join("\n");
 }
 
 export async function handleBoardClientCommand(
@@ -370,7 +395,21 @@ export async function handleBoardClientCommand(
   }
   if (command === "mission") {
     const [action, id, argument, ...rest] = positional;
-    if (!action || !id) throw new Error("Usage: infinite mission status ID | answer ID DECISION_ID TEXT | steer ID TEXT | pause|resume|cancel ID");
+    if (!action || !id) throw new Error("Usage: infinite mission status ID | progress ID [--after CURSOR] [--json] | watch ID [--json] | answer ID DECISION_ID TEXT | steer ID TEXT | pause|resume|cancel ID");
+    if (action === "watch") {
+      if (argument || rest.length) throw new Error("Usage: infinite mission watch ID [--json]");
+      await runMissionWatch(api, id, { json: Boolean(options["--json"]) });
+      return true;
+    }
+    if (action === "progress") {
+      const after = options["--after"];
+      if (argument || rest.length || (after !== undefined && (typeof after !== "string" || !after)))
+        throw new Error("Usage: infinite mission progress ID [--after CURSOR] [--json]");
+      const query = after ? `?cursor=${encodeURIComponent(after)}` : "";
+      const page = await api.json<MissionProgressPage>(`/missions/${encodeURIComponent(id)}/progress${query}`);
+      console.log(options["--json"] ? JSON.stringify(page, null, 2) : formatMissionProgress(page));
+      return true;
+    }
     if (action === "status") {
       if (argument || rest.length) throw new Error("Usage: infinite mission status ID");
       const mission = await api.json<Mission>(`/missions/${id}`);
@@ -390,7 +429,7 @@ export async function handleBoardClientCommand(
     } else if (["pause", "resume", "cancel"].includes(action)) {
       if (argument || rest.length) throw new Error(`Usage: infinite mission ${action} ID`);
       await api.json(`/missions/${id}/${action}`, { requestId, revision: current.revision });
-    } else throw new Error("Usage: infinite mission status|answer|steer|pause|resume|cancel ...");
+    } else throw new Error("Usage: infinite mission status|progress|watch|answer|steer|pause|resume|cancel ...");
     console.log(`Mission ${id} ${action} requested.`);
     return true;
   }
@@ -405,7 +444,10 @@ export async function handleBoardClientCommand(
 function formatMission(mission: Mission) {
   const lines = [`${mission.title}  ${mission.id}`, `${mission.groupName}  · ${mission.status}  · revision ${mission.revision}`, safe(mission.objective)];
   if (mission.reason) lines.push(`Reason: ${safe(mission.reason)}`);
-  for (const decision of mission.decisions.filter(item => !item.answer)) lines.push(`Decision ${decision.id}: ${safe(decision.question)}`);
+  for (const decision of mission.decisions.filter(item => !item.answer)) {
+    lines.push(`Decision ${decision.id}: ${safe(decision.question)}`);
+    if (decision.recommendation) lines.push(safe(recommendationLine(decision.recommendation)));
+  }
   for (const task of mission.subtasks) lines.push(`${task.title}  ${task.repoProjectId}  ${task.status}`);
   return lines.join("\n");
 }
@@ -427,7 +469,7 @@ async function runBoard(api: Api, config: ClientConfig, configPath: string, opti
   if (requested && projectIndex < 0) throw new Error(`Unknown project ID: ${requested}`);
   const target = () => projects[projectIndex]!.id;
   const visibleBoard = () => options["--project"]
-    ? { ...board, items: board.items.filter(item => item.groupId === target() || (!item.groupId && item.projectName === projects[projectIndex]!.name)) }
+    ? { ...board, items: board.items.filter(item => item.groupId === target()) }
     : board;
   const selectedItem = () => boardItem(visibleBoard(), cursor);
   const clearAnswerMode = (message?: string) => {

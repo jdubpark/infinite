@@ -9,7 +9,6 @@ export function NodeShape({ shape, w, h, fill, stroke, dashed, opacity = 1 }: {
   fill: string;
   stroke: string;
   dashed?: boolean;
-  /** Applied per element: group opacity is not reliable across react-native-svg renderers. */
   opacity?: number;
 }) {
   const strokeDasharray = dashed ? "6 4" : undefined;

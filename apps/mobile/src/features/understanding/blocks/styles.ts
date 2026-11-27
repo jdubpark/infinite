@@ -1,7 +1,6 @@
 import { StyleSheet } from "react-native";
 import { theme } from "../../../theme";
 
-/** Shared styles for the work brief block renderers. Colours come from the theme tokens only. */
 export const styles = StyleSheet.create({
   stack: { gap: 10 },
   card: { gap: 8, padding: 12, borderRadius: theme.radius.card, backgroundColor: theme.colors.white, borderWidth: StyleSheet.hairlineWidth, borderColor: theme.colors.rule },

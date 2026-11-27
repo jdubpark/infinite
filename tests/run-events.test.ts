@@ -45,12 +45,16 @@ test("a plan digest covers every planned field", () => {
   assert.notEqual(planDigest([task({ instructions: "Do something else" }), second]), digest, "instructions");
   assert.notEqual(planDigest([task({ kind: "fix" }), second]), digest, "kind");
   assert.notEqual(planDigest([task({ risk: "elevated" }), second]), digest, "risk");
+  const linked = (objectiveVersion: number, criteria: string[]) =>
+    planDigest([task({ criterionRefs: { objectiveVersion, criteria } }), second]);
+  assert.notEqual(linked(1, ["c0"]), digest, "a goal link changes the plan receipt");
+  assert.notEqual(linked(1, ["c0"]), linked(2, ["c0"]), "objective version");
+  assert.notEqual(linked(1, ["c0"]), linked(1, ["c1"]), "criterion");
   assert.notEqual(planDigest([second, task()]), digest, "task order");
 });
 
 test("a path list over its byte budget is omitted", () => {
   assert.deepEqual(pathField(["a.ts"]), { paths: ["a.ts"] });
-  // The JSON of ["abcdef"] is ten bytes.
   assert.deepEqual(pathField(["abcdef"], 10), { paths: ["abcdef"] });
   assert.deepEqual(pathField(["abcdefg"], 10), { pathsOmitted: true });
 });

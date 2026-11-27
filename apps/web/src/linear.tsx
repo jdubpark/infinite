@@ -11,8 +11,10 @@ function issueLink(value: string) {
   } catch { return undefined; }
 }
 const date = (value: string) => new Date(value).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+type Issue = NonNullable<LinearTrackingView["issue"]>;
+type Tracking = Omit<LinearTrackingView, "issue"> & { issue?: Pick<Issue, "identifier" | "url" | "title" | "state"> & Partial<Pick<Issue, "description">> };
 
-export function LinearTracking({ tracking, stale, compact = false }: { tracking?: LinearTrackingView; stale: boolean; compact?: boolean }) {
+export function LinearTracking({ tracking, stale, compact = false }: { tracking?: Tracking; stale: boolean; compact?: boolean }) {
   if (!tracking) return null;
   const issue = tracking.issue;
   const href = issue && issueLink(issue.url);

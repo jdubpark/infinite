@@ -7,6 +7,7 @@ import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { setTimeout as delay } from "node:timers/promises";
 import type { ControlLease, Receipt, Session, Status, WorkerState } from "./types.js";
+import { createClientApi, HttpError, type ClientApi, type ClientConfig } from "./client-api.js";
 import { terminalConnection, TerminalAccessError, TerminalControlError, type TerminalPage } from "./client-transport.js";
 import { draftTerminal } from "./client-draft.js";
 import { localDraftStore } from "./client-draft-store.js";
@@ -24,13 +25,25 @@ import { boundTeamProject, forgetBoundTeamProject, handleTeamClientCommand } fro
 import { handleBoardClientCommand, projectsLines } from "./board-cli.js";
 import { handleUnderstandingCommand } from "./understanding-cli.js";
 import { handleRoutineClientCommand } from "./routine-cli.js";
+import { handleAutonomyClientCommand } from "./autonomy-cli.js";
+import { handleRoutingClientCommand } from "./routing-cli.js";
+import { handleSignalClientCommand } from "./signal-cli.js";
+import { handleHaltClientCommand } from "./halt-cli.js";
+import { handleEgressClientCommand } from "./egress.js";
+import { handleGoalClientCommand } from "./objective-cli.js";
+import { handlePermissionsClientCommand } from "./permissions-cli.js";
+import { handleDuelClientCommand, handleEvalClientCommand } from "./eval-cli.js";
 import type { ProjectGroupList } from "./project-group-types.js";
+import { MIN_COUNTED_ROWS, type LevelCount } from "./outcome-cells.js";
+import type { CellsResult } from "./outcome-reads.js";
+import type { OutcomeRollup } from "./outcome-rollup.js";
+import { LEGACY_BATCH_MAX, parseLegacyFile, type LegacyLineOutcome } from "./outcome-legacy.js";
+import type { LegacyImportResult } from "./outcome-import.js";
+import { handleUsageInterruptedCommand, handleUsageRepairsCommand } from "./repair-metrics-cli.js";
 
-type ClientConfig = { origin: string; token: string; projectId?: string };
 type Me = { role: string; capabilities?: { workspaceMirror?: number; mirrorForget?: number }; machine?: { label?: string }; nativeUi?: string[]; execution?: { laptop: boolean; cloudHandoff: boolean }; terminal?: { stream: boolean; raw: boolean; duplex?: boolean; snapshot?: boolean; control?: boolean }; projects: { id: string; name: string }[] };
 const providers = new Set(["claude", "codex", "grok", "opencode"]);
 const providerNames: Record<string, string> = { claude: "Claude Code", codex: "Codex", grok: "Grok", opencode: "OpenCode" };
-/** Project IDs name local sync files, so an ID from the host or the command line is checked before it becomes a path. */
 const PROJECT_ID = /^[a-z0-9-]{1,80}$/;
 const clean = (value: string) => value.replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
 function startupProgress() {
@@ -47,7 +60,6 @@ function startupProgress() {
     stop,
   };
 }
-class HttpError extends Error { constructor(readonly status: number, message: string, readonly code?: string) { super(message); } }
 function originOf(value: string) {
   const url = new URL(value);
   if (url.username || url.password || url.search || url.hash || url.pathname !== "/") throw new Error("Use the host origin without credentials, a path, or query parameters");
@@ -66,30 +78,9 @@ function loadConfig(path: string): ClientConfig {
   if (typeof config.token !== "string" || !/^[\x21-\x7e]{32,200}$/.test(config.token)) throw new Error("Invalid device key in client configuration");
   return { ...config, origin: originOf(config.origin) };
 }
-function connection(config: ClientConfig, clientId = randomUUID()) {
-  const request = async (path: string, body?: unknown, signal?: AbortSignal, headers: Record<string, string> = {}, method?: string) => {
-    const response = await fetch(config.origin + "/api" + path, {
-      method: method ?? (body === undefined ? "GET" : "POST"), redirect: "error",
-      headers: { Authorization: `Bearer ${config.token}`, "X-Infinite-Client": clientId, ...(body === undefined ? {} : { "Content-Type": "application/json" }), ...headers },
-      body: body === undefined ? undefined : body instanceof Uint8Array ? body as unknown as BodyInit : JSON.stringify(body),
-      signal: signal ?? AbortSignal.timeout(15000),
-    });
-    if (!response.ok) {
-      // Server errors may contain request details; report only a bounded category.
-      const detail = await response.json().catch(() => ({})) as { code?: unknown };
-      const code = typeof detail.code === "string" && /^[a-z0-9-]{1,80}$/.test(detail.code) ? detail.code : undefined;
-      const guidance = code === "stale-enrollment-revision" ? "The repository enrollment changed; refresh its status and submit a new request ID." :
-        response.status === 401 ? "Pair a current device key." : response.status === 403 ? "This device is not permitted to perform that action." : "Inspect the current state before retrying a mutation.";
-      throw new HttpError(response.status, `Host returned HTTP ${response.status}${code ? ` (${code})` : ""}. ${guidance}`, code);
-    }
-    return response;
-  };
-  return { request, json: async <T>(path: string, body?: unknown, signal?: AbortSignal, headers?: Record<string, string>, method?: string): Promise<T> => (await request(path, body, signal ? AbortSignal.any([signal, AbortSignal.timeout(15000)]) : undefined, headers, method)).json() as Promise<T> };
-}
 function sessionCwd(session: Session & Partial<WorkerState>) {
   return (session.execution?.location ?? session.executionLocation) === "laptop" ? session.workspace?.cwd : session.cwd;
 }
-/** One line per session, with where its tools run: the live executor when the session reports one, else its recorded location. */
 function printSessions(sessions: (Session & Partial<WorkerState>)[], machine: string) {
   for (const s of sessions) {
     const execution = s.execution;
@@ -133,7 +124,7 @@ function printResources(value: ResourceSnapshot) {
   for (const session of value.sessions) console.log(`Session ${clean(session.sessionId)} · PID ${session.pid ?? "unavailable"} · CPU ${percent(session.cpuPercent)} · RSS ${bytes(session.rssBytes)} (provider process)`);
   for (const item of value.unavailable) console.log(`Unavailable ${clean(item.field)}: ${clean(item.reason)}`);
 }
-async function resources(api: ReturnType<typeof connection>, options: Record<string, string | boolean>) {
+async function resources(api: ClientApi, options: Record<string, string | boolean>) {
   const abort = new AbortController(), stop = () => abort.abort();
   process.on("SIGINT", stop); process.on("SIGTERM", stop);
   try {
@@ -151,7 +142,7 @@ async function resources(api: ReturnType<typeof connection>, options: Record<str
   finally { process.off("SIGINT", stop); process.off("SIGTERM", stop); }
 }
 
-async function closeSession(api: ReturnType<typeof connection>, me: Me, selected: Session, options: Record<string, string | boolean>) {
+async function closeSession(api: ClientApi, me: Me, selected: Session, options: Record<string, string | boolean>) {
   if (me.role !== "owner") throw new Error("Closing a session requires an owner device key");
   const session = await api.json<Session & WorkerState>(`/sessions/${selected.id}`);
   if (session.status !== "running") throw new Error(`Session is ${clean(session.status)}. Inspect it with infinite monitor ${selected.id}; no close was sent.`);
@@ -204,9 +195,6 @@ async function selectSession(sessions: Session[], requested: string | undefined,
     return candidates[Number(answer) - 1];
   } finally { input.close(); }
 }
-// The server's headless terminal already answers device queries. Replaying them
-// on a second terminal would inject duplicate answers as if they were user input.
-// Clipboard OSC sequences are also excluded from recording replay.
 function terminalRenderer() {
   let pending = "";
   return (text: string) => {
@@ -236,7 +224,7 @@ function terminalRenderer() {
 async function attach(config: ClientConfig, configFile: string, me: Me, session: Session, watch: boolean, launched = false) {
   if (!me.terminal?.stream) throw new Error("Upgrade the host to a version with native CLI streaming support");
   if (!watch && !launched && !["running", "starting"].includes(session.status)) throw new Error("This process is no longer running. Use infinite monitor ID to replay its recording. A server reboot requires explicit provider-native recovery");
-  const clientId = randomUUID(), api = connection(config, clientId), abort = new AbortController();
+  const clientId = randomUUID(), api = createClientApi(config, clientId), abort = new AbortController();
   let render = terminalRenderer();
   const progress = startupProgress();
   const notice = (message: string) => process.stderr.write(`\r\n[Infinite] ${message}\r\n`);
@@ -249,16 +237,27 @@ async function attach(config: ClientConfig, configFile: string, me: Me, session:
   let handoffTimer: ReturnType<typeof setTimeout> | undefined, handoffBusy = false, handoffNotice = "";
   let renewal: ReturnType<typeof setInterval> | undefined;
   let lastStatus: Status = session.status;
-  // A detached CLI has no background job to keep alive. Terminate this client
-  // after restoring the TTY; an open proxy stream must not prevent detachment.
+  let tailIncomplete = false;
   const stop = () => { restoreTerminal(); process.exit(0); };
   const owner = me.role === "owner" && me.terminal.raw;
-  const resize = () => {
+  const RESIZE_RETRY_MS = [250, 500, 1000];
+  let resizeRetry: ReturnType<typeof setTimeout> | undefined, resizeAttempts = 0;
+  const sendSize = () => {
     if (!interactive || !online || !process.stdout.isTTY) return;
     const cols = Math.max(20, Math.min(240, process.stdout.columns || 120)), rows = Math.max(5, Math.min(100, process.stdout.rows || 32));
-    screen.resize(cols, rows);
     if (duplex) { try { duplex.resize(cols, rows); } catch {} }
-    else void api.json(`/sessions/${session.id}/resize`, { cols, rows }).catch(() => {});
+    else void api.json(`/sessions/${session.id}/resize`, { cols, rows }).catch(refusedResize);
+  };
+  const refusedResize = () => {
+    if (resizeRetry || resizeAttempts >= RESIZE_RETRY_MS.length || abort.signal.aborted) return;
+    resizeRetry = setTimeout(() => { resizeRetry = undefined; sendSize(); }, RESIZE_RETRY_MS[resizeAttempts++]);
+    resizeRetry.unref();
+  };
+  const resize = () => {
+    if (!interactive || !online || !process.stdout.isTTY) return;
+    clearTimeout(resizeRetry); resizeRetry = undefined; resizeAttempts = 0;
+    screen.resize(Math.max(20, Math.min(240, process.stdout.columns || 120)), Math.max(5, Math.min(100, process.stdout.rows || 32)));
+    sendSize();
   };
   const loseControl = (message: string) => {
     clearInterval(renewal); renewal = undefined;
@@ -340,7 +339,7 @@ async function attach(config: ClientConfig, configFile: string, me: Me, session:
         notice(message);
         stop();
       }
-    } catch { /* Older hosts return no handoff route; normal attachment continues. */ }
+    } catch {}
     finally { handoffBusy = false; scheduleHandoff(nextPollMs); }
   };
   const send = async () => {
@@ -413,7 +412,6 @@ async function attach(config: ClientConfig, configFile: string, me: Me, session:
       const signal = AbortSignal.any([abort.signal, stalled.signal]);
       try {
         if (!warned) progress.start(`Connecting to ${providerNames[session.provider] ?? session.provider} terminal`);
-        // A fresh HTTP connection resumes only the recording cursor, never the provider.
         duplex = me.terminal.duplex ? terminalConnection(config.origin, config.token, session.id, cursor, signal, { clientId, snapshot: me.terminal.snapshot, control: me.terminal.control }) : undefined;
         async function* legacyPages(): AsyncGenerator<TerminalPage> {
           const response = await api.request(`/sessions/${session.id}/stream?after=${cursor}`, undefined, signal);
@@ -432,13 +430,19 @@ async function attach(config: ClientConfig, configFile: string, me: Me, session:
         for await (const page of duplex ? duplex.pages() : legacyPages()) {
             clearTimeout(watchdog); watchdog = setTimeout(() => stalled.abort(), 20000);
             if (page.error) throw new Error("Stream interrupted");
-            if (page.refusal) loseControl(new TerminalControlError(page.refusal.code).message);
+            if (page.resizeRefusal) refusedResize();
+            else if (page.refusal) loseControl(new TerminalControlError(page.refusal.code).message);
             if (page.snapshot) {
               render = terminalRenderer();
               await screen.snapshot(render(page.snapshot.ansi), page.snapshot.cols, page.snapshot.rows);
               progress.stop();
+            } else if (!interactive && typeof page.open?.cols === "number" && typeof page.open?.rows === "number") {
+              screen.resize(page.open.cols, page.open.rows);
             }
             for (const event of page.events ?? []) {
+              if (!interactive && event.type === "lifecycle" && typeof event.data.cols === "number" && typeof event.data.rows === "number") {
+                screen.resize(event.data.cols, event.data.rows);
+              }
               if (event.type === "output") {
                 const text = render(String(event.data.text));
                 if (text) progress.stop();
@@ -447,6 +451,7 @@ async function attach(config: ClientConfig, configFile: string, me: Me, session:
             }
             if (page.cursor !== undefined) cursor = page.cursor;
             if (page.state) { lastStatus = page.state.status; if (page.state.exitCode !== undefined) process.exitCode = page.state.exitCode; }
+            if (page.state?.outputTailIncomplete) tailIncomplete = true;
             if (!online && page.state) {
               progress.stop(); online = true;
               leasesSupported = Boolean(duplex && me.terminal.control && page.state.capabilities?.inputControl);
@@ -459,7 +464,7 @@ async function attach(config: ClientConfig, configFile: string, me: Me, session:
               initialControl = false; warned = false;
             }
         }
-        if (["exited", "unavailable"].includes(lastStatus)) { notice(`Session ${lastStatus}. The recording remains on the host.`); break; }
+        if (["exited", "unavailable"].includes(lastStatus)) { notice(`Session ${lastStatus}. The recording remains on the host${tailIncomplete ? ", but may be missing the session's last output" : ""}.`); break; }
         throw new Error("Stream ended");
       } catch (error) {
         if (abort.signal.aborted) break;
@@ -484,15 +489,11 @@ async function attach(config: ClientConfig, configFile: string, me: Me, session:
   }
 }
 
-const CLIENT_COMMANDS = new Set(["pair", "resume", "monitor", "recover", "projects", "start", "mission", "board", "understand", "list", "usage", "cost", "evidence", "resources", "close", "sync", "pull", "team", "repo", "routine"]);
+const CLIENT_COMMANDS = new Set(["pair", "resume", "monitor", "recover", "projects", "start", "mission", "board", "understand", "list", "usage", "cost", "evidence", "fuse", "resources", "close", "sync", "pull", "team", "repo", "routine", "autonomy", "routing", "signal", "halt", "egress", "permissions", "goal", "eval", "duels"]);
 export interface ParsedClientArgs { command: string; args: string[]; options: Record<string, string | boolean>; includes: string[] }
-const CLIENT_STRING_OPTIONS = new Set(["--client-config", "--project", "--workspace", "--title", "--token-file", "--output", "--prd", "--provider", "--setup-json", "--check-json", "--linear-team", "--linear-project", "--handoff", "--request-id", "--pending", "--head", "--processes-stopped", "--identity", "--revision", "--file", "--relationship", "--delivery", "--source", "--repository", "--base-branch", "--merge-method", "--teamwork", "--permissions", "--permission-scope", "--permission-limit", "--role"]);
-const CLIENT_BOOLEAN_OPTIONS = new Set(["--detach", "--json", "--local-ui", "--takeover", "--laptop", "--cloud", "--stop", "--status", "--apply", "--force", "--watch", "--yes", "--logs"]);
+const CLIENT_STRING_OPTIONS = new Set(["--client-config", "--project", "--workspace", "--title", "--token-file", "--output", "--prd", "--provider", "--setup-json", "--check-json", "--linear-team", "--linear-project", "--handoff", "--request-id", "--pending", "--head", "--processes-stopped", "--identity", "--revision", "--file", "--relationship", "--delivery", "--source", "--repository", "--base-branch", "--merge-method", "--teamwork", "--permissions", "--permission-scope", "--permission-limit", "--role", "--autonomy", "--profile", "--run", "--by", "--sources", "--days", "--judge", "--pairs", "--judge-minutes", "--member", "--issue", "--commit", "--at", "--reason", "--withdraw", "--goal", "--mission", "--kind", "--task", "--since", "--direction", "--note", "--set", "--limit", "--before", "--after", "--version", "--routing", "--routing-value", "--routing-contributor", "--routing-points"]);
+const CLIENT_BOOLEAN_OPTIONS = new Set(["--detach", "--host", "--json", "--local-ui", "--takeover", "--laptop", "--cloud", "--stop", "--status", "--apply", "--force", "--watch", "--yes", "--logs", "--board", "--dry-run", "--all", "--clear-direction", "--wrong", "--rejected", "--raised", "--keep-paused"]);
 
-/**
- * The provider or client command that `handleClientCommand` dispatches on. A token that directly follows
- * a client string option, or an option the client parser does not know, is that option's value.
- */
 export function clientCommandCandidate(args: readonly string[]): string | undefined {
   for (let index = 0; index < args.length; index++) {
     const token = args[index];
@@ -502,7 +503,6 @@ export function clientCommandCandidate(args: readonly string[]): string | undefi
   return undefined;
 }
 
-/** Infinite options come before the provider; everything after a provider is passed through unchanged. */
 export function parseClientArgs(argv: string[]): ParsedClientArgs {
   const args = [...argv];
   const options: Record<string, string | boolean> = {};
@@ -517,9 +517,7 @@ export function parseClientArgs(argv: string[]): ParsedClientArgs {
   while (args[0]?.startsWith("--")) option();
   const command = args.shift() ?? "";
   const positional: string[] = [];
-  // Unknown commands belong to the server CLI, whose options this parser must not reject.
   if (CLIENT_COMMANDS.has(command)) while (args.length) { if (args[0].startsWith("--")) option(); else positional.push(args.shift()!); }
-  // Checked after trailing options, so `infinite sync --include DIR` is refused like the leading form.
   if (options["--cloud"] && options["--laptop"]) throw new Error("Choose either cloud execution or --laptop");
   if (options["--laptop"]) {
     if (command !== "codex") throw new Error("--laptop starts a Codex session in this directory. Resume existing sessions with infinite resume ID.");
@@ -533,13 +531,12 @@ export function parseClientArgs(argv: string[]): ParsedClientArgs {
   if (options["--watch"] && command !== "resources") throw new Error("--watch applies to infinite resources");
   if (options["--yes"] && command !== "close") throw new Error("--yes applies to infinite close");
   if (options["--logs"] && command !== "team") throw new Error("--logs applies to infinite team status or infinite team watch");
-  if (options["--logs"] && options["--json"]) throw new Error("Use either --logs or --json");
+  if (options["--logs"] && options["--json"]) throw new Error("Use either --logs or --json"); if (options["--board"] && (command !== "team" || options["--logs"] || options["--json"])) throw new Error(command !== "team" ? "--board applies to infinite team watch" : options["--logs"] ? "Use either --board or --logs" : "Use either --board or --json");
   if (command === "resources" && positional.length) throw new Error("infinite resources takes no arguments");
   if (command === "close" && positional.length !== 1) throw new Error("Usage: infinite close SESSION_ID [--yes] [--takeover]");
   return { command, args: providers.has(command) ? args : positional, options, includes };
 }
 
-/** Real path of `path`, resolving the nearest existing ancestor when the path does not exist yet. */
 function realPath(path: string): string {
   const missing: string[] = [];
   for (let current = resolve(path); ; current = dirname(current)) {
@@ -549,7 +546,6 @@ function realPath(path: string): string {
     }
   }
 }
-/** Checkout roots recorded by sync services in `syncDir`, running or not. An unreadable record names no root. */
 function syncRoots(syncDir: string) {
   if (!existsSync(syncDir)) return [];
   return readdirSync(syncDir).flatMap(name => {
@@ -561,7 +557,6 @@ function gitRoot(cwd: string) {
   try { return realpathSync(execFileSync("git", ["-C", cwd, "rev-parse", "--show-toplevel"], { encoding: "utf8", timeout: 3000, stdio: ["ignore", "pipe", "ignore"] }).trim()); }
   catch { return cwd; }
 }
-/** A local sync record keeps offline stop and explicit apply/pull pointed at this checkout. */
 function localSyncProject(syncDir: string, origin: string): string | undefined {
   if (!existsSync(syncDir)) return undefined;
   const root = gitRoot(realpathSync(process.cwd()));
@@ -584,7 +579,6 @@ type ProjectDetail = { id: string; name: string; sync: { lastSyncedAt?: string; 
 const shortHead = (head?: string) => head ? clean(head.slice(0, 8)) : undefined;
 const sourceBranch = (source: ProjectSourceStatus) => clean(source.baseBranch ?? "unknown");
 const sourceOrigin = (source: ProjectSourceStatus) => `origin/${sourceBranch(source)}`;
-/** One-line source status for project listings and launch output. */
 export function describeSource(source: ProjectSourceStatus, now = Date.now()): string {
   if (source.mode !== "github") return "follows laptop";
 
@@ -615,14 +609,11 @@ export function describeSource(source: ProjectSourceStatus, now = Date.now()): s
   return `${prefix} · ${state}${savedBranch ? ` · saved local edits on ${clean(savedBranch)}` : ""}`;
 }
 
-/** Compare the enrolled checkout with the host's last fetched commit without fetching. */
 export function compareLaptop(root: string, source: ProjectSourceStatus, now = Date.now()): string {
   const branch = sourceOrigin(source);
   const mirrorHead = source.mirrorHead;
   if (!mirrorHead) return `host has not fetched ${branch} yet`;
   if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(mirrorHead)) return "host is ahead; fetch to compare";
-  // Comparison is strictly local, including for partial clones whose promisor remote
-  // could otherwise be contacted by Git when an object is missing.
   const localGit = { cwd: root, env: { ...process.env, GIT_NO_LAZY_FETCH: "1" } };
 
   try {
@@ -686,14 +677,20 @@ async function showProjects(me: Me, api: { json<T>(path: string): Promise<T> }, 
   await listProjects(groups, api, json);
 }
 
-/** One line per provider. Period words come from each provider's own window, never a fixed "month". */
 export function usageLines(summary: import("./usage-service.js").UsageSummary): string[] {
   const width = Math.max(...Object.keys(summary.providers).map(name => name.length));
   return Object.entries(summary.providers).map(([name, entry]) => {
     const label = name.padEnd(width);
-    if (!entry.measured || !entry.spent) return `${label}  unmeasured (${entry.unmeasuredSessions} session${entry.unmeasuredSessions === 1 ? "" : "s"}, no usage is recorded for this provider)`;
     const days = Math.round((Date.parse(entry.period.end) - Date.parse(entry.period.start)) / 86_400_000);
     const word = entry.budget?.period ?? (days <= 1 ? "day" : days <= 7 ? "week" : "month");
+    if (!entry.measured || !entry.spent) {
+      if (entry.recorded && entry.recorded.messages > 0) {
+        const tokens = Object.values(entry.recorded.tokens).reduce((sum, value) => sum + value, 0);
+        const partial = entry.partialSessions ? `, ${entry.partialSessions} partial` : "";
+        return `${label}  ${tokens} tokens for ${word} from ${entry.period.start.slice(0, 10)} (${entry.recorded.messages} steps${partial}, ${entry.unmeasuredSessions} unmeasured sessions)`;
+      }
+      return `${label}  unmeasured (${entry.unmeasuredSessions} session${entry.unmeasuredSessions === 1 ? "" : "s"}, no usage is recorded for this provider)`;
+    }
     const unpriced = entry.spent.pricing.unknown;
     const detail = [`${entry.spent.messages} steps`, ...(unpriced ? [`${unpriced} unpriced`] : []), `${entry.unmeasuredSessions} unmeasured sessions`].join(", ");
     const { messages, pricing } = entry.spent, noPrice = messages > 0 && pricing.unknown === messages;
@@ -703,7 +700,6 @@ export function usageLines(summary: import("./usage-service.js").UsageSummary): 
   });
 }
 
-/** Lines for `infinite evidence status`. Host text is cleaned before it reaches the terminal. */
 export function evidenceStatusLines(status: import("./evidence/types.js").EvidenceDescription): string[] {
   return [
     `Evidence store: ${clean(String(status.state))}`,
@@ -712,6 +708,87 @@ export function evidenceStatusLines(status: import("./evidence/types.js").Eviden
     `File: ${Number(status.fileBytes)} bytes, WAL: ${Number(status.walBytes)} bytes`,
     `Events: ${Number(status.events)}`,
   ];
+}
+
+export function fuseLines(view: import("./fuse/service.js").FuseView): string[] {
+  const line = (name: string, scope: import("./fuse/service.js").FuseScopeView) => {
+    if (scope.state === "closed") return `${name}: closed, ${Number(scope.hour.launches)} of ${Number(scope.hour.limit)} launches in the last hour`;
+    const cause = scope.trip?.cause === "unmeasurable" ? "launch record unreadable, it closes once it can be read"
+      : scope.trip?.ownerClose ? "launch rate, the owner must close it" : "launch rate, it closes on its own";
+    return `${name}: open (${clean(cause)})`;
+  };
+  return [
+    line("Host", view.host),
+    ...view.projects.map(project => line(`Project ${clean(String(project.projectId))}`, project)),
+    ...(view.writeFailedAt ? [`The host could not record a launch at ${clean(String(view.writeFailedAt))}. New team launches wait until it can.`] : []),
+  ];
+}
+
+export type FuseCommand = { action: "view" } | { action: "close"; scope: { scope: "host" } | { scope: "project"; projectId: string } };
+const FUSE_USAGE = "Usage: infinite fuse [--json] | infinite fuse close --project ID | --host";
+export function parseFuseCommand(positional: readonly string[], options: Record<string, string | boolean>): FuseCommand {
+  const host = options["--host"] === true, project = options["--project"];
+  if (positional.length === 0 && !host && project === undefined) return { action: "view" };
+  if (positional.length !== 1 || positional[0] !== "close" || host === (project !== undefined)) throw new Error(FUSE_USAGE);
+  if (host) return { action: "close", scope: { scope: "host" } };
+  return { action: "close", scope: { scope: "project", projectId: String(project) } };
+}
+
+export function outcomeCellLines(result: CellsResult): string[] {
+  const level = (count: LevelCount) => `${count.yes} yes, ${count.no} no, ${count.unknown} unknown, ${count.rate === null ? "rate unknown" : `${Math.round(count.rate * 100)}%${count.interval ? ` (${Math.round(count.interval[0] * 100)}–${Math.round(count.interval[1] * 100)}%)` : ""}`}`;
+  const lines = result.cells.length === 0 ? ["No outcome rows match."] : result.cells.map(cell => {
+    const key = Object.entries(cell.key).map(([name, value]) => `${clean(name)}=${clean(value)}`).join(" ") || "all";
+    const excluded = `excluded limit ${cell.excluded.limit}, owner ${cell.excluded.owner}, host ${cell.excluded.host}, duel ${cell.excluded.duel}`;
+    const counts = cell.completed ? [`completed ${level(cell.completed)}`]
+      : (["integrated", "accepted", "firstPass", "held"] as const).map(name => `${name} ${level(cell.levels[name])}`);
+    return [`${key} · sources ${cell.sources.map(clean).join(", ")} · attempts ${cell.attempts} · open ${cell.open} · ${excluded}`, ...counts,
+      ...(cell.enough ? [] : [`fewer than ${MIN_COUNTED_ROWS} counted attempts`])].join(" · ");
+  });
+  if (result.unreadable > 0) lines.push(`Unreadable rows left out: ${result.unreadable}.`);
+  return lines;
+}
+
+export function outcomeRollupLines(rollup: OutcomeRollup): string[] {
+  const { runs, cost, unreadable } = rollup;
+  const names = (record: Record<string, number>) => Object.keys(record).sort().map(name => `${clean(name)} ${record[name]}`).join(", ");
+  const held = rollup.known ? "" : " · not held by the host";
+  const head = rollup.target.kind === "goal"
+    ? `Goal ${clean(rollup.target.id)}${rollup.assessment ? ` · assessment ${clean(rollup.assessment.result)} at ${clean(rollup.assessment.at)}` : " · no assessment"}`
+    : `Mission ${clean(rollup.target.id)}`;
+  const blocked = Object.keys(runs.blockCodes).length > 0 ? ` · blocked by ${names(runs.blockCodes)}` : "";
+  const lines = [
+    `${head}${held}`,
+    `Runs ${runs.total} · with a summary ${runs.withSummary} · settled ${runs.withCounts} · deleted ${runs.deleted} · status ${Object.keys(runs.status).length ? names(runs.status) : "none"}${blocked}${runs.flagged.backfilled > 0 ? ` · backfilled ${runs.flagged.backfilled}` : ""}${runs.flagged.gap > 0 ? ` · gap ${runs.flagged.gap}` : ""}`,
+  ];
+  if (runs.counts === null) lines.push("No run has settled, so its counts are unknown.");
+  else {
+    lines.push(`Counts: ${Object.entries(runs.counts).map(([name, value]) => `${clean(name)} ${value}`).join(", ")}`);
+    if (runs.rounds) lines.push(`Rounds: total ${runs.rounds.total}, attributed ${runs.rounds.attributed}, unattributed ${runs.rounds.unattributed}, unknown ${runs.rounds.unknown}`);
+  }
+  const attempts = Object.entries(rollup.attempts).filter((entry): entry is [string, number] => entry[1] !== undefined);
+  lines.push(attempts.length ? `Attempts: ${attempts.map(([name, value]) => `${clean(name)} ${value}`).join(", ")}` : "Attempts: none");
+  lines.push("Implementers:", ...outcomeCellLines({ cells: rollup.implementer, unreadable: 0 }));
+  if (rollup.scout.length > 0) lines.push("Scouts:", ...outcomeCellLines({ cells: rollup.scout, unreadable: 0 }));
+  lines.push(`Members without a task: ${rollup.members}`);
+  const tokens = cost.tokens === null ? "tokens unknown" : `tokens ${cost.tokens}`;
+  lines.push(`Cost: ${tokens} over ${cost.complete} of ${cost.sessions} sessions${cost.spentUsd === null ? "" : ` · spent $${formatUsd(cost.spentUsd)}`}${cost.noSession > 0 ? ` · ${cost.noSession} without a session` : ""}`);
+  if (unreadable.summaries + unreadable.rows + unreadable.members > 0)
+    lines.push(`Unreadable records left out: ${unreadable.summaries} summaries, ${unreadable.rows} rows, ${unreadable.members} member results.`);
+  if (rollup.unindexed > 0) lines.push(`Records with no goal or mission index: ${rollup.unindexed}.`);
+  return lines;
+}
+
+export function legacyRefusedLines(lines: readonly { line: number; outcome: LegacyLineOutcome }[]): string[] {
+  return lines.filter(line => line.outcome === "changed" || line.outcome === "conflict").map(line => `Line ${line.line}: ${line.outcome}`);
+}
+
+export function legacyImportLines(result: { dryRun: boolean; lines: { line: number; outcome: LegacyLineOutcome }[]; removed: number; batches: number }): string[] {
+  const count = (name: LegacyLineOutcome) => result.lines.filter(line => line.outcome === name).length;
+  const refused = legacyRefusedLines(result.lines);
+  const summary = `Imported ${count("imported")}, repeated ${count("repeated")}, superseded ${count("superseded")}, expired ${count("expired")}, refused ${refused.length}, removed ${result.removed}.`;
+  const dry = result.dryRun ? "Dry run, nothing was written: " : "";
+  const perBatch = result.dryRun && result.batches > 1 ? ` A dry run checks each batch of ${LEGACY_BATCH_MAX} lines on its own.` : "";
+  return [...refused, `${dry}${summary}${perBatch}`];
 }
 
 export function usageBars(values: number[]): string {
@@ -745,7 +822,6 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
   }
   const progress = startupProgress();
   const args = [...argv];
-  // Keep server administration commands and their --config semantics intact.
   const candidate = clientCommandCandidate(args);
   if (!candidate || (candidate === "list" && args.includes("--config"))) return false;
   try {
@@ -764,7 +840,7 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
       token = token.trim();
       if (!/^[\x21-\x7e]{32,200}$/.test(token)) throw new Error("Provide a device key, not the devices JSON file");
       const config: ClientConfig = { origin: originOf(positional[0]), token };
-      const me = await connection(config).json<Me>("/me");
+      const me = await createClientApi(config).json<Me>("/me");
       if (!me.terminal?.stream) throw new Error("Upgrade the host before pairing this native CLI");
       config.projectId = String(options["--project"] ?? me.projects[0]?.id ?? "");
       if (!me.projects.some(p => p.id === config.projectId)) throw new Error("Unknown project ID");
@@ -773,11 +849,19 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
       console.log(`Paired ${config.origin} as ${me.role}. Credentials saved privately at ${path}`);
       return true;
     }
-    // Existing local-host list remains available before a laptop is paired.
     if (command === "list" && !existsSync(path) && !options["--client-config"] && !process.env.INFINITE_CLIENT_CONFIG) return false;
-    const config = loadConfig(path), api = connection(config);
+    const config = loadConfig(path), api = createClientApi(config);
     if (command === "understand") return await handleUnderstandingCommand(positional, options, api);
     if (command === "routine") return await handleRoutineClientCommand(positional, options, api);
+    if (command === "autonomy") return await handleAutonomyClientCommand(positional, options, api);
+    if (command === "routing") { await handleRoutingClientCommand(positional, options, api); return true; }
+    if (command === "signal") return await handleSignalClientCommand(positional, options, api);
+    if (command === "halt") return await handleHaltClientCommand(positional, options, api);
+    if (command === "egress") return await handleEgressClientCommand(positional, options, api);
+    if (command === "goal") return await handleGoalClientCommand(positional, options, api);
+    if (command === "permissions") return await handlePermissionsClientCommand(positional, options, api);
+    if (command === "eval") return await handleEvalClientCommand(positional, options, api);
+    if (command === "duels") return await handleDuelClientCommand(positional, options, api);
     if (command === "team" || command === "repo") {
       return await handleTeamClientCommand(command, positional, options, config, api, path, argv);
     }
@@ -785,6 +869,170 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
       const { sessions } = await api.json<{ sessions: Session[] }>("/sessions");
       if (options["--json"]) console.log(JSON.stringify(sessions, null, 2));
       else printSessions(sessions, (await api.json<Me>("/me")).machine?.label || new URL(config.origin).hostname);
+      return true;
+    }
+    if (command === "usage" && positional[0] === "outcomes") {
+      const runId = options["--run"];
+      const goalId = options["--goal"], missionId = options["--mission"];
+      if (positional.length === 1 && (goalId !== undefined || missionId !== undefined)) {
+        if (goalId !== undefined && missionId !== undefined) throw new Error("Usage: infinite usage outcomes --goal ID | --mission ID [--json]. Give one of --goal or --mission, not both.");
+        const [kind, id] = goalId !== undefined ? ["goal", String(goalId)] : ["mission", String(missionId)];
+        let rollup: OutcomeRollup;
+        try {
+          rollup = await api.json<OutcomeRollup>(`/outcomes/rollup?${kind}=${encodeURIComponent(id)}`);
+        } catch (error) {
+          if (error instanceof HttpError && error.status === 404) throw new Error("No roll-up exists for this goal or mission. Check the ID.");
+          if (error instanceof HttpError && error.status === 400) throw new Error("The host refused the roll-up query.");
+          if (error instanceof HttpError && error.status === 503) throw new Error("The evidence store is unavailable.");
+          throw error;
+        }
+        if (options["--json"]) console.log(JSON.stringify(rollup, null, 2));
+        else for (const line of outcomeRollupLines(rollup)) console.log(line);
+        return true;
+      }
+      if (positional.length === 2 && positional[1] === "import-legacy") {
+        const file = options["--file"];
+        if (typeof file !== "string" || !file) throw new Error("Usage: infinite usage outcomes import-legacy --file FILE [--dry-run] [--json]");
+        let text: string;
+        try { text = readFileSync(file, "utf8"); } catch { throw new Error("The file could not be read."); }
+        const parsed = parseLegacyFile(text, Date.now());
+        if ("errors" in parsed) {
+          for (const error of parsed.errors) console.log(`Line ${error.line}: ${clean(error.reason)}${error.path === undefined ? "" : ` at ${clean(error.path)}`}`);
+          console.log("Nothing was sent.");
+          process.exitCode = 1;
+          return true;
+        }
+        const dryRun = options["--dry-run"] === true;
+        const { lines, numbers } = parsed;
+        const outcomes: { line: number; outcome: LegacyLineOutcome }[] = [];
+        let removed = 0, batches = 0;
+        for (let start = 0; start < lines.length; start += LEGACY_BATCH_MAX) {
+          const batch = lines.slice(start, start + LEGACY_BATCH_MAX);
+          const first = numbers[start]!;
+          const sentThrough = start === 0 ? "" : ` Lines 1 to ${numbers[start - 1]} were sent; run the same command again to continue.`;
+          let answer: LegacyImportResult;
+          try {
+            answer = await api.json<LegacyImportResult>("/outcomes/legacy", { dryRun, lines: batch }, undefined, undefined, "POST");
+            if (!Array.isArray(answer.outcomes) || answer.outcomes.length !== batch.length)
+              throw new Error(`The host answered the batch that starts at line ${first} with another number of lines. Check that the host and this command are the same version.`);
+          } catch (error) {
+            for (const line of legacyRefusedLines(outcomes)) console.log(line);
+            if (error instanceof HttpError && error.status === 403) throw new Error("Importing legacy outcomes requires an owner device key.");
+            if (error instanceof HttpError && error.status === 409) throw new Error(`The host holds too many legacy lines: the limit is 50,000. The batch that starts at line ${first} was not imported.`);
+            if (error instanceof HttpError && error.status === 400) throw new Error(`The host refused the batch that starts at line ${first} as invalid. Nothing of it was imported.`);
+            if (error instanceof HttpError && error.status === 503) throw new Error(start === 0 ? "The evidence store is unavailable. No line was imported; run the same command again." : `The evidence store is unavailable.${sentThrough}`);
+            throw error;
+          }
+          batches++;
+          removed += answer.removed;
+          outcomes.push(...answer.outcomes.map((outcome, index) => ({ line: numbers[start + index]!, outcome })));
+        }
+        if (options["--json"]) console.log(JSON.stringify({ dryRun, lines: outcomes, removed }, null, 2));
+        else for (const line of legacyImportLines({ dryRun, lines: outcomes, removed, batches })) console.log(line);
+        if (outcomes.some(line => line.outcome === "changed" || line.outcome === "conflict")) process.exitCode = 1;
+        return true;
+      }
+      if (positional.length === 1 && typeof runId === "string" && runId) {
+        type Level = 0 | 1 | null;
+        type OutcomeView = {
+          rows: { memberId: string; role: string; profileId: string; disposition: string; integrated: Level; accepted: Level; firstPass: Level; held: Level }[];
+          members: { memberId: string; role: string; profileId: string; disposition: string }[];
+          signals?: { signalId: string; outcomeId: string | null; kind: string; author: string; state: string; at: string }[];
+        };
+        const level = (value: Level) => value === 1 ? "yes" : value === 0 ? "no" : "unknown";
+        let view: OutcomeView;
+        try {
+          view = await api.json<OutcomeView>(`/outcomes/runs/${encodeURIComponent(runId)}`);
+        } catch (error) {
+          if (error instanceof HttpError && error.status === 404) throw new Error(`No outcome rows exist for run \"${clean(runId)}\".`);
+          if (error instanceof HttpError && error.status === 503) throw new Error("The evidence store is unavailable.");
+          throw error;
+        }
+        if (options["--json"]) console.log(JSON.stringify(view, null, 2));
+        else if (view.rows.length === 0 && view.members.length === 0) console.log("No outcome rows exist for this run.");
+        else {
+          for (const row of view.rows)
+            console.log(`${clean(row.memberId)} ${clean(row.role)} ${clean(row.profileId)} ${clean(row.disposition)} integrated=${level(row.integrated)} accepted=${level(row.accepted)} firstPass=${level(row.firstPass)} held=${level(row.held)}`);
+          for (const member of view.members)
+            console.log(`${clean(member.memberId)} ${clean(member.role)} ${clean(member.profileId)} ${clean(member.disposition)}`);
+          for (const signal of view.signals ?? []) {
+            const member = signal.outcomeId?.slice(runId.length + 1);
+            console.log(`signal ${clean(signal.signalId.slice(0, 12))} ${clean(signal.kind)} ${clean(signal.author)} ${clean(signal.state)} ${clean(signal.at)}${member ? ` ${clean(member)}` : ""}`);
+          }
+        }
+        return true;
+      }
+      if (positional.length === 1 && runId === undefined && options["--profile"] === undefined) {
+        const params = new URLSearchParams();
+        for (const [flag, name] of [["--project", "project"], ["--role", "role"], ["--by", "by"], ["--sources", "sources"], ["--days", "days"]] as const) {
+          const value = options[flag];
+          if (typeof value === "string") params.set(name, value);
+        }
+        let view: CellsResult & { use: string };
+        try {
+          view = await api.json<CellsResult & { use: string }>(`/outcomes${params.size ? `?${params}` : ""}`);
+        } catch (error) {
+          if (error instanceof HttpError && error.status === 503) throw new Error("The evidence store is unavailable.");
+          if (error instanceof HttpError && error.status === 400) throw new Error(`The host refused the outcome query.${error.code ? ` Code: ${clean(error.code)}.` : ""}`);
+          throw error;
+        }
+        if (options["--json"]) console.log(JSON.stringify(view, null, 2));
+        else for (const line of outcomeCellLines(view)) console.log(line);
+        return true;
+      }
+      if (positional.length === 2 && (positional[1] === "link-fix" || positional[1] === "exclude")) {
+        const signalUsage = "Usage: infinite usage outcomes link-fix --run ID [--member ID] (--issue KEY | --commit SHA) [--at TIME] [--request-id ID] [--json] | infinite usage outcomes exclude --run ID --member ID --reason REASON [--request-id ID] [--json] | either form with --withdraw SIGNAL";
+        const optionValue = (name: string) => { const value = options[name]; return typeof value === "string" && value ? value : undefined; };
+        const signalKind = positional[1] === "link-fix" ? "linked-fix" : "exclusion";
+        const requestId = optionValue("--request-id") ?? randomUUID();
+        const withdraw = optionValue("--withdraw");
+        const signalRun = optionValue("--run");
+        const signalMember = optionValue("--member");
+        let body: Record<string, unknown>;
+        if (withdraw !== undefined) body = { action: "withdraw", kind: signalKind, signalId: withdraw };
+        else if (positional[1] === "link-fix") {
+          const issue = optionValue("--issue"), commit = optionValue("--commit"), at = optionValue("--at");
+          if (signalRun === undefined || (issue === undefined && commit === undefined)) throw new Error(signalUsage);
+          body = { action: "record", kind: signalKind, requestId, runId: signalRun, ...(signalMember === undefined ? {} : { memberId: signalMember }),
+            ...(issue === undefined ? {} : { issue }), ...(commit === undefined ? {} : { commit }), ...(at === undefined ? {} : { at }) };
+        } else {
+          const reason = optionValue("--reason");
+          if (signalRun === undefined || signalMember === undefined || reason === undefined) throw new Error(signalUsage);
+          body = { action: "record", kind: signalKind, requestId, runId: signalRun, memberId: signalMember, reason };
+        }
+        type Signal = { signalId: string; kind: string; author: string; state: string; at: string };
+        let signalResult: { signal: Signal; repeated: boolean };
+        try {
+          signalResult = await api.json<{ signal: Signal; repeated: boolean }>("/outcomes/signals", body, undefined, undefined, "POST");
+        } catch (error) {
+          if (error instanceof HttpError && error.status === 403) throw new Error("Recording a signal requires an owner device key.");
+          if (error instanceof HttpError && error.status === 404) throw new Error("The run, the member, or the signal was not found.");
+          if (error instanceof HttpError && error.status === 409) throw new Error("The request conflicts with a recorded signal.");
+          if (error instanceof HttpError && error.status === 503) throw new Error("The evidence store is unavailable.");
+          if (error instanceof HttpError && error.status === 400) throw new Error(signalUsage);
+          throw error;
+        }
+        if (options["--json"]) console.log(JSON.stringify(signalResult, null, 2));
+        else console.log(`Signal ${clean(signalResult.signal.signalId)} ${clean(signalResult.signal.state)}${signalResult.repeated ? " (repeated)" : ""}`);
+        return true;
+      }
+      const profileId = options["--profile"];
+      if (positional.length !== 2 || positional[1] !== "new-epoch" || typeof profileId !== "string" || !profileId)
+        throw new Error("Usage: infinite usage outcomes --run ID [--json] | infinite usage outcomes new-epoch --profile ID [--json] | infinite usage outcomes link-fix|exclude ... (see --withdraw) | infinite usage outcomes [--project ID] [--role ROLE] [--by LIST] [--sources LIST] [--days N] [--json] | infinite usage outcomes --goal ID | --mission ID [--json] | infinite usage outcomes import-legacy --file FILE [--dry-run] [--json]");
+      type Epoch = { profileId: string; provider: string; model: string | null; effort: string | null; epoch: number; since: string; repeated: boolean };
+      let result: Epoch;
+      try {
+        result = await api.json<Epoch>("/outcomes/epochs", { profileId, requestId: randomUUID() }, undefined, undefined, "POST");
+      } catch (error) {
+        if (error instanceof HttpError && error.status === 403) throw new Error("Advancing a profile epoch requires an owner device key.");
+        if (error instanceof HttpError && error.status === 404) throw new Error(`No configured profile has ID \"${clean(profileId)}\". Check the lineup in the team settings.`);
+        if (error instanceof HttpError && error.status === 409 && error.code === "request-conflict") throw new Error("This request was already used for another profile. No epoch was advanced.");
+        if (error instanceof HttpError && error.status === 409 && error.code === "profile-ambiguous") throw new Error(`Profile \"${clean(profileId)}\" names more than one configuration. Give each its own ID.`);
+        if (error instanceof HttpError && error.status === 503) throw new Error("The evidence store is unavailable. No epoch was advanced; retry later.");
+        throw error;
+      }
+      if (options["--json"]) console.log(JSON.stringify(result, null, 2));
+      else console.log(`Profile ${clean(result.profileId)} (${[result.provider, result.model, result.effort].filter((value): value is string => value !== null).map(clean).join(" ")}) is in epoch ${result.epoch} since ${clean(result.since)}.`);
       return true;
     }
     if (command === "cost" && positional[0] === "plan") {
@@ -814,14 +1062,14 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
     if (command === "cost" && positional.length) throw new Error("Usage: infinite cost [plan ACCOUNT USD|reset] [--json]");
     if (command === "usage" || command === "cost") {
       const sub = positional[0], tz = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC", query = `?tz=${encodeURIComponent(tz)}`;
-      if (sub === "projects") { const result = await api.json("/usage/projects" + query); if (options["--json"]) console.log(JSON.stringify(result, null, 2)); else console.log(JSON.stringify(result, null, 2)); return true; }
-      if (sub === "project" || sub === "goal") { if (!positional[1]) throw new Error(`Usage: infinite usage ${sub} ID [--json]`); const result = await api.json(sub === "project" ? `/usage/projects/${encodeURIComponent(positional[1])}${query}` : `/goals/${encodeURIComponent(positional[1])}`); if (options["--json"]) console.log(JSON.stringify(result, null, 2)); else console.log(JSON.stringify(result, null, 2)); return true; }
-      if (sub === "models") { const result = await api.json(`/usage/models?role=${encodeURIComponent(String(options["--role"] ?? "implementer"))}`); if (options["--json"]) console.log(JSON.stringify(result, null, 2)); else console.log(JSON.stringify(result, null, 2)); return true; }
-      if (sub || positional.length) throw new Error("Usage: infinite usage [projects|project ID|goal ID|models [--role ROLE]] [--json]");
+      if (sub === "repairs") return await handleUsageRepairsCommand(positional.slice(1), options, api);
+      if (sub === "interrupted") return await handleUsageInterruptedCommand(positional.slice(1), options, api);
+      if (sub === "projects") { const result = await api.json("/usage/projects" + query); console.log(JSON.stringify(result, null, 2)); return true; }
+      if (sub === "project" || sub === "goal") { if (!positional[1]) throw new Error(`Usage: infinite usage ${sub} ID [--json]`); console.log(JSON.stringify(await api.json(sub === "project" ? `/usage/projects/${encodeURIComponent(positional[1])}${query}` : `/goals/${encodeURIComponent(positional[1])}`), null, 2)); return true; }
+      if (sub === "models") { console.log(JSON.stringify(await api.json(`/usage/models?role=${encodeURIComponent(String(options["--role"] ?? "implementer"))}`), null, 2)); return true; }
+      if (sub || positional.length) throw new Error("Usage: infinite usage [repairs|interrupted|projects|project ID|goal ID|models [--role ROLE]] [--json]");
       const [summary, daily] = await Promise.all([api.json<import("./usage-service.js").UsageSummary>("/usage"), api.json<{ days: { date: string; usd: number }[] }>(`/usage/daily?days=30&tz=${encodeURIComponent(tz)}`)]);
-      if (options["--json"]) console.log(JSON.stringify({ ...summary, daily }, null, 2));
-      else for (const line of usageOverview(summary, daily)) console.log(line);
-      return true;
+      if (options["--json"]) console.log(JSON.stringify({ ...summary, daily }, null, 2)); else for (const line of usageOverview(summary, daily)) console.log(line); return true;
     }
     if (command === "evidence") {
       if (positional.length !== 1 || positional[0] !== "status") throw new Error("Usage: infinite evidence status [--json]");
@@ -830,9 +1078,24 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
       else for (const line of evidenceStatusLines(status)) console.log(line);
       return true;
     }
+    if (command === "fuse") {
+      const fuseCommand = parseFuseCommand(positional, options);
+      if (fuseCommand.action === "view") {
+        const view = await api.json<import("./fuse/service.js").FuseView>("/fuse");
+        if (options["--json"]) console.log(JSON.stringify(view, null, 2));
+        else for (const line of fuseLines(view)) console.log(line);
+        return true;
+      }
+      const closed = await api.json<{ result: string; view: import("./fuse/service.js").FuseView }>("/fuse/close", fuseCommand.scope);
+      if (options["--json"]) console.log(JSON.stringify(closed, null, 2));
+      else {
+        console.log(`Close result: ${clean(String(closed.result))}`);
+        for (const line of fuseLines(closed.view)) console.log(line);
+      }
+      return true;
+    }
     if (command === "resources") { await resources(api, options); return true; }
     if (command === "sync" && (options["--stop"] || options["--status"])) {
-      // The service is a local process: stopping or inspecting it must not depend on reaching the host.
       const syncDir = join(dirname(path), "sync");
       const recorded = existsSync(syncDir) ? readdirSync(syncDir).flatMap(name => /^([a-z0-9-]{1,80})\.json$/.exec(name)?.[1] ?? []) : [];
       if (options["--stop"]) {
@@ -915,9 +1178,8 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
       const { sessions } = await api.json<{ sessions: Session[] }>("/sessions");
       const selected = await selectSession(sessions, positional[0], true);
       progress.start("Downloading a cloud checkpoint for reconciliation");
-      const call = async (method: string, extra: Record<string, unknown> = {}, signal?: AbortSignal) =>
-        (await api.request(`/sessions/${selected.id}/workspace-export`, { method, ...extra },
-          signal ? AbortSignal.any([signal, AbortSignal.timeout(300000)]) : AbortSignal.timeout(300000))).json();
+      const call = (method: string, extra: Record<string, unknown> = {}, signal?: AbortSignal) =>
+        api.json<any>(`/sessions/${selected.id}/workspace-export`, { method, ...extra }, signal, undefined, undefined, 300000);
       const exported = await call("sync/export");
       const manifest = validateWorkspaceManifest(exported.manifest);
       const directory = join(dirname(path), "workspaces", selected.id);
@@ -945,12 +1207,11 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
       const projectId = String(enrolled ?? mapped?.id ?? options["--project"] ?? localSyncProject(join(dirname(path), "sync"), config.origin) ?? config.projectId ?? me.projects[0]?.id ?? "");
       if (!PROJECT_ID.test(projectId) || (!mapped && !me.projects.some(p => p.id === projectId))) throw new Error("Unknown project. Use infinite projects");
       if (options["--apply"]) {
-        // A large tree can take minutes to publish; a refusal (409) leaves its reason in the pending marker.
-        const applied = await api.request(`/projects/${projectId}/sync/apply`, options["--force"] ? { force: true } : {}, AbortSignal.timeout(300000)).catch(async (error: unknown) => {
+        const applied = await api.json<ProjectDetail["sync"]>(`/projects/${projectId}/sync/apply`, options["--force"] ? { force: true } : {}, undefined, undefined, undefined, 300000).catch(async (error: unknown) => {
           if (!(error instanceof HttpError) || error.status !== 409) throw error;
           throw new Error(`Not applied. ${describeSync((await api.json<ProjectDetail>(`/projects/${projectId}`)).sync)}`);
         });
-        console.log(describeSync(await applied.json() as ProjectDetail["sync"])); return true;
+        console.log(describeSync(applied)); return true;
       }
       const sourceDetail = await api.json<ProjectDetail>(`/projects/${projectId}`);
       if (sourceDetail.source?.mode === "github") throw new Error("This project follows GitHub; laptop sync is off. Push to GitHub, or re-enroll with infinite repo init --source laptop.");
@@ -971,14 +1232,11 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
       const directory = join(dirname(path), "pulls", projectId);
       const storeDir = { directory: join(directory, "objects"), sharedPoolDirectory: join(dirname(path), "workspace-pool") };
       const output = options["--output"] === undefined ? undefined : resolve(String(options["--output"]));
-      // A sync service uploads everything under its root, so a pulled copy there would travel back to the cloud.
       const target = realPath(output ?? directory);
       if (syncRoots(join(dirname(path), "sync")).some(root => target === root || target.startsWith(root.endsWith(sep) ? root : root + sep)))
         throw new Error("Choose an --output directory outside every synced checkout; the sync service would upload the pulled copy");
       progress.start("Downloading the cloud project tree");
-      const exportSignal = AbortSignal.timeout(300000);
-      // The host scans the whole cloud tree before replying; api.json would cap that at 15 s.
-      const { manifest: exported } = await (await api.request(`/projects/${projectId}/sync/export`, {}, exportSignal)).json() as { manifest: unknown };
+      const { manifest: exported } = await api.json<{ manifest: unknown }>(`/projects/${projectId}/sync/export`, {}, undefined, undefined, undefined, 300000);
       const manifest = validateWorkspaceManifest(exported);
       const hashes = [...new Set(manifest.entries.flatMap(entry => entry.chunks ?? []))];
       for (let offset = 0; offset < hashes.length; offset += 512)
@@ -1054,8 +1312,6 @@ export async function handleClientCommand(argv: string[]): Promise<boolean> {
       if (workspace) {
         progress.start("Connecting the laptop executor");
         await startLaptopService({ ...config, sessionId: session.id, workspaceToken: workspace.token, cwd: workspace.cwd, roots: workspace.roots, configFile: path });
-        // Tunnel readiness precedes provider admission. Detached launch must not
-        // report success if the backend rejects this executor or the first thread.
         progress.start("Preparing the first laptop turn");
         const deadline = Date.now() + 30000;
         while (true) {

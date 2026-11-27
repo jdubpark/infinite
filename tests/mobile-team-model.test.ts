@@ -21,25 +21,30 @@ test("phone team controls follow the documented roles and goal ownership", () =>
   assert.deepEqual(teamControls(team(), "owner", true), { answer: true, steer: true, pause: true, resume: false, cancel: true });
   assert.deepEqual(teamControls(team(), "controller", true), { answer: true, steer: true, pause: false, resume: false, cancel: false });
   assert.deepEqual(teamControls(team(), "viewer", true), { answer: false, steer: false, pause: false, resume: false, cancel: false });
-  // A goal-owned team is steered and stopped from its goal; its decisions stay answerable here.
   assert.deepEqual(teamControls(team({ goal: { id: "goal", revision: 1, cycle: 1 } }), "owner", true), { answer: true, steer: false, pause: false, resume: false, cancel: false });
-  // A mission subteam is run only by its coordinator; the owner talks to the coordinator instead.
-  assert.deepEqual(teamControls(team({ missionId: "mission", status: "blocked", resumable: true }), "owner", true), { answer: false, steer: false, pause: false, resume: false, cancel: false });
-  // A stale view offers nothing until a poll succeeds.
+  assert.deepEqual(teamControls(team({ missionId: "mission", status: "blocked", resumable: true }), "owner", true), { answer: false, steer: false, pause: false, resume: false, cancel: true });
   assert.deepEqual(teamControls(team(), "owner", false), { answer: false, steer: false, pause: false, resume: false, cancel: false });
   assert.deepEqual(teamControls(team({ status: "paused" }), "owner", true), { answer: false, steer: true, pause: false, resume: true, cancel: true });
-  // A team blocked by a member's runtime limit resumes from its preserved integration commit.
   assert.deepEqual(teamControls(team({ status: "blocked", resumable: true }), "owner", true), { answer: true, steer: true, pause: false, resume: true, cancel: true });
   assert.equal(teamControls(team({ status: "blocked", resumable: true }), "controller", true).resume, false);
-  // Delivery is a separate phase: decisions remain answerable, steering stops, and an owner can still pause an in-flight publisher.
   assert.deepEqual(teamControls(team({ status: "delivering" }), "owner", true), { answer: true, steer: false, pause: true, resume: false, cancel: true });
-  // A merge receipt is an agent claim; steering and pausing stop, while decisions stay answerable.
   assert.deepEqual(teamControls(team({ status: "merged" }), "owner", true), { answer: true, steer: false, pause: false, resume: false, cancel: true });
   const receipt = { revision: 2, headCommit: "a".repeat(40), pullRequestUrl: "https://github.com/owner/repo/pull/12", mergeCommit: "b".repeat(40), summary: "Merged", reportedAt: "2026-01-01T00:00:00.000Z" };
   assert.deepEqual(teamControls(team({ status: "paused", deliveryReceipt: receipt }), "owner", true), { answer: false, steer: false, pause: false, resume: false, cancel: true });
   assert.deepEqual(teamControls(team({ status: "blocked", deliveryReceipt: receipt }), "owner", true), { answer: true, steer: false, pause: false, resume: false, cancel: true });
   for (const status of ["blocked", "ready-for-review", "no-change"] as const) assert.equal(teamControls(team({ status }), "owner", true).pause, false, status);
   assert.deepEqual(teamControls(team({ status: "cancelled" }), "owner", true), { answer: false, steer: false, pause: false, resume: false, cancel: false });
+});
+
+test("an owner may cancel a blocked goal or mission run only while the view is fresh", () => {
+  const goalRun = { id: "goal", revision: 1, cycle: 1 };
+  assert.equal(teamControls(team({ status: "blocked", goal: goalRun }), "owner", true).cancel, true);
+  assert.equal(teamControls(team({ status: "implementing", goal: goalRun }), "owner", true).cancel, false);
+  assert.equal(teamControls(team({ status: "blocked", goal: goalRun }), "controller", true).cancel, false);
+  assert.equal(teamControls(team({ status: "blocked", goal: goalRun }), "owner", false).cancel, false);
+  assert.equal(teamControls(team({ status: "blocked", missionId: "mission" }), "owner", true).cancel, true);
+  assert.equal(teamControls(team({ status: "blocked", missionId: "mission" }), "viewer", true).cancel, false);
+  assert.equal(teamControls(team({ status: "blocked" }), "owner", true).cancel, true);
 });
 
 test("phone worker status reports live capacity and waiting ready tasks", () => {
@@ -55,9 +60,7 @@ test("phone goal controls allow an outcome only after the goal has stopped", () 
   assert.deepEqual(goalControls(goal(), "owner", true), { steer: true, pause: true, resume: false, cancel: true, outcome: false });
   assert.deepEqual(goalControls(goal(), "controller", true), { steer: true, pause: false, resume: false, cancel: false, outcome: false });
   assert.deepEqual(goalControls(goal({ status: "paused" }), "owner", true, beforeDeadline), { steer: false, pause: false, resume: true, cancel: true, outcome: false });
-  // Pausing does not extend the deadline; the host refuses to resume an expired goal.
   assert.equal(goalControls(goal({ status: "paused" }), "owner", true, Date.parse("2026-01-01T01:00:00.000Z")).resume, false);
-  // The cycle may still be stopping after cancellation; the outcome waits for it.
   assert.equal(goalControls(goal({ status: "cancelled" }), "owner", true).outcome, false);
   assert.deepEqual(goalControls(goal({ status: "ready-for-review", activeTeamId: undefined }), "controller", true), { steer: false, pause: false, resume: false, cancel: false, outcome: true });
   assert.equal(goalControls(goal({ status: "ready-for-review", activeTeamId: undefined }), "viewer", true).outcome, false);
@@ -80,16 +83,13 @@ test("a late poll cannot replace a newer recorded revision, and only current que
 test("an unconfirmed run request stays pending for an identical retry until the host answers it", () => {
   const key = "machine/team/run";
   const first = runRequests.begin(key, { requestId: "first", revision: 2, path: "/teams/run/steer", label: "Direction", fields: { text: "Keep the layout" } });
-  // A second send while the first is unconfirmed resends the original request, not a new one.
   assert.equal(runRequests.begin(key, { requestId: "second", revision: 3, path: "/teams/run/pause", label: "Pause", fields: {} }), first);
   runRequests.fail(key, "first", "The host did not respond.");
   assert.equal(runRequests.read(key).pending, first);
-  // A late answer for a different request cannot settle this one.
   assert.equal(runRequests.complete(key, "second", { id: "run" }), false);
   assert.equal(runRequests.read(key).pending, first);
   assert.equal(runRequests.complete(key, "first", { id: "run" }, "Direction recorded"), true);
   assert.equal(runRequests.read(key).pending, undefined);
-  // A refusal clears the request so the person decides again against the refreshed run.
   runRequests.begin(key, { requestId: "third", revision: 3, path: "/teams/run/pause", label: "Pause", fields: {} });
   runRequests.fail(key, "third", "This team is not running and cannot be paused.", true);
   assert.equal(runRequests.read(key).pending, undefined);
@@ -102,7 +102,6 @@ const question = { id: "q", memberId: "m", revision: 2, question: "Which?", opti
 test("phone run lists put work waiting on a person first and fold stopped runs together", () => {
   assert.equal(teamGroup(team({ status: "needs-input" })), "attention");
   assert.equal(teamGroup(team({ status: "blocked" })), "attention");
-  // An open question pulls a working run into Needs you; a cancelled run's questions can no longer be answered.
   assert.equal(teamGroup(team({ decisions: [question] })), "attention");
   assert.equal(teamGroup(team({ status: "cancelled", decisions: [question] })), "closed");
   assert.equal(teamGroup(team({ status: "no-change" })), "closed");
@@ -139,10 +138,8 @@ test("blocked team runs lead the list stably and only eligible owners can resume
 
 test("phone status icons show plan progress without reading a full ring as completion", () => {
   assert.deepEqual(teamKind(team({ tasks: [task("t1", "integrated"), task("t2", "integrated"), task("t3", "running"), task("t4", "pending")] })), { kind: "progress", fraction: 0.5 });
-  // Planning has no tasks yet, but started work still shows a quarter.
   assert.deepEqual(teamKind(team({ status: "planning" })), { kind: "progress", fraction: 0.25 });
   assert.equal(teamKind(team({ status: "ready-for-review" })).kind, "review");
-  // A mission subteam waiting on its coordinator needs nothing from the owner, unless a provider prompt is open.
   assert.equal(teamKind(team({ missionId: "mission", status: "needs-input" })).kind, "progress");
   assert.equal(teamKind(team({ missionId: "mission", status: "needs-input" }), 1).kind, "attention");
   assert.equal(teamKind(team({ status: "paused", decisions: [question] })).kind, "paused");
@@ -173,33 +170,25 @@ const lineup = (tier?: "light" | "strong") => ({ coordinator: { id: "pm", label:
 const delegated = { permissions: { mode: "coordinator" as const, scope: "Read access", maxDecisions: 3 }, lineup: lineup("strong") };
 
 test("agent prompts reach a person only when the coordinator cannot or did not decide them", () => {
-  // The host marks a prompt delegable only with the complete evidence a coordinator review needs.
   const permission = { id: 7, kind: "permission", delegable: true };
-  // Without delegation every open agent prompt waits on a person.
   assert.equal(approvalOwner(team(), "s-a", permission), "person");
-  // A delegated one-shot permission is the coordinator's, until it escalates or its decision goes stale.
   assert.equal(approvalOwner(team(delegated), "s-a", permission), "coordinator");
   assert.equal(approvalOwner(team({ ...delegated, permissionDecisions: [decided("a", 7, "reviewing")] }), "s-a", permission), "coordinator");
   assert.equal(approvalOwner(team({ ...delegated, permissionDecisions: [decided("a", 7, "escalated")] }), "s-a", permission), "person");
   assert.equal(approvalOwner(team({ ...delegated, permissionDecisions: [decided("a", 7, "stale")] }), "s-a", permission), "person");
-  // A decision about an earlier prompt does not cover a new one.
   assert.equal(approvalOwner(team({ ...delegated, permissionDecisions: [decided("a", 6, "answered")] }), "s-a", permission), "coordinator");
-  // Questions, destructive or multi-select commands, revoked delegation, and a spent decision budget stay with a person.
   assert.equal(approvalOwner(team(delegated), "s-a", { id: 7, kind: "question", delegable: true }), "person");
   assert.equal(approvalOwner(team(delegated), "s-a", { id: 7, kind: "permission", delegable: true, destructive: { pattern: "rm-rf" } }), "person");
   assert.equal(approvalOwner(team(delegated), "s-a", { id: 7, kind: "permission", delegable: true, multiSelect: true }), "person");
   assert.equal(approvalOwner(team({ ...delegated, permissionsRevokedAt: "2026-01-01T00:00:00.000Z" }), "s-a", permission), "person");
   const spent = ["x", "y", "z"].map((id, index) => decided(id, index, "answered"));
   assert.equal(approvalOwner(team({ ...delegated, permissionDecisions: spent }), "s-a", permission), "person");
-  // A prompt without the host's delegable evidence (the INF-80 Codex command dialog had none) waits on a person, even under a strong coordinator.
   assert.equal(approvalOwner(team(delegated), "s-a", { id: 7, kind: "permission" }), "person");
-  // Only a strong coordinator reviews, so a light coordinator or a run without a lineup leaves the prompt with a person.
   assert.equal(approvalOwner(team({ ...delegated, lineup: lineup("light") }), "s-a", permission), "person");
   assert.equal(approvalOwner(team({ permissions: delegated.permissions }), "s-a", permission), "person");
 
   const run = team({ ...delegated, members: [member("a"), member("b"), member("c", "stopped"), { ...member("d"), revision: 1 }], permissionDecisions: [decided("b", 9, "escalated")] });
   const sessions = [waiting("a", permission), waiting("b", { id: 9, kind: "permission", delegable: true }), waiting("c", { id: 1, kind: "question" }), waiting("d", { id: 2, kind: "question" })];
-  // Only live members of the current revision count; a's prompt is the coordinator's, b's was escalated.
   assert.deepEqual(pendingApprovals(run, sessions).map(item => item.member.memberId), ["b"]);
   assert.equal(teamGroup(run, 1), "attention");
   assert.equal(teamKind(run, 1).kind, "attention");
@@ -210,7 +199,6 @@ test("the coordinator card's phase track follows the recorded work, with deliver
   const states = (run: TeamView) => teamPhases(run).map(phase => `${phase.label}:${phase.state}`).join(" ");
   assert.equal(states(team({ status: "planning" })), "Plan:current Build:todo Integrate:todo Check:todo Review:todo");
   assert.equal(states(team({ status: "verifying", tasks: [task("t1", "integrated")] })), "Plan:done Build:done Integrate:done Check:current Review:todo");
-  // A run waiting on a person keeps the step its work reached.
   assert.equal(states(team({ status: "needs-input", tasks: [task("t1", "integrated"), task("t2", "running")] })), "Plan:done Build:current Integrate:todo Check:todo Review:todo");
   const review = { verdict: "approved" as const, summary: "Looks right", revision: 2 };
   assert.equal(states(team({ status: "ready-for-review", review })), "Plan:done Build:done Integrate:done Check:done Review:done");

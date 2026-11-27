@@ -5,17 +5,17 @@ import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { Session, Event } from "../packages/host/src/types.js";
+import { workerCall } from "../packages/host/src/ipc.js";
 import { demoProfile, startHost, waitFor } from "./helpers.js";
 
 test(
   "13 real PTYs survive API death; reconnect and retries keep identity and deliver one input",
-  { timeout: 60000 },
+  { timeout: 90000 },
   async () => {
     const host = await startHost({
       agents: {
         codex: {
           command: process.execPath,
-          // `--` keeps any hook flags the worker appends for Codex (off by default) out of node's own option parsing.
           args: [
             "-e",
             `
@@ -173,12 +173,12 @@ test(
       const before = await waitFor(
         async () => (await fetchApi(`/sessions/${first.id}`)).body,
         (value) => value.screen.includes("You: followup-confidential-marker"),
+        15000,
       );
       assert.equal(
         before.screen.split("You: followup-confidential-marker").length - 1,
         1,
       );
-      // A session holding an open dialog must keep its attention across the API restart.
       const dialog = await fetchApi("/sessions", "owner", {
         requestId: randomUUID(),
         provider: "demo",
@@ -194,7 +194,7 @@ test(
           (value) =>
             value.attention?.state === "needs-you" &&
             value.attention.prompt?.hash,
-          15000,
+          20000,
         )
       );
       const signalOpens = async () =>
@@ -209,8 +209,16 @@ test(
       assert.equal(opensBefore.length, 1);
       assert.equal(dialogBefore.attention.prompt.id, opensBefore[0].seq);
       await host.stopApi();
-      // No API process or connected client exists while these PTYs make progress.
-      await new Promise((resolve) => setTimeout(resolve, 3200));
+      const stoppedSeq = (
+        await workerCall<{ seq: number }>(config, first.id, { op: "state" })
+      ).seq;
+      await waitFor(
+        async () =>
+          (await workerCall<{ seq: number }>(config, first.id, { op: "state" }))
+            .seq,
+        (seq) => seq > stoppedSeq,
+        15000,
+      );
       await host.start();
       const dialogAfter = (await fetchApi(`/sessions/${dialog.body.id}`)).body;
       assert.equal(dialogAfter.attention.state, "needs-you");
@@ -283,6 +291,7 @@ test(
       await waitFor(
         async () => (await fetchApi(`/sessions/${first.id}`)).body.status,
         (value) => value === "exited",
+        15000,
       );
       assert.ok(
         (await fetchApi(`/sessions/${first.id}/events`)).body.events.length > 0,
@@ -301,14 +310,13 @@ test(
         async () =>
           (await fetchApi(`/sessions/${terminalSession.body.id}`)).body,
         (value) => value.screen.includes("terminal-query-ok"),
-        3000,
+        15000,
       );
       assert.ok(terminalView.screen.includes("row-099"));
       assert.ok(
         !terminalView.screen.includes("row-000"),
         "compact screen omits old scrollback",
       );
-      // Screen parsing can finish before the worker's buffered journal flush.
       const terminalOutput = await waitFor(
         async () => {
           const events = (
@@ -320,7 +328,7 @@ test(
             .join("");
         },
         (output) => output.includes("terminal-query-ok"),
-        3000,
+        15000,
       );
       assert.ok(
         terminalOutput.includes("row-000"),

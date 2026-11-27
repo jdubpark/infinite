@@ -64,13 +64,13 @@ struct CmuxWorkspaceView: View {
                 Text("TERMINALS").font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary)
                 Spacer()
                 Button { Task { await model.refresh() } } label: { Image(systemName: "arrow.clockwise") }.buttonStyle(.borderless).disabled(model.connecting)
-                Button { showingCreate = true } label: { Image(systemName: "plus") }.buttonStyle(.borderless).disabled(!model.connected || model.busy)
+                Button { showingCreate = true } label: { Image(systemName: "plus") }.buttonStyle(.borderless).disabled(!model.connected || !model.creationReceiptLoaded || model.busy)
             }
             TextField("Find terminal or path", text: $search).textFieldStyle(.roundedBorder)
             if model.creationPending {
                 VStack(alignment: .leading, spacing: 6) {
                     Text("An earlier creation is unconfirmed.").font(.caption)
-                    Button("Retry same creation") { Task { await model.retryCreation() } }.disabled(model.busy || !model.connected)
+                    Button("Retry same creation") { Task { await model.retryCreation() } }.disabled(model.busy || !model.connected || !model.creationReceiptLoaded)
                     Button("Clear after checking catalog") { model.clearCreationAfterReview() }.font(.caption).disabled(model.busy)
                 }.padding(8).background(Color.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: 6))
             }
@@ -111,7 +111,7 @@ struct CmuxWorkspaceView: View {
                     }.opacity(!model.attached || model.attaching ? 1 : 0)
                         .disabled(model.attached || model.attaching || model.busy || !model.connected)
                     Toggle("Enable input", isOn: Binding(get: { model.inputEnabled }, set: { model.setInputEnabled($0) })).toggleStyle(.checkbox).disabled(!model.attached || !model.connected || !model.snapshotReady)
-                    Toggle("Direct keys", isOn: $model.directInput).toggleStyle(.checkbox).disabled(!model.inputEnabled)
+                    Toggle("Direct keys", isOn: Binding(get: { model.directInput }, set: { model.setDirectInput($0) })).toggleStyle(.checkbox).disabled(!model.inputEnabled)
                     Button { terminateID = id } label: { Image(systemName: "stop.circle") }.help("Terminate this server terminal").disabled(model.busy || !model.connected)
                 }.padding(10)
                 GeometryReader { area in
@@ -131,7 +131,7 @@ struct CmuxWorkspaceView: View {
                         Button("Clear after checking terminal") { model.clearPendingAfterReview() }.disabled(model.sending)
                     }.padding(.horizontal, 12).padding(.vertical, 8)
                 }
-                PromptEditor(text: Binding(get: { model.draft.text }, set: model.setDraft), enabled: model.canSend, submit: { Task { await model.send() } }).frame(height: 100)
+                PromptEditor(text: Binding(get: { model.draft.text }, set: model.setDraft), enabled: model.canSend, editable: !model.draftEditingLocked, submit: { Task { await model.send() } }).frame(height: 100)
                 HStack {
                     Text(model.directInput ? "Direct keys go to the terminal. Local draft is kept." : "Local draft · Enter sends · Shift-Enter adds a line").font(.system(size: 10)).foregroundStyle(.secondary)
                     Spacer()
@@ -150,7 +150,7 @@ struct CmuxWorkspaceView: View {
                 else {
                     Image(systemName: "terminal").font(.largeTitle).foregroundStyle(.secondary)
                     Text("Select a terminal or start an agent.").foregroundStyle(.secondary)
-                    Button("New terminal") { showingCreate = true }.disabled(!model.connected || model.creationPending)
+                    Button("New terminal") { showingCreate = true }.disabled(!model.connected || !model.creationReceiptLoaded || model.creationPending)
                 }
             }.frame(maxWidth: .infinity, maxHeight: .infinity)
         }
@@ -198,7 +198,7 @@ private struct CmuxCreateSheet: View {
             HStack {
                 Button("Cancel") { isPresented = false }; Spacer()
                 Button("Start") { isPresented = false; Task { await model.create(provider: provider, cwd: cwd, name: name) } }
-                    .buttonStyle(.borderedProminent).disabled(!cwd.hasPrefix("/") || model.creationPending || model.busy)
+                    .buttonStyle(.borderedProminent).disabled(!cwd.hasPrefix("/") || !model.creationReceiptLoaded || model.creationPending || model.busy)
             }
         }.textFieldStyle(.roundedBorder).padding(24).frame(width: 460)
             .onAppear { cwd = model.selected?.cwd ?? "" }

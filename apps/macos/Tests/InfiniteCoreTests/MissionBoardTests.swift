@@ -1,8 +1,6 @@
 import XCTest
 @testable import InfiniteCore
 
-/// The project-first Home reads the host's project, board, and mission JSON directly; these pin the
-/// grouping and filtering it derives from them.
 final class MissionBoardTests: XCTestCase {
     private func parse(_ text: String) throws -> JSON { try JSON.parse(Data(text.utf8)) }
     private func item(_ id: String, column: String, updatedAt: String, groupID: String? = "storefront", project: String = "Storefront", kind: String = "mission") -> JSON {
@@ -25,12 +23,25 @@ final class MissionBoardTests: XCTestCase {
         XCTAssertEqual(list.groups.map(\.id), ["storefront", "notes"])
         XCTAssertEqual(list.groups.map(\.repoCountLabel), ["2 repos", nil])
         XCTAssertEqual(list.group("storefront")?.revision, 3)
-        // A repository without a display name falls back to its host project ID.
         XCTAssertEqual(list.repoName("storefront-api"), "storefront-api")
         XCTAssertEqual(list.repoName("notes"), "notes")
         XCTAssertNil(list.repoName("missing"))
         XCTAssertEqual(list.suggestions.count, 1)
         XCTAssertEqual(ProjectGroupList.empty.groups, [])
+    }
+
+    func testRepositoriesListEveryCheckoutPrimaryFirstAndOlderHostsFallBackToThePrimary() throws {
+        let list = ProjectGroupList(try parse("""
+        {"groups":[
+          {"id":"storefront","name":"Storefront","repos":[
+            {"projectId":"storefront-api","name":"storefront-api","path":"/srv/work/api","checkouts":[
+              {"projectId":"storefront-api","primary":true},{"projectId":"storefront-api-review","primary":false}]},
+            {"projectId":"storefront-web","name":"storefront-web","path":"/srv/work/web"}]}
+        ],"suggestions":[]}
+        """))
+        let group = try XCTUnwrap(list.group("storefront"))
+        XCTAssertEqual(group.repos.map(\.checkoutIDs), [["storefront-api", "storefront-api-review"], ["storefront-web"]])
+        XCTAssertEqual(group.projectIDs, ["storefront-api", "storefront-api-review", "storefront-web"])
     }
 
     func testBoardColumnsFollowBoardOrderNewestFirstAndHideEmptyOnes() {
@@ -49,7 +60,6 @@ final class MissionBoardTests: XCTestCase {
         XCTAssertEqual(BoardColumn.allCases.map(\.title), ["Needs input", "Working", "Ready for review", "Ended"])
     }
 
-    /// An unknown column still shows, and a row without an ID is dropped rather than colliding.
     func testUnknownColumnsShowAsWorkingAndRowsWithoutIDsDrop() {
         var nameless = item("x", column: "review", updatedAt: "")
         if case .object(var fields) = nameless { fields["id"] = nil; nameless = .object(fields) }
@@ -58,21 +68,27 @@ final class MissionBoardTests: XCTestCase {
         XCTAssertEqual(board.items.first?.column, .working)
     }
 
-    func testFilteringByProjectMatchesGroupIDOrProjectNameWhenUngrouped() {
-        let storefront = ProjectGroup(.object(["id": .string("storefront"), "name": .string("Storefront"), "repos": .array([])]))
-        let notes = ProjectGroup(.object(["id": .string("notes"), "name": .string("Notes"), "implicit": .bool(true), "repos": .array([])]))
+    func testFilteringByProjectMatchesOnlyCanonicalGroupID() {
+        let appOne = ProjectGroup(.object(["id": .string("app-1"), "name": .string("App"), "repos": .array([])]))
+        let appTwo = ProjectGroup(.object(["id": .string("app-2"), "name": .string("App"), "repos": .array([])]))
+        let emptyID = ProjectGroup(.object(["id": .string(""), "name": .string("App"), "repos": .array([])]))
         let board = Board(.object(["items": .array([
-            item("mission", column: "working", updatedAt: "1"),
-            item("team-no-group", column: "review", updatedAt: "2", groupID: nil, kind: "team"),
-            item("notes-goal", column: "working", updatedAt: "3", groupID: "notes", project: "Notes", kind: "goal"),
-            // A group ID wins over a matching name: this row belongs elsewhere.
-            item("elsewhere", column: "working", updatedAt: "4", groupID: "other"),
+            item("app1-mission", column: "working", updatedAt: "6", groupID: "app-1", project: "App"),
+            item("app2-team", column: "review", updatedAt: "5", groupID: "app-2", project: "App", kind: "team"),
+            item("missing-group", column: "review", updatedAt: "4", groupID: nil, project: "App", kind: "team"),
+            item("empty-group", column: "working", updatedAt: "3", groupID: "", project: "App", kind: "goal"),
+            item("orphan-group", column: "working", updatedAt: "2", groupID: "unmapped:group:app-1", project: "App"),
+            item("orphan-project", column: "ended", updatedAt: "1", groupID: "unmapped:project:legacy", project: "App", kind: "team"),
         ])]))
-        XCTAssertEqual(Set(board.items(in: storefront).map(\.id)), ["mission", "team-no-group"])
-        XCTAssertEqual(board.items(in: notes).map(\.id), ["notes-goal"])
-        XCTAssertEqual(board.items(in: nil).count, 4)
-        XCTAssertEqual(board.columns(in: storefront).map(\.column), [.working, .review])
-        XCTAssertEqual(board.count(.working, in: notes), 1)
+        XCTAssertEqual(board.items(in: appOne).map(\.id), ["app1-mission"])
+        XCTAssertEqual(board.items(in: appTwo).map(\.id), ["app2-team"])
+        XCTAssertEqual(board.items(in: emptyID), [])
+        XCTAssertEqual(board.items(in: nil).map(\.id), ["app1-mission", "app2-team", "missing-group", "empty-group", "orphan-group", "orphan-project"])
+        XCTAssertEqual(board.columns(in: appOne).map(\.column), [.working])
+        XCTAssertEqual(board.columns(in: appTwo).map(\.column), [.review])
+        XCTAssertEqual(board.count(.working, in: appOne), 1)
+        XCTAssertEqual(board.count(.review, in: appOne), 0)
+        XCTAssertEqual(board.count(.review, in: appTwo), 1)
     }
 
     func testBoardItemReadsKindsSubtaskProgressAndLabels() throws {
@@ -92,22 +108,23 @@ final class MissionBoardTests: XCTestCase {
         XCTAssertEqual(BoardItem(try parse(#"{"id":"m","subtasks":{"total":4,"running":0,"done":3}}"#)).progressFraction, 0.75)
     }
 
-    /// The row already shows "1/3 subtasks", so the host's closing count is dropped; other detail stays whole.
-    func testCaptionDetailDropsOnlyTheProgressTheRowAlreadyShows() throws {
-        func item(_ detail: String, done: Int = 1, total: Int = 3) throws -> BoardItem {
-            BoardItem(try parse(#"{"id":"m","kind":"mission","detail":"\#(detail)","subtasks":{"total":\#(total),"running":1,"done":\#(done)}}"#))
+    func testCaptionDetailPreservesHostDetailVerbatim() {
+        func item(_ detail: String, done: Int = 1, total: Int = 3) -> BoardItem {
+            BoardItem(.object([
+                "id": .string("m"),
+                "kind": .string("mission"),
+                "detail": .string(detail),
+                "subtasks": .object(["total": .number(Double(total)), "running": .number(1), "done": .number(Double(done))]),
+            ]))
         }
-        XCTAssertEqual(try item("Running: Call api /health from web. 1 of 3 subtasks done").detailBesideProgress, "Running: Call api /health from web")
-        XCTAssertEqual(try item("1 of 3 subtasks done").detailBesideProgress, "")
-        XCTAssertEqual(try item("1 of 1 subtask done", total: 1).detailBesideProgress, "")
-        // The host's own wording for a single subtask.
-        XCTAssertEqual(try item("Running: X. 0 of 1 subtasks done", done: 0, total: 1).detailBesideProgress, "Running: X")
-        // A longer number that merely ends in the row's count is not the row's count.
-        XCTAssertEqual(try item("Running: X. 21 of 3 subtasks done").detailBesideProgress, "Running: X. 21 of 3 subtasks done")
-        // Counts that disagree with the row, a question, and a row without counts keep the host's words.
-        XCTAssertEqual(try item("2 of 3 subtasks done").detailBesideProgress, "2 of 3 subtasks done")
-        XCTAssertEqual(try item("Should web wait for the merge?").detailBesideProgress, "Should web wait for the merge?")
-        XCTAssertEqual(BoardItem(try parse(#"{"id":"m","detail":"0 of 0 subtasks done"}"#)).detailBesideProgress, "0 of 0 subtasks done")
+        XCTAssertEqual(item("Running: Call api /health from web").detailBesideProgress, "Running: Call api /health from web")
+        XCTAssertEqual(item("").detailBesideProgress, "")
+        XCTAssertEqual(item("Planning subtasks", done: 0, total: 0).detailBesideProgress, "Planning subtasks")
+        XCTAssertEqual(item("Should web wait for the merge?").detailBesideProgress, "Should web wait for the merge?")
+        XCTAssertEqual(item("Running: Show 1 of 2 subtasks done", done: 1, total: 2).detailBesideProgress, "Running: Show 1 of 2 subtasks done")
+        XCTAssertEqual(item("Running: Check summary. 1 of 2 subtasks done", done: 1, total: 2).detailBesideProgress, "Running: Check summary. 1 of 2 subtasks done")
+        XCTAssertEqual(item("1 of 2 subtasks done", done: 1, total: 2).detailBesideProgress, "1 of 2 subtasks done")
+        XCTAssertEqual(BoardItem(.object(["id": .string("m"), "detail": .string("Planning subtasks")])).detailBesideProgress, "Planning subtasks")
     }
 
     func testMissionDecodesDecisionsSubtasksAndOwnerControls() throws {
@@ -129,6 +146,7 @@ final class MissionBoardTests: XCTestCase {
         XCTAssertEqual(mission.progress.done, 1)
         XCTAssertEqual(mission.progress.total, 2)
         XCTAssertEqual(mission.subtasks.map(\.sizeLabel), ["Team · up to 3", "Solo"])
+        XCTAssertEqual(mission.subtasks.map(\.typedSize), [.team(parallelism: 3), .solo])
         XCTAssertEqual(mission.subtasks.map(\.teamID), ["t-1", nil])
         XCTAssertEqual(mission.subtasks[0].statusLabel, "Done · Ready for your review")
         XCTAssertEqual(mission.subtasks[1].statusLabel, "Queued")
@@ -140,8 +158,6 @@ final class MissionBoardTests: XCTestCase {
         XCTAssertTrue(mission.canCancel)
     }
 
-    /// A card and its draft follow the decision's host ID. When polling drops an answered question,
-    /// the remaining one keeps its own ID instead of inheriting the first card's position.
     func testOpenDecisionsKeepTheirIdentityWhenAnEarlierOneIsAnswered() {
         func mission(revision: Int, answeredA: Bool) -> Mission {
             var a: [String: JSON] = ["id": .string("a"), "question": .string("Items or products?"), "options": .array([])]
@@ -157,7 +173,6 @@ final class MissionBoardTests: XCTestCase {
         XCTAssertEqual(Set(before.map(\.id)).count, before.count)
     }
 
-    /// An answer names the decision and the revision the owner saw, whatever the mission says by the time it is sent.
     func testRequestsPinTheDecisionAndTheObservedRevision() {
         let answer = MissionRequest.answer(missionID: "m1", decisionID: "b", revision: 3, text: "Yes", requestID: "r1")
         XCTAssertEqual(answer.path, "/missions/m1/answer/b")
@@ -173,7 +188,6 @@ final class MissionBoardTests: XCTestCase {
         XCTAssertTrue(BoardColumn.review.subtitle.contains("each repository's policy"))
     }
 
-    /// Each mission status lands in the column the board contract names, and controls follow it.
     func testMissionStatusesMapToBoardColumnsAndControls() {
         let expected: [String: BoardColumn] = [
             "planning": .working, "working": .working, "paused": .working, "needs-input": .needsInput,
@@ -187,7 +201,6 @@ final class MissionBoardTests: XCTestCase {
         XCTAssertFalse(cancelled.canCancel)
         XCTAssertTrue(cancelled.ended)
         XCTAssertFalse(Mission(.object(["status": .string("ready-for-review")])).canPause)
-        // Answers match the host's running statuses, so a paused, blocked, or cancelled mission offers none.
         for status in ["planning", "working", "needs-input"] { XCTAssertTrue(Mission(.object(["status": .string(status)])).canAnswer, status) }
         for status in ["paused", "blocked", "ready-for-review", "cancelled"] { XCTAssertFalse(Mission(.object(["status": .string(status)])).canAnswer, status) }
     }
@@ -195,11 +208,19 @@ final class MissionBoardTests: XCTestCase {
     func testManagedSessionsDecodeTheirMissionAndOwnerSessionsCarryNone() throws {
         let managed = try parse(#"{"id":"s-1","status":"running","managedBy":{"kind":"mission","missionId":"m-1","teamId":"t-1"}}"#)
         XCTAssertEqual(try managed["managedBy"].decoded(SessionManagement.self), SessionManagement(kind: "mission", missionId: "m-1", teamId: "t-1"))
-        // A coordinator's own session names no team.
         let coordinator = try parse(#"{"id":"s-2","managedBy":{"kind":"mission","missionId":"m-1"}}"#)
         XCTAssertNil(try coordinator["managedBy"].decoded(SessionManagement.self).teamId)
-        // Older hosts and owner-run sessions send no managedBy, which decodes to nil.
         let owned = try parse(#"{"id":"s-3","status":"running"}"#)
         XCTAssertNil(try? owned["managedBy"].decoded(SessionManagement.self))
+    }
+
+    func testDecisionRecommendationReadsOnlyWhenPresentAndNamesTheComparison() throws {
+        XCTAssertNil(DecisionRecommendation(try parse(#"{"id":"d-1","question":"Ship?"}"#)["recommendation"]))
+        XCTAssertNil(DecisionRecommendation(try parse(#"{"recommendation":{"answers":[],"reason":"x"}}"#)["recommendation"]))
+        let recommendation = try XCTUnwrap(DecisionRecommendation(try parse(#"{"recommendation":{"answers":["Yes"],"reason":"Tests pass.","outcome":"different"}}"#)["recommendation"]))
+        XCTAssertTrue(recommendation.recommends("Yes"))
+        XCTAssertFalse(recommendation.recommends("No"))
+        XCTAssertEqual(recommendation.comparisonNote, "Different from the recommendation")
+        XCTAssertNil(DecisionRecommendation(try parse(#"{"answers":["Later"],"outcome":"other"}"#))?.comparisonNote)
     }
 }

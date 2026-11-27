@@ -1,36 +1,49 @@
 import { useState } from "react";
 import { ActivityIndicator, Alert, Pressable, RefreshControl, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import { useRouter } from "expo-router";
-import { api, connectionKey, type Connection, type Me, type Mission, type ProjectGroupList } from "../../api/client";
+import { api, connectionKey, type Board as BoardData, type Connection, type Me, type Mission, type ProjectGroupList } from "../../api/client";
 import { usePoll } from "../../api/usePoll";
 import { FloatingNotice } from "../../components/FloatingNotice";
+import { HaltBanner } from "../halt/HaltBanner";
 import { useKeyboardPadding } from "../../components/keyboard";
 import { Button } from "../../components/Button";
 import { Card, Chip, TopBar } from "../../components/Glass";
 import { Glyph, StatusIcon } from "../../components/Icon";
 import { age } from "../../status";
 import { theme } from "../../theme";
-import { newer } from "../teams/model";
+import { directionSourceLabel, newer } from "../teams/model";
 import { RequestStatus, Section, SteerBox, t } from "../teams/parts";
 import { useRunRequest } from "../teams/useRunRequest";
-import { missionControls, missionStatusLabel, missionSubtaskLabel, openMissionDecisions } from "./model";
+import { attemptLabel, attemptsOf, findBoardItem, missionControls, missionExtendChoices, missionShowsReason, missionStatusLabel, missionStopLine, missionStoppedAtLimit, missionSubtaskLabel, missionTimeLeftMs, openMissionDecisions } from "./model";
+import { DecisionOptions, OutcomeNote, RecommendationBlock, type DecisionRecommendation } from "../teams/Recommendation";
+import { Attempts } from "./Attempts";
+import { MissionProgressSection } from "./MissionProgressSection";
 
 export function MissionDetail({ connection, id }: { connection: Connection; id: string }) {
   const router = useRouter();
   const keyboardPadding = useKeyboardPadding();
   const machine = connectionKey(connection);
   const poll = usePoll(async () => {
-    const [mission, me, projects] = await Promise.all([
+    const [mission, me, projects, board] = await Promise.all([
       api<Mission>(connection, `/missions/${id}`), api<Me>(connection, "/me"), api<ProjectGroupList>(connection, "/project-groups"),
+      api<BoardData>(connection, "/board").catch(() => null),
     ]);
-    return { mission, me, projects, at: Date.now() };
+    return { mission, me, projects, board: board?.items ?? [], at: Date.now() };
   }, 2500, [connection, id]);
-  const [recorded, setRecorded] = useState<Mission | null>(null);
+  const [recordedState, setRecordedState] = useState<{ id: string; mission: Mission } | null>(null);
+  const recorded = recordedState?.id === id ? recordedState.mission : null;
   const [direction, setDirection] = useState("");
   const [dockHeight, setDockHeight] = useState(0);
+  const [extendOpen, setExtendOpen] = useState(false);
   const mission = poll.data ? newer(recorded, poll.data.mission) : recorded;
   const request = useRunRequest<Mission>(connection, `${machine}/mission/${id}`, {
-    accepted: result => { setRecorded(previous => newer(previous, result)); poll.refresh(); },
+    accepted: result => {
+      setRecordedState(previous => ({
+        id,
+        mission: newer(previous?.id === id ? previous.mission : null, result),
+      }));
+      poll.refresh();
+    },
     refused: poll.refresh,
   });
   const fresh = poll.online;
@@ -40,8 +53,15 @@ export function MissionDetail({ connection, id }: { connection: Connection; id: 
 
   const me = poll.data?.me;
   const now = poll.data?.at ?? 0;
+  const board = poll.data?.board ?? [];
+  const boardItem = findBoardItem(board, "mission", id);
+  const attempts = boardItem ? attemptsOf(board, boardItem) : [];
+  const attemptChip = boardItem ? attemptLabel(boardItem) : undefined;
   const controls = missionControls(mission, me?.role, fresh, now);
   const locked = request.busy || Boolean(request.pending);
+  const stoppedAtLimit = missionStoppedAtLimit(mission);
+  const timeLeft = missionTimeLeftMs(mission, now);
+  const stopLine = missionStopLine(mission, now);
   const decisions = openMissionDecisions(mission);
   const answered = mission.decisions.filter(decision => decision.answer != null);
   const titleOf = (subtaskId: string) => mission.subtasks.find(subtask => subtask.id === subtaskId)?.title ?? subtaskId;
@@ -49,7 +69,11 @@ export function MissionDetail({ connection, id }: { connection: Connection; id: 
   const projectName = group?.name ?? mission.groupName;
   const repoName = (projectId: string) => me?.projects?.find(project => project.id === projectId)?.name
     ?? group?.repos.find(repo => repo.projectId === projectId)?.name ?? projectId;
-  const send = (action: string, label: string, fields?: Record<string, string>) => request.send(`/missions/${id}/${action}`, label, mission.revision, fields);
+  const send = (action: string, label: string, fields?: Record<string, string | number>) => request.send(`/missions/${id}/${action}`, label, mission.revision, fields);
+  const extend = (minutes: number) => { setExtendOpen(false); send("extend", "Time extension", { minutes }); };
+  const extendChoices = (secondary: boolean) => <View style={s.controls}>
+    {missionExtendChoices(mission.maxMinutes).map(choice => <Button key={choice.minutes} compact secondary={secondary} title={choice.label} accessibilityLabel={choice.spoken} disabled={locked} onPress={() => extend(choice.minutes)} />)}
+  </View>;
   const answer = (decisionId: string, text: string) => {
     const value = text.trim();
     if (value) send(`answer/${decisionId}`, "Answer", { text: value });
@@ -65,15 +89,28 @@ export function MissionDetail({ connection, id }: { connection: Connection; id: 
       <View style={s.heading}>
         <Text style={t.note}>{projectName} · {age(mission.createdAt, now)}</Text>
         <Text style={t.title}>{mission.title}</Text>
-        <View style={s.chips}><Chip kind={statusIcon} label={missionStatusLabel(mission.status)} tone={mission.status === "needs-input" || mission.status === "paused" ? "attention" : mission.status === "blocked" ? "error" : undefined} />
+        <View style={s.chips}><Chip kind={statusIcon} label={missionStatusLabel(mission.status, mission.stopReason)} tone={mission.status === "needs-input" || mission.status === "paused" ? "attention" : mission.status === "blocked" ? "error" : undefined} />
+          {attemptChip ? <Chip label={attemptChip} /> : null}
           <Chip label={`Updated ${age(mission.updatedAt, now)}`} /><Chip label={`Rev ${mission.revision}`} /></View>
-        {mission.reason ? <Text style={mission.status === "blocked" ? t.error : t.warning}>{mission.reason}</Text> : null}
+        {stopLine ? <Text style={stoppedAtLimit || timeLeft <= 0 ? t.warning : t.note}>{stopLine}</Text> : null}
+        {missionShowsReason(mission) ? <Text style={mission.status === "blocked" ? t.error : t.warning}>{mission.reason}</Text> : null}
+        <HaltBanner connection={connection} place={{ projectIds: mission.repoProjectIds }} names={repoName} />
       </View>
 
       {decisions.length ? <Section title="Needs your input" count={decisions.length}>
-        {decisions.map(decision => <Decision key={decision.id} question={decision.question} options={decision.options}
+        {decisions.map(decision => <Decision key={decision.id} question={decision.question} options={decision.options} recommendation={decision.recommendation}
           enabled={controls.answer && !locked} onAnswer={value => answer(decision.id, value)} />)}
       </Section> : null}
+
+      {attempts.length ? <Attempts attempts={attempts} current={id} machine={machine} now={now} /> : null}
+
+      <MissionProgressSection
+        connection={connection}
+        missionId={id}
+        repoName={repoName}
+        onOpenTeam={teamId => router.push({ pathname: "/team/[id]", params: { id: teamId, machine } })}
+        onOpenSession={sessionId => router.push({ pathname: "/session/[id]", params: { id: sessionId, machine } })}
+      />
 
       <Section title="Subtasks" count={mission.subtasks.length}>
         {mission.subtasks.length ? mission.subtasks.map(subtask => {
@@ -95,22 +132,26 @@ export function MissionDetail({ connection, id }: { connection: Connection; id: 
       {mission.dispatchSummary ? <Section title="Coordinator update"><Text style={t.body}>{mission.dispatchSummary}</Text></Section> : null}
       {mission.result ? <Section title="Reported result"><Card><Text style={t.body}>{mission.result.summary}</Text><Text style={t.note}>Coordinator report · not an independent review</Text></Card></Section> : null}
 
-      {me?.role === "owner" && (controls.pause || controls.resume || controls.cancel) ? <Section title="Mission controls">
+      {me?.role === "owner" && (controls.pause || controls.resume || controls.extend || controls.cancel) ? <Section title="Mission controls">
+        {controls.extend && stoppedAtLimit ? extendChoices(false) : null}
         <View style={s.controls}>
           {controls.resume ? <Button compact title="Resume" glyph="play" disabled={locked} onPress={() => send("resume", "Resume")} />
             : controls.pause ? <Button compact secondary title="Pause" glyph="pause" disabled={locked} onPress={() => send("pause", "Pause")} /> : null}
+          {controls.extend && !stoppedAtLimit ? <Button compact secondary title="Extend…" glyph="plus" disabled={locked} onPress={() => setExtendOpen(open => !open)} /> : null}
           {controls.cancel ? <Button compact secondary title="Cancel…" glyph="close" disabled={locked} onPress={() => Alert.alert("Cancel this mission?", "Stops the coordinator and active subtasks. Recorded work stays.", [
             { text: "Keep running", style: "cancel" }, { text: "Cancel mission", style: "destructive", onPress: () => send("cancel", "Cancellation") },
           ])} /> : null}
         </View>
+        {controls.extend && !stoppedAtLimit && extendOpen ? extendChoices(true) : null}
       </Section> : null}
 
-      {mission.steering.length || answered.length ? <Section title="Your directions and decisions" count={mission.steering.length + answered.length}>
-          {[...mission.steering].reverse().map((entry, index) => <Card key={`${entry.at}/${index}`}><Text style={t.note}>Direction · revision {entry.revision} · {age(entry.at, now)}</Text><Text style={t.body}>{entry.text}</Text></Card>)}
+      {mission.steering.length || answered.length ? <Section title="Directions and decisions" count={mission.steering.length + answered.length}>
+          {[...mission.steering].reverse().map((entry, index) => <Card key={`${entry.at}/${index}`}><Text style={t.note}>{directionSourceLabel(entry.source)} · direction · revision {entry.revision} · {age(entry.at, now)}</Text><Text style={t.body}>{entry.text}</Text></Card>)}
           {[...answered].reverse().map(decision => <Card key={decision.id}>
-            <Text style={t.note}>Decision · answered by {decision.answeredBy === "coordinator" ? "the coordinator" : "you"}{decision.answeredAt ? ` · ${age(decision.answeredAt, now)}` : ""}</Text>
+            <Text style={t.note}>Decision · answered by {decision.answeredBy === "connector" ? decision.source?.name ?? "Connector" : decision.answeredBy === "coordinator" ? "the coordinator" : "you"}{decision.answeredAt ? ` · ${age(decision.answeredAt, now)}` : ""}</Text>
             <Text style={t.body}>{decision.question}</Text>
             <Text style={t.strong}>Answer: {decision.answer}</Text>
+            <OutcomeNote recommendation={decision.recommendation} />
           </Card>)}
       </Section> : null}
 
@@ -132,11 +173,12 @@ export function MissionDetail({ connection, id }: { connection: Connection; id: 
   </View>;
 }
 
-function Decision({ question, options, enabled, onAnswer }: { question: string; options: string[]; enabled: boolean; onAnswer: (text: string) => void }) {
+function Decision({ question, options, recommendation, enabled, onAnswer }: { question: string; options: string[]; recommendation?: DecisionRecommendation; enabled: boolean; onAnswer: (text: string) => void }) {
   const [text, setText] = useState("");
   return <Card attention style={s.decision}>
     <Text style={s.decisionQuestion}>{question}</Text>
-    {options.map((option, index) => <Button key={`${option}/${index}`} compact secondary title={option} disabled={!enabled} onPress={() => onAnswer(option)} />)}
+    {recommendation ? <RecommendationBlock recommendation={recommendation} /> : null}
+    <DecisionOptions options={options} recommendation={recommendation} disabled={!enabled} onAnswer={onAnswer} />
     <TextInput accessibilityLabel="Write an answer" value={text} onChangeText={setText} multiline maxLength={8000}
       placeholder="Or write your answer…" placeholderTextColor={theme.colors.placeholder} editable={enabled} style={s.answerInput} />
     <Button compact title="Send answer" disabled={!enabled || !text.trim()} onPress={() => onAnswer(text.trim())} />

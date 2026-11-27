@@ -11,8 +11,6 @@ const alive = (pid: number) => {
   try { process.kill(pid, 0); return true; } catch (error) { return (error as NodeJS.ErrnoException).code !== "ESRCH"; }
 };
 
-// Every client owns a separate file. An active editor cannot overwrite another
-// client's draft, and recovering a crashed client never dispatches its input.
 export function localDraftStore(configFile: string, identity: { origin: string; token: string; sessionId: string; projectId: string; runtimeId?: string }, report: (message: string) => void) {
   const scope = JSON.stringify(["cli-draft-v1", identity.origin, identity.sessionId, identity.projectId, identity.runtimeId ?? null]);
   const key = Buffer.from(hkdfSync("sha256", identity.token, scope, "infinite-local-draft", 32));
@@ -34,8 +32,6 @@ export function localDraftStore(configFile: string, identity: { origin: string; 
         privateDirectory(parent); privateDirectory(directory);
         writeSealed(file, key, scope, { ...value, pid, updatedAt: Date.now() } satisfies StoredDraft);
       } else remove(file);
-      // Only a dead/closed writer is eligible for recovery. Its original is
-      // removed after the new copy is durable, never before.
       remove(recovered); recovered = undefined; warned = false; return true;
     } catch { return failed(); }
   };

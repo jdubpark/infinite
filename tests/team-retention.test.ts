@@ -5,12 +5,23 @@ import { dirname, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { Manager } from "../packages/host/src/manager.js";
 import { TeamError, TeamService } from "../packages/host/src/teams.js";
-import { DEFAULT_TEAM_RETENTION, type TeamMember, type TeamRun } from "../packages/host/src/team-types.js";
+import { DEFAULT_TEAM_RETENTION, hostClosedBlockedReason, type TeamMember, type TeamRun } from "../packages/host/src/team-types.js";
 import type { VolumeUsage } from "../packages/host/src/storage.js";
-import { removeMemberWorkspace, removeTeamWorkspace } from "../packages/host/src/team-workspace.js";
+import { commandScope, removeMemberWorkspace, removeTeamWorkspace, teamCommand } from "../packages/host/src/team-workspace.js";
+import { newWitness, type CensusResult, type HostProcesses } from "../packages/host/src/process-census.js";
+import { unseal } from "../packages/host/src/vault.js";
 import { schedulerFixture } from "./fixtures/team-scheduler.js";
 
-type ServiceOptions = { now?: () => number; volumeUsage?: (path: string) => Promise<VolumeUsage> };
+type ServiceOptions = { now?: () => number; volumeUsage?: (path: string) => Promise<VolumeUsage>; processes?: HostProcesses };
+
+function scriptedProcesses(census: () => CensusResult): HostProcesses {
+  return { table: async () => ({ boot: "test-boot", rows: [] }), start: async () => "test-start", census: async () => census() };
+}
+
+function savedRecord(f: ReturnType<typeof schedulerFixture>) {
+  return unseal<{ pending?: { recording?: true; witness?: { processes: { pid: number; start: string }[]; sessions: number[]; groups: number[] } } }>(
+    f.key, `team:${f.run.id}`, readFileSync(join(f.config.stateDir, "teams", `${f.run.id}.sealed`), "utf8"));
+}
 
 function openTeam(f: ReturnType<typeof schedulerFixture>, options: ServiceOptions = {}) {
   return new TeamService(f.config, f.key, f.manager as unknown as Manager, (_project, start) => start(), undefined, undefined, options);
@@ -82,36 +93,316 @@ test("cancelled runs lose their workspaces and sealed record after cancelledMinu
   } finally { await close(f, teams); }
 });
 
-test("blocked workspaces remain until blockedHours and removed runs reject resume while pause and cancel still work", async () => {
+test("stale blocked runs close after workspace removal and keep one host-closed event across restart", async () => {
   const f = schedulerFixture();
   const at = new Date().toISOString();
+  const blocker = "A worker reported a blocker.";
   f.run.status = "blocked";
   f.run.updatedAt = at;
-  f.run.reason = "A worker reported a blocker.";
+  f.run.reason = blocker;
   f.run.members.forEach(member => { member.status = "stopped"; });
-  f.run.events.push({ at, text: f.run.reason });
-  retention(f, { blockedHours: 1 });
+  f.run.events.push({ at, text: blocker });
+  retention(f, { blockedHours: 1, cancelledMinutes: 1 });
   let now = Date.parse(at);
   f.writeTeam();
-  const teams = openTeam(f, { now: () => now });
+  let teams = openTeam(f, { now: () => now });
   try {
     teams.start();
     await teams.idle();
     assert.ok(existsSync(runDirectory(f.run)), "blocked workspaces stay available before the configured window");
+    assert.equal(teams.get(f.run.id).status, "blocked");
     now += 3_600_001;
     await waitFor(() => !existsSync(runDirectory(f.run)), "blocked workspace should be removed after blockedHours");
     await teams.idle();
-    assert.ok(teams.get(f.run.id).workspaceRemovedAt);
     assert.equal(existsSync(runDirectory(f.run)), false);
-    const action = () => ({ requestId: randomUUID(), revision: 1 });
-    assert.equal(teams.get(f.run.id).resumable, false);
-    assert.equal(teams.get(f.run.id).continuable, false);
-    await assert.rejects(teams.resume(f.run.id, action()), (error: unknown) => error instanceof TeamError && error.status === 409 && error.code === "team-workspace-removed");
-    await assert.rejects(teams.continueRun(f.run.id, action()), (error: unknown) => error instanceof TeamError && error.status === 409 && error.code === "team-workspace-removed");
-    await assert.rejects(teams.steer(f.run.id, { ...action(), text: "Try a new direction" }), (error: unknown) => error instanceof TeamError && error.status === 409 && error.code === "team-workspace-removed");
-    assert.equal((await teams.pause(f.run.id, action())).status, "paused");
-    await assert.rejects(teams.resume(f.run.id, action()), (error: unknown) => error instanceof TeamError && error.code === "team-workspace-removed");
-    assert.equal((await teams.cancel(f.run.id, action())).status, "cancelled");
+    const closedReason = hostClosedBlockedReason(1, blocker);
+    await waitFor(() => teams.get(f.run.id).status === "cancelled", "removed blocked run should be closed by the host");
+    const closed = teams.get(f.run.id);
+    assert.ok(closed.workspaceRemovedAt);
+    assert.equal(closed.reason, closedReason);
+    assert.equal(closed.events.filter(event => event.text === closedReason).length, 1);
+    assert.equal(closed.resumable, false);
+
+    teams.close(); await teams.idle();
+    teams = openTeam(f, { now: () => now });
+    teams.start(); await teams.idle();
+    await waitFor(() => teams.get(f.run.id).status === "cancelled", "the closed run should survive restart");
+    assert.equal(teams.get(f.run.id).events.filter(event => event.text === closedReason).length, 1);
+    now += 60_001;
+    await waitFor(() => !teams.statuses().some(row => row.id === f.run.id), "the closed run should use cancelledMinutes before deleting its record");
+    assert.equal(existsSync(join(f.config.stateDir, "teams", `${f.run.id}.sealed`)), false);
+  } finally { await close(f, teams); }
+});
+
+test("a blocked run with an unresolved operation keeps its workspace and stays blocked past blockedHours", async () => {
+  const f = schedulerFixture();
+  const at = new Date().toISOString();
+  f.run.status = "blocked"; f.run.updatedAt = at; f.run.reason = "A worker reported a blocker.";
+  f.run.members.forEach(member => { member.status = "stopped"; });
+  retention(f, { blockedHours: 1 }); f.writeTeam();
+  const teams = openTeam(f, { now: () => Date.parse(at) + 3_600_001 });
+  try {
+    (teams as unknown as { records: Map<string, { pending?: unknown }> }).records.get(f.run.id)!.pending = { id: randomUUID(), kind: "check", revision: 1 };
+    teams.start(); await teams.idle();
+    assert.equal(existsSync(runDirectory(f.run)), true);
+    assert.equal(teams.get(f.run.id).status, "blocked");
+  } finally { await close(f, teams); }
+});
+
+test("a blocked run keeps its workspace while the host sees a process of the interrupted check or a process using the run directory, and closes once it sees neither", async () => {
+  const f = schedulerFixture();
+  const at = new Date().toISOString();
+  const blocker = "A worker reported a blocker.";
+  f.run.status = "blocked"; f.run.updatedAt = at; f.run.reason = blocker;
+  f.run.members.forEach(member => { member.status = "stopped"; });
+  f.run.events.push({ at, text: blocker });
+  retention(f, { blockedHours: 1 }); f.writeTeam();
+  let result: CensusResult = { ok: true, findings: [{ pid: 4242, reason: "recorded-session" }] };
+  let now = Date.parse(at) + 3_600_001, looks = 0;
+  const teams = openTeam(f, { now: () => now, processes: scriptedProcesses(() => { looks++; return result; }) });
+  const eventCount = (text: string) => teams.get(f.run.id).events.filter(event => event.text === text).length;
+  const sees = "The host still sees 1 process(es) that match its record of the interrupted check operation.";
+  const inUse = "The host sees 1 process(es) using this run's directory. None matches its record of the interrupted check operation.";
+  try {
+    (teams as unknown as { records: Map<string, { pending?: unknown }> }).records.get(f.run.id)!.pending = { id: randomUUID(), kind: "check", revision: 1, witness: newWitness() };
+    teams.start(); await teams.idle();
+    await waitFor(() => eventCount(sees) === 1, "the host should report the process it still sees");
+    await new Promise(resolve => setTimeout(resolve, 1200)); await teams.idle();
+    assert.equal(eventCount(sees), 1, "an unchanged census adds no second event");
+    assert.equal(looks, 1, "a look that found a process stands until the next scheduled look, though the pass runs on every tick");
+    assert.equal(teams.get(f.run.id).pendingOperation?.processes, "running");
+
+    result = { ok: true, findings: [{ pid: 4243, reason: "working-directory" }] }; now += 10 * 60_000;
+    await waitFor(() => eventCount(inUse) === 1, "the host should report a process that uses the run directory as such");
+    assert.equal(teams.get(f.run.id).pendingOperation?.processes, "in-use");
+    assert.equal(existsSync(runDirectory(f.run)), true);
+    assert.equal(teams.get(f.run.id).status, "blocked");
+
+    result = { ok: true, findings: [] }; now += 10 * 60_000;
+    await waitFor(() => teams.get(f.run.id).status === "cancelled", "a blocked run should close once the host sees no process");
+    assert.equal(existsSync(runDirectory(f.run)), false);
+    assert.equal(teams.get(f.run.id).reason, hostClosedBlockedReason(1, blocker));
+    assert.equal(eventCount("The host sees no process that matches its record of the interrupted check operation, and none using this run's directory. The intent stays recorded and is not replayed."), 1);
+  } finally { await close(f, teams); }
+});
+
+test("a cancelled run that holds an unfinished operation with a witness keeps its workspace and refuses removal while the census sees its processes", async () => {
+  const f = schedulerFixture();
+  const at = new Date().toISOString();
+  f.run.status = "cancelled"; f.run.updatedAt = at;
+  f.run.members.forEach(member => { member.status = "stopped"; });
+  retention(f, { cancelledMinutes: 1 }); f.writeTeam();
+  let result: CensusResult = { ok: true, findings: [{ pid: 4242, reason: "recorded-session" }] };
+  let now = Date.parse(at) + 60_001;
+  const teams = openTeam(f, { now: () => now, processes: scriptedProcesses(() => result) });
+  try {
+    (teams as unknown as { records: Map<string, { pending?: unknown }> }).records.get(f.run.id)!.pending = { id: randomUUID(), kind: "check", revision: 1, witness: newWitness() };
+    teams.start(); await teams.idle();
+    await waitFor(() => teams.get(f.run.id).pendingOperation?.processes === "running", "the host should look for the operation's processes");
+    await assert.rejects(teams.removeRun(f.run.id), (error: unknown) => error instanceof TeamError && error.code === "team-operation-running");
+    await new Promise(resolve => setTimeout(resolve, 1200)); await teams.idle();
+    assert.equal(existsSync(runDirectory(f.run)), true);
+    result = { ok: true, findings: [] }; now += 10 * 60_000;
+    await waitFor(() => !existsSync(runDirectory(f.run)), "the workspace should be removed once the census sees none of the operation's processes");
+  } finally { await close(f, teams); }
+});
+
+test("a blocked run whose census cannot finish keeps its workspace and says the host cannot tell", async () => {
+  const f = schedulerFixture();
+  const at = new Date().toISOString();
+  f.run.status = "blocked"; f.run.updatedAt = at; f.run.reason = "A worker reported a blocker.";
+  f.run.members.forEach(member => { member.status = "stopped"; });
+  retention(f, { blockedHours: 1 }); f.writeTeam();
+  const teams = openTeam(f, { now: () => Date.parse(at) + 3_600_001, processes: scriptedProcesses(() => ({ ok: false, problem: "The process table is unreadable" })) });
+  const cannotTell = "The host cannot tell whether the interrupted check operation left processes: The process table is unreadable.";
+  try {
+    (teams as unknown as { records: Map<string, { pending?: unknown }> }).records.get(f.run.id)!.pending = { id: randomUUID(), kind: "check", revision: 1, witness: newWitness() };
+    teams.start(); await teams.idle();
+    await waitFor(() => teams.get(f.run.id).events.some(event => event.text === cannotTell), "the host should say when it cannot finish its census");
+    await new Promise(resolve => setTimeout(resolve, 1200)); await teams.idle();
+    assert.equal(teams.get(f.run.id).events.filter(event => event.text === cannotTell).length, 1);
+    assert.equal(existsSync(runDirectory(f.run)), true);
+    assert.equal(teams.get(f.run.id).status, "blocked");
+  } finally { await close(f, teams); }
+});
+
+test("a blocked run stays blocked when the census finds only a process it cannot inspect, and the host does not call it the check's process", async () => {
+  const f = schedulerFixture();
+  const at = new Date().toISOString();
+  f.run.status = "blocked"; f.run.updatedAt = at; f.run.reason = "A worker reported a blocker.";
+  f.run.members.forEach(member => { member.status = "stopped"; });
+  retention(f, { blockedHours: 1 }); f.writeTeam();
+  const teams = openTeam(f, { now: () => Date.parse(at) + 3_600_001, processes: scriptedProcesses(() => ({ ok: true, findings: [{ pid: 4242, reason: "unreadable" }] })) });
+  const cannotTell = "The host cannot tell whether the interrupted check operation left processes: 1 process(es) of the accounts it inspects could not be inspected.";
+  try {
+    (teams as unknown as { records: Map<string, { pending?: unknown }> }).records.get(f.run.id)!.pending = { id: randomUUID(), kind: "check", revision: 1, witness: newWitness() };
+    teams.start(); await teams.idle();
+    await waitFor(() => teams.get(f.run.id).events.some(event => event.text === cannotTell), "the host should say when it cannot finish its census");
+    await new Promise(resolve => setTimeout(resolve, 1200)); await teams.idle();
+    assert.equal(teams.get(f.run.id).events.filter(event => event.text === cannotTell).length, 1);
+    assert.equal(existsSync(runDirectory(f.run)), true);
+    assert.equal(teams.get(f.run.id).status, "blocked");
+  } finally { await close(f, teams); }
+});
+
+test("a command inside a command scope waits for the scope before it starts and reports its process id; outside one nothing is reported", async () => {
+  const seen: (string | number | undefined)[] = [];
+  const scope = { starting: () => new Promise<void>(resolve => setTimeout(() => { seen.push("announced"); resolve(); }, 30)), started: (pid: number | undefined) => { seen.push(pid); } };
+  const scoped = await commandScope.run(scope, () => teamCommand({ command: process.execPath, args: ["-e", ""] }, process.cwd()));
+  assert.equal(scoped.exitCode, 0);
+  assert.equal(seen.length, 2);
+  assert.equal(seen[0], "announced", "the command starts only after the scope has announced it");
+  assert.ok(typeof seen[1] === "number" && seen[1] > 0);
+  const refused = { starting: () => Promise.reject(new Error("not announced")), started: () => { seen.push("started"); } };
+  await assert.rejects(commandScope.run(refused, () => teamCommand({ command: process.execPath, args: ["-e", ""] }, process.cwd())), /not announced/);
+  const unscoped = await teamCommand({ command: process.execPath, args: ["-e", ""] }, process.cwd());
+  assert.equal(unscoped.exitCode, 0);
+  assert.equal(seen.length, 2, "a command that could not be announced does not start, and one outside a scope reports nothing");
+});
+
+test("verification reconciliation is refused while the host sees the interrupted check, and once workspace removal has started", async () => {
+  const f = schedulerFixture();
+  const at = new Date().toISOString();
+  const interrupted = "The host restarted during a workspace or verification operation. Inspect the isolated workspace before starting a new team; the operation will not be replayed.";
+  f.run.status = "blocked"; f.run.updatedAt = at; f.run.reason = interrupted; f.run.headCommit = f.run.baseCommit;
+  f.run.members.forEach(member => { member.status = "stopped"; });
+  f.writeTeam();
+  let result: CensusResult = { ok: true, findings: [{ pid: 4242, reason: "recorded-process" }, { pid: 4243, reason: "open-file" }] };
+  const teams = openTeam(f, { processes: scriptedProcesses(() => result) });
+  const pendingId = randomUUID();
+  const body = () => ({ requestId: randomUUID(), revision: 1, pendingId, headCommit: f.run.baseCommit,
+    attestation: { boundary: "check-only", processesStopped: true, text: "Confirmed the interrupted check is quiescent." } });
+  try {
+    const stored = (teams as unknown as { records: Map<string, { run: TeamRun; pending?: unknown; workspaceRemovedAt?: string }> }).records.get(f.run.id)!;
+    stored.pending = { id: pendingId, kind: "check", revision: 1, witness: newWitness() };
+    await assert.rejects(teams.reconcileVerification(f.run.id, body()), (error: unknown) => error instanceof TeamError && error.status === 409 && error.code === "team-operation-running" &&
+      error.message === "The host still sees 1 process(es) that match its record of the interrupted check. Reconcile verification after they have exited.");
+    assert.ok(stored.pending, "a refused reconciliation keeps the pending check");
+
+    result = { ok: true, findings: [{ pid: 4243, reason: "open-file" }, { pid: 4244, reason: "working-directory" }] };
+    await assert.rejects(teams.reconcileVerification(f.run.id, body()), (error: unknown) => error instanceof TeamError && error.status === 409 && error.code === "team-directory-in-use" &&
+      error.message === "The host sees 2 process(es) using this run's directory. Reconcile verification after they have exited or left it.");
+
+    stored.run.workspaceRemovedAt = at;
+    await assert.rejects(teams.reconcileVerification(f.run.id, body()), (error: unknown) => error instanceof TeamError && error.status === 409 && error.code === "team-workspace-removed");
+  } finally { await close(f, teams); }
+});
+
+test("an operation's intent says its record may be incomplete until a save holds the command it started", async () => {
+  const f = schedulerFixture();
+  f.writeTeam();
+  const teams = openTeam(f, { processes: scriptedProcesses(() => ({ ok: true, findings: [] })) });
+  try {
+    const internals = teams as unknown as { records: Map<string, { pending?: { recording?: true; witness?: { processes: { pid: number; start: string }[]; sessions: number[]; groups: number[] } } }>;
+      operation: (stored: unknown, kind: string, perform: () => Promise<unknown>, complete: () => void) => void };
+    const stored = internals.records.get(f.run.id)!;
+    internals.operation(stored, "check", () => teamCommand({ command: process.execPath, args: ["-e", "setTimeout(() => {}, 1500)"] }, process.cwd()), () => {});
+    const pid = stored.pending!.witness!.sessions[0]!;
+    assert.ok(pid > 0, "the command's session and group are recorded as it starts");
+    assert.deepEqual(stored.pending!.witness!.groups, [pid]);
+    assert.equal(savedRecord(f).pending?.recording, true);
+    assert.deepEqual(savedRecord(f).pending?.witness?.sessions, []);
+    await waitFor(() => savedRecord(f).pending !== undefined && savedRecord(f).pending!.recording === undefined, "the save that holds the command should close the record");
+    assert.deepEqual(savedRecord(f).pending?.witness?.sessions, [pid]);
+    assert.deepEqual(savedRecord(f).pending?.witness?.processes, [{ pid, start: "test-start" }]);
+    await waitFor(() => stored.pending === undefined, "the operation should finish and clear its intent");
+  } finally { await close(f, teams); }
+});
+
+test("a host stop inside a command's drain signals nothing, and after a restart the census still sees what the command left", { skip: process.platform === "win32" && "process groups are POSIX" }, async t => {
+  const f = schedulerFixture();
+  f.writeTeam();
+  const directory = runDirectory(f.run);
+  const leaderFile = join(directory, "leader"), leftFile = join(directory, "left"), release = join(directory, "release");
+  const pidIn = (file: string) => { const text = existsSync(file) ? readFileSync(file, "utf8") : ""; return text.endsWith("\n") ? Number.parseInt(text, 10) : undefined; };
+  const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch (error) { return (error as NodeJS.ErrnoException).code !== "ESRCH"; } };
+  const realSetTimeout = globalThis.setTimeout;
+  const waitReal = async (check: () => boolean, message: string, timeoutMs = 10_000) => {
+    const deadline = performance.now() + timeoutMs;
+    while (performance.now() < deadline) {
+      if (check()) return;
+      await new Promise(resolve => realSetTimeout(resolve, 10));
+    }
+    assert.fail(message);
+  };
+  type Internals = { records: Map<string, { pending?: unknown }>; operation: (stored: unknown, kind: string, perform: (signal: AbortSignal) => Promise<unknown>, complete: () => void) => void;
+    fence: { refresh: (stored: unknown, force: boolean) => Promise<string | undefined> } };
+  const teams = openTeam(f);
+  let restarted: TeamService | undefined;
+  try {
+    const internals = teams as unknown as Internals;
+    const stored = internals.records.get(f.run.id)!;
+    const script = `echo $$ > '${leaderFile}'; sleep 30 & echo $! > '${leftFile}'; i=0; while [ ! -f '${release}' ] && [ "$i" -lt 600 ]; do sleep 0.05; i=$((i + 1)); done; exit 0`;
+    let commandSettled = false;
+    internals.operation(stored, "check", signal => teamCommand({ command: "sh", args: ["-c", script] }, f.run.workspace, signal).finally(() => { commandSettled = true; }), () => {});
+    await waitFor(() => pidIn(leftFile) !== undefined && savedRecord(f).pending?.recording === undefined && (savedRecord(f).pending?.witness?.sessions.length ?? 0) > 0,
+      "the saved intent should hold the command", 10_000);
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    writeFileSync(release, "");
+    const leader = pidIn(leaderFile)!;
+    await waitReal(() => !alive(leader), "the leader exits once released", 10_000);
+    assert.equal(commandSettled, false, "the command stays in its drain until the host stops");
+    teams.close();
+    await teams.idle();
+    t.mock.timers.tick(300);
+    t.mock.timers.reset();
+    assert.ok(stored.pending, "a stop during the drain leaves the operation's intent for the next start");
+    await new Promise(resolve => setTimeout(resolve, 300));
+    assert.equal(alive(pidIn(leftFile)!), true, "the host stop signalled nothing after the leader's exit");
+    restarted = openTeam(f);
+    const restartedInternals = restarted as unknown as Internals;
+    assert.equal(await restartedInternals.fence.refresh(restartedInternals.records.get(f.run.id)!, true), "running", "the census finds the sleep in the recorded group");
+  } finally {
+    t.mock.timers.reset();
+    for (const pid of [pidIn(leaderFile), pidIn(leftFile)])
+      if (pid !== undefined && Number.isSafeInteger(pid) && pid > 1 && alive(pid)) process.kill(pid, "SIGKILL");
+    if (restarted) { restarted.close(); await restarted.idle(); }
+    else teams.close();
+    f.close();
+  }
+});
+
+test("a blocked run whose intent was still recording when the host stopped stays blocked though the host finds no process, unless the host has rebooted since", async () => {
+  const f = schedulerFixture();
+  const at = new Date().toISOString();
+  f.run.status = "blocked"; f.run.updatedAt = at; f.run.reason = "A worker reported a blocker.";
+  f.run.members.forEach(member => { member.status = "stopped"; });
+  retention(f, { blockedHours: 1 }); f.writeTeam();
+  let now = Date.parse(at) + 3_600_001;
+  const teams = openTeam(f, { now: () => now, processes: scriptedProcesses(() => ({ ok: true, findings: [] })) });
+  const cannotTell = "The host cannot tell whether the interrupted check operation left processes: the host stopped while the operation was starting a command, so its record of the operation's processes may be incomplete.";
+  try {
+    const witness = newWitness();
+    (teams as unknown as { records: Map<string, { pending?: unknown }> }).records.get(f.run.id)!.pending = { id: randomUUID(), kind: "check", revision: 1, witness, recording: true };
+    teams.start(); await teams.idle();
+    await waitFor(() => teams.get(f.run.id).events.some(event => event.text === cannotTell), "the host should say that its record may be incomplete");
+    await new Promise(resolve => setTimeout(resolve, 1200)); await teams.idle();
+    assert.equal(existsSync(runDirectory(f.run)), true);
+    assert.equal(teams.get(f.run.id).status, "blocked");
+
+    witness.boot = "an-earlier-boot"; now += 10 * 60_000;
+    await waitFor(() => teams.get(f.run.id).status === "cancelled", "after a reboot the run should close once the host sees no process");
+    assert.equal(existsSync(runDirectory(f.run)), false);
+  } finally { await close(f, teams); }
+});
+
+test("a blocked run of an ended goal, with its workspace already removed, closes on the first sweep", async () => {
+  const f = schedulerFixture();
+  const at = new Date(Date.now() - 3_600_001).toISOString();
+  const blocker = "A worker reported a blocker.";
+  f.run.status = "blocked"; f.run.updatedAt = at; f.run.reason = blocker; f.run.workspaceRemovedAt = at; f.run.goal = {};
+  f.run.members.forEach(member => { member.status = "stopped"; });
+  f.run.events.push({ at, text: blocker });
+  rmSync(runDirectory(f.run), { recursive: true, force: true });
+  retention(f, { blockedHours: 1 }); f.writeTeam();
+  const teams = openTeam(f, { ownerActive: () => false });
+  try {
+    teams.start(); await teams.idle();
+    const closed = teams.get(f.run.id);
+    const reason = hostClosedBlockedReason(1, blocker);
+    assert.equal(closed.status, "cancelled");
+    assert.equal(closed.reason, reason);
+    assert.equal(closed.events.filter(event => event.text === reason).length, 1);
   } finally { await close(f, teams); }
 });
 
@@ -160,8 +451,6 @@ test("member retention removes an integrated clone at its recorded recovery path
   const f = schedulerFixture();
   const at = new Date(Date.now() - 1000).toISOString();
   const memberId = randomUUID();
-  // Recovered integration workspaces live at recovery/<operation>; prepareMemberWorkspace
-  // creates their member clones in the sibling recovery/members directory.
   const cwd = join(runDirectory(f.run), "recovery", "members", memberId);
   mkdirSync(cwd, { recursive: true });
   const receiptDir = join(f.config.stateDir, "recovered-member-receipts");
@@ -376,7 +665,7 @@ test("a failed permission invalidation save during block is observed without unh
   try {
     const scheduler = teams as unknown as { block(stored: unknown, error: TeamError): void; record(id: string): unknown };
     try { scheduler.block(scheduler.record(f.run.id), new TeamError(409, "test-block", "Injected failure.")); }
-    catch { /* The synchronous run-record save is expected to fail in this test. */ }
+    catch { }
     await new Promise(resolve => setTimeout(resolve, 25));
     assert.deepEqual(unhandled, []);
   } finally {
@@ -421,7 +710,6 @@ test("failed workspace removal records one event, retries later, and does not bl
     'const { spawnSync } = require("node:child_process");',
     'const marker = process.argv[1];',
     'const [command, ...args] = process.argv.slice(2);',
-    // The first attempt leaves an unreadable directory behind, which the host cannot remove either; the retry repairs it.
     'if (!fs.existsSync(marker)) { fs.writeFileSync(marker, "failed once"); fs.mkdirSync("locked", { recursive: true }); fs.writeFileSync("locked/keep", ""); fs.chmodSync("locked", 0); process.exit(73); }',
     'if (fs.existsSync("locked")) fs.chmodSync("locked", 0o755);',
     'const result = spawnSync(command, args, { stdio: "inherit" });',
@@ -575,7 +863,6 @@ test("entries the agent account cannot remove are finished by the host", async (
   f.run.events.push({ at, text: "The delivery agent reported a merged pull request for the reviewed commit." });
   f.run.members.forEach(member => { member.status = "stopped"; });
   mkdirSync(join(runDirectory(f.run), "scratch", "notes"), { recursive: true });
-  // The prefix stands in for an agent-side rm that exits non-zero on a host-owned scratch directory and removes nothing.
   f.config.teams!.commandPrefix = { command: process.execPath, args: ["-e", "process.exit(1)"] };
   retention(f, { finishedMinutes: 0 });
   f.writeTeam();
@@ -604,7 +891,6 @@ test("a cancelled run with an interrupted operation and members whose sessions a
   f.run.events.push({ at, text: "Team cancelled." }, { at, text: "The host restarted with an unresolved operation from a cancelled team. The intent will not be replayed." });
   retention(f, { cancelledMinutes: 0 });
   f.writeTeam();
-  // Both unsettled members' sessions were deleted on the host; a saved status file still answers state() as running.
   (f.manager as unknown as { meta: (id: string) => unknown }).meta = () => { throw Object.assign(new Error("Session not found"), { code: "ENOENT" }); };
   const teams = openTeam(f, { now: () => Date.parse(at) + 1000 });
   try {

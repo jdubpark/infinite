@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { accountOf, periodStart, priceUsage, sumUsage, type UsageRecord } from "../packages/host/src/usage.js";
+import { accountOf, listPriceUsage, periodStart, priceUsage, sumUsage, type UsageRecord } from "../packages/host/src/usage.js";
 import type { UsageConfig } from "../packages/host/src/config.js";
 
 const base: UsageRecord = {
@@ -10,11 +10,10 @@ const base: UsageRecord = {
 
 test("configured prices override the reported cost and are per million tokens", () => {
   const record = { ...base, tokens: { input: 1_000_000, output: 500_000, reasoning: 0, cacheRead: 2_000_000, cacheWrite: 0 }, reportedCost: 9 };
-  // The expected sum is a float sum in the test itself (0.30800000000000005), so compare within 1e-9.
   const configured = priceUsage(record, { "deepseek/deepseek-flash": { input: 0.14, output: 0.28, cacheRead: 0.014 } });
   assert.ok(Math.abs(configured.cost - (0.14 + 0.14 + 0.028)) < 1e-9);
   assert.equal(configured.pricing, "configured");
-  assert.deepEqual(priceUsage(record, { "deepseek/deepseek-flash": { input: 1, output: 1 } }).cost, 1 + 0.5 + 2); // cacheRead defaults to input
+  assert.deepEqual(priceUsage(record, { "deepseek/deepseek-flash": { input: 1, output: 1 } }).cost, 1 + 0.5 + 2);
 });
 
 test("reasoning tokens bill at the output rate", () => {
@@ -34,11 +33,11 @@ test("a record whose model was never observed is unknown, whatever its reported 
 });
 
 test("period starts are UTC day, Monday week, and month", () => {
-  const now = new Date("2026-10-17T15:00:00Z"); // a Saturday
+  const now = new Date("2026-10-17T15:00:00Z");
   assert.equal(periodStart("day", now).toISOString(), "2026-10-17T00:00:00.000Z");
   assert.equal(periodStart("week", now).toISOString(), "2026-10-12T00:00:00.000Z");
   assert.equal(periodStart("month", now).toISOString(), "2026-10-01T00:00:00.000Z");
-  assert.equal(periodStart("week", new Date("2026-10-18T00:00:00Z")).toISOString(), "2026-10-12T00:00:00.000Z"); // a Sunday ends the week
+  assert.equal(periodStart("week", new Date("2026-10-18T00:00:00Z")).toISOString(), "2026-10-12T00:00:00.000Z");
 });
 
 test("sumUsage rounds the total to micro-dollars once, not per row", () => {
@@ -71,4 +70,34 @@ test("configured price beats the built-in catalog and accounts match globs", () 
   assert.deepEqual(priceUsage({ ...base, tokens: { ...base.tokens, input: 1_000_000 } }, { "deepseek/deepseek-flash": { input: 3, output: 2 } }), { cost: 3, pricing: "configured" });
   assert.equal(accountOf("deepseek", "deepseek-flash", { deepseek: { kind: "metered", match: ["deepseek/*"] } }), "deepseek");
   assert.equal(accountOf("meta", "muse-spark", { deepseek: { kind: "metered", match: ["deepseek/*"] } }), "meta");
+});
+
+test("Codex records with positive cacheWrite stay unpriced while zero cacheWrite and Claude price normally", () => {
+  const prices: UsageConfig["prices"] = {
+    "openai/gpt-5.4": { input: 2, output: 8, cacheRead: 0.2, cacheWrite: 2 },
+    "anthropic/claude-sonnet": { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 },
+  };
+  const codexBase: UsageRecord = {
+    ...base,
+    provider: "codex",
+    providerId: "openai",
+    modelId: "gpt-5.4",
+    tokens: { input: 100_000, output: 50_000, reasoning: 0, cacheRead: 10_000, cacheWrite: 5_000 },
+    reportedCost: 0,
+  };
+  assert.deepEqual(listPriceUsage(codexBase, prices), { cost: 0, pricing: "unknown" });
+  assert.deepEqual(priceUsage(codexBase, prices), { cost: 0, pricing: "unknown" });
+  assert.deepEqual(
+    listPriceUsage({ ...codexBase, tokens: { ...codexBase.tokens, cacheWrite: 0 } }, prices),
+    { cost: 0.602, pricing: "configured" },
+  );
+  const claudeRecord: UsageRecord = {
+    ...base,
+    provider: "claude",
+    providerId: "anthropic",
+    modelId: "claude-sonnet",
+    tokens: { input: 100_000, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 100_000 },
+    reportedCost: 0,
+  };
+  assert.deepEqual(listPriceUsage(claudeRecord, prices), { cost: 0.675, pricing: "configured" });
 });

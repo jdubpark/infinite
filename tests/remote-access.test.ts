@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { randomBytes, randomUUID } from "node:crypto";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { WebSocket, WebSocketServer } from "ws";
@@ -11,7 +11,9 @@ import { MAX_REQUEST_BYTES, MAX_EVENTS_BUFFERED_BYTES, MAX_EVENTS_EVENT_BYTES } 
 import { connectRemoteAccess } from "../packages/host/src/remote-access.js";
 import { createRelayServer } from "../packages/host/src/relay.js";
 import { hashToken } from "../packages/host/src/config.js";
+import { createGoalSchema, type ProductGoal } from "../packages/host/src/goal-types.js";
 import type { Config } from "../packages/host/src/types.js";
+import { writeSealed } from "../packages/host/src/vault.js";
 import { inProcessHost, startHost, waitFor } from "./helpers.js";
 import { httpRunner, listen, wireProxy } from "./remote-fixture.js";
 
@@ -49,6 +51,10 @@ test("encrypted relay creates and steers real sessions while retaining roles and
     const control = await owner.request<{ control: { id: string } }>(`/sessions/${session.id}/control`, { body: { action: "claim" }, headers: ownerHeaders });
     const steeringHeaders = { ...ownerHeaders, "X-Infinite-Control": control.control.id };
     await assert.rejects(controller.request(`/sessions/${session.id}/control`, { body: { action: "claim" }, headers: controllerHeaders }), (error: RemoteError) => error.status === 409 && error.code === "control-busy");
+    for (const action of ["renew", "release"] as const)
+      await assert.rejects(owner.request(`/sessions/${session.id}/control`, { body: { action }, headers: ownerHeaders }), (error: RemoteError) => error.status === 409 && error.code === "control-lost");
+    const renewedHttp = await owner.request<{ control: { id: string } }>(`/sessions/${session.id}/control`, { body: { action: "renew", leaseId: control.control.id, takeover: false }, headers: ownerHeaders });
+    assert.equal(renewedHttp.control.id, control.control.id);
     const input = { requestId: randomUUID(), text: "private steering sentinel", submit: true };
     await owner.request(`/sessions/${session.id}/input`, { body: input, headers: steeringHeaders });
     const next = await controller.request<{ control: { id: string } }>(`/sessions/${session.id}/control`, { body: { action: "claim", takeover: true }, headers: controllerHeaders });
@@ -100,10 +106,19 @@ test("encrypted terminals carry real PTY output and receipts, enforce leases and
     const refused = randomUUID();
     terminal.send({ op: "raw", requestId: refused, text: "must not arrive\r" });
     await waitFor(async () => pages.find(page => page.refusal?.requestId === refused), value => value?.refusal?.code === "control-lost");
+    for (const action of ["renew", "release"] as const) {
+      const missingLease = randomUUID();
+      terminal.send({ op: "control", requestId: missingLease, action });
+      await waitFor(async () => pages.find(page => page.refusal?.requestId === missingLease), value => value?.refusal?.code === "control-lost");
+    }
+    assert.deepEqual(closed, []);
     const claim = randomUUID();
     terminal.send({ op: "control", requestId: claim, action: "claim" });
     const control = await waitFor(async () => pages.find(page => page.requestId === claim), value => Boolean(value?.control?.id));
     const leaseId = control!.control!.id;
+    const legacyRenew = randomUUID();
+    terminal.send({ op: "control", requestId: legacyRenew, action: "renew", leaseId, takeover: false });
+    await waitFor(async () => pages.find(page => page.requestId === legacyRenew), value => value?.control?.id === leaseId);
     const text = "encrypted terminal input sentinel", requestId = randomUUID();
     terminal.send({ op: "raw", requestId, text: text + "\r", leaseId });
     await waitFor(async () => pages.find(page => page.receipt?.requestId === requestId), value => value?.receipt?.state === "delivered");
@@ -304,10 +319,10 @@ test("remote access rejects wrong keys, revoked keys, privileged paths and exces
     for (const path of ["/login", "/sessions/../me", "/sessions/%2e%2e/me", "/sessions/" + randomUUID() + "/raw", "/events?topics=sessions"]) {
       await assert.rejects(client.request(path), (error: RemoteError) => error.status === 403);
     }
-    // Workspace content moves only over a direct owner connection.
     const hash = "a".repeat(64);
     for (const [method, path] of [["POST", "/projects/project/sync/begin"], ["POST", "/projects/project/sync/has"], ["PUT", `/projects/project/sync/blob/${hash}`], ["PUT", "/projects/project/sync/blobs"],
-      ["GET", `/projects/project/sync/blob/${hash}`], ["POST", "/projects/project/sync/commit"], ["POST", "/projects/project/sync/export"]] as const)
+      ["GET", `/projects/project/sync/blob/${hash}`], ["POST", "/projects/project/sync/commit"], ["POST", "/projects/project/sync/export"], ["POST", "/outcomes/signals"],
+      ["GET", `/outcomes/rollup?goal=${randomUUID()}`], ["POST", "/outcomes/legacy"], ["GET", "/projects/project/main-check"]] as const)
       await assert.rejects(client.request(path, { method, body: method === "GET" ? undefined : {} }), (error: RemoteError) => error.status === 403 && error.code === "remote-endpoint-denied");
     await assert.rejects(client.request("/projects/project/context", { method: "PUT", body: { text: "x".repeat(MAX_REQUEST_BYTES) } }), (error: RemoteError) => error.status === 413);
     assert.equal(runner.requests.length, 1);
@@ -320,9 +335,7 @@ test("remote access rejects wrong keys, revoked keys, privileged paths and exces
     assert.deepEqual(await client.request(`/missions/${missionId}`), { count: 7, method: "GET", path: `/api/missions/${missionId}` });
     assert.deepEqual(await client.request(`/missions/${missionId}/answer/${decisionId}`, { body: {} }), { count: 8, method: "POST", path: `/api/missions/${missionId}/answer/${decisionId}` });
     assert.deepEqual(await client.request("/project-groups/shop", { method: "DELETE", body: {} }), { count: 9, method: "DELETE", path: "/api/project-groups/shop" });
-    // The phone dictates over this channel; transcript cleanup is a POST only.
     assert.deepEqual(await client.request("/dictation/cleanup", { body: { text: "um add retries" } }), { count: 10, method: "POST", path: "/api/dictation/cleanup" });
-    // A project, by its id or by one of its checkouts' host project ids, is readable by any paired role.
     assert.deepEqual(await client.request("/project-groups/shop"), { count: 11, method: "GET", path: "/api/project-groups/shop" });
     assert.deepEqual(await client.request("/project-groups/shop/understanding"), { count: 12, method: "GET", path: "/api/project-groups/shop/understanding" });
     assert.deepEqual(await client.request("/project-groups/shop/understanding/catalog"), { count: 13, method: "GET", path: "/api/project-groups/shop/understanding/catalog" });
@@ -333,6 +346,19 @@ test("remote access rejects wrong keys, revoked keys, privileged paths and exces
       await assert.rejects(client.request(path, { method, body: method === "GET" ? undefined : {} }), (error: RemoteError) => error.status === 403);
     for (const [method, path] of [["POST", `/missions/${missionId}/answer/not-a-uuid`], ["GET", `/missions/${missionId}/steer`], ["GET", "/project-groups/Shop"], ["PUT", "/project-groups/Shop"], ["GET", "/project-groups/shop/understanding/extra"], ["POST", "/project-groups/shop/understanding"], ["GET", "/dictation/cleanup"]] as const)
       await assert.rejects(client.request(path, { method, body: method === "GET" ? undefined : {} }), (error: RemoteError) => error.status === 403);
+    const contextTeam = randomUUID(), contextSession = randomUUID();
+    assert.deepEqual(await client.request("/projects/project/graph/map"), { count: 17, method: "GET", path: "/api/projects/project/graph/map" });
+    assert.deepEqual(await client.request(`/teams/${contextTeam}/context`), { count: 18, method: "GET", path: `/api/teams/${contextTeam}/context` });
+    assert.deepEqual(await client.request(`/sessions/${contextSession}/context`), { count: 19, method: "GET", path: `/api/sessions/${contextSession}/context` });
+    for (const [method, path] of [["POST", "/projects/project/graph/map"], ["GET", "/projects/project/graph"], ["POST", `/teams/${contextTeam}/context`], ["GET", "/teams/not-a-uuid/context"], ["POST", `/sessions/${contextSession}/context`]] as const)
+      await assert.rejects(client.request(path, { method, body: method === "GET" ? undefined : {} }), (error: RemoteError) => error.status === 403);
+    assert.deepEqual(await client.request(`/missions/${missionId}/extend`, { body: {} }), { count: 20, method: "POST", path: `/api/missions/${missionId}/extend` });
+    await assert.rejects(client.request(`/missions/${missionId}/extend`, { method: "GET" }), (error: RemoteError) => error.status === 403);
+    assert.deepEqual(await client.request("/halt"), { count: 21, method: "GET", path: "/api/halt" });
+    for (const [method, path] of [["POST", "/halt"], ["POST", "/halt/release"], ["GET", "/halt/release"]] as const)
+      await assert.rejects(client.request(path, { method, body: method === "GET" ? undefined : {} }), (error: RemoteError) => error.status === 403 && error.code === "remote-endpoint-denied");
+    assert.deepEqual(await client.request("/decision-queue"), { count: 22, method: "GET", path: "/api/decision-queue" });
+    await assert.rejects(client.request("/decision-queue", { method: "POST", body: {} }), (error: RemoteError) => error.status === 403 && error.code === "remote-endpoint-denied");
     runner.oversized();
     await assert.rejects(client.request("/me"), (error: RemoteError) => error.status === 413 && error.code === "response-too-large");
     const beforeRevoke = runner.requests.length;
@@ -411,4 +437,424 @@ test("a configured access token is sent as relay upgrade headers", { timeout: 15
     assert.deepEqual(await seen, { id: access.clientId, secret: access.clientSecret, path: `/relay/clients/${machineId}` });
     assert.throws(() => createRemoteClient({ url: "https://relay.example", token: randomBytes(32).toString("base64url"), relay: { machineId }, access: { clientId: "short", clientSecret: access.clientSecret } }), /access token/);
   } finally { client.close(); sockets.close(); }
+});
+
+test("the relay refuses signal writes", { timeout: 20000 }, async () => {
+  const runner = await httpRunner();
+  const client = createRemoteClient({ url: runner.url, token: runner.token });
+  try {
+    await client.request("/me");
+    await assert.rejects(client.request("/outcomes/signals", { method: "POST", body: {} }), (error: RemoteError) => error.status === 403 && error.code === "remote-endpoint-denied");
+    assert.equal(runner.requests.length, 1, "a refused signal write does not reach the host");
+  } finally { client.close(); runner.close(); }
+});
+
+test("the relay refuses entry withdrawals", { timeout: 20000 }, async () => {
+  const runner = await httpRunner();
+  const client = createRemoteClient({ url: runner.url, token: runner.token });
+  try {
+    await client.request("/me");
+    await assert.rejects(client.request(`/teams/${randomUUID()}/entries/${randomUUID()}/withdraw`, { method: "POST", body: { requestId: randomUUID() } }),
+      (error: RemoteError) => error.status === 403 && error.code === "remote-endpoint-denied");
+    assert.equal(runner.requests.length, 1, "a refused withdrawal does not reach the host");
+  } finally { client.close(); runner.close(); }
+});
+
+test("the relay refuses roll-ups and imports", { timeout: 20000 }, async () => {
+  const runner = await httpRunner();
+  const client = createRemoteClient({ url: runner.url, token: runner.token });
+  try {
+    await client.request("/me");
+    for (const path of [`/outcomes/rollup?goal=${randomUUID()}`, `/outcomes/rollup?mission=${randomUUID()}`])
+      await assert.rejects(client.request(path), (error: RemoteError) => error.status === 403 && error.code === "remote-endpoint-denied");
+    await assert.rejects(client.request("/outcomes/legacy", { method: "POST", body: { dryRun: true, lines: [] } }), (error: RemoteError) => error.status === 403 && error.code === "remote-endpoint-denied");
+    assert.equal(runner.requests.length, 1, "a refused roll-up or import does not reach the host");
+  } finally { client.close(); runner.close(); }
+});
+
+test("the relay carries the permission decision log and a mark, and refuses the owner's delegation acts", { timeout: 20000 }, async () => {
+  const runner = await httpRunner();
+  const client = createRemoteClient({ url: runner.url, token: runner.token });
+  try {
+    await client.request("/me");
+    await client.request("/permissions/log?rejected=1&limit=50");
+    await client.request("/permissions/candidates");
+    await client.request("/permissions/decisions/pd-0123456789abcdef0123456789abcdef");
+    await client.request("/permissions/marks", { method: "POST", body: { requestId: randomUUID(), decisionId: "pd-0123456789abcdef0123456789abcdef", label: "wrong", note: "Should have asked." } });
+    assert.equal(runner.requests.length, 5, "the phone's review reads and its mark reach the host");
+    for (const [method, path] of [["POST", "/permissions/delegations"], ["POST", "/permissions/revocations"], ["POST", "/permissions/reopenings"],
+      ["POST", "/permissions/unlocks"], ["GET", "/permissions/status"], ["GET", "/permissions/decisions/pd-1/../../me"], ["POST", "/permissions/log"]] as const)
+      await assert.rejects(client.request(path, { method, body: method === "GET" ? undefined : {} }), (error: RemoteError) => error.status === 403);
+    assert.equal(runner.requests.length, 5, "an act that changes what the permission agent may decide never passes the relay");
+  } finally { client.close(); runner.close(); }
+});
+
+test("the relay refuses objective records", async () => {
+  const runner = await httpRunner();
+  const client = createRemoteClient({ url: runner.url, token: runner.token });
+  try {
+    await client.request("/me");
+    for (const path of [`/goals/${randomUUID()}/record`, `/goals/${randomUUID()}/record?version=1`, `/teams/${randomUUID()}/record`])
+      await assert.rejects(client.request(path), (error: RemoteError) => error.status === 403 && error.code === "remote-endpoint-denied");
+    assert.equal(runner.requests.length, 1, "a refused record read does not reach the host");
+  } finally { client.close(); runner.close(); }
+});
+
+test("the relay refuses the verdicts read", async () => {
+  const runner = await httpRunner();
+  const client = createRemoteClient({ url: runner.url, token: runner.token });
+  try {
+    await client.request("/me");
+    await assert.rejects(client.request(`/goals/${randomUUID()}/verdicts`), (error: RemoteError) => error.status === 403 && error.code === "remote-endpoint-denied");
+    assert.equal(runner.requests.length, 1, "a refused verdicts read does not reach the host");
+  } finally { client.close(); runner.close(); }
+});
+
+test("the relay refuses the reported-numbers curve", async () => {
+  const runner = await httpRunner();
+  const client = createRemoteClient({ url: runner.url, token: runner.token });
+  try {
+    await client.request("/me");
+    for (const path of [`/goals/${randomUUID()}/metrics`, `/goals/${randomUUID()}/metrics?view=full`])
+      await assert.rejects(client.request(path), (error: RemoteError) => error.status === 403 && error.code === "remote-endpoint-denied");
+    assert.equal(runner.requests.length, 1, "a refused curve read does not reach the host");
+  } finally { client.close(); runner.close(); }
+});
+
+test("the relay refuses routing reads", async () => {
+  const runner = await httpRunner();
+  const client = createRemoteClient({ url: runner.url, token: runner.token });
+  try {
+    await client.request("/me");
+    for (const path of [`/routing/projects/rehearsal`, `/teams/${randomUUID()}/routing/task-1`])
+      await assert.rejects(client.request(path), (error: RemoteError) => error.status === 403 && error.code === "remote-endpoint-denied");
+    assert.equal(runner.requests.length, 1, "a refused routing read does not reach the host");
+  } finally { client.close(); runner.close(); }
+});
+
+test("the relay refuses routing writes", async () => {
+  const runner = await httpRunner();
+  const client = createRemoteClient({ url: runner.url, token: runner.token });
+  try {
+    await client.request("/me");
+    for (const [method, path] of [["POST", `/routing/projects/rehearsal/explore/pause`], ["POST", `/routing/projects/rehearsal/explore/resume`], ["POST", `/teams/${randomUUID()}/routing/revoke`]] as const)
+      await assert.rejects(client.request(path, { method, body: {} }), (error: RemoteError) => error.status === 403 && error.code === "remote-endpoint-denied");
+    assert.equal(runner.requests.length, 1, "a refused routing write does not reach the host");
+  } finally { client.close(); runner.close(); }
+});
+
+test("the relay refuses corrections", async () => {
+  const runner = await httpRunner();
+  const client = createRemoteClient({ url: runner.url, token: runner.token });
+  try {
+    await client.request("/me");
+    await assert.rejects(client.request(`/goals/${randomUUID()}/record`, { method: "POST", body: {} }), (error: RemoteError) => error.status === 403 && error.code === "remote-endpoint-denied");
+    assert.equal(runner.requests.length, 1, "a refused correction does not reach the host");
+  } finally { client.close(); runner.close(); }
+});
+
+test("remote router round-trips valid percent-encoded path segments to Express and rejects traversal, separator, control, malformed, and double-encoded segments", { timeout: 30000 }, async () => {
+  const encodedAccounts = [
+    { id: "team alpha", encoded: "team%20alpha", planUsd: 11.25 },
+    { id: "claude+work", encoded: "claude%2Bwork", planUsd: 22.5 },
+    { id: "alice@example.com", encoded: "alice%40example.com", planUsd: 33.75 },
+    { id: "café", encoded: "caf%C3%A9", planUsd: 44 },
+    { id: "100%", encoded: "100%25", planUsd: 55 },
+    { id: "a%b", encoded: "a%25b", planUsd: 66 },
+    { id: "a".repeat(201), encoded: "a".repeat(201), planUsd: 77 },
+  ];
+  const host = await inProcessHost({
+    configure: config => {
+      config.remote = { enabled: true };
+      config.usage = {
+        prices: {},
+        budgets: {},
+        accounts: Object.fromEntries(encodedAccounts.map(account => [account.id, { kind: "subscription" as const, match: [], planUsd: 10 }])),
+      };
+    },
+  });
+  const owner = createRemoteClient({ url: host.origin, token: host.tokens.owner });
+  const runner = await httpRunner();
+  const runnerClient = createRemoteClient({ url: runner.url, token: runner.token });
+  try {
+    for (const account of encodedAccounts) {
+      const reply = await owner.request<{ accounts: { id: string; planUsd?: number; planSource?: string }[] }>(
+        `/usage/accounts/${account.encoded}/plan`,
+        { method: "PUT", body: { planUsd: account.planUsd } },
+      );
+      const updated = reply.accounts.find(item => item.id === account.id);
+      assert.equal(updated?.planUsd, account.planUsd, `Express decoded ${account.encoded} once to ${account.id}`);
+      assert.equal(updated?.planSource, "owner");
+    }
+
+    assert.deepEqual(
+      await runnerClient.request("/permissions/decisions/pd%3A123"),
+      { count: 1, method: "GET", path: "/api/permissions/decisions/pd%3A123" },
+    );
+    assert.deepEqual(
+      await runnerClient.request("/project-groups/shop/understanding/behaviors/account%3Aflow.v2"),
+      { count: 2, method: "GET", path: "/api/project-groups/shop/understanding/behaviors/account%3Aflow.v2" },
+    );
+    assert.deepEqual(
+      await runnerClient.request("/usage/projects/my-project?tz=America%2FNew_York"),
+      { count: 3, method: "GET", path: "/api/usage/projects/my-project?tz=America%2FNew_York" },
+    );
+
+    const beforeRejections = runner.requests.length;
+    const rejected: readonly [method: "GET" | "PUT", path: string][] = [
+      ["PUT", "/usage/accounts/%2e%2e/plan"],
+      ["PUT", "/usage/accounts/%2E%2E/plan"],
+      ["PUT", "/usage/accounts/.%2e/plan"],
+      ["PUT", "/usage/accounts/%2e./plan"],
+      ["PUT", "/usage/accounts/../plan"],
+      ["PUT", "/usage/accounts/%2e/plan"],
+      ["PUT", "/usage/accounts/%2E/plan"],
+      ["PUT", "/usage/accounts/./plan"],
+      ["PUT", "/usage/accounts/a%2fb/plan"],
+      ["PUT", "/usage/accounts/a%2Fb/plan"],
+      ["PUT", "/usage/accounts/a%5cb/plan"],
+      ["PUT", "/usage/accounts/a%5Cb/plan"],
+      ["PUT", "/usage/accounts/a%00b/plan"],
+      ["PUT", "/usage/accounts/a%0ab/plan"],
+      ["PUT", "/usage/accounts/a%0db/plan"],
+      ["PUT", "/usage/accounts/a%1fb/plan"],
+      ["PUT", "/usage/accounts/a%7fb/plan"],
+      ["PUT", "/usage/accounts/a%ZZb/plan"],
+      ["PUT", "/usage/accounts/a%2/plan"],
+      ["PUT", "/usage/accounts/a%/plan"],
+      ["PUT", "/usage/accounts/%C0%AF/plan"],
+      ["PUT", "/usage/accounts/%FF/plan"],
+      ["PUT", "/usage/accounts/%252e%252e/plan"],
+      ["PUT", "/usage/accounts/%252e/plan"],
+      ["PUT", "/usage/accounts/%252f/plan"],
+      ["PUT", "/usage/accounts/%255c/plan"],
+      ["PUT", "/usage/accounts/%2500/plan"],
+      ["PUT", "/usage/accounts/%25252e%25252e/plan"],
+      ["PUT", "/usage/accounts/a%2520b/plan"],
+      ["PUT", "/usage/accounts//plan"],
+      ["PUT", `/usage/accounts/${"a".repeat(8200)}/plan`],
+      ["PUT", "/usage/%61ccounts/claude/plan"],
+      ["PUT", "/usage/accounts/claude/%70lan"],
+      ["GET", "/%6de"],
+      ["GET", "/sessions/%2e%2e/me"],
+      ["GET", "/sessions/%252e%252e/me"],
+      ["GET", "/permissions/decisions/pd%2f1"],
+      ["GET", "/usage/projects/a%2Fb?tz=UTC"],
+    ];
+    for (const [method, path] of rejected) {
+      await assert.rejects(
+        runnerClient.request(path, { method, body: method === "PUT" ? { planUsd: 1 } : undefined }),
+        (error: RemoteError) => error.status === 403 && error.code === "remote-endpoint-denied",
+        `${method} ${path} must be denied`,
+      );
+    }
+    assert.equal(runner.requests.length, beforeRejections, "rejected encoded paths never reach the upstream HTTP server");
+  } finally {
+    owner.close();
+    runnerClient.close();
+    runner.close();
+    await host.stop();
+  }
+});
+
+test("the relay carries mission progress and team entry reads and denies mutations or unrelated subpaths", { timeout: 20000 }, async () => {
+  const runner = await httpRunner();
+  const client = createRemoteClient({ url: runner.url, token: runner.token });
+  const missionId = randomUUID();
+  const teamId = randomUUID();
+  const entryId = randomUUID();
+  const v8EntryId = "12345678-1234-8123-8123-123456789abc";
+  const cursor = `mp1.${randomUUID()}.${missionId}.${randomUUID()}.4`;
+  try {
+    assert.deepEqual(
+      await client.request(`/missions/${missionId}/progress`),
+      { count: 1, method: "GET", path: `/api/missions/${missionId}/progress` },
+    );
+    assert.deepEqual(
+      await client.request(`/missions/${missionId}/progress?cursor=${encodeURIComponent(cursor)}`),
+      { count: 2, method: "GET", path: `/api/missions/${missionId}/progress?cursor=${encodeURIComponent(cursor)}` },
+    );
+    assert.deepEqual(
+      await client.request(`/teams/${teamId}/entries`),
+      { count: 3, method: "GET", path: `/api/teams/${teamId}/entries` },
+    );
+    assert.deepEqual(
+      await client.request(`/teams/${teamId}/entries?kind=check&since=10`),
+      { count: 4, method: "GET", path: `/api/teams/${teamId}/entries?kind=check&since=10` },
+    );
+    assert.deepEqual(
+      await client.request(`/teams/${teamId}/entries/${entryId}`),
+      { count: 5, method: "GET", path: `/api/teams/${teamId}/entries/${entryId}` },
+    );
+    assert.deepEqual(
+      await client.request(`/teams/${teamId}/entries/${v8EntryId}`),
+      { count: 6, method: "GET", path: `/api/teams/${teamId}/entries/${v8EntryId}` },
+    );
+
+    const denied: readonly [method: "GET" | "POST" | "PUT" | "DELETE", path: string][] = [
+      ["POST", `/missions/${missionId}/progress`],
+      ["GET", `/missions/${missionId}/progress/extra`],
+      ["GET", "/missions/not-a-uuid/progress"],
+      ["GET", `/missions/${missionId}/%70rogress`],
+      ["POST", `/teams/${teamId}/entries`],
+      ["PUT", `/teams/${teamId}/entries/${entryId}`],
+      ["POST", `/teams/${teamId}/entries/${entryId}`],
+      ["DELETE", `/teams/${teamId}/entries/${entryId}`],
+      ["GET", `/teams/${teamId}/entries/not-a-uuid`],
+      ["GET", `/teams/${teamId}/entries/${entryId}/withdraw`],
+      ["POST", `/teams/${teamId}/entries/${entryId}/withdraw`],
+      ["GET", `/teams/${teamId}/entries/${entryId}/extra`],
+      ["GET", "/teams/not-a-uuid/entries"],
+      ["GET", `/teams/${teamId}/%65ntries`],
+    ];
+    for (const [method, path] of denied) {
+      await assert.rejects(
+        client.request(path, { method, body: method === "GET" ? undefined : {} }),
+        (error: RemoteError) => error.status === 403 && error.code === "remote-endpoint-denied",
+        `${method} ${path} must be denied`,
+      );
+    }
+    assert.equal(runner.requests.length, 6, "denied inspector mutations and subpaths never reach the host");
+  } finally {
+    client.close();
+    runner.close();
+  }
+});
+
+test("the relay carries understanding work brief reads and refreshes, enforces roles, and denies invalid work paths", { timeout: 30000 }, async () => {
+  const goalId = randomUUID();
+  const workId = `goal:${goalId}`;
+  const encodedWorkId = encodeURIComponent(workId);
+  const host = await inProcessHost({
+    configure: config => {
+      config.remote = { enabled: true };
+      const request = createGoalSchema.parse({
+        requestId: goalId,
+        projectId: "rehearsal",
+        title: "Remote work brief goal",
+        objective: "Verify remote work brief access",
+        successCriteria: "Work brief opens over remote channel",
+      });
+      const { requestId: id, ...input } = request;
+      const at = new Date(Date.UTC(2026, 0, 1, 0, 0, 0)).toISOString();
+      const strong = { id: "fixture-strong", label: "Fixture reviewer", provider: "codex" as const, model: "fixture", tier: "strong" as const };
+      const goal: ProductGoal = {
+        ...input, id, revision: 1, status: "cancelled", createdAt: at, updatedAt: at, deadlineAt: at,
+        lineup: { coordinator: strong, integrator: strong, reviewer: strong, implementers: [], escalations: [] },
+        cycles: [], memberCount: 0, steering: [], events: [], outcomes: [],
+      };
+      mkdirSync(join(config.stateDir, "goals"), { recursive: true });
+      writeSealed(join(config.stateDir, "goals", `${id}.sealed`), readFileSync(config.keyFile), `goal:${id}`, { goal, fingerprint: "fixture", receipts: {} });
+    },
+  });
+  const owner = createRemoteClient({ url: host.origin, token: host.tokens.owner });
+  const controller = createRemoteClient({ url: host.origin, token: host.tokens.controller });
+  const viewer = createRemoteClient({ url: host.origin, token: host.tokens.viewer });
+  let runner: Awaited<ReturnType<typeof httpRunner>> | undefined;
+  let runnerClient: RemoteClient | undefined;
+  try {
+    runner = await httpRunner();
+    runnerClient = createRemoteClient({ url: runner.url, token: runner.token });
+    const listed = await owner.request<{ groups: { id: string; repos: { checkouts: { projectId: string }[] }[] }[] }>("/project-groups");
+    const workspace = listed.groups.find(group => group.repos.some(repo => repo.checkouts.some(checkout => checkout.projectId === "rehearsal")));
+    assert.ok(workspace, "rehearsal checkout has a canonical workspace");
+    const workPath = `/project-groups/${encodeURIComponent(workspace.id)}/understanding/work/${encodedWorkId}`;
+
+    for (const reader of [owner, controller, viewer]) {
+      const brief = await reader.request<{ schemaVersion: number; workId: string; narrative: { state: string } }>(workPath);
+      assert.equal(brief.schemaVersion, 1);
+      assert.equal(brief.workId, workId);
+      assert.equal(brief.narrative.state, "unavailable");
+    }
+
+    for (const writer of [owner, controller]) {
+      const refreshed = await writer.request<{ narrative: { state: string } }>(`${workPath}/refresh`, { method: "POST", body: {} });
+      assert.equal(refreshed.narrative.state, "unavailable");
+    }
+
+    await assert.rejects(
+      viewer.request(`${workPath}/refresh`, { method: "POST", body: {} }),
+      (error: RemoteError) => error.status === 403 && error.code !== "remote-endpoint-denied",
+      "viewer refresh reaches Express role enforcement instead of the remote allowlist",
+    );
+
+    await assert.rejects(
+      viewer.request(`/project-groups/${encodeURIComponent(workspace.id)}/understanding/work/${encodeURIComponent(`team:${randomUUID()}`)}`),
+      (error: RemoteError) => error.status === 404 && error.code === "understanding-work",
+      "missing work briefs return 404 understanding-work through remote transport",
+    );
+
+    const teamId = randomUUID();
+    const missionId = randomUUID();
+    const allowed: readonly [method: "GET" | "POST", path: string][] = [
+      ["GET", `/project-groups/shop/understanding/work/${encodeURIComponent(`team:${teamId}`)}`],
+      ["GET", `/project-groups/shop/understanding/work/${encodeURIComponent(`mission:${missionId}`)}`],
+      ["GET", `/project-groups/shop/understanding/work/${encodeURIComponent(`goal:${goalId}`)}`],
+      ["GET", `/project-groups/shop/understanding/work/team:${teamId}`],
+      ["POST", `/project-groups/shop/understanding/work/${encodeURIComponent(`team:${teamId}`)}/refresh`],
+      ["POST", `/project-groups/shop/understanding/work/${encodeURIComponent(`mission:${missionId}`)}/refresh`],
+      ["POST", `/project-groups/shop/understanding/work/${encodeURIComponent(`goal:${goalId}`)}/refresh`],
+    ];
+    for (let index = 0; index < allowed.length; index++) {
+      const [method, path] = allowed[index]!;
+      assert.deepEqual(
+        await runnerClient.request(path, { method, body: method === "POST" ? {} : undefined }),
+        { count: index + 1, method, path: `/api${path}` },
+      );
+    }
+
+    const denied: readonly [method: "GET" | "POST" | "PUT" | "DELETE", path: string][] = [
+      ["POST", "/project-groups/shop/understanding/work"],
+      ["POST", `/project-groups/shop/understanding/work/${encodeURIComponent(`team:${teamId}`)}`],
+      ["PUT", `/project-groups/shop/understanding/work/${encodeURIComponent(`team:${teamId}`)}`],
+      ["DELETE", `/project-groups/shop/understanding/work/${encodeURIComponent(`team:${teamId}`)}`],
+      ["GET", `/project-groups/shop/understanding/work/${encodeURIComponent(`team:${teamId}`)}/refresh`],
+      ["PUT", `/project-groups/shop/understanding/work/${encodeURIComponent(`team:${teamId}`)}/refresh`],
+      ["DELETE", `/project-groups/shop/understanding/work/${encodeURIComponent(`team:${teamId}`)}/refresh`],
+      ["GET", `/project-groups/shop/understanding/work/${encodeURIComponent(`session:${teamId}`)}`],
+      ["GET", "/project-groups/shop/understanding/work/goal%3Anot-a-uuid"],
+      ["GET", `/project-groups/shop/understanding/work/${encodeURIComponent(`team:${teamId.toUpperCase()}`)}`],
+      ["GET", `/project-groups/shop/understanding/work/${encodeURIComponent(`team:${teamId}`)}/extra`],
+      ["POST", `/project-groups/shop/understanding/work/${encodeURIComponent(`team:${teamId}`)}/extra`],
+      ["POST", `/project-groups/shop/understanding/work/${encodeURIComponent(`team:${teamId}`)}/refresh/extra`],
+      ["GET", `/project-groups/shop/understanding/%77ork/${encodeURIComponent(`team:${teamId}`)}`],
+      ["POST", `/project-groups/shop/understanding/work/${encodeURIComponent(`team:${teamId}`)}/%72efresh`],
+      ["GET", `/project-groups/shop/understanding/work/team%253A${teamId}`],
+    ];
+    for (const [method, path] of denied) {
+      await assert.rejects(
+        runnerClient.request(path, { method, body: method === "GET" ? undefined : {} }),
+        (error: RemoteError) => error.status === 403 && error.code === "remote-endpoint-denied",
+        `${method} ${path} must be denied`,
+      );
+    }
+    assert.equal(runner.requests.length, allowed.length, "denied work brief requests never reach the host");
+  } finally {
+    owner.close();
+    controller.close();
+    viewer.close();
+    runnerClient?.close();
+    runner?.close();
+    await host.stop();
+  }
+});
+
+test("remote access allows GET /api/usage/interrupted-tasks and rejects mutations", async () => {
+  const runner = await httpRunner();
+  const client = createRemoteClient({ url: runner.url, token: runner.token });
+  try {
+    await client.request("/me");
+    assert.deepEqual(
+      await client.request("/usage/interrupted-tasks?project=shop&days=14"),
+      { count: 2, method: "GET", path: "/api/usage/interrupted-tasks?project=shop&days=14" },
+    );
+    await assert.rejects(
+      client.request("/usage/interrupted-tasks", { method: "POST", body: {} }),
+      (error: RemoteError) => error.status === 403 && error.code === "remote-endpoint-denied",
+    );
+    assert.equal(runner.requests.length, 2);
+  } finally {
+    client.close();
+    runner.close();
+  }
 });

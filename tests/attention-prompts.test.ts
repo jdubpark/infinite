@@ -30,6 +30,139 @@ test("claude permission dialog inside a box", () => {
   assert.equal(p.multiSelect, false);
 });
 
+test("Claude Code Mode confirmation is an owner-reserved prompt", () => {
+  const captured = screen("claude-code-mode");
+  const prompt = detectPrompt(captured, "claude");
+  assert.ok(prompt);
+  assert.equal(prompt.kind, "permission");
+  assert.equal(prompt.title, "Code Mode (experimental)");
+  assert.match(prompt.detail ?? "", /In Code Mode, Claude works by writing and running JavaScript/);
+  assert.deepEqual(prompt.options, [
+    { index: 0, label: "No, start without it", role: "reject" },
+    { index: 1, label: "Yes, turn on Code Mode", role: "accept" },
+  ]);
+  assert.equal(prompt.highlighted, 0);
+  assert.equal(prompt.acceptsText, false);
+  assert.equal(prompt.multiSelect, false);
+  assert.equal(prompt.pinned, true);
+
+  const yesSelected = captured.map(line => line.replace("❯ No, start without it", "No, start without it")
+    .replace("Yes, turn on Code Mode", "❯ Yes, turn on Code Mode"));
+  assert.equal(detectPrompt(yesSelected, "claude")?.highlighted, 1);
+  assert.equal(detectPrompt(["Claude Code is ready."], "claude"), null);
+  assert.equal(detectPrompt(["The transcript mentions Code Mode (experimental)."], "claude"), null);
+  assert.equal(detectPrompt(["Code Mode (experimental)", "No, start without it", "Yes, turn on Code Mode"], "claude"), null);
+
+  const wrapped = captured.flatMap(line => line.trim() === "❯ No, start without it" ? ["      ❯ No, start without", "        it"]
+    : line.trim() === "Yes, turn on Code Mode" ? ["      Yes, turn on", "        Code Mode"] : [line]);
+  const wrappedPrompt = detectPrompt(wrapped, "claude");
+  assert.deepEqual(wrappedPrompt?.options.map(option => option.label), ["No, start without it", "Yes, turn on Code Mode"]);
+
+  const trust = detectPrompt(screen("claude-trust"), "claude");
+  assert.ok(trust);
+  assert.match(trust.title, /^Quick safety check: Is this a project you created or one you trust\?/);
+  assert.equal(trust.kind, "permission");
+  assert.equal(trust.options[0].label, "No, exit");
+  assert.equal(trust.pinned, true);
+});
+
+const staleCodeModeMenu = (highlighted: "no" | "yes") => [
+  "Code Mode (experimental)",
+  `${highlighted === "no" ? "❯ " : "  "}No, start without it`,
+  `${highlighted === "yes" ? "❯ " : "  "}Yes, turn on Code Mode`,
+];
+
+test("Code Mode selects the final dialog when an older No menu remains above it", () => {
+  const live = screen("claude-code-mode").map(line => line.replace("❯ No, start without it", "No, start without it")
+    .replace("Yes, turn on Code Mode", "❯ Yes, turn on Code Mode"));
+  const lines = [...staleCodeModeMenu("no"), "", ...live];
+  const prompt = detectPrompt(lines, "claude");
+  assert.equal(prompt?.title, "Code Mode (experimental)");
+  assert.equal(prompt?.highlighted, 1);
+  assert.equal(prompt?.pinned, true);
+  assert.ok(prompt && prompt.blockStart >= staleCodeModeMenu("no").length + 1);
+});
+
+test("Code Mode selects the final dialog when an older Yes menu remains above it", () => {
+  const lines = [...staleCodeModeMenu("yes"), "", ...screen("claude-code-mode")];
+  const prompt = detectPrompt(lines, "claude");
+  assert.equal(prompt?.title, "Code Mode (experimental)");
+  assert.equal(prompt?.highlighted, 0);
+  assert.equal(prompt?.pinned, true);
+  assert.ok(prompt && prompt.blockStart >= staleCodeModeMenu("yes").length + 1);
+});
+
+test("an old Code Mode menu above a yes-no prompt leaves the yes-no prompt open", () => {
+  const prompt = detectPrompt([...staleCodeModeMenu("no"), "Continue? [y/N]"], "claude");
+  assert.equal(prompt?.kind, "yes-no");
+  assert.equal(prompt?.title, "Continue? [y/N]");
+});
+
+test("another prompt's key hint is not the Code Mode footer", () => {
+  for (const cursor of ["no", "yes"] as const) {
+    const prompt = detectPrompt([...staleCodeModeMenu(cursor), "", "Press y to proceed or n to cancel [Y/n]"], "claude");
+    assert.equal(prompt?.kind, "yes-no", cursor);
+    assert.equal(prompt?.title, "Press y to proceed or n to cancel [Y/n]", cursor);
+  }
+  for (const hint of ["Press Enter to continue", "Esc to cancel", "Enter to confirm"])
+    assert.notEqual(detectPrompt([...staleCodeModeMenu("no"), hint], "claude")?.title, "Code Mode (experimental)", hint);
+});
+
+test("characters after an old Code Mode menu that are not its footer leave no open dialog", () => {
+  for (const trailing of ["❯", ">", "›", "$", "!!!", "继续", "/"]) {
+    for (const cursor of ["no", "yes"] as const)
+      assert.notEqual(detectPrompt([...staleCodeModeMenu(cursor), "", trailing], "claude")?.title, "Code Mode (experimental)", `${cursor} menu, then ${trailing}`);
+    assert.notEqual(detectPrompt([...screen("claude-code-mode"), trailing], "claude")?.title, "Code Mode (experimental)", `footer, then ${trailing}`);
+  }
+  const idle = [...staleCodeModeMenu("no"), "", "❯"];
+  assert.equal(isIdleScreen(idle, "claude"), true);
+  assert.equal(detectPrompt(idle, "claude"), null);
+});
+
+test("the Code Mode footer is read at every wrap width", () => {
+  const footer = ["Tell us how it goes with /feedback", "Enter to confirm · Esc to start without it"];
+  for (let width = 1; width <= 80; width++) {
+    const lines = screen("claude-code-mode").flatMap(line =>
+      footer.includes(line.trim()) ? line.trim().match(new RegExp(`.{1,${width}}`, "g")) ?? [] : [line]);
+    assert.equal(detectPrompt(lines, "claude")?.title, "Code Mode (experimental)", `width ${width}`);
+  }
+});
+
+test("an old Code Mode menu followed by transcript text is not an open prompt", () => {
+  assert.equal(detectPrompt([...staleCodeModeMenu("no"), "Task continued in the transcript."], "claude"), null);
+});
+
+test("Code Mode option fragments cannot combine across unrelated screen text", () => {
+  assert.equal(detectPrompt([
+    "Code Mode (experimental)",
+    "❯ Yes, turn on Code Mode",
+    "The transcript continues here.",
+    "No, start without it",
+  ], "claude"), null);
+});
+
+test("Code Mode takes precedence over an older numbered permission menu", () => {
+  const lines = [...screen("claude-permission"), "", ...screen("claude-code-mode")];
+  const prompt = detectPrompt(lines, "claude");
+  assert.equal(prompt?.title, "Code Mode (experimental)");
+  assert.ok(prompt && prompt.blockStart >= screen("claude-permission").length + 1);
+});
+
+test("Code Mode takes precedence over an older folder-trust menu", () => {
+  const lines = [...screen("claude-trust"), "", ...screen("claude-code-mode")];
+  const prompt = detectPrompt(lines, "claude");
+  assert.equal(prompt?.title, "Code Mode (experimental)");
+  assert.ok(prompt && prompt.blockStart >= screen("claude-trust").length + 1);
+});
+
+test("Code Mode accepts a footer hint wrapped across two screen lines", () => {
+  const lines = screen("claude-code-mode").flatMap(line => line.trim() === "Enter to confirm · Esc to start without it"
+    ? ["  Enter to confirm · Esc to start", "    without it"] : [line]);
+  const prompt = detectPrompt(lines, "claude");
+  assert.equal(prompt?.title, "Code Mode (experimental)");
+  assert.equal(prompt?.pinned, true);
+});
+
 test("transcript lines above a boxed dialog are not part of its header", () => {
   const lines = ["⏺ I'll remove the stale build directory first.", "  Then rebuild from scratch.", ...screen("claude-permission")];
   const p = detectPrompt(lines, "claude");
@@ -37,7 +170,6 @@ test("transcript lines above a boxed dialog are not part of its header", () => {
   assert.equal(p.title, "Do you want to proceed?");
   assert.equal(p.detail, "Bash command\nrm -rf build\nRemove the stale build directory");
   assert.doesNotMatch(p.detail ?? "", /stale build directory first|rebuild/);
-  // The fingerprint, and so the answer hash, is the same with or without the transcript above.
   assert.equal(p.fingerprint, detectPrompt(screen("claude-permission"), "claude")!.fingerprint);
 });
 
@@ -90,7 +222,7 @@ test("fingerprint includes the dialog's detail, normalised", () => {
   const a = detectPrompt(screen("demo-dialog"), "demo")!;
   const other = detectPrompt(screen("demo-dialog").map((l) => l.replace("rm -rf build", "rm -rf /data")), "demo")!;
   const respaced = detectPrompt(screen("demo-dialog").map((l) => l.replace("  rm -rf build", "    rm   -rf  build ")), "demo")!;
-  assert.notEqual(a.fingerprint, other.fingerprint);   // same title and options, different command
+  assert.notEqual(a.fingerprint, other.fingerprint);
   assert.equal(a.fingerprint, respaced.fingerprint);
 });
 

@@ -63,7 +63,7 @@ export function useLiveRefresh(
     const resync = () => {
       generation++;
       setFresh(false);
-      markStaleLater();
+      if (document.visibilityState === "hidden") recover(); else markStaleLater();
       if (!navigator.onLine) setFailed(true);
       clearTimeout(timer);
       if (foreground()) void poll();

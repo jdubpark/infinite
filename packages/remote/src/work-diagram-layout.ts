@@ -180,19 +180,73 @@ function placeGroupsAndNonMembersOutside(
   return groupBoxes(diagram, nodes);
 }
 
+export function deduplicateById<T extends { id: string }>(items: readonly T[]): T[] {
+  const seen = new Set<string>();
+  const unique: T[] = [];
+  for (const item of items) {
+    if (seen.has(item.id)) continue;
+    seen.add(item.id);
+    unique.push(item);
+  }
+  return unique;
+}
+
+export function normalizeDiagram<T extends Pick<Diagram, "nodes" | "groups" | "sequence">>(diagram: T): T {
+  const nodes = deduplicateById(diagram.nodes);
+  const groups = deduplicateById(diagram.groups);
+  const sequence = diagram.sequence
+    ? { ...diagram.sequence, participants: deduplicateById(diagram.sequence.participants) }
+    : undefined;
+  return {
+    ...diagram,
+    nodes,
+    groups,
+    ...(sequence ? { sequence } : {}),
+  } as T;
+}
+
+export function describeDiagram(diagram: Pick<Diagram, "title" | "nodes" | "edges" | "groups" | "sequence">): string {
+  const normalized = normalizeDiagram(diagram);
+  const changes = normalized.nodes.reduce((counts, node) => {
+    if (node.change) counts[node.change] += 1;
+    return counts;
+  }, { added: 0, modified: 0, removed: 0 });
+  const title = normalized.title || "Change map";
+  const count = normalized.sequence?.participants.length ?? normalized.nodes.length;
+  const relationships = normalized.sequence?.messages.length ?? normalized.edges.length;
+  return `${title}: ${count} components, ${changes.modified} modified, ${changes.added} added, ${changes.removed} removed; ${relationships} relationships`;
+}
+
+export function relatedDiagramGroups(
+  diagram: Pick<Diagram, "nodes" | "edges" | "groups" | "sequence">,
+  selectedId: string | undefined,
+): Set<string> {
+  const normalized = normalizeDiagram(diagram);
+  if (!selectedId) return new Set(normalized.groups.map(group => group.id));
+  const neighbors = new Set<string>([selectedId]);
+  const relationships = normalized.sequence?.messages ?? normalized.edges;
+  for (const edge of relationships) {
+    if (edge.from === selectedId) neighbors.add(edge.to);
+    if (edge.to === selectedId) neighbors.add(edge.from);
+  }
+  const related = new Set<string>();
+  for (const node of normalized.nodes) {
+    if (node.group && neighbors.has(node.id)) related.add(node.group);
+  }
+  return related;
+}
+
 function layoutSequence(sequence: NonNullable<Diagram["sequence"]>): DiagramLayout {
   const spacing = NODE_W + LAYER_GAP;
-  const lanes = sequence.participants.map((participant, index) => ({
+  const participants = deduplicateById(sequence.participants);
+  const lanes = participants.map((participant, index) => ({
     id: participant.id,
     label: participant.label,
     x: index * spacing,
   }));
-  const laneById = new Map<string, number>();
-  sequence.participants.forEach((participant, index) => {
-    if (!laneById.has(participant.id)) laneById.set(participant.id, index);
-  });
+  const laneById = new Map(participants.map((participant, index) => [participant.id, index]));
 
-  const nodes: LayoutNode[] = sequence.participants.map((participant, index) => ({
+  const nodes: LayoutNode[] = participants.map((participant, index) => ({
     id: participant.id,
     x: index * spacing,
     y: 0,
@@ -240,22 +294,19 @@ function layoutSequence(sequence: NonNullable<Diagram["sequence"]>): DiagramLayo
   };
 }
 
-/** Deterministic layered layout; sequence diagrams lay out as lanes and message rows. */
 export function layoutDiagram(diagram: Pick<Diagram, "direction" | "nodes" | "edges" | "groups" | "sequence">): DiagramLayout {
-  if (diagram.sequence) return layoutSequence(diagram.sequence);
+  const normalized = normalizeDiagram(diagram);
+  if (normalized.sequence) return layoutSequence(normalized.sequence);
 
-  const ids = diagram.nodes.map(node => node.id);
-  const indexById = new Map<string, number>();
-  ids.forEach((id, index) => {
-    if (!indexById.has(id)) indexById.set(id, index);
-  });
+  const uniqueNodes = normalized.nodes;
+  const ids = uniqueNodes.map(node => node.id);
+  const indexById = new Map(ids.map((id, index) => [id, index]));
   const edges: EdgeRef[] = diagram.edges
     .map((edge, index) => ({ from: edge.from, to: edge.to, index }))
     .filter(edge => indexById.has(edge.from) && indexById.has(edge.to));
   const outgoing = new Map(ids.map(id => [id, [] as EdgeRef[]]));
   for (const edge of edges) outgoing.get(edge.from)?.push(edge);
 
-  // Reverse only DFS back-edges in the layering graph. The rendered edge is unchanged.
   const state = new Map<string, 0 | 1 | 2>(ids.map(id => [id, 0]));
   const reversed = new Set<number>();
   const visit = (id: string): void => {
@@ -306,7 +357,6 @@ export function layoutDiagram(diagram: Pick<Diagram, "direction" | "nodes" | "ed
       if (degree === 0) ready.push(target);
     }
   }
-  // The DFS reversal makes a DAG; this guard also ensures malformed duplicate ids terminate.
   for (const id of ids) if (!topological.includes(id)) topological.push(id);
 
   const layerById = new Map(ids.map(id => [id, 0]));
@@ -376,13 +426,13 @@ export function layoutDiagram(diagram: Pick<Diagram, "direction" | "nodes" | "ed
         y: diagram.direction === "LR" ? crossOffset : MARGIN + layerIndex * (NODE_H + LAYER_GAP),
         w: NODE_W,
         h: NODE_H,
-        lines: wrapLabel(diagram.nodes[indexById.get(id) ?? 0]?.label ?? ""),
+        lines: wrapLabel(uniqueNodes[indexById.get(id) ?? 0]?.label ?? ""),
       };
       nodesById.set(id, node);
     }
   }
   const nodes = ids.map(id => nodesById.get(id)).filter((node): node is LayoutNode => node !== undefined);
-  const groups = placeGroupsAndNonMembersOutside(diagram, layerIds, nodes);
+  const groups = placeGroupsAndNonMembersOutside(normalized, layerIds, nodes);
 
   const layoutEdges: LayoutEdge[] = [];
   for (const edge of diagram.edges) {

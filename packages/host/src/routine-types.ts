@@ -1,9 +1,10 @@
 import { z } from "zod";
 import { createGoalSchema, type CreateGoal } from "./goal-types.js";
+import { signalKinds, type PendingWake, type SignalKind } from "./signals/types.js";
 
 const explicitAllowedPaths = createGoalSchema.shape.allowedPaths.unwrap();
 const explicitBudget = z.number().int();
-const { requestId: _requestId, ...goalFields } = createGoalSchema.shape;
+const { requestId: _requestId, standing: _standing, ...goalFields } = createGoalSchema.shape;
 const routineGoalSchema = z.object(goalFields).extend({
   allowedPaths: explicitAllowedPaths,
   maxRuns: explicitBudget.min(1).max(10),
@@ -13,6 +14,9 @@ const routineGoalSchema = z.object(goalFields).extend({
   path: ["maxTotalMinutes"], message: "The total time ceiling cannot be shorter than the time limit.",
 });
 
+const wakeOnSchema = z.array(z.enum(signalKinds)).min(1).max(4)
+  .refine(kinds => new Set(kinds).size === kinds.length, "Each signal kind may appear once.");
+
 export const createRoutineSchema = z.object({
   requestId: z.uuid(),
   goal: routineGoalSchema,
@@ -20,13 +24,20 @@ export const createRoutineSchema = z.object({
   maxOccurrences: z.number().int().min(1).max(100),
   startsAt: z.string().datetime({ offset: true }),
   expiresAt: z.string().datetime({ offset: true }),
+  wakeOn: wakeOnSchema.optional(),
 }).strict();
 export type CreateRoutine = Omit<z.infer<typeof createRoutineSchema>, "goal"> & { goal: Omit<CreateGoal, "requestId"> };
 
 export const routineActionSchema = z.object({ requestId: z.uuid(), revision: z.number().int().min(1) }).strict();
 export type RoutineAction = z.infer<typeof routineActionSchema>;
 
-export interface RoutineOccurrence { goalId: string; startedAt: string }
+export interface RoutineWake { signalIds: string[]; dropped: number }
+export interface RoutineOccurrence {
+  goalId: string;
+  startedAt: string;
+  endedAt?: string;
+  wake?: RoutineWake;
+}
 export type RoutineStatus = "scheduled" | "running" | "paused" | "blocked" | "completed" | "cancelled" | "expired";
 export interface Routine {
   id: string;
@@ -43,4 +54,8 @@ export interface Routine {
   reason?: string;
   createdAt: string;
   updatedAt: string;
+  wakeOn?: SignalKind[];
+  signalCursor?: number;
+  pendingWake?: PendingWake;
+  wakeDeferred?: boolean;
 }

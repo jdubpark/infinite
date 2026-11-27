@@ -9,8 +9,10 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { forwardExecutor, type ExecutorControl } from "./executor-tunnel.js";
 import { captureWorkspace, hasWorkspaceBlobs, materializeWorkspace, putWorkspaceBlob, readWorkspaceBlob, validateWorkspaceManifest, type WorkspaceManifest } from "./workspace-checkpoint.js";
+import { recordClientLaptopState, removeClientLaptopState } from "./workspace-pool-gc.js";
 import { shouldCaptureWorkspace, watchWorkspaceChanges } from "./workspace-changes.js";
 import { transferWorkspaceBlobs } from "./workspace-transfer.js";
+import { supervisorArgs } from "./group-supervisor.js";
 
 interface LaptopServiceOptions {
   origin: string;
@@ -29,7 +31,6 @@ function entriesFingerprint(manifest: WorkspaceManifest): string {
   return createHash("sha256").update(JSON.stringify({ cwd: manifest.cwd, roots: manifest.roots, entries: manifest.entries })).digest("hex");
 }
 
-/** One incremental transfer at a time, independent of the terminal and first tool. */
 export async function synchronizeWorkspace(options: LaptopServiceOptions, control: ExecutorControl, signal: AbortSignal) {
   const inside = (root: string, path: string) => { const rel = relative(root, path); return !rel || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel)); };
   let directory = join(dirname(options.configFile), "workspaces", options.sessionId);
@@ -38,11 +39,13 @@ export async function synchronizeWorkspace(options: LaptopServiceOptions, contro
   await mkdir(directory, { recursive: true, mode: 0o700 });
   const storeDir = { directory: join(directory, "objects"), sharedPoolDirectory: join(dirname(dirname(directory)), "workspace-pool") };
   if (options.roots.some(root => inside(root, storeDir.sharedPoolDirectory))) throw new Error("Workspace cache must be outside the selected project");
-  const changeDetector = await watchWorkspaceChanges(options.roots, join(storeDir.directory, "watch-cache"));
+  let changeDetector: Awaited<ReturnType<typeof watchWorkspaceChanges>> | undefined;
   let previous: WorkspaceManifest | undefined, recovered: string | undefined, lastFull = 0;
   let committed: { revision: number; epoch: number; id: string; entriesFingerprint: string } | undefined;
   let previousIterationFailed = false, lastCaptureStartedAt = 0;
   try {
+    await recordClientLaptopState(directory, options.sessionId);
+    changeDetector = await watchWorkspaceChanges(options.roots, join(storeDir.directory, "watch-cache"));
     while (!signal.aborted) {
       try {
         const status = await control("sync/status");
@@ -75,7 +78,6 @@ export async function synchronizeWorkspace(options: LaptopServiceOptions, contro
           if (capture) {
             const begin = await control("sync/begin");
             const forceFull = Date.now() - lastFull > 60000;
-            // Clear events received during sync/begin just before capture; later events schedule another capture.
             await changeDetector?.take();
             lastCaptureStartedAt = Date.now();
             const manifest = await captureWorkspace({ roots: options.roots, cwd: options.cwd, storeDir, signal, previous, forceFull });
@@ -109,10 +111,12 @@ export async function synchronizeWorkspace(options: LaptopServiceOptions, contro
       }
       await delay(3000, undefined, { signal }).catch(() => {});
     }
-  } finally { await changeDetector?.close(); }
+  } finally {
+    await changeDetector?.close();
+    await removeClientLaptopState(directory);
+  }
 }
 
-/** Check the installed executable before creating a cloud session. */
 export async function checkLaptopExecutor(): Promise<void> {
   if (process.platform === "win32") throw new Error("Laptop execution currently requires macOS or Linux.");
   let help: string;
@@ -149,7 +153,6 @@ function validateOptions(options: LaptopServiceOptions): LaptopServiceOptions {
   return { ...options, origin: origin.origin, cwd, roots };
 }
 
-/** Launch once per session. The service and its executor survive terminal detachment. */
 export async function startLaptopService(options: LaptopServiceOptions): Promise<void> {
   let validated: LaptopServiceOptions;
   try { validated = validateOptions(options); }
@@ -158,8 +161,6 @@ export async function startLaptopService(options: LaptopServiceOptions): Promise
   const child = spawn(process.execPath, [...(file.endsWith(".ts") ? ["--import", import.meta.resolve("tsx")] : []), file, "--laptop-service"], {
     cwd: validated.cwd, detached: true, stdio: ["ignore", "ignore", "ignore", "ipc"],
   });
-  // Device credentials are passed only through private IPC, never copied into
-  // the service's arguments or environment.
   await new Promise<void>((resolve, reject) => {
     let started = false, ready = false, detached = false, finished = false;
     const timer = setTimeout(() => fail(), STARTUP_TIMEOUT);
@@ -169,7 +170,7 @@ export async function startLaptopService(options: LaptopServiceOptions): Promise
     const fail = () => {
       if (finished) return;
       finished = true; cleanup();
-      if (child.connected) try { child.disconnect(); } catch { /* Already disconnected. */ }
+      if (child.connected) try { child.disconnect(); } catch {}
       child.kill("SIGTERM");
       const killTimer = setTimeout(() => child.kill("SIGKILL"), 4000); killTimer.unref();
       child.once("exit", () => clearTimeout(killTimer));
@@ -199,22 +200,6 @@ export async function startLaptopService(options: LaptopServiceOptions): Promise
     child.on("error", failed); child.on("exit", exited); child.on("disconnect", disconnected); child.on("message", message);
   });
 }
-
-// An inherited pipe keeps the executor tied to its service even if the service
-// is killed. Its own process group is cleaned up on exit. This is lifecycle
-// cleanup; it does not establish fencing for tools that escape that group.
-const EXECUTOR_SUPERVISOR = `
-  const {spawn}=require('node:child_process');
-  const child=spawn(process.argv[1],process.argv.slice(2),{detached:true,stdio:['ignore','pipe','pipe']});
-  let stopping=false;
-  const kill=signal=>{if(child.pid)try{process.kill(-child.pid,signal)}catch{}};
-  const stop=()=>{if(stopping)return;stopping=true;kill('SIGTERM');setTimeout(()=>{kill('SIGKILL');process.exit(1)},2000)};
-  process.on('exit',()=>kill('SIGKILL'));process.stdout.on('error',stop);process.stderr.on('error',stop);
-  child.stdout.pipe(process.stdout);child.stderr.pipe(process.stderr);
-  process.stdin.resume();process.stdin.on('end',stop);process.stdin.on('error',stop);
-  for(const signal of ['SIGINT','SIGTERM','SIGHUP'])process.on(signal,stop);
-  child.on('error',()=>process.exit(1));child.on('exit',code=>{kill('SIGKILL');process.exit(code??1)});
-`;
 
 function executorEndpoint(child: ChildProcess, signal: AbortSignal): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -275,8 +260,8 @@ async function runLaptopService(): Promise<void> {
     });
     if (abort.signal.aborted) throw new Error(STARTUP_ERROR);
     const executorToken = randomBytes(32).toString("hex");
-    executor = spawn(process.execPath, ["-e", EXECUTOR_SUPERVISOR, "codex", "exec-server", "--listen", "ws://127.0.0.1:0", "--ws-auth", "capability-token",
-      "--ws-token-sha256", createHash("sha256").update(executorToken).digest("hex")], { cwd: options.cwd, stdio: ["pipe", "pipe", "pipe"] });
+    executor = spawn(process.execPath, supervisorArgs("codex", ["exec-server", "--listen", "ws://127.0.0.1:0", "--ws-auth", "capability-token",
+      "--ws-token-sha256", createHash("sha256").update(executorToken).digest("hex")], { cwd: options.cwd }), { cwd: options.cwd, stdio: ["pipe", "pipe", "pipe"] });
     executor.on("error", stop); executor.on("exit", stop);
     executor.stdin?.on("error", stop);
     const executorUrl = await executorEndpoint(executor, abort.signal);
@@ -295,7 +280,7 @@ async function runLaptopService(): Promise<void> {
           const state = await response.json() as { status?: unknown };
           if (state.status === "exited") stop();
         } else await response.body?.cancel();
-      } catch { /* A network outage does not replace the executor or replay work. */ }
+      } catch {}
       finally { checking = false; }
     };
     monitor = setInterval(() => { void checkSession(); }, 15000);
@@ -304,7 +289,7 @@ async function runLaptopService(): Promise<void> {
       const transfer = new AbortController();
       try {
         await forwardExecutor({
-          url: url.href, token: options.token, deviceHeaders: { "X-Infinite-Executor": options.workspaceToken }, executorUrl, executorToken, cwd: options.cwd, signal: abort.signal,
+          url: url.href, token: options.token, deviceHeaders: { "X-Infinite-Executor": options.workspaceToken }, executorUrl, executorToken, cwd: options.cwd, roots: options.roots, signal: abort.signal,
           onReady: control => {
             retryDelay = 1000;
             void synchronizeWorkspace(options, control, AbortSignal.any([abort.signal, transfer.signal])).catch(() => {});
@@ -314,7 +299,7 @@ async function runLaptopService(): Promise<void> {
             process.send({ type: "ready" }, error => { if (error) stop(); });
           },
         });
-      } catch { /* Only transport reconnection is retried, against this same exec-server. */ }
+      } catch {}
       finally { transfer.abort(); }
       if (!abort.signal.aborted) {
         await checkSession();
@@ -327,7 +312,7 @@ async function runLaptopService(): Promise<void> {
     stop(); clearTimeout(startup); clearInterval(monitor);
     process.off("disconnect", disconnected); process.off("message", detach);
     for (const name of ["SIGINT", "SIGTERM", "SIGHUP"] as const) process.off(name, stop);
-    if (process.connected && process.send) try { process.send({ type: "failed" }, () => { if (process.connected) process.disconnect(); }); } catch { /* Parent already exited. */ }
+    if (process.connected && process.send) try { process.send({ type: "failed" }, () => { if (process.connected) process.disconnect(); }); } catch {}
     if (executor && executor.exitCode === null && executor.signalCode === null) {
       const child = executor;
       await new Promise<void>(resolve => {

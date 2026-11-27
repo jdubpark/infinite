@@ -16,7 +16,6 @@ export interface Moment {
 const basename = (p: string) => p.split("/").filter(Boolean).at(-1) ?? p;
 const s = (v: unknown) => (typeof v === "string" ? v : "");
 
-/** Oldest-in, newest-first out. */
 export function deriveMoments(events: SignalEvent[]): Moment[] {
   const out: Moment[] = [];
   const openTools = new Map<string, Moment>();
@@ -40,7 +39,7 @@ export function deriveMoments(events: SignalEvent[]): Moment[] {
     switch (d.kind) {
       case "turn-start":
         flushQuiet(); lastEdit = undefined;
-        out.push({ id, at: e.at, kind: "turn", title: d.prompt ?? "New turn", source: d.source, expanded: d.prompt ? [{ label: "Request", text: d.prompt }] : [] });
+        out.push({ id, at: e.at, kind: "turn", title: d.automatic ? "Continued after the answer" : d.prompt ?? "New turn", source: d.source, expanded: d.prompt ? [{ label: d.automatic ? "Provider's own prompt" : "Request", text: d.prompt }] : [] });
         break;
       case "turn-end":
         flushQuiet(); lastEdit = undefined;
@@ -79,7 +78,6 @@ export function deriveMoments(events: SignalEvent[]): Moment[] {
         if (m.kind === "command" && bits.length) m.detail = bits.join(" · ");
         if (d.files?.length) m.expanded.push({ label: "Changed files", text: d.files.join("\n") });
         if (d.error) m.expanded.push({ label: "Error", text: d.error });
-        // A moment sits at its latest activity, so a finished tool surfaces above decisions opened while it ran.
         const at = out.lastIndexOf(m);
         if (at !== -1 && at !== out.length - 1) { out.splice(at, 1); out.push(m); }
         if (d.toolUseId) openTools.delete(d.toolUseId);
@@ -106,7 +104,6 @@ export function deriveMoments(events: SignalEvent[]): Moment[] {
         out.push({ id, at: e.at, kind: "notice", title: d.message.split("\n")[0].slice(0, 200), status: "failed", source: d.source, expanded: [{ label: "Error", text: d.message }] });
         break;
       case "notice":
-        // A hook-first prompt took the dialog's own title and detail once its block appeared.
         if (d.type === "prompt-merged" && d.promptId !== undefined) {
           const m = prompts.get(d.promptId);
           if (m) {

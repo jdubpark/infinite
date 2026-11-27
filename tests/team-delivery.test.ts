@@ -1,60 +1,21 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { randomUUID } from "node:crypto";
-import { fixture, git, limitLineup } from "./team-fixture.js";
+import { createHash, randomUUID } from "node:crypto";
+import { fixture, git, independentDeliveryLineup, limitLineup } from "./team-fixture.js";
 import { waitFor } from "./helpers.js";
-import { TeamError, type TeamService } from "../packages/host/src/teams.js";
-import { teamDeliveryReconcileSchema, type TeamDeliveryReconcile, type TeamMember, type TeamReport, type TeamRun } from "../packages/host/src/team-types.js";
+import { TeamError } from "../packages/host/src/teams.js";
+import { teamDeliveryReconcileSchema, type TeamDeliveryReconcile, type TeamReport } from "../packages/host/src/team-types.js";
 import { unseal } from "../packages/host/src/vault.js";
 import type { ProjectSourceService, ProjectSourceStatus } from "../packages/host/src/project-source.js";
 import { teamPrompt } from "../packages/host/src/team-prompts.js";
-
-type DeliveryStored = {
-  run: TeamRun; fingerprint: string; receipts: Record<string, string>; prepared: boolean; root: string;
-  checkHead?: string; halt?: string; deliveryAttempt?: { memberId: string; revision: number; headCommit: string };
-  pending?: { id: string; kind: "result" | "member" | "check" | "prepare"; revision: number;
-    source?: { memberId: string; role: TeamMember["role"]; cwd: string; baseCommit: string; headCommit: string; workspace: "member" | "integration" };
-    failure?: { code?: string; reason: string; at: string } };
-};
-const deliveryInternals = (teams: TeamService) => teams as unknown as {
-  records: Map<string, DeliveryStored>; commands: Map<string, AbortController>;
-  save(stored: DeliveryStored): void; step(stored: DeliveryStored): Promise<void>; consume(stored: DeliveryStored, member: TeamMember): void;
-};
-
-async function deliveryRecord(mode: "merge" | "pr", onMerged?: (projectId: string) => void,
-  source?: Pick<ProjectSourceService, "refresh" | "mirrorPath" | "isGithub" | "status"> | ((fixture: Awaited<ReturnType<typeof fixture>>) => Pick<ProjectSourceService, "refresh" | "mirrorPath" | "isGithub" | "status">)) {
-  const f = await fixture("delivery-fast", limitLineup, {}, { deliveryMode: mode, noServer: true });
-  const id = randomUUID(), memberId = randomUUID(), branch = "infinite/team-delivery-test";
-  git(f.source, "checkout", "-b", branch);
-  const sourceService = typeof source === "function" ? source(f) : source;
-  const teams = await f.openTeamService({ onMerged, ...(sourceService ? { source: sourceService } : {}), start: false });
-  const root = join(f.host.config.teams!.workspaceDir, id);
-  const workspace = join(root, "integration"), members = join(root, "members"), cwd = join(members, memberId);
-  mkdirSync(members, { recursive: true, mode: 0o700 });
-  git(f.source, "clone", "--no-hardlinks", f.source, workspace);
-  git(workspace, "remote", "remove", "origin");
-  const headCommit = git(workspace, "rev-parse", "HEAD");
-  git(workspace, "clone", "--no-hardlinks", workspace, cwd);
-  git(cwd, "remote", "remove", "origin");
-  const at = new Date().toISOString();
-  const policy = structuredClone(f.host.config.projects[0]!.team!.delivery!);
-  const member: TeamMember = { runId: id, memberId, revision: 1, role: "delivery", provider: "codex", sessionId: randomUUID(),
-    title: "delivery: Implement a small feature", status: "reported", cwd, baseCommit: headCommit, prompt: "", cursor: 0, stopRequestId: randomUUID(), startedAt: at };
-  const run: TeamRun = { id, projectId: "rehearsal", provider: "codex", title: "Implement a small feature", objective: "Record an owner-authorized delivery.",
-    parallelism: 2, revision: 1, status: "delivering", createdAt: at, updatedAt: at, workspace, branch, baseCommit: headCommit, headCommit,
-    tasks: [], members: [member], decisions: [], checks: [], steering: [], events: [], round: 0, delivery: policy,
-    review: { verdict: "approved", summary: "Reviewed the exact integration head.", revision: 1 } };
-  const stored: DeliveryStored = { run, fingerprint: "fixture", receipts: {}, prepared: true, root: f.host.config.teams!.workspaceDir,
-    checkHead: headCommit, deliveryAttempt: { memberId, revision: 1, headCommit } };
-  const internals = teams as unknown as { records: Map<string, typeof stored>; consume: (record: typeof stored, member: TeamMember) => void };
-  internals.records.set(id, stored);
-  return { f, teams, run, member, stored, headCommit, id, consume(report: TeamReport) { member.report = report; internals.consume(stored, member); } };
-}
+import type { EvidenceStore } from "../packages/host/src/evidence/store.js";
+import type { RunEvent } from "../packages/host/src/evidence/types.js";
+import { type DeliveryStored, deliveryInternals, deliveryRecord } from "./fixtures/team-delivery-record.js";
 
 async function blockedDeliveryRecord() {
-  const h = await deliveryRecord("merge");
+  const h = await deliveryRecord("merge", undefined, undefined, { reviewLineage: true });
   h.run.lineup = structuredClone(limitLineup);
   h.run.status = "blocked";
   h.run.reason = "Delivery was blocked before a confirmed remote result.";
@@ -113,7 +74,6 @@ async function restartDeliveryRecord(h: FailedDeliveryRecord) {
   h.teams.close(); await h.teams.idle();
   h.teams = await h.f.openTeamService({ source: h.source, start: false });
   bindDeliveryRecord(h, deliveryInternals(h.teams).records.get(h.id)!);
-  // One real stop-draining step clears the restart halt. Keep the scheduler off so no test agent launches.
   if (h.stored.halt) await deliveryInternals(h.teams).step(h.stored);
   assert.equal(h.stored.halt, undefined);
 }
@@ -130,12 +90,11 @@ function persistedDelivery(h: FailedDeliveryRecord) {
 function withoutUpdatedAt(stored: DeliveryStored) {
   const copy = structuredClone(stored);
   copy.run.updatedAt = "ignored save timestamp";
-  // Sealed JSON omits optional undefined fields present on the in-memory object.
   return JSON.parse(JSON.stringify(copy));
 }
 
 test("owner-authorized delivery waits for exact-head checks and review, survives API restart, and records one merge claim", { timeout: 90000 }, async () => {
-  const f = await fixture("delivery-hold", limitLineup);
+  const f = await fixture("delivery-hold", independentDeliveryLineup);
   try {
     const created = await f.host.fetchApi("/teams", "owner", f.create());
     assert.equal(created.status, 200, JSON.stringify(created.body));
@@ -218,7 +177,7 @@ test("a completed merge report invokes the source refresh callback once", { time
 
 test("delivery rejects foreign targets, stale heads, changed files, and invalid merged baselines", { timeout: 120000 }, async () => {
   for (const [scenario, reason] of [["delivery-foreign", /configured repository/], ["delivery-stale", /reviewed commit/], ["delivery-dirty", /read-only member workspace/], ["delivery-baseline-changed", /beyond the reviewed tree/], ["delivery-baseline-tree", /must identify a commit/]] as const) {
-    const f = await fixture(scenario, limitLineup);
+    const f = await fixture(scenario, independentDeliveryLineup);
     try {
       const created = await f.host.fetchApi("/teams", "owner", f.create());
       const blocked = await f.settled(created.body.id);
@@ -231,7 +190,7 @@ test("delivery rejects foreign targets, stale heads, changed files, and invalid 
 });
 
 test("delivery repairs repeat checks and independent review before a new delivery attempt", { timeout: 90000 }, async () => {
-  const f = await fixture("delivery-repair", limitLineup);
+  const f = await fixture("delivery-repair", independentDeliveryLineup);
   try {
     const created = await f.host.fetchApi("/teams", "owner", f.create());
     const merged = await f.settled(created.body.id);
@@ -247,7 +206,7 @@ test("delivery repairs repeat checks and independent review before a new deliver
 });
 
 test("an exited delivery without a receipt is not merged or replayed by steering", { timeout: 90000 }, async () => {
-  const f = await fixture("delivery-unreported", limitLineup);
+  const f = await fixture("delivery-unreported", independentDeliveryLineup);
   try {
     const created = await f.host.fetchApi("/teams", "owner", f.create());
     await waitFor(() => f.get(created.body.id), run => run.status === "delivering" && existsSync(join(f.receipts, "delivery-started.json")), 40000);
@@ -375,18 +334,20 @@ test("a matching no-publication inspection allows same-head repair before checks
 test("an existing matching pull request is reused for bounded merge-policy delivery", { timeout: 30000 }, async () => {
   const h = await blockedDeliveryRecord();
   try {
+    const memberCountBefore = h.run.members.length;
     h.run.status = "delivering";
     h.consume({ kind: "delivery-reconciliation", headCommit: h.headCommit, repository: "example/app", branch: h.run.branch!,
       baseHeadCommit: h.run.baseCommit!, disposition: "pull-request", remoteHeadCommit: h.headCommit,
       pullRequestUrl: "https://github.com/example/app/pull/1", summary: "The matching reviewed PR exists and has not merged." });
-    const next = await waitFor(() => Promise.resolve(h.teams.get(h.id)), run => run.members.length > 1 || run.status === "blocked", 15000);
+    const next = await waitFor(() => Promise.resolve(h.teams.get(h.id)), run => run.members.length > memberCountBefore || run.status === "blocked", 15000);
     assert.notEqual(next.status, "blocked", next.reason);
     assert.equal(next.deliveryRecovery?.attempts, 1);
     assert.equal(next.deliveryReceipt, undefined, "an open PR is not a merge receipt");
     assert.equal(next.pullRequest, undefined, "merge policy still requires guarded merge delivery");
-    assert.equal(next.members.length, 2, "one coordinator continues the existing PR");
-    assert.equal(next.members[1].role, "delivery");
-    assert.equal(next.members[1].baseCommit, h.headCommit);
+    assert.equal(next.members.length, memberCountBefore + 1, "one coordinator continues the existing PR");
+    const continuation = next.members.find(member => member.role === "delivery" && member.memberId !== h.member.memberId)!;
+    assert.equal(continuation.role, "delivery");
+    assert.equal(continuation.baseCommit, h.headCommit);
   } finally { await h.f.close(); }
 });
 
@@ -428,6 +389,31 @@ test("automatic delivery recovery refuses a changed publication policy", { timeo
     assert.deepEqual(h.stored.deliveryAttempt, prior.attempt);
     assert.equal(h.run.deliveryRecovery, undefined);
     assert.equal(h.run.events.length, prior.events + 1);
+  } finally { await h.f.close(); }
+});
+
+test("delivery recovery leaves its pending member preparation running across scheduler passes", { timeout: 30000 }, async () => {
+  const h = await blockedDeliveryRecord();
+  try {
+    h.run.status = "planning";
+    h.run.recovery = { attempts: 1, status: "stopping", source: { code: "delivery-recovery", memberId: h.member.memberId,
+      revision: h.run.revision, reportKind: "blocked", reason: "Inspect publication state.", at: new Date().toISOString() } };
+    h.run.deliveryRecovery = { attempts: 1, status: "stopping", revision: h.run.revision, headCommit: h.headCommit,
+      policyHash: createHash("sha256").update(JSON.stringify(h.run.delivery ?? null)).digest("hex"), sourceMemberId: h.member.memberId };
+
+    const internals = deliveryInternals(h.teams);
+    assert.equal(await internals.recovery.startAutomaticDeliveryRecovery(h.stored, true), true);
+    const pendingId = h.stored.pending?.id;
+    assert.equal(h.stored.pending?.kind, "member");
+    const membersBeforeSecondPass = h.run.members.length;
+
+    assert.equal(await internals.recovery.startAutomaticDeliveryRecovery(h.stored, true), true);
+    assert.equal(h.stored.pending?.id, pendingId, "the scheduler keeps the original preparation operation alive");
+    assert.equal(h.run.status, "planning", "the in-flight preparation is not classified as reconciliation failure");
+    assert.equal(h.run.members.length, membersBeforeSecondPass, "a second pass does not prepare a duplicate member");
+
+    await waitFor(() => Promise.resolve(h.stored.pending), pending => pending === undefined, 10000);
+    assert.equal(h.run.members.length, membersBeforeSecondPass + 1);
   } finally { await h.f.close(); }
 });
 
@@ -554,12 +540,13 @@ test("owner delivery reconciliation refuses unsafe prior attempts without changi
 test("owner delivery reconciliation starts one strong worker at the pinned head and retains the prior report", { timeout: 90000 }, async () => {
   const h = await blockedDeliveryRecord();
   try {
+    const priorMemberCount = h.run.members.length;
     const priorAttempt = structuredClone(h.stored.deliveryAttempt);
     const priorReport = structuredClone(h.member.report);
     const request = { requestId: randomUUID(), revision: h.run.revision, text: "Check the branch, PR, and CI state before doing anything." };
     await h.teams.reconcileDelivery(h.id, request);
-    const prepared = await waitFor(() => Promise.resolve(h.teams.get(h.id)), run => run.members.length === 2 && run.members.some(member => member.memberId !== h.member.memberId && member.status === "queued"), 10000);
-    const fresh = h.run.members.find(member => member.memberId !== h.member.memberId)!;
+    const prepared = await waitFor(() => Promise.resolve(h.teams.get(h.id)), run => run.members.length === priorMemberCount + 1 && run.members.some(member => member.memberId !== h.member.memberId && member.status === "queued"), 10000);
+    const fresh = h.run.members.find(member => member.memberId !== h.member.memberId && member.role === "delivery" && member.status === "queued")!;
     assert.equal(fresh.role, "delivery");
     assert.equal(fresh.revision, h.run.revision);
     assert.equal(fresh.baseCommit, h.headCommit);
@@ -576,7 +563,7 @@ test("owner delivery reconciliation starts one strong worker at the pinned head 
     assert.equal(existsSync(join(h.f.receipts, "delivery-started.json")), false, "reconciliation queues a worker but does not publish directly");
 
     await h.teams.reconcileDelivery(h.id, request);
-    assert.equal(h.run.members.length, 2, "an idempotent retry must not queue another delivery member");
+    assert.equal(h.run.members.length, priorMemberCount + 1, "an idempotent retry must not queue another delivery member");
     assert.equal(h.stored.deliveryAttempt?.memberId, fresh.memberId);
   } finally { await h.f.close(); }
 });
@@ -589,7 +576,8 @@ test("attested reconciliation clears only a settled moved-base preparation failu
     const originalWorkspace = h.run.workspace;
     await restartDeliveryRecord(h);
     assert.deepEqual(h.stored.pending, pending, "the structured failure survives the generic restart reason");
-    assert.deepEqual(h.teams.get(h.id).pendingOperation, { id: pending.id, kind: "result", revision: 1, failed: true,
+    const { processes: _processes, processesCheckedAt: _checkedAt, ...operation } = h.teams.get(h.id).pendingOperation!;
+    assert.deepEqual(operation, { id: pending.id, kind: "result", revision: 1, failed: true,
       failureCode: "workspace-operation-failed", sourceMemberId: h.member.memberId, sourceRole: "delivery" });
     const plain = { requestId: randomUUID(), revision: h.run.revision, text: "Inspect remote delivery state again." };
     const beforePlain = structuredClone(h.stored);
@@ -862,12 +850,12 @@ test("restart reserves a persisted blocked delivery attempt once without replayi
     assert.equal(secondRestore.deliveryRecovery?.attempts, 1, "a second restart must not reserve another inspection attempt");
     assert.equal(secondRestore.recovery?.attempts, 1);
     assert.equal(secondRestore.members.filter(member => member.role === "delivery").length, 1, "the blocked delivery report remains historical evidence");
-    assert.equal(secondRestore.members[0]?.report?.kind, "blocked");
+    assert.equal(secondRestore.members.find(member => member.role === "delivery" && member.memberId === h.member.memberId)?.report?.kind, "blocked");
   } finally { await h.f.close(); }
 });
 
 test("failed checks never launch delivery and a weak lineup cannot opt into merge", { timeout: 90000 }, async () => {
-  const f = await fixture("delivery-failed-check", limitLineup);
+  const f = await fixture("delivery-failed-check", independentDeliveryLineup);
   try {
     const created = await f.host.fetchApi("/teams", "owner", f.create());
     const blocked = await f.settled(created.body.id);
@@ -880,4 +868,60 @@ test("failed checks never launch delivery and a weak lineup cannot opt into merg
     assert.equal(refused.status, 409);
     assert.equal(refused.body.code, "delivery-lineup-required");
   } finally { await weak.close(); }
+});
+
+
+function allRunEvents(store: EvidenceStore, runId: string): RunEvent[] {
+  const events: RunEvent[] = [];
+  let after = 0;
+  for (;;) {
+    const page = store.events({ runId, after, limit: 500 });
+    events.push(...page.events);
+    if (!page.more) return events;
+    after = page.cursor;
+  }
+}
+
+test("a pull-request report records the delivery without its URL", { timeout: 30000 }, async () => {
+  const h = await deliveryRecord("pr", undefined, undefined, { events: true });
+  try {
+    h.consume({ kind: "pull-request", headCommit: h.headCommit, pullRequestUrl: "https://github.com/example/app/pull/7", summary: "Opened the reviewed head." });
+    await waitFor(() => Promise.resolve(h.teams.get(h.id)), run => ["ready-for-review", "blocked"].includes(run.status), 10000);
+    await h.teams.idle();
+    const events = allRunEvents(h.store!, h.id);
+    const [recorded] = events.filter(event => event.kind === "delivery.recorded");
+    assert.ok(recorded, "delivery.recorded is stored");
+    assert.equal(recorded.memberId, h.member.memberId);
+    assert.equal(recorded.revision, 1);
+    assert.deepEqual(recorded.data, { v: 1, method: "pull-request", headCommit: h.headCommit });
+    assert.equal(JSON.stringify(events).includes("github.com"), false, "a pull request URL is never stored");
+  } finally { h.store?.close(); await h.f.close(); }
+});
+
+test("a reconciled pull request records the delivery", { timeout: 30000 }, async () => {
+  const h = await deliveryRecord("pr", undefined, undefined, { events: true });
+  try {
+    h.consume({ kind: "delivery-reconciliation", headCommit: h.headCommit, repository: "example/app", branch: h.run.branch,
+      baseHeadCommit: h.run.baseCommit, disposition: "pull-request", remoteHeadCommit: h.headCommit,
+      pullRequestUrl: "https://github.com/example/app/pull/8", summary: "Found the open pull request for the reviewed head." });
+    await waitFor(() => Promise.resolve(h.teams.get(h.id)), run => ["ready-for-review", "blocked"].includes(run.status), 10000);
+    await h.teams.idle();
+    const [recorded] = allRunEvents(h.store!, h.id).filter(event => event.kind === "delivery.recorded");
+    assert.ok(recorded, "delivery.recorded is stored");
+    assert.equal(recorded.memberId, h.member.memberId);
+    assert.deepEqual(recorded.data, { v: 1, method: "pull-request", headCommit: h.headCommit });
+  } finally { h.store?.close(); await h.f.close(); }
+});
+
+test("a merge receipt is recorded even when the baseline capture fails", { timeout: 30000 }, async () => {
+  const h = await deliveryRecord("merge", undefined, undefined, { events: true });
+  try {
+    const mergeCommit = "a".repeat(40);
+    h.consume({ kind: "delivery", headCommit: h.headCommit, pullRequestUrl: "https://github.com/example/app/pull/9", mergeCommit, summary: "Merged the reviewed head." });
+    const blocked = await waitFor(() => Promise.resolve(h.teams.get(h.id)), run => run.status === "blocked", 10000);
+    await h.teams.idle();
+    const [recorded] = allRunEvents(h.store!, h.id).filter(event => event.kind === "delivery.recorded");
+    assert.ok(recorded, "delivery.recorded is stored");
+    assert.deepEqual(recorded.data, { v: 1, method: "merge", headCommit: h.headCommit, mergeCommit });
+  } finally { h.store?.close(); await h.f.close(); }
 });

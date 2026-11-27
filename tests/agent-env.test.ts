@@ -9,9 +9,9 @@ const loader = resolve("deploy/ubuntu/agent-env.sh");
 
 const anchorCheck = resolve("deploy/ubuntu/agent-anchor.sh");
 const shells = ["/bin/sh", ...["dash", "bash"].filter((shell) => spawnSync(shell, ["-c", ":"]).status === 0)];
+const egressEnvNames = ["HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy", "NO_PROXY", "no_proxy", "NODE_USE_ENV_PROXY"] as const;
 
 function runLoader(root: string, projectId: string, shell = "/bin/sh", extraArgs: string[] = [], hostEnv: Record<string, string> = {}) {
-  // NUL-separated so a multi-line value cannot masquerade as another entry.
   const result = spawnSync(shell, [...extraArgs, "-c", 'set -eu; . "$1"; infinite_load_env "$2" "$3"; env -0', "sh", loader, root, projectId], {
     cwd: root,
     env: { PATH: process.env.PATH ?? "/usr/bin:/bin", ...hostEnv },
@@ -70,7 +70,13 @@ test("owner-managed environment files load safely in sorted, layered order", () 
     writeFileSync(join(root, "secrets", "world.env"), "WORLD_SECRET=must-skip\n", { mode: 0o666 });
     chmodSync(join(root, "secrets", "world.env"), 0o666);
     writeFileSync(join(root, "android.env"), "ANDROID_HOME=/opt/android\nJAVA_HOME=/opt/java\nSAME=android\nPATH_APPEND=/android/bin\n");
-    writeFileSync(join(root, "projects", "p1.env"), "SAME=project\nPROJECT_ONLY=project-value\nPATH_APPEND=/project/bin\n");
+    writeFileSync(join(root, "projects", "p1.env"), [
+      "SAME=project",
+      "PROJECT_ONLY=project-value",
+      "PATH_APPEND=/project/bin",
+      ...egressEnvNames.map(name => `${name}=project-file-value`),
+      "",
+    ].join("\n"));
 
     const { values, stderr } = runLoader(root, "p1");
     assert.equal(values.get("EXPO_TOKEN"), "host-token");
@@ -79,6 +85,8 @@ test("owner-managed environment files load safely in sorted, layered order", () 
     assert.equal(values.get("SAME"), "project", "project values override Android and host-wide values");
     assert.equal(values.get("ORDER"), "last", "secret files are read in sorted pathname order");
     assert.equal(values.get("PROJECT_ONLY"), "project-value");
+    for (const name of egressEnvNames)
+      assert.equal(values.has(name), false, `${name} cannot be loaded from a project file when egress is off`);
     assert.equal(values.get("PATH"), `${process.env.PATH ?? "/usr/bin:/bin"}:/host/bin:/android/bin:/project/bin`);
     assert.equal(values.get("LITERAL"), "$(touch pwned)");
     assert.equal(values.get("VALUE_EQUALS"), "first=second");
@@ -102,6 +110,10 @@ test("owner-managed environment files load safely in sorted, layered order", () 
       assert.equal(multiline.values.get("EXPO_TOKEN"), "host-token", `${shell}: a multiline host value cannot invent host-owned names`);
       assert.equal(multiline.values.get("ORDER"), "last", `${shell}: layering between files still applies`);
       assert.equal(multiline.values.get("HOST_OWNED"), "from-host", `${shell}: host variables still win`);
+      const proxyEnv = Object.fromEntries(egressEnvNames.map(name => [name, name === "NODE_USE_ENV_PROXY" ? "1" : "host-value"]));
+      const withEgress = runLoader(root, "p1", shell, shell === "bash" ? ["--posix"] : [], proxyEnv);
+      for (const [name, value] of Object.entries(proxyEnv))
+        assert.equal(withEgress.values.get(name), value, `${shell}: project files cannot override host egress value ${name}`);
     }
     assert.equal(values.has("WORLD_SECRET"), false);
     assert.match(stderr, new RegExp(`infinite_load_env: skipping ${join(root, "secrets", "world.env")}: world-writable`));

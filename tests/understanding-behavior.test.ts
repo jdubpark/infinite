@@ -266,7 +266,6 @@ test("source edits, complete plan-set changes, membership removal, and checkout 
   const rebound = { ...input, planRevisions: [{ id: plan.id, revision: plan.revision }] };
   assert.throws(() => s.service.save("workspace", { requestId: randomUUID(), revision: 1, definition: rebound }), (error: unknown) => error instanceof BehaviorError && error.statusCode === 409, "dirty source files cannot be rebound by resaving the stale map");
 
-  // Refresh a new source observation after the covered file edit, then bind the complete plan set.
   s.runtime.refresh("workspace");
   await waitUntil(() => s.runtime.read("workspace").components[0]?.current.snapshotId !== input.sourceSnapshotId);
   const currentComponent = s.runtime.read("workspace").components[0]!;
@@ -311,7 +310,6 @@ test("symlinked covered files and corrupt encrypted behavior state are unavailab
     files: { "src/link.ts": { hash: createHash("sha256").update(readFileSync(join(s.base, "outside.ts"))).digest("hex"), lines: 1 } },
     components: [{ id: "component", path: "src", name: "Auth", files: 1, examples: ["src/link.ts"], entryPoints: [], incoming: 0, outgoing: 0, changed: 0 }],
   };
-  // Build an observation whose captured component file is a symlink, then let the service inspect it.
   const runtime = new UnderstandingRuntime({ config: s.config, key, groups: s.groups, catalog: s.catalog, adapter: { context: async () => symlinkContext } });
   runtime.refresh("workspace");
   await waitUntil(() => runtime.read("workspace").components[0]?.files[0]?.path === "src/link.ts");

@@ -7,7 +7,8 @@ import { basename, isAbsolute, join, relative } from "node:path";
 import { applyLifecycle, initialAttention, type Attention, type Prompt } from "@infinite/attention";
 import { projectCwd, type CreateSession } from "../manager.js";
 import type { Config, ControlActor, ControlLease, Event, InputControl, Receipt, Session, WorkerRequest, WorkerState } from "../types.js";
-import { Journal, readEvents, unseal, writeSealed } from "../vault.js";
+import { Journal, unseal, writeSealed } from "../vault.js";
+import { readIndexedEvents, SignalIndex } from "../signal-index.js";
 import { CmuxClient, CmuxError, array, string, type Json, type Surface } from "./client.js";
 import { foregroundAgent, LAUNCH_ENV, processAlive, readHooks, type CmuxProvider, type HookSession } from "./discovery.js";
 import { digest, feedReply, matchingFeed, pendingPrompt, type PendingPrompt } from "./prompts.js";
@@ -43,6 +44,7 @@ interface Stored {
 }
 
 const UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i;
+const compareCodeUnits = (left: string, right: string) => (left < right ? -1 : left > right ? 1 : 0);
 const LEASE_MS = 30_000;
 const MAX_QUEUED = 8;
 const OBSERVATION_WAIT_MS = 5_000;
@@ -50,12 +52,13 @@ const quote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
 const cleanTitle = (value: string) => value.replace(/^[^\p{L}\p{N}]+\s+/u, "").trim().slice(0, 160);
 const now = () => new Date().toISOString();
 
-/** An adapter for independently managed cmux terminals. */
 export class CmuxSessions {
   private readonly client: CmuxClient;
+  private readonly projectContexts: ProjectContexts;
   private readonly directory: string;
   private readonly records = new Map<string, Stored>();
   private readonly journals = new Map<string, Journal>();
+  private readonly signalIndexes = new Map<string, SignalIndex>();
   private readonly unreadable = new Set<string>();
   private readonly mutations: (() => Promise<void>)[] = [];
   private readonly observations: (() => Promise<void>)[] = [];
@@ -66,16 +69,17 @@ export class CmuxSessions {
   private available = false;
   private closed = false;
 
-  constructor(readonly config: CmuxConfig, readonly key: Buffer) {
+  constructor(readonly config: CmuxConfig, readonly key: Buffer, projectContexts?: ProjectContexts) {
+    this.projectContexts = projectContexts ?? new ProjectContexts(config, key);
     this.client = new CmuxClient(config.cmux?.command ?? "cmux");
     this.directory = join(config.stateDir, "cmux");
     mkdirSync(this.directory, { recursive: true, mode: 0o700 });
-    for (const id of readdirSync(this.directory).filter((value) => UUID.test(value))) {
+    for (const id of readdirSync(this.directory).filter((value) => UUID.test(value)).sort(compareCodeUnits)) {
       try {
         const stored = unseal<Stored>(key, `cmux:${id}:meta`, readFileSync(join(this.directory, id, "meta.sealed"), "utf8"));
         if (stored.session.id !== id) continue;
         this.records.set(id, stored);
-        try { this.journals.set(id, new Journal(join(this.directory, id, "events"), key, id)); }
+        try { this.openJournal(id); }
         catch { stored.recordingError = true; }
       } catch { this.unreadable.add(id); }
     }
@@ -91,8 +95,6 @@ export class CmuxSessions {
     const result = new Promise<T>((resolve, reject) => {
       queue.push(async () => {
         try {
-          // Abandoned polling must not keep adding subprocess work. Mutations
-          // retain their admission and perform their own fresh safety checks.
           if (observation && Date.now() - queuedAt > OBSERVATION_WAIT_MS) throw new CmuxError("cmux-busy", "The observation expired while cmux was busy. Refresh to reconnect.");
           resolve(await operation());
         } catch (error) { reject(error); }
@@ -133,14 +135,24 @@ export class CmuxSessions {
     catch (error) { record.recordingError = true; throw error; }
   }
 
+  private openJournal(id: string): Journal {
+    const sessionDir = join(this.directory, id);
+    let signalIndex: SignalIndex | undefined;
+    const journal = new Journal(join(sessionDir, "events"), this.key, id, {
+      onAppend: (event, meta) => {
+        signalIndex?.observe(event, meta);
+      },
+    });
+    signalIndex = new SignalIndex(sessionDir, this.key, id, journal.seq);
+    this.journals.set(id, journal);
+    this.signalIndexes.set(id, signalIndex);
+    return journal;
+  }
+
   private append(record: Stored, type: Event["type"], data: Event["data"]): Event {
     if (record.recordingError) throw new CmuxError("recording-error");
     try {
-      let journal = this.journals.get(record.session.id);
-      if (!journal) {
-        journal = new Journal(join(this.directory, record.session.id, "events"), this.key, record.session.id);
-        this.journals.set(record.session.id, journal);
-      }
+      const journal = this.journals.get(record.session.id) ?? this.openJournal(record.session.id);
       return journal.append(type, data);
     } catch (error) { record.recordingError = true; throw error; }
   }
@@ -157,7 +169,6 @@ export class CmuxSessions {
     }).sort((a, b) => b.root.length - a.root.length)[0];
   }
 
-  /** Keep a discovered native conversation inside the project identity it first received. */
   private boundProject(record: Stored, cwd: string) {
     const configured = this.config.projects.find((project) => project.id === record.session.projectId);
     if (!configured) return undefined;
@@ -165,8 +176,6 @@ export class CmuxSessions {
     try { root = realpathSync(configured.path); } catch { return undefined; }
     if (record.session.projectRoot && record.session.projectRoot !== root) return undefined;
     if (!record.session.projectRoot) {
-      // Without a saved root, only a historical root-level cwd proves the old
-      // binding. A nested cwd could have crossed into a newly broadened root.
       if (record.session.cwd !== root) return undefined;
       record.session.projectRoot = root;
     }
@@ -208,7 +217,6 @@ export class CmuxSessions {
     const surface = hook.surfaceId ? this.tree.get(hook.surfaceId) : undefined;
     const newest = hook.surfaceId ? active.get(hook.surfaceId) : undefined;
     let record = this.nativeRecord(hook.provider, hook.nativeId);
-    // A launch receives its provider-native identity once its first hook arrives.
     record ??= [...this.records.values()].find((candidate) => !candidate.nativeId && candidate.surfaceId === hook.surfaceId && candidate.session.provider === hook.provider && hook.updatedAt >= (candidate.launchedAt ?? 0) - 1000);
     record ??= hook.cwd ? this.newRecord(hook.provider, hook.cwd, surface?.title ?? basename(hook.cwd)) : undefined;
     if (!record) return;
@@ -234,8 +242,6 @@ export class CmuxSessions {
       record.lifecycle = hook.lifecycle;
       record.session.title = cleanTitle(surface.title) || record.session.title;
     } else if (record.surfaceId === hook.surfaceId && newest && newest !== hook) {
-      // A new conversation now owns this surface. Keep the old transcript, never
-      // redirect the old session's remote input to the replacement conversation.
       record.surfaceId = undefined;
       record.workspaceId = undefined;
       record.pid = undefined;
@@ -262,7 +268,6 @@ export class CmuxSessions {
     const hooks = readHooks(this.config.cmux.hooksDir ?? join(homedir(), ".cmuxterm"));
     const active = new Map<string, HookSession>();
     for (const hook of hooks) if (hook.surfaceId && (!active.has(hook.surfaceId) || active.get(hook.surfaceId)!.updatedAt < hook.updatedAt)) active.set(hook.surfaceId, hook);
-    // Pending launches claim their native IDs before Vault adds history rows.
     for (const hook of hooks) this.mergeHook(hook, active);
     if (vault.status === "fulfilled") for (const row of array(vault.value.sessions)) {
       if (!["claude", "codex"].includes(row.agent) || !string(row.session_id) || !string(row.cwd)) continue;
@@ -277,26 +282,41 @@ export class CmuxSessions {
       record.nativeId = row.session_id;
       record.transcript = string(row.file) ?? record.transcript;
     }
+    let failure: { error: unknown } | undefined;
     for (const record of this.records.values()) {
       const surface = record.surfaceId ? this.tree.get(record.surfaceId) : undefined;
       const live = surface?.workspaceId === record.workspaceId && surface?.type === "terminal" && (!record.pid || processAlive(record.pid));
       const pending = record.launchedAt !== undefined && Date.now() - record.launchedAt < 30_000;
       const status = live ? "running" : pending ? "starting" : record.creation?.state === "uncertain" ? "unavailable" : "exited";
+      let unreadable = false;
       if (record.session.id === screenId && live) {
         try {
-          // A lines argument enables scrollback on some cmux versions. Read the
-          // current viewport so an old dialog in history cannot authorize input.
+          const validReplaySize = (value?: Record<string, unknown>) =>
+            value && Number.isInteger(value.columns) && Number.isInteger(value.rows) &&
+            (value.columns as number) > 0 && (value.columns as number) <= 1000 &&
+            (value.rows as number) > 0 && (value.rows as number) <= 1000
+              ? { cols: value.columns as number, rows: value.rows as number }
+              : undefined;
+          const beforeReplay = await this.client.rpc("terminal.replay", { surface_id: record.surfaceId, workspace_id: record.workspaceId }).catch(() => undefined);
+          if (beforeReplay?.surface_id && beforeReplay.surface_id !== record.surfaceId) throw new CmuxError("snapshot-unavailable");
           const screen = await this.client.rpc("surface.read_text", { surface_id: record.surfaceId, workspace_id: record.workspaceId, scrollback: false });
           if (typeof screen.text !== "string") throw new CmuxError("snapshot-unavailable");
           if (screen.surface_id && screen.surface_id !== record.surfaceId || screen.workspace_id && screen.workspace_id !== record.workspaceId) throw new CmuxError("snapshot-unavailable");
-          const replay = await this.client.rpc("terminal.replay", { surface_id: record.surfaceId, workspace_id: record.workspaceId }).catch(() => undefined);
-          if (replay?.surface_id && replay.surface_id !== record.surfaceId) throw new CmuxError("snapshot-unavailable");
-          if (replay && Number.isInteger(replay.columns) && Number.isInteger(replay.rows) && replay.columns > 0 && replay.columns <= 1000 && replay.rows > 0 && replay.rows <= 1000) {
-            record.columns = replay.columns;
-            record.rows = replay.rows;
-          }
-          // Protect a person's unfinished local prompt when chat sends a new
-          // instruction. Dim placeholder spans are not text the person typed.
+          const afterReplay = await this.client.rpc("terminal.replay", { surface_id: record.surfaceId, workspace_id: record.workspaceId }).catch(() => undefined);
+          if (afterReplay?.surface_id && afterReplay.surface_id !== record.surfaceId) throw new CmuxError("snapshot-unavailable");
+          const previousSize = record.columns && record.rows ? { cols: record.columns, rows: record.rows } : undefined;
+          const beforeSize = validReplaySize(beforeReplay);
+          const afterSize = validReplaySize(afterReplay);
+          const consistentSize = beforeSize && afterSize && beforeSize.cols === afterSize.cols && beforeSize.rows === afterSize.rows ? afterSize : undefined;
+          const emitResize = (size: { cols: number; rows: number }) => {
+            record.columns = size.cols;
+            record.rows = size.rows;
+            if (!previousSize || previousSize.cols !== size.cols || previousSize.rows !== size.rows) {
+              this.append(record, "lifecycle", { event: "resize", cols: size.cols, rows: size.rows });
+            }
+          };
+          if (consistentSize) emitResize(consistentSize);
+          const replay = afterReplay ?? beforeReplay;
           const grid = replay?.render_grid;
           const cursorRow = grid?.cursor?.row;
           const styles = array(grid?.styles);
@@ -308,20 +328,21 @@ export class CmuxSessions {
           record.draft = Boolean(row && /^[\s│┃]*[>›❯]\s*\S/.test(row));
           if (record.screen !== screen.text) {
             record.screen = screen.text.slice(-512 * 1024);
-            this.append(record, "output", { text: `\u001b[2J\u001b[H${record.screen.replace(/\r?\n/g, "\r\n")}`, snapshot: true });
+            this.append(record, "output", { text: `\u001b[2J\u001b[H${record.screen.replace(/\r?\n/g, "\r\n")}`, snapshot: true, ...(consistentSize ? { cols: consistentSize.cols, rows: consistentSize.rows } : {}) });
           }
-        } catch { this.observe(record, "unavailable"); continue; }
+          if (!consistentSize && afterSize) emitResize(afterSize);
+        } catch { unreadable = true; }
       }
-      const nativeFeed = matchingFeed(this.feed, { provider: record.session.provider as CmuxProvider, nativeId: record.nativeId, surfaceId: record.surfaceId });
-      const prompt = status === "running" ? pendingPrompt(record.session.provider as CmuxProvider, record.screen, nativeFeed) : undefined;
-      // Failure to refresh native Feed must never erase a known unanswered approval.
-      if (feed.status === "rejected" && record.prompt?.feed) {
-        this.observe(record, "unavailable");
-        continue;
-      }
-      this.observe(record, status, prompt);
-      if (JSON.stringify(record) !== previous.get(record.session.id)) this.save(record);
+      try {
+        if (unreadable || feed.status === "rejected" && record.prompt?.feed) this.observe(record, "unavailable");
+        else {
+          const nativeFeed = matchingFeed(this.feed, { provider: record.session.provider as CmuxProvider, nativeId: record.nativeId, surfaceId: record.surfaceId });
+          this.observe(record, status, status === "running" ? pendingPrompt(record.session.provider as CmuxProvider, record.screen, nativeFeed) : undefined);
+        }
+        if (JSON.stringify(record) !== previous.get(record.session.id)) this.save(record);
+      } catch (error) { failure ??= { error }; }
     }
+    if (failure) throw failure.error;
   }
 
   private observe(record: Stored, status: Session["status"], pending?: PendingPrompt) {
@@ -332,10 +353,8 @@ export class CmuxSessions {
     record.session.status = status;
     if (status !== "running" && status !== "starting") {
       record.controller = undefined;
-      // An outage is not evidence that an authenticated Feed decision closed.
-      // Keep it latched in durable state until a successful observation resolves it.
       if (status !== "unavailable" || !record.prompt?.feed) record.prompt = undefined;
-      record.attention = applyLifecycle(record.attention, status as "exited" | "unavailable" | "recording-error", at);
+      if (record.attention.state !== status) record.attention = applyLifecycle(record.attention, status as "exited" | "unavailable" | "recording-error", at);
     } else {
       if (pending?.fingerprint !== record.prompt?.fingerprint) {
         if (record.prompt) this.append(record, "signal", { kind: "prompt-closed", promptId: record.prompt.id, reason: "vanished", source: "host", provider: record.session.provider });
@@ -347,14 +366,52 @@ export class CmuxSessions {
       } else if (pending && record.prompt) record.prompt = { ...pending, id: record.prompt.id };
       const attentionState = record.prompt || record.lifecycle === "needsInput" ? "needs-you"
         : record.lifecycle === "idle" ? "idle" : "working";
-      record.attention = {
-        ...record.attention, state: attentionState, source: record.prompt?.prompt.source ?? "lifecycle",
+      const base = {
         since: record.attention.state === attentionState ? record.attention.since : at,
-        prompt: record.prompt ? { ...record.prompt.prompt, id: record.prompt.id } : undefined,
-        now: record.prompt ? record.prompt.prompt.title : record.lifecycle === "needsInput" ? "Input requested in cmux"
-          : record.lifecycle === "idle" ? "Waiting for your direction" : "cmux session is connected",
-        lastMessage: record.lastMessage, hooks: record.hookAt ? "active" : "none", sawTurnEnd: false,
+        lastActivityAt: record.attention.lastActivityAt,
+        lastMessage: record.lastMessage,
+        hooks: (record.hookAt ? "active" : "none") as "active" | "none",
+        hookErrors: record.attention.hookErrors,
+        ...(record.attention.limit ? { limit: record.attention.limit } : {}),
+        sawTurnEnd: false,
       };
+      if (record.prompt) {
+        record.attention = {
+          ...base,
+          state: "needs-you",
+          source: record.prompt.prompt.source,
+          prompt: { ...record.prompt.prompt, id: record.prompt.id },
+          now: record.prompt.prompt.title,
+          ...(record.attention.lastTool ? { lastTool: record.attention.lastTool } : {}),
+        };
+      } else if (record.lifecycle === "needsInput") {
+        record.attention = {
+          ...base,
+          state: "needs-you",
+          source: "lifecycle",
+          prompt: undefined,
+          now: "Input requested in cmux",
+          ...(record.attention.lastTool ? { lastTool: record.attention.lastTool } : {}),
+        };
+      } else if (record.lifecycle === "idle") {
+        record.attention = {
+          ...base,
+          state: "idle",
+          source: "lifecycle",
+          prompt: undefined,
+          lastTool: undefined,
+          now: "Waiting for your direction",
+        };
+      } else {
+        record.attention = {
+          ...base,
+          state: "working",
+          source: "lifecycle",
+          prompt: undefined,
+          now: "cmux session is connected",
+          ...(record.attention.lastTool ? { lastTool: record.attention.lastTool } : {}),
+        };
+      }
     }
     this.currentControl(record);
     if (JSON.stringify(record) !== before) this.save(record);
@@ -364,15 +421,16 @@ export class CmuxSessions {
     const status = record.recordingError ? "recording-error" : record.session.status;
     return {
       status, pid: record.pid, seq: this.journals.get(record.session.id)?.seq ?? 0, screen: record.screen,
-      attention: record.recordingError ? applyLifecycle(record.attention, "recording-error", now()) : record.attention,
+      attention: record.recordingError ? applyLifecycle(record.attention, "recording-error", record.attention.lastActivityAt) : record.attention,
       capabilities: { terminalSnapshot: 1, inputControl: 1 }, control: this.currentControl(record),
       runtime: record.session.runtime,
+      ...(record.columns && record.rows ? { terminalSize: { cols: record.columns, rows: record.rows } } : {}),
       ...(record.nativeId ? { nativeSession: { id: record.nativeId, source: "hook" as const } } : {}),
     };
   }
 
   list() {
-    const rows = () => [...this.records.values()].map((record) => {
+    const rows = () => [...this.records.values()].sort((left, right) => compareCodeUnits(left.session.id, right.session.id)).map((record) => {
       const { context: _context, initialPrompt: _prompt, nativeArgs: _args, ...session } = record.session;
       const { screen: _screen, ...state } = this.state(record);
       return { ...session, ...state, attention: { ...state.attention, lastMessage: state.attention.lastMessage?.slice(0, 280) } };
@@ -382,10 +440,8 @@ export class CmuxSessions {
       return rows();
     }, "list").catch(error => {
       if (!(error instanceof CmuxError) || error.code !== "cmux-busy") throw error;
-      // Keep managed workers visible when cmux is overloaded, without presenting
-      // a cached cmux observation as a connected runtime or valid input lease.
       return rows().map(row => ({ ...row, status: "unavailable" as const, control: null,
-        attention: applyLifecycle(row.attention, "unavailable", now()) }));
+        attention: applyLifecycle(row.attention, "unavailable", row.attention.lastActivityAt) }));
     });
   }
 
@@ -397,9 +453,11 @@ export class CmuxSessions {
     }, `get:${id}`);
   }
 
+  requireStored(id: string) { this.stored(id); }
+
   events(id: string, after = 0, limit = 200, types?: Set<string>) {
     this.stored(id);
-    return readEvents(join(this.directory, id, "events"), this.key, id, after, limit, types);
+    return readIndexedEvents(join(this.directory, id), this.key, id, after, limit, types);
   }
 
   messages(id: string, after?: string, limit = 200) {
@@ -433,7 +491,7 @@ export class CmuxSessions {
       if (!this.available) throw new CmuxError("cmux-unavailable");
       if ([...this.records.values()].filter((row) => ["running", "starting"].includes(row.session.status)).length >= this.config.maxSessions) throw new CmuxError("session-limit");
       if (request.nativeArgs) assertFreshNativeContext(request.provider, request.nativeArgs);
-      const context = new ProjectContexts(this.config, this.key).snapshot(project.id);
+      const context = this.projectContexts.snapshot(project.id);
       const record = this.newRecord(request.provider as CmuxProvider, projectCwd(project.path, request.cwd), request.title, request.requestId);
       if (!record) throw new CmuxError("unknown-project");
       record.session.initialPrompt = request.prompt;
@@ -461,7 +519,7 @@ export class CmuxSessions {
     for (const argument of [command, ...argv]) this.validText(argument, true);
     const input = `export ${LAUNCH_ENV}=${quote(record.launchId!)}; exec ${[command, ...argv].map(quote).join(" ")}\r`;
     this.append(record, "input-intent", { op: "launch", launchId: record.launchId });
-    this.save(record); // The uncertain intent is durable before the external mutation.
+    this.save(record);
     try {
       const result = await this.client.rpc("workspace.create", { cwd: record.session.cwd, focus: false, initial_input: input });
       const workspaceId = string(result.workspace_id), surfaceId = string(result.surface_id);
@@ -599,8 +657,6 @@ export class CmuxSessions {
     try {
       if (answer) receipt.result = await answer();
       else if (request.op === "input" || request.op === "raw") {
-        // terminal.paste is cmux's bracketed-paste operation. Raw control bytes
-        // are refused; this adapter cannot safely provide a lossless native PTY.
         const result = await this.client.rpc("terminal.paste", { surface_id: record.surfaceId, workspace_id: record.workspaceId, text: request.text, submit_key: request.op === "input" && request.submit ? "return" : "none" });
         if (result.surface_id && result.surface_id !== record.surfaceId || result.workspace_id && result.workspace_id !== record.workspaceId) throw new CmuxError("delivery-uncertain");
         if (request.op === "input" && request.submit && result.submitted !== true) throw new CmuxError("delivery-uncertain");
@@ -609,8 +665,6 @@ export class CmuxSessions {
       } else if (request.op === "stop") {
         try { await this.client.rpc("surface.close", { workspace_id: record.workspaceId, surface_id: record.surfaceId }); }
         catch (error) {
-          // Only close a whole workspace when a fresh tree proves this is its
-          // sole surface. Never close another person's adjacent terminal.
           if (!(error instanceof CmuxError) || error.code !== "invalid_state") throw error;
           const tree = await this.client.tree();
           const owned = [...tree.values()].filter((surface) => surface.workspaceId === record.workspaceId);
@@ -626,8 +680,6 @@ export class CmuxSessions {
       this.save(record);
       return this.publicReceipt(receipt);
     } catch {
-      // The durable uncertain receipt intentionally survives API restarts. No
-      // failure path retries an input that may already have reached the agent.
       return this.publicReceipt(receipt);
     }
   }
@@ -693,6 +745,12 @@ export class CmuxSessions {
     };
   }
 
-  /** Closing the adapter does not close or interrupt any cmux terminal. */
-  async close(): Promise<void> { this.closed = true; await this.draining; }
+  async close(): Promise<void> {
+    this.closed = true;
+    while (this.draining) await this.draining;
+    for (const [id, index] of this.signalIndexes) {
+      const journal = this.journals.get(id);
+      if (journal) index.checkpoint(journal.seq);
+    }
+  }
 }

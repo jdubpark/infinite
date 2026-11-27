@@ -2,8 +2,6 @@ import Foundation
 import Security
 import Darwin
 
-/// Identity and daemon pins are kept together in a device-only Keychain item.
-/// Plaintext files exist only in a private directory while cmux is connected.
 struct CmuxIdentityVault {
     let profileID: String
     private let service = "dev.infinite.desktop.cmux.identity"
@@ -56,8 +54,6 @@ struct CmuxIdentityVault {
             }
             archive[name] = try Data(contentsOf: file)
         }
-        // A failed first enrollment must not replace a previously saved identity
-        // with an empty archive.
         guard !archive.isEmpty else { return }
         let payload = try JSONEncoder().encode(archive)
         let update = [kSecValueData as String: payload]

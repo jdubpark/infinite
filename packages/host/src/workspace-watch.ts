@@ -4,6 +4,7 @@ import { chmod, lstat, mkdir, readFile, realpath, rename, rm, writeFile } from "
 import { isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { replyDeadline } from "./deadline.js";
 
 const run = promisify(execFile);
 const BARRIER_TIMEOUT_MS = 15000;
@@ -12,7 +13,6 @@ const MAX_PENDING = 16;
 
 export interface WorkspaceWatchRevision {
   revision: number;
-  /** Complete vnode registration remains intact; not a certificate for mmap writes. */
   valid: boolean;
 }
 export interface WorkspaceWatch {
@@ -42,7 +42,6 @@ async function helper(cacheDir: string): Promise<string> {
   const temporary = `${binary}-${randomUUID()}`;
   const sourceCopy = `${temporary}.c`;
   try {
-    // Compile exactly the bytes named by the cache hash, even during an update.
     await writeFile(sourceCopy, source, { flag: "wx", mode: 0o600 });
     await run("xcrun", ["clang", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror", sourceCopy,
       "-o", temporary], { timeout: 60000, maxBuffer: 65536 });
@@ -57,24 +56,6 @@ async function helper(cacheDir: string): Promise<string> {
   }
 }
 
-/**
- * Start only from background preparation: the first build can invoke clang.
- * Compare revisions from this same live watch around the complete capture.
- * Any revision change requires discarding the capture. Loss is sticky:
- * recreate the watch and repeat the entire capture after an invalid revision.
- * Registers a kernel vnode filter for every entry on local APFS, including
- * ignored/build files. Directory topology changes require watch recreation.
- * Resource limits, special files and nested mounts are explicit blockers.
- * Change-notification watches skip special files, matching sync capture output;
- * their containing directories still detect replacement/removal. Capture guards
- * retain the strict default. Change-notification startup may return invalid so
- * its owner can report dirty and retry registration after writers settle.
- * Equal valid revisions detect ordinary write/metadata syscalls, NOT writable
- * shared mappings: real MAP_SHARED writes can change bytes without vnode events.
- * A best-effort capture must report its observation span and stable-read/hash
- * evidence separately. Atomic consistency requires a filesystem snapshot or
- * enforced exclusion of every writer; this watcher cannot certify that property.
- */
 export async function createWorkspaceWatch(roots: string[], cacheDir: string, options: { purpose?: "capture" | "changes" } = {}): Promise<WorkspaceWatch> {
   if (process.platform !== "darwin") throw new Error("Workspace change watch is unsupported on this platform");
   if (!roots.length || roots.length > 64 || roots.some(root => !isAbsolute(root) || root.includes("\0"))) {
@@ -99,7 +80,7 @@ export async function createWorkspaceWatch(roots: string[], cacheDir: string, op
   }
   function awaitReply(id: number): Promise<WorkspaceWatchRevision> {
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => fail("Workspace watch barrier timed out"), BARRIER_TIMEOUT_MS);
+      const timer = replyDeadline(BARRIER_TIMEOUT_MS, () => { if (pending.has(id)) fail("Workspace watch barrier timed out"); });
       pending.set(id, { resolve, reject, timer });
     });
   }

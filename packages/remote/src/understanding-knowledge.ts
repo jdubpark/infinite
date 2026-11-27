@@ -1,11 +1,9 @@
 import type { DiagramGraph } from "./understanding-diagrams.js";
 import type { UnderstandingBrief, UnderstandingWork } from "./understanding.js";
 
-/** Source observations never confer completion or delivery authority. */
 export interface KnowledgeSource {
   repositoryId: string; head: string | null; fingerprint: string; observedAt: string; kind: "checkout";
 }
-/** A null line cites a file-level observation, never a fabricated source line. */
 export interface KnowledgeEvidence { repositoryId: string; source: string; line: number | null; text?: string }
 export interface KnowledgeClaim { text: string; basis: "source" | "agent" | "owner" | "provider"; evidence: KnowledgeEvidence[] }
 export interface KnowledgeHistory { revision: number; at: string; summary: string }
@@ -17,7 +15,6 @@ export type KnowledgeFeatureStatus = "planned" | "active" | "blocked" | "complet
 export interface KnowledgeFeature {
   id: string; revision: number; projectId: string | null; title: string; description: string;
   repositoryIds: string[]; workIds: string[]; componentIds: string[];
-  /** Explicit owner assessment, independent of execution and provider delivery. */
   status: KnowledgeFeatureStatus;
   sourceUrl: string | null; archived: boolean; createdAt: string; updatedAt: string; history: KnowledgeHistory[];
 }
@@ -29,15 +26,12 @@ export interface KnowledgePlan {
 }
 export interface KnowledgeComponentOverride {
   id: string; revision: number; repositoryIds: string[]; name: string; description: string;
-  /** Owner redirects preserve navigation after a rename or split. */
   redirectTo: string | null; pinned: boolean; updatedAt: string;
 }
 export interface KnowledgePolicy {
   enabled: boolean;
-  /** Models run only when enabled here and a host writer is configured. */
   synthesis: boolean;
   delivery: boolean; intervalMinutes: number; dailyJobLimit: number;
-  /** Set when the owner edits the policy or the one-time migration applies the defaults. */
   editedAt?: string | null; editedBy?: "owner" | "migration" | null;
 }
 export interface KnowledgeCatalog {
@@ -46,7 +40,6 @@ export interface KnowledgeCatalog {
 }
 export interface KnowledgeDifference {
   state: "unverified" | "review-needed" | "aligned"; summary: string; claims: KnowledgeClaim[];
-  /** Exact plan revisions and source generation compared by the writer. */
   planRevisions: { id: string; revision: number }[]; snapshotId: string | null; generatedAt: string | null;
 }
 export interface KnowledgeComponent {
@@ -85,7 +78,6 @@ export interface KnowledgeMaintenance {
   jobsToday: number; dailyJobLimit: number; message: string | null;
   lastFailure?: { at: string; reason: string } | null;
 }
-/** Whole-repository brief at the tracked head; `base` is the prior head the changes section compares against. */
 export interface KnowledgeRepositoryBrief {
   repositoryId: string; head: string | null; base: string | null; generatedAt: string; observedAt: string;
   state: "ready" | "stale"; brief: UnderstandingBrief; diagrams: DiagramGraph[];
@@ -97,7 +89,6 @@ export interface WorkspaceKnowledge {
   briefs?: KnowledgeRepositoryBrief[]; diagrams?: DiagramGraph[];
 }
 
-/** Caller UUID plus catalog revision protects mutations against replay and races. */
 export interface KnowledgeMutation { requestId: string; revision: number }
 export type KnowledgeProjectInput = Pick<KnowledgeProject, "name" | "description" | "repositoryIds">;
 export type KnowledgeFeatureInput = Pick<KnowledgeFeature, "projectId" | "title" | "description" | "repositoryIds" | "workIds" | "componentIds" | "status" | "sourceUrl">;

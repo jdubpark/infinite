@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import type { Prompt } from "@infinite/attention";
+import { terminalOnlyPrompt, type Prompt } from "@infinite/attention";
 import { RefreshCw } from "lucide-react";
 import { ApiError, isControlRefusal, isMissionManaged, useApi, type ChatMessage, type MessagesPage, type ProjectFile, type Session } from "./api";
 import { useMachines } from "./machines";
@@ -22,7 +22,6 @@ export function Conversation({ id }: { id: string }) {
     setStale(false);
     setLoaded(false);
     const collected = new Map<string, ChatMessage>();
-    // Hiding the tab starts a new generation: a reply to an earlier read is dropped, and returning reads again at once.
     let generation = 0, inFlight: number | undefined;
     async function poll() {
       clearTimeout(timer);
@@ -37,7 +36,6 @@ export function Conversation({ id }: { id: string }) {
         clearTimeout(staleTimer);
         staleTimer = undefined;
         setStale(false);
-        // An empty page keeps the current array, so it does not re-render the same messages every poll.
         if (page.messages.length) {
           for (const message of page.messages) collected.set(message.id, message);
           while (collected.size > 500) collected.delete(collected.keys().next().value!);
@@ -61,7 +59,6 @@ export function Conversation({ id }: { id: string }) {
       clearTimeout(staleTimer);
       staleTimer = undefined;
       if (document.visibilityState === "hidden") return;
-      // Returning clears an earlier warning; it shows again only if no read lands within the same grace period.
       setStale(false);
       staleTimer = setTimeout(() => { staleTimer = undefined; if (active) setStale(true); }, 3000);
       void poll();
@@ -114,8 +111,9 @@ export function ProjectFiles({ id, online }: { id: string; online: boolean }) {
 
 type Answer = { requestId: string; promptId: number; option?: number; text?: string };
 const answers = new Map<string, Answer>();
-export function PromptDecision({ sessionId, backend, prompt, canAnswer, controlId, refresh, onRefused, openTerminal }: {
+export function PromptDecision({ sessionId, backend, prompt, canAnswer, controlId, refresh, onRefused, openTerminal, selectionOnly, selectedOption, onOptionSelection, submitSignal, terminalOnlyOverride, onDelivered }: {
   sessionId: string; backend?: Session["backend"]; prompt: Prompt; canAnswer: boolean; controlId?: string; refresh: () => void; onRefused: () => void; openTerminal: () => void;
+  selectionOnly?: boolean; selectedOption?: number; onOptionSelection?: (index: number) => void; submitSignal?: number; terminalOnlyOverride?: boolean; onDelivered?: (result: "closed" | "still-open" | "changed") => void;
 }) {
   const api = useApi();
   const machine = useMachines().active.id;
@@ -124,6 +122,7 @@ export function PromptDecision({ sessionId, backend, prompt, canAnswer, controlI
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState(pending.current ? "Earlier answer delivery remains unconfirmed. Check Terminal before retrying." : "");
   const [reply, setReply] = useState("");
+  const handledSubmit = useRef(submitSignal ?? 0);
   async function deliver(option?: number, text?: string) {
     if (!canAnswer || busy) return;
     const retrying = Boolean(pending.current);
@@ -131,10 +130,11 @@ export function PromptDecision({ sessionId, backend, prompt, canAnswer, controlI
     answers.set(cacheKey, pending.current);
     setBusy(true); setMessage("");
     try {
-      const receipt = await api<{ state: string; result: string }>(`/sessions/${sessionId}/answer`, pending.current, undefined, controlId);
+      const receipt = await api<{ state: "delivered" | "uncertain"; result: "closed" | "still-open" | "changed" }>(`/sessions/${sessionId}/answer`, pending.current, undefined, controlId);
       if (receipt.state !== "delivered") throw new Error("Delivery is uncertain. Check Terminal before retrying.");
       pending.current = undefined; answers.delete(cacheKey);
       setMessage(receipt.result === "closed" ? "Answer delivered. Waiting for the dialog to close." : receipt.result === "changed" ? "The prompt changed. Refreshing before another answer." : "The dialog remains open. Check Terminal.");
+      onDelivered?.(receipt.result);
     } catch (error) {
       if (isControlRefusal(error)) { onRefused(); if (!retrying) { pending.current = undefined; answers.delete(cacheKey); } }
       else if (error instanceof ApiError && ["prompt-changed", "unsupported", "invalid-option", "text-not-accepted"].includes(error.code ?? "")) { pending.current = undefined; answers.delete(cacheKey); }
@@ -142,19 +142,26 @@ export function PromptDecision({ sessionId, backend, prompt, canAnswer, controlI
     } finally { setBusy(false); refresh(); }
   }
   const feedText = backend === "cmux" && prompt.source === "protocol" && prompt.acceptsText && Boolean(prompt.hash);
-  const terminalOnly = !feedText && (prompt.multiSelect || !prompt.hash || !prompt.options.length);
+  const terminalOnly = Boolean(terminalOnlyOverride) || terminalOnlyPrompt(prompt, backend);
   const textReply = prompt.acceptsText && prompt.kind !== "yes-no" && (backend !== "cmux" || prompt.source === "protocol");
+  useEffect(() => {
+    if (submitSignal === undefined || handledSubmit.current === submitSignal) return;
+    handledSubmit.current = submitSignal;
+    if (selectedOption !== undefined && !terminalOnly && !pending.current && prompt.options.some(option => option.index === selectedOption)) void deliver(selectedOption);
+  }, [submitSignal, selectedOption, terminalOnly]);
   return <section className="prompt-decision" aria-label="Session needs your decision">
     <strong>{prompt.title}</strong>{prompt.detail && <pre>{prompt.detail}</pre>}
     {prompt.destructive && <p className="error">Destructive command: {prompt.destructive.pattern.replace(/-/g, " ")}</p>}
     {terminalOnly ? backend === "cmux" ? <p className="quiet">Answer this prompt in native cmux on the machine.</p> : <button className="text-button" onClick={openTerminal}>Open Terminal to answer this prompt</button> : <div className="prompt-options">
-      {prompt.options.map(option => <button key={option.index} disabled={!canAnswer || busy || Boolean(pending.current)} onClick={() => void deliver(option.index)}>{option.label}</button>)}
+      {prompt.options.map(option => <button key={option.index} aria-pressed={selectionOnly ? selectedOption === option.index : undefined}
+        disabled={!canAnswer || busy || Boolean(pending.current)} onClick={() => selectionOnly ? onOptionSelection?.(option.index) : void deliver(option.index)}>{option.label}{selectionOnly && selectedOption === option.index && <span className="team-recommended-tag" aria-hidden="true">Selected</span>}</button>)}
       {textReply && <form onSubmit={event => { event.preventDefault(); void deliver(undefined, reply.trim()); }}><textarea aria-label="Reply instead" value={reply} onChange={event => setReply(event.target.value)} disabled={busy || Boolean(pending.current)} placeholder="Reply instead…" maxLength={32000} rows={feedText && !prompt.options.length ? 3 : 2} /><button disabled={!canAnswer || busy || Boolean(pending.current) || !reply.trim()}>Send reply</button></form>}
       {backend === "cmux" && prompt.acceptsText && !textReply && <p className="quiet">To reply with text, answer in native cmux on the machine.</p>}
     </div>}
-    {!canAnswer && <p className="quiet">Connect with a controller or owner key and take control to answer.</p>}
+    {selectionOnly && !terminalOnly && prompt.options.length > 0 && <button type="button" className="primary decision-queue-submit" data-decision-queue-submit disabled={!canAnswer || busy || Boolean(pending.current) || selectedOption === undefined || !prompt.options.some(option => option.index === selectedOption)} onClick={() => { if (selectedOption !== undefined) void deliver(selectedOption); }}>Submit selected answer</button>}
+    {!canAnswer && !selectionOnly && <p className="quiet">Connect with a controller or owner key and take control to answer.</p>}
     <p className="prompt-feedback" role="status">{!busy && message}</p>
-    {pending.current && !busy && <button disabled={!canAnswer} onClick={() => void deliver()}>Retry same answer</button>}
+    {pending.current && !busy && !(selectionOnly && terminalOnly) && <button disabled={!canAnswer} onClick={() => void deliver()}>Retry same answer</button>}
   </section>;
 }
 

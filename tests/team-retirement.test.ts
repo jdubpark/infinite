@@ -60,8 +60,8 @@ test("retirement signals the stopped launcher and detached agent descendants thr
     const calls = readFileSync(join(receipts, "commands.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
     assert.ok(calls.some(call => call.command === process.execPath && call.args[0] === "-e"), "agent signal must use configured team command prefix");
   } finally {
-    for (const pid of spawnedPids) if (fixtureProcess(pid)) { try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ } }
-    for (const child of [launcher, unrelated]) if (child?.pid && fixtureProcess(child.pid)) { try { process.kill(child.pid, "SIGKILL"); } catch { /* already gone */ } }
+    for (const pid of spawnedPids) if (fixtureProcess(pid)) { try { process.kill(pid, "SIGKILL"); } catch { } }
+    for (const child of [launcher, unrelated]) if (child?.pid && fixtureProcess(child.pid)) { try { process.kill(child.pid, "SIGKILL"); } catch { } }
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -173,7 +173,7 @@ test("multi-UID configured-boundary deployment probe", { skip: !process.env.INFI
       const target = rows.find(row => row.pid === Number(readFileSync(unrelatedPidFile, "utf8")));
       if (target) await boundary.signal([{ pid: target.pid, born: target.born, signal: "SIGKILL" }]).catch(() => {});
     }
-    for (const child of [main, unrelated]) if (child.pid && fixtureProcess(child.pid)) { try { process.kill(child.pid, "SIGKILL"); } catch { /* already gone */ } }
-    for (const file of [grandchildPath, childPath, launcherPath, childPidFile, grandPidFile, unrelatedPidFile]) { try { unlinkSync(file); } catch { /* already removed */ } }
+    for (const child of [main, unrelated]) if (child.pid && fixtureProcess(child.pid)) { try { process.kill(child.pid, "SIGKILL"); } catch { } }
+    for (const file of [grandchildPath, childPath, launcherPath, childPidFile, grandPidFile, unrelatedPidFile]) { try { unlinkSync(file); } catch { } }
   }
 });

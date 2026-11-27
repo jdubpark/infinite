@@ -1,9 +1,10 @@
-// Scripted agent for tests/worker-attention.test.ts. It draws one Claude-style permission dialog
-// for `rm -rf build` and posts PermissionRequest hooks in a fixed order, so each mode drives one
-// of the worker's rules for merging hook prompts with the dialog on screen.
-// The prompt is the last argument; Claude launches put their hook settings before it.
 const mode = process.argv.at(-1) ?? "";
+const gateIndex = process.argv.indexOf("--gate");
+const gateBase = gateIndex >= 0 ? process.argv[gateIndex + 1] : undefined;
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const gate = async (name) => {
+  if (gateBase) await fetch(`${gateBase}/${name}`).catch(() => {});
+};
 const post = (body) =>
   fetch(`${process.env.INFINITE_HOOK_URL}/claude`, {
     method: "POST",
@@ -13,7 +14,9 @@ const post = (body) =>
 const permission = (command) => post({ hook_event_name: "PermissionRequest", tool_name: "Bash", tool_input: { command } });
 
 const HEADER = ["Bash command", "  rm -rf build", "", "Do you want to proceed?"];
-const OPTIONS = ["Yes", "No"];
+const OPTIONS = mode === "dialog-first"
+  ? ["Yes", "Yes, and don't ask again for rm commands", "No, and tell Claude what to do differently"]
+  : ["Yes", "No"];
 let highlighted = 0;
 let open = false;
 let raceHook = Promise.resolve();
@@ -27,60 +30,75 @@ if (process.stdin.isTTY) process.stdin.setRawMode(true);
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", async (chunk) => {
   if (!open) return;
-  if (chunk.includes("\x1b[B") || chunk.includes("\x1b[A")) {
-    highlighted = chunk.includes("\x1b[B") ? Math.min(OPTIONS.length - 1, highlighted + 1) : Math.max(0, highlighted - 1);
+  const downs = chunk.match(/\x1b\[B/g)?.length ?? 0;
+  const ups = chunk.match(/\x1b\[A/g)?.length ?? 0;
+  if (downs || ups) {
+    highlighted = Math.max(0, Math.min(OPTIONS.length - 1, highlighted + downs - ups));
     process.stdout.write(`\x1b[${OPTIONS.length}A` + rows().map((row) => `\x1b[2K${row}\n`).join(""));
-    // A hook for this very dialog arrives while the answer is still in flight.
     if (mode === "answer-race") raceHook = permission("rm -rf build");
-  } else if (chunk.includes("\r")) {
-    await raceHook; // keep the dialog on screen until that hook was delivered
+  }
+  if (chunk.includes("\r")) {
+    await raceHook;
+    if (mode === "expiring-lease") await gate("close-dialog");
     open = false;
     process.stdout.write(`\x1b[${HEADER.length + OPTIONS.length}A\x1b[J`);
     console.log(`Selected: ${OPTIONS[highlighted]}`);
+    if (mode === "dialog-first") process.stdout.write("Tell Claude what to do differently:\n> ");
   }
 });
 
-await sleep(300);
-if (mode === "mismatch") {
+if (mode === "expiring-lease") {
   draw();
-  await sleep(400);
-  await permission("git push --force origin main");
-} else if (mode === "hook-first") {
-  await permission("git push --force origin main");
-  await sleep(400);
+} else if (mode === "dialog-first") {
   draw();
-} else if (mode === "two-hooks") {
+  if (gateBase) await gate("dialog-first-screen");
+  else await sleep(300);
+  await post({ hook_event_name: "UserPromptSubmit", prompt: "dialog-first" });
+  await post({ hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: { command: "rm -rf build", description: "Remove the stale build directory" }, tool_use_id: "demo-1" });
   await permission("rm -rf build");
+} else {
   await sleep(300);
-  await permission("git push --force origin main");
-} else if (mode === "answer-race") draw();
-else if (mode === "merge") {
-  // The hook for this very dialog arrives first; the block then supplies title, detail and options.
-  await permission("rm -rf build");
-  await sleep(400);
-  draw();
-} else if (mode === "rate-limit-notice-first") {
-  console.log("You've hit your session limit · resets 3:45pm");
-  await sleep(500);
-  await post({ hook_event_name: "StopFailure", error: "rate_limit" });
-  await sleep(1500);
-  await post({ hook_event_name: "StopFailure", error: "rate_limit" });
-} else if (mode === "rate-limit-then-stop") {
-  console.log("You've hit your session limit · resets 3:45pm");
-  await post({ hook_event_name: "StopFailure", error: "rate_limit" });
-  await sleep(1500);
-  await post({ hook_event_name: "Stop" });
-} else if (mode === "rate-limit" || mode === "rate-limit-blip") {
-  // The hook reports the limit; only `rate-limit` also prints the notice that corroborates it.
-  await post({ hook_event_name: "StopFailure", error: "rate_limit" });
-  if (mode === "rate-limit") {
+  if (mode === "mismatch") {
+    draw();
+    if (gateBase) await gate("mismatch-screen");
+    else await sleep(400);
+    await permission("git push --force origin main");
+  } else if (mode === "hook-first") {
+    await permission("git push --force origin main");
+    await sleep(400);
+    draw();
+  } else if (mode === "two-hooks") {
+    await permission("rm -rf build");
     await sleep(300);
+    await permission("git push --force origin main");
+  } else if (mode === "answer-race") draw();
+  else if (mode === "merge") {
+    await permission("rm -rf build");
+    await sleep(400);
+    draw();
+  } else if (mode === "rate-limit-notice-first") {
     console.log("You've hit your session limit · resets 3:45pm");
+    if (gateBase) await gate("notice-first-screen");
+    else await sleep(500);
+    await post({ hook_event_name: "StopFailure", error: "rate_limit" });
+    await sleep(200);
+    await post({ hook_event_name: "StopFailure", error: "rate_limit" });
+    if (gateBase) await gate("notice-first-done");
+  } else if (mode === "rate-limit-then-stop") {
+    console.log("You've hit your session limit · resets 3:45pm");
+    await post({ hook_event_name: "StopFailure", error: "rate_limit" });
+    if (gateBase) await gate("then-stop-corroborated");
+    else await sleep(1500);
+    await post({ hook_event_name: "Stop" });
+  } else if (mode === "rate-limit" || mode === "rate-limit-blip") {
+    await post({ hook_event_name: "StopFailure", error: "rate_limit" });
+    if (mode === "rate-limit") {
+      console.log("You've hit your session limit · resets 3:45pm");
+    }
+  } else if (mode === "denied") {
+    await permission("rm -rf build");
+    await sleep(300);
+    await post({ hook_event_name: "PermissionDenied", tool_name: "Bash", tool_input: { command: "rm -rf build" }, reason: "Denied by policy" });
   }
-} else if (mode === "denied") {
-  // No dialog is drawn: the permission is refused without asking.
-  await permission("rm -rf build");
-  await sleep(300);
-  await post({ hook_event_name: "PermissionDenied", tool_name: "Bash", tool_input: { command: "rm -rf build" }, reason: "Denied by policy" });
 }
 setInterval(() => {}, 1000);

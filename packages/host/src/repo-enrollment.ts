@@ -9,6 +9,8 @@ import { projectSourceSchema, teamProjectSchema, type ProjectSource, type TeamCo
 import { TeamError, teamCommand } from "./team-workspace.js";
 import { unseal, writeSealed } from "./vault.js";
 import { homeRelativePath } from "./mirrored-projects.js";
+import { autonomyReady, evaluatorOverlaps, type NotReady } from "./evaluator-profiles.js";
+import { autonomyModeSchema, autonomyOf, enrollmentAutonomy, type AutonomyMode, type AutonomySource } from "./autonomy.js";
 
 const enrollmentTeamSchema = teamProjectSchema;
 const enrollmentLinearSchema = z.object({ teamId: z.uuid(), projectId: z.uuid().optional() }).strict();
@@ -19,8 +21,16 @@ export const repoEnrollmentRequestSchema = z.object({
   linear: z.union([enrollmentLinearSchema, z.null()]).optional(),
   teamwork: z.union([z.string().refine(homeRelativePath), z.null()]).optional(),
   source: projectSourceSchema.optional(),
-}).strict();
+  autonomy: autonomyModeSchema.optional(),
+  permissionOptOut: z.literal(true).optional(),
+}).strict().refine(request => !(request.permissionOptOut && request.team.permissions), {
+  path: ["permissionOptOut"], message: "An opt-out cannot carry a permission policy.",
+});
 export type RepoEnrollmentRequest = z.infer<typeof repoEnrollmentRequestSchema>;
+export type RepoEnrollmentHooks = { beforeWrite?: () => void };
+
+export const autonomyChangeSchema = z.object({ requestId: z.uuid(), revision: z.number().int().min(1), mode: autonomyModeSchema }).strict();
+export type AutonomyChange = z.infer<typeof autonomyChangeSchema>;
 
 export interface RepoEnrollmentView {
   id: string;
@@ -33,19 +43,22 @@ export interface RepoEnrollmentView {
   revision: number;
   execution: "cloud" | "local";
   hostSetup: { ready: boolean; missing: string[] };
+  autonomy: AutonomyMode;
+  autonomySource: AutonomySource;
+  autonomyReady: boolean; autonomyReason?: NotReady;
+  evaluatorOverlaps: string[];
 }
 
 interface StoredEnrollment {
   path: string;
   team: z.infer<typeof enrollmentTeamSchema>;
-  /** null records an explicit removal; absence means no project overlay was saved. */
   linear?: z.infer<typeof enrollmentLinearSchema> | null;
   teamwork?: string | null;
-  /** Absent on enrollments saved before source modes existed; those projects follow the laptop. */
   source?: ProjectSource;
+  autonomy?: AutonomyMode;
   revision: number;
 }
-interface Receipt { fingerprint: string; projectId: string; path: string; response: RepoEnrollmentView }
+interface Receipt { fingerprint: string; projectId: string; path: string; response: RepoEnrollmentView; created?: true }
 interface EnrollmentStore { version: 1; projects: Record<string, StoredEnrollment>; requests: Record<string, Receipt> }
 interface Options { isBusy?: (projectId: string) => boolean | Promise<boolean> }
 
@@ -53,7 +66,6 @@ const emptyStore = (): EnrollmentStore => ({ version: 1, projects: {}, requests:
 const canonicalPath = (path: string) => realpathSync(resolve(path));
 const fingerprint = (value: RepoEnrollmentRequest) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
 
-/** Recheck a saved teamwork root against current host paths before using it. */
 export function assertTeamworkPath(config: Config, path: string) {
   const home = canonicalMissing(resolve(config.sync?.homeDir ?? homedir()));
   const target = resolve(path);
@@ -71,9 +83,9 @@ export function assertTeamworkPath(config: Config, path: string) {
     }
   }
   const comparable = (value: string) => { try { return canonicalMissing(resolve(value)); } catch { return resolve(value); } };
-  const conflicts = [...config.projects.map(project => project.path), config.stateDir, config.runDir, config.keyFile,
+  const conflicts = [...config.projects.map(project => project.path), config.stateDir, config.runDir, config.socketDir, config.keyFile,
     config.teams?.workspaceDir, config.linear?.apiKeyFile, config.push?.accessTokenFile,
-      config.remote?.relay?.tokenFile, config.summaries?.apiKeyFile, config.jev?.apiKeyFile].filter((value): value is string => Boolean(value));
+    config.remote?.relay?.tokenFile, config.summaries?.apiKeyFile, config.jev?.apiKeyFile].filter((value): value is string => Boolean(value));
   const overlaps = (left: string, right: string) => {
     const rel = relative(left, right);
     return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
@@ -90,11 +102,10 @@ function canonicalMissing(path: string): string {
   }
 }
 
-/** Applies owner-authenticated team enrollment overlays after mirrored projects have loaded. */
 export class RepoEnrollmentService {
   private readonly file: string;
   private store: EnrollmentStore;
-  private mutation = Promise.resolve();
+  private readonly projectLocks = new Map<string, Promise<unknown>>();
 
   constructor(private readonly config: Config, private readonly key: Buffer, private readonly options: Options = {}) {
     this.file = join(config.stateDir, "repo-enrollments.sealed");
@@ -108,20 +119,76 @@ export class RepoEnrollmentService {
     const saved = this.store.projects[projectId];
     this.assertPathBinding(project, saved);
     this.assertProjectPathAllowed(this.projectPath(project));
-    // A conflicting saved folder stays readable so repo init can replace or remove it.
     return this.view(project, saved?.revision ?? 0, saved);
   }
 
   async put(projectId: string, input: RepoEnrollmentRequest): Promise<RepoEnrollmentView> {
-    const previous = this.mutation;
-    let release!: () => void;
-    this.mutation = new Promise<void>(resolve => { release = resolve; });
-    await previous;
-    try { return await this.putLocked(projectId, input); }
-    finally { release(); }
+    return (await this.enroll(projectId, input)).view;
   }
 
-  private async putLocked(projectId: string, input: RepoEnrollmentRequest): Promise<RepoEnrollmentView> {
+  async enroll(projectId: string, input: RepoEnrollmentRequest, hooks: RepoEnrollmentHooks = {}): Promise<{ view: RepoEnrollmentView; first: boolean }> {
+    return this.serialized(projectId, () => this.putLocked(projectId, input, hooks));
+  }
+
+  async setAutonomy(projectId: string, input: AutonomyChange): Promise<RepoEnrollmentView> {
+    return this.serialized(projectId, () => this.setAutonomyLocked(projectId, input));
+  }
+
+  private serialized<T>(projectId: string, run: () => Promise<T>): Promise<T> {
+    const previous = this.projectLocks.get(projectId) ?? Promise.resolve();
+    const next = previous.then(run, run);
+    const settled = next.catch(() => {});
+    this.projectLocks.set(projectId, settled);
+    void settled.finally(() => {
+      if (this.projectLocks.get(projectId) === settled) this.projectLocks.delete(projectId);
+    });
+    return next;
+  }
+
+  private persistUpdate(projectId: string, entry: StoredEnrollment, requestId: string, receipt: Receipt, beforeWrite?: () => void): void {
+    const prior = this.store.requests[requestId];
+    if (prior) {
+      if (prior.fingerprint !== receipt.fingerprint || prior.projectId !== projectId)
+        throw new TeamError(409, "request-conflict", "This request ID belongs to a different repository enrollment request.");
+    }
+    const next: EnrollmentStore = {
+      version: 1,
+      projects: { ...this.store.projects, [projectId]: entry },
+      requests: { ...this.store.requests, [requestId]: receipt },
+    };
+    beforeWrite?.();
+    writeSealed(this.file, this.key, "repo-enrollments", next);
+    this.store = next;
+  }
+
+  private async setAutonomyLocked(projectId: string, input: AutonomyChange): Promise<RepoEnrollmentView> {
+    const change = autonomyChangeSchema.parse(input);
+    const project = this.project(projectId);
+    const path = this.projectPath(project);
+    const requestFingerprint = createHash("sha256").update(JSON.stringify({ action: "autonomy", ...change })).digest("hex");
+    const prior = this.store.requests[change.requestId];
+    if (prior) {
+      if (prior.fingerprint !== requestFingerprint || prior.projectId !== projectId)
+        throw new TeamError(409, "request-conflict", "This request ID belongs to a different repository enrollment request.");
+      if (prior.path !== path) throw this.pathMismatch();
+      return structuredClone(prior.response);
+    }
+
+    const current = this.store.projects[projectId];
+    if (!current) throw new TeamError(409, "autonomy-requires-enrollment", "Only a repository enrolled with infinite repo init has an autonomy mode. Other projects stay supervised.");
+    this.assertPathBinding(project, current);
+    if (project.autonomy === undefined) throw new TeamError(409, "autonomy-requires-enrollment", "Only a repository enrolled with infinite repo init has an autonomy mode. Other projects stay supervised.");
+    if (change.revision !== current.revision) throw new TeamError(409, "stale-enrollment-revision", "The repository enrollment changed. Refresh it before saving.");
+
+    const entry: StoredEnrollment = { ...current, autonomy: change.mode, revision: current.revision + 1 };
+    const applied = enrollmentAutonomy(entry, this.config).mode;
+    const response = this.view({ ...project, autonomy: applied }, entry.revision, entry);
+    this.persistUpdate(projectId, entry, change.requestId, { fingerprint: requestFingerprint, projectId, path, response });
+    project.autonomy = applied;
+    return structuredClone(response);
+  }
+
+  private async putLocked(projectId: string, input: RepoEnrollmentRequest, hooks: RepoEnrollmentHooks): Promise<{ view: RepoEnrollmentView; first: boolean }> {
     const request = repoEnrollmentRequestSchema.parse(input);
     const project = this.project(projectId);
     const path = this.projectPath(project);
@@ -131,7 +198,7 @@ export class RepoEnrollmentService {
       if (prior.fingerprint !== requestFingerprint || prior.projectId !== projectId)
         throw new TeamError(409, "request-conflict", "This request ID belongs to a different repository enrollment request.");
       if (prior.path !== path) throw this.pathMismatch();
-      return structuredClone(prior.response);
+      return { view: structuredClone(prior.response), first: prior.created === true };
     }
 
     const current = this.store.projects[projectId];
@@ -157,8 +224,10 @@ export class RepoEnrollmentService {
       linear: request.linear === undefined ? inheritedLinear : request.linear,
       ...(request.teamwork !== undefined ? { teamwork: request.teamwork === null ? null : this.relativeTeamworkPath(teamworkPath!) } : current?.teamwork !== undefined ? { teamwork: current.teamwork } : project.teamworkDir ? { teamwork: this.relativeTeamworkPath(teamworkPath!) } : {}),
       ...(request.source ? { source: structuredClone(request.source) } : current?.source ? { source: current.source } : {}),
+      ...(request.autonomy !== undefined ? { autonomy: request.autonomy } : current?.autonomy !== undefined ? { autonomy: current.autonomy } : {}),
       revision: nextRevision,
     };
+    const applied = enrollmentAutonomy(entry, this.config).mode;
     const prospective: Config = { ...this.config, projects: this.config.projects.map(item => item.id === projectId ? { ...item, team: entry.team, ...(entry.teamwork ? { teamworkDir: teamworkPath } : {}), ...(entry.linear === null ? { linear: undefined } : entry.linear ? { linear: entry.linear } : {}) } : item) };
     try { validateLinearConfig(prospective); }
     catch { throw new TeamError(409, "linear-configuration-invalid", "The requested Linear mapping conflicts with the host credential or protected workspace paths."); }
@@ -168,25 +237,27 @@ export class RepoEnrollmentService {
 
     const responseProject: Project = { ...project, team: entry.team as Project["team"] };
     if (entry.source) responseProject.source = entry.source; else delete responseProject.source;
+    responseProject.autonomy = applied;
     if (entry.teamwork) responseProject.teamworkDir = teamworkPath;
     else delete responseProject.teamworkDir;
     if (entry.linear) responseProject.linear = entry.linear;
     else delete responseProject.linear;
     const response = this.view(responseProject, nextRevision, entry);
-    const next: EnrollmentStore = {
-      version: 1,
-      projects: { ...this.store.projects, [projectId]: entry },
-      requests: { ...this.store.requests, [request.requestId]: { fingerprint: requestFingerprint, projectId, path, response } },
-    };
-    writeSealed(this.file, this.key, "repo-enrollments", next);
-    this.store = next;
+    this.persistUpdate(
+      projectId,
+      entry,
+      request.requestId,
+      { fingerprint: requestFingerprint, projectId, path, response, ...(nextRevision === 1 ? { created: true as const } : {}) },
+      hooks.beforeWrite,
+    );
     Object.assign(project, { team: entry.team });
     if (entry.source) project.source = entry.source; else delete project.source;
+    project.autonomy = applied;
     if (entry.teamwork) project.teamworkDir = teamworkPath;
     else delete project.teamworkDir;
     if (entry.linear === null) delete project.linear;
     else if (entry.linear) project.linear = entry.linear;
-    return structuredClone(response);
+    return { view: structuredClone(response), first: nextRevision === 1 };
   }
 
   private project(projectId: string): Project {
@@ -226,7 +297,7 @@ export class RepoEnrollmentService {
 
   private assertProjectPathAllowed(path: string) {
     const protectedPaths = [
-      this.config.stateDir, this.config.runDir, this.config.keyFile, this.config.teams?.workspaceDir,
+      this.config.stateDir, this.config.runDir, this.config.socketDir, this.config.keyFile, this.config.teams?.workspaceDir,
       this.config.linear?.apiKeyFile, this.config.push?.accessTokenFile, this.config.remote?.relay?.tokenFile,
       this.config.summaries?.apiKeyFile,
       this.config.jev?.apiKeyFile,
@@ -260,6 +331,10 @@ export class RepoEnrollmentService {
       revision,
       execution: this.config.environment === "cloud" ? "cloud" : "local",
       hostSetup: { ready: missing.length === 0, missing },
+      autonomy: autonomyOf(project),
+      autonomySource: project.autonomy === undefined ? "not-enrolled" : saved?.autonomy !== undefined ? "saved" : "host-default",
+      ...((readiness) => readiness.ready ? { autonomyReady: true } : { autonomyReady: false, autonomyReason: readiness.reason })(autonomyReady(this.config.teams?.lineup)),
+      evaluatorOverlaps: this.config.teams?.lineup ? evaluatorOverlaps(this.config.teams.lineup) : [],
     };
   }
 
@@ -279,6 +354,7 @@ export class RepoEnrollmentService {
     } catch { return; }
     project.team = enrollment.team as Project["team"];
     if (enrollment.source) project.source = enrollment.source; else delete project.source;
+    project.autonomy = enrollmentAutonomy(enrollment, this.config).mode;
     if (Object.hasOwn(enrollment, "linear")) {
       if (enrollment.linear) project.linear = enrollment.linear;
       else delete project.linear;

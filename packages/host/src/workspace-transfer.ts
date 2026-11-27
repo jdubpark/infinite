@@ -33,7 +33,6 @@ export function createWorkspaceTransferPool(limit = WORKSPACE_TRANSFER_CONCURREN
   return { run, drain };
 }
 
-/** Run independent content transfers with a shared bound and settle in-flight work before returning. */
 export async function transferWorkspaceBlobs(
   hashes: readonly string[],
   transfer: (hash: string, signal: AbortSignal) => Promise<void>,

@@ -7,11 +7,11 @@ import { usePoll } from "../../api/usePoll";
 import { Button } from "../../components/Button";
 import { Chip, TopBar } from "../../components/Glass";
 import { Section, t } from "../teams/parts";
+import { HaltBanner } from "../halt/HaltBanner";
 import { theme } from "../../theme";
 
 const STALE_MESSAGE = "This project changed. Try again.";
 
-/** One project: its name, repositories and checkouts, and owner-only changes. */
 export function ProjectDetail({ connection, id }: { connection: Connection; id: string }) {
   const router = useRouter();
   const [draft, setDraft] = useState<string | null>(null);
@@ -24,7 +24,6 @@ export function ProjectDetail({ connection, id }: { connection: Connection; id: 
   const group = poll.data?.group ?? null;
   const owner = poll.data?.me.role === "owner";
 
-  /** Sends one owner change against the revision on screen. Returns whether the host accepted it. */
   async function change(body: Omit<ProjectGroupUpdateRequest, "requestId" | "revision">): Promise<boolean> {
     if (!group || busy) return false;
     setBusy(true);
@@ -98,11 +97,13 @@ export function ProjectDetail({ connection, id }: { connection: Connection; id: 
   const name = draft ?? group.name;
   const trimmed = name.trim();
   const canSave = owner && draft !== null && trimmed.length > 0 && trimmed !== group.name && !busy;
+  const checkouts = group.repos.flatMap(repo => repo.checkouts);
 
   return <View style={s.fill}>
     <TopBar backLabel="Projects" onBack={() => router.back()} title={group.name} />
     <ScrollView style={s.fill} contentContainerStyle={s.content} keyboardShouldPersistTaps="handled"
       refreshControl={<RefreshControl refreshing={poll.refreshing} onRefresh={poll.refresh} tintColor={theme.colors.forest} colors={[theme.colors.forest]} />}>
+      <HaltBanner connection={connection} place={{ projectIds: checkouts.map(checkout => checkout.projectId) }} names={id => checkouts.find(checkout => checkout.projectId === id)?.name} style={s.halt} />
       <Section title="Name">
         <TextInput accessibilityLabel="Project name" value={name} onChangeText={setDraft} editable={owner && !busy} maxLength={100}
           placeholderTextColor={theme.colors.placeholder} style={t.input} />
@@ -141,6 +142,7 @@ export function ProjectDetail({ connection, id }: { connection: Connection; id: 
 const s = StyleSheet.create({
   fill: { flex: 1, backgroundColor: theme.colors.paper },
   content: { paddingHorizontal: 16, paddingBottom: 32 },
+  halt: { marginTop: 8 },
   loading: { marginTop: 100 },
   actions: { flexDirection: "row", flexWrap: "wrap", alignItems: "center", justifyContent: "flex-end", gap: 8, marginTop: 12 },
   checkout: { gap: 4, paddingVertical: 10, borderBottomWidth: StyleSheet.hairlineWidth, borderColor: theme.colors.rule },

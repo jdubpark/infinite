@@ -5,17 +5,19 @@ import {
   writeFileSync,
   readFileSync,
   existsSync,
+  lstatSync,
   statSync,
   unlinkSync,
   openSync,
   closeSync,
 } from "node:fs";
 import { resolve, join, dirname } from "node:path";
-import { homedir, tmpdir } from "node:os";
+import { homedir } from "node:os";
 import { randomBytes, randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
 import { createApp } from "./server.js";
+import { mainCheckSetting } from "./main-check-state.js";
 import { Notifier } from "./notifier.js";
 import { sampleVolumes } from "./desktop.js";
 import { expoSender } from "./push.js";
@@ -24,11 +26,45 @@ import { workerCall } from "./ipc.js";
 import { Manager } from "./manager.js";
 import { parseDeployment } from "./deployment.js";
 import { planFleet } from "./fleet.js";
-import type { Config, Provider, Role } from "./types.js";
+import { CEILING_TARGETS, checkCeiling, nodeCeilingFs, shippedCeilingTemplate, type CeilingProvider } from "./ceilings.js";
+import { egressDoctorLine, installHostEgress } from "./egress.js";
+import type { Config, Role } from "./types.js";
 
 import { handleClientCommand } from "./client.js";
 import { handleMachineCommand } from "./machine-cli.js";
 import { handleLocalBehaviorCheckCommand } from "./understanding-cli.js";
+import { githubProxyDoctorLine } from "./github-grants.js";
+
+function claudeSettingsDoctorLine(settingsPath: string): string | undefined {
+  let raw: string;
+  try {
+    raw = readFileSync(settingsPath, "utf8");
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") {
+      try {
+        lstatSync(settingsPath);
+      } catch {
+        return undefined;
+      }
+    }
+    const safeCode = typeof code === "string" && /^[A-Z0-9_]{1,32}$/.test(code) ? ` (${code})` : "";
+    return `WARNING: ~/.claude/settings.json could not be read${safeCode}; allowedHttpHookUrls could not be verified.`;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return "WARNING: ~/.claude/settings.json contains invalid JSON; allowedHttpHookUrls could not be verified.";
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    return "WARNING: ~/.claude/settings.json does not contain a JSON object; allowedHttpHookUrls could not be verified.";
+  }
+  if ((parsed as Record<string, unknown>).allowedHttpHookUrls) {
+    return "WARNING: ~/.claude/settings.json defines allowedHttpHookUrls; add http://127.0.0.1:*/hook/claude or Infinite's Claude hooks will not run.";
+  }
+  return undefined;
+}
 
 const argv = process.argv.slice(2);
 if (!await handleLocalBehaviorCheckCommand(argv) && !await handleMachineCommand(argv) && !await handleClientCommand(argv)) {
@@ -201,26 +237,62 @@ async function attach(manager: Manager, sessionId: string) {
     process.stdin.pause();
     process.exit(0);
   };
-  let inputChain = Promise.resolve();
+  const MAX_INPUT_BYTES = 65536;
+  const queued: Buffer[] = [];
+  let queuedBytes = 0;
+  let draining = false;
+  let inputFailed = false;
+  const drain = async () => {
+    if (draining || inputFailed) return;
+    draining = true;
+    try {
+      while (queued.length > 0 && !inputFailed) {
+        const chunk = queued[0]!;
+        await workerCall(manager.socketTarget, sessionId, {
+          op: "raw",
+          text: chunk.toString("utf8"),
+          requestId: randomUUID(),
+        });
+        queued.shift();
+        queuedBytes -= chunk.length;
+      }
+    } catch {
+      inputFailed = true;
+      queued.length = 0;
+      queuedBytes = 0;
+      console.error(
+        "\r\nInput was not confirmed. Check the session before retrying.",
+      );
+    } finally {
+      draining = false;
+      if (queued.length > 0 && !inputFailed) void drain();
+    }
+  };
   process.stdin.setRawMode?.(true);
   process.stdin.setEncoding("utf8");
   process.stdin.resume();
   process.stdin.on("data", (data: string) => {
     if (data.includes("\x1d")) return cleanup();
-    inputChain = inputChain
-      .then(async () => {
-        for (let offset = 0; offset < data.length; offset += 8192)
-          await workerCall(manager.config.runDir, sessionId, {
-            op: "raw",
-            text: data.slice(offset, offset + 8192),
-            requestId: randomUUID(),
-          });
-      })
-      .catch(() =>
-        console.error(
-          "\r\nInput was not confirmed. Check the session before retrying.",
-        ),
+    if (inputFailed) return;
+    const pieces: Buffer[] = [];
+    let totalBytes = 0;
+    for (let offset = 0; offset < data.length; offset += 8192) {
+      const piece = Buffer.from(data.slice(offset, offset + 8192), "utf8");
+      pieces.push(piece);
+      totalBytes += piece.length;
+    }
+    if (queuedBytes + totalBytes > MAX_INPUT_BYTES) {
+      inputFailed = true;
+      queued.length = 0;
+      queuedBytes = 0;
+      console.error(
+        "\r\nInput buffer limit reached. Check the session before retrying.",
       );
+      return;
+    }
+    queued.push(...pieces);
+    queuedBytes += totalBytes;
+    void drain();
   });
   process.on("SIGTERM", cleanup);
 }
@@ -238,7 +310,18 @@ infinite repo init [DIRECTORY]              Enroll a repository or set parent-fo
 infinite repo init [--permissions coordinator|off] [--permission-scope TEXT] [--permission-limit N]
                                           First enrollment delegates to coordinator by default
 infinite repo init --permissions off        Disable delegation for future runs
+infinite repo init [--routing off|shadow|auto] [--routing-value cost|balanced|quality|USD] [--routing-contributor allow|deny] [--routing-points start[,escalation][,scout]]
 infinite team revoke-permissions TEAM_ID    Revoke delegation for an active run
+infinite team revoke-routing TEAM_ID    Stop host routing for the run's new tasks
+infinite permissions status [--json]        Show workspace permission delegation
+infinite permissions delegate (--workspace W | --all) [--direction TEXT | --clear-direction] [--request-id UUID]
+infinite permissions revoke --workspace W [--request-id UUID]
+infinite permissions reopen DECISION_ID [--request-id UUID]
+infinite permissions unlock ASSIGNMENT [--request-id UUID]
+infinite permissions log [--rejected] [--raised] [--workspace W] [--since T] [--limit N] [--before CURSOR] [--json]
+infinite permissions mark DECISION_ID --wrong --note TEXT [--request-id UUID]
+infinite permissions replay --set FILE [--json] [--request-id UUID]
+                                          Measure the permission agent on a labelled set
 infinite projects [--json]                 List projects and suggested groups
 infinite understand [--workspace ID] [--json] Read workspace Understanding
 infinite understand catalog|components|component ID|policy|refresh --workspace ID
@@ -252,16 +335,26 @@ infinite projects group NAME REPO_ID...    Create a multi-repository project
 infinite projects rename|hide|show ID       Rename or hide a project
 infinite projects primary ID CHECKOUT_ID   Choose the checkout a project works in
 infinite start [--project ID] "task"       Start a mission
-infinite mission status|answer|steer|pause|resume|cancel ...
+infinite mission status|watch|answer|steer|pause|resume|cancel ...
+infinite mission progress ID [--after CURSOR] [--json]  Read child assignments and check receipts
 infinite board [--project ID]              Watch the owner board
 infinite team start [OBJECTIVE] [--prd FILE] Start a team in the bound project
 infinite team status [ID] [--logs]          Show teams, or one team's Brief
-infinite team watch ID [--logs]             Follow the summary; l logs, n/p agents, b summary
+infinite team watch ID [--logs | --board]   Follow the summary, board, or logs; b board, l logs, s summary
 infinite team steer ID TEXT                 Steer an active team
 infinite team answer ID QUESTION_ID TEXT    Answer a pending question
 infinite routine create --file FILE [--request-id UUID] [--json]
 infinite routine list [--json] | status ID [--json]
 infinite routine pause|resume|cancel ID --revision N [--request-id UUID] [--json]
+infinite routing status PROJECT [--json]
+infinite routing explain RUN_ID TASK_ID [--json]
+infinite routing pause-explore PROJECT
+infinite routing resume-explore PROJECT
+infinite signal add --project ID TEXT [--request-id UUID] [--json]
+infinite signal list --project ID [--after SEQ] [--json]
+infinite egress [--project ID] [--json]    Hosts agents reached through the egress proxy
+infinite usage repairs [--project ID] [--days N] [--json]  Repair loop latency and recovery metrics
+infinite usage interrupted [--project ID] [--days N] [--json]  Interrupted-task build trigger gauge (INF-325)
 
 Ctrl+] detaches. Ctrl+G returns to monitor mode. Flags after a provider
 name belong to that provider and use cloud paths.
@@ -283,7 +376,6 @@ infinite init --deployment-mode single-tenant --origin https://HOST
 infinite serve --config FILE          Start the API; workers survive API exit
 infinite doctor --config FILE         Check configured CLI binaries
 infinite list --config FILE           List sessions on this host
-infinite new --provider codex --title "Task" --prompt "..."
 infinite attach SESSION_ID --config FILE
 infinite plan-fleet FILE               Print a secret-free development VM plan
 infinite init --deployment-mode tenant-development --tenant-id UUID --origin https://HOST
@@ -303,9 +395,12 @@ else if (command === "plan-fleet") {
   if (!values.local && !values.origin?.startsWith("https://"))
     throw new Error("init requires --origin https://your-host.tailnet.ts.net");
   initialize();
+} else if (command === "new") {
+  throw new Error("Host-local session creation is retired. Pair an owner laptop with `infinite pair https://HOST --token-file FILE`, then launch with `infinite --project ID --title \"Task\" codex`.");
 } else {
   if (dev && !existsSync(configFile)) initialize();
   const { config, key } = readConfig(configFile);
+  installHostEgress(config);
   if (command === "serve" || dev) {
     mkdirSync(config.runDir, { recursive: true, mode: 0o700 });
     const lock = join(config.runDir, "server.lock");
@@ -323,12 +418,37 @@ else if (command === "plan-fleet") {
     const fd = openSync(lock, "wx", 0o600);
     writeFileSync(fd, String(process.pid));
     closeSync(fd);
-    const { sessions, teams, goals, pushStore, server, closeConnections } = createApp(config, key);
-    server.listen(config.port, "127.0.0.1", () =>
-      console.log(
-        `Infinite: ${config.origin}\nExecution host: ${config.environment}\nClosing this API does not stop agent workers.`,
-      ),
-    );
+    const unlock = () => { try { unlinkSync(lock); } catch {} };
+    let host: ReturnType<typeof createApp>;
+    try { host = createApp(config, key, { configFile }); }
+    catch (error) { unlock(); throw error; }
+    const { sessions, teams, goals, pushStore, server, mcpServer, closeConnections, fuse, permissions, mainCheck } = host;
+    let stopping: Promise<void> | undefined;
+    const stop = () => stopping ??= (async () => {
+      try {
+        const closing = closeConnections();
+        closing.catch(() => {});
+        await new Promise<void>(resolve => server.close(() => resolve()));
+        await closing;
+      } finally {
+        unlock();
+      }
+    })();
+    const bind = (listener: typeof server, port: number) => new Promise<void>((resolve, reject) => {
+      const failed = (error: Error) => { listener.off("listening", ready); reject(error); };
+      const ready = () => { listener.off("error", failed); resolve(); };
+      listener.once("error", failed);
+      listener.once("listening", ready);
+      listener.listen(port, "127.0.0.1");
+    });
+    try {
+      if (mcpServer) await bind(mcpServer, config.mcp!.port);
+      await bind(server, config.port);
+    } catch (error) {
+      try { await stop(); } catch (stopError) { console.error(stopError); }
+      throw error;
+    }
+    console.log(`Infinite: ${config.origin}\nExecution host: ${config.environment}\nClosing this API does not stop agent workers.`);
     if (config.push?.enabled) {
       const accessToken = config.push.accessTokenFile
         ? readFileSync(config.push.accessTokenFile, "utf8").trim()
@@ -351,26 +471,23 @@ else if (command === "plan-fleet") {
               ? []
               : [{ label: volume.label, path: volume.path, fullness: volume.fullness, availableBytes: volume.availableBytes, availableInodes: volume.availableInodes, fullnessBy: volume.fullnessBy }]),
         },
+        fuse,
+        permissions,
+        mainCheck,
       ).start();
       console.log(`Push notifications: enabled (${config.push.detail} bodies)`);
+      if (!config.push.events.includes("autonomy-interrupt")) console.warn("Push is on, but push.events has no autonomy-interrupt: an open spend fuse will send no notification.");
+      if (!config.push.events.includes("main-check") && config.projects.some(project => mainCheckSetting(project.team) !== undefined)) console.warn("Push is on and a project sets team.mainCheck, but push.events has no main-check: a change of main's health will send no notification.");
     }
-    const unlock = () => {
-      try {
-        unlinkSync(lock);
-      } catch {}
-    };
-    server.on("error", (error) => {
-      unlock();
-      throw error;
-    });
+    const failed = (error: Error) => { void stop().catch(stopError => console.error(stopError)).then(() => { throw error; }); };
+    server.on("error", failed);
+    mcpServer?.on("error", failed);
     for (const signal of ["SIGTERM", "SIGINT"] as const)
       process.once(signal, () => {
-        const closing = closeConnections();
-        server.close(async () => {
-          await closing;
-          unlock();
-          process.exit(0);
-        });
+        void stop().then(
+          () => process.exit(0),
+          error => { console.error(error); process.exit(1); },
+        );
       });
   } else {
     const manager = new Manager(config, key);
@@ -379,21 +496,7 @@ else if (command === "plan-fleet") {
         console.log(
           `${session.id}  ${session.provider.padEnd(8)}  ${session.status.padEnd(12)}  ${session.title}`,
         );
-    else if (command === "new") {
-      const provider = values.provider as Provider;
-      if (!config.agents[provider])
-        throw new Error("Choose a configured --provider");
-      const generatedTitle = !values.title?.trim();
-      const session = await manager.create({
-        requestId: randomUUID(),
-        provider,
-        projectId: values.project ?? config.projects[0].id,
-        title: values.title?.trim() || `${provider} session`,
-        ...(generatedTitle ? { generatedTitle: true as const } : {}),
-        prompt: values.prompt ?? "",
-      });
-      console.log(`${session.id}  ${session.status}`);
-    } else if (command === "attach") await attach(manager, positionals[1]);
+    else if (command === "attach") await attach(manager, positionals[1]);
     else if (command === "doctor") {
       for (const [provider, profile] of Object.entries(config.agents)) {
         if (provider === "demo" || !profile) continue;
@@ -401,13 +504,31 @@ else if (command === "plan-fleet") {
           provider === "claude" || provider === "codex"
             ? ` · hooks ${(config.attention?.hooks ?? DEFAULT_HOOKS)[provider] ? "enabled" : "disabled"}`
             : "";
+        const codeMode = provider === "claude" ? ` · Code Mode ${config.codeMode?.claude ?? "off"}` : "";
         try {
           console.log(
-            `${provider}: ${execFileSync(profile.command, [...profile.args, "--version"], { encoding: "utf8", timeout: 10000, stdio: ["ignore", "pipe", "ignore"] }).trim()}${hooks}`,
+            `${provider}: ${execFileSync(profile.command, [...profile.args, "--version"], { encoding: "utf8", timeout: 10000, stdio: ["ignore", "pipe", "ignore"] }).trim()}${hooks}${codeMode}`,
           );
         } catch {
           console.log(
-            `${provider}: unavailable; install and authenticate on this host`,
+            `${provider}: unavailable; install and authenticate on this host${hooks}${codeMode}`,
+          );
+        }
+      }
+      for (const provider of ["claude", "codex"] as const satisfies readonly CeilingProvider[]) {
+        const profile = config.agents[provider];
+        if (!profile) continue;
+        for (const line of checkCeiling({
+          provider,
+          systemPath: CEILING_TARGETS[provider].systemPath,
+          templatePath: shippedCeilingTemplate(provider),
+          launchArgs: [...profile.args, ...(profile.appServerArgs ?? [])],
+          fs: nodeCeilingFs,
+        })) {
+          console.log(
+            line.status === "ok"
+              ? `ceiling ${line.provider} ${line.check}: ok (${line.detail})`
+              : `Warning: ceiling ${line.provider} ${line.check}: ${line.status} (${line.detail})`,
           );
         }
       }
@@ -415,31 +536,22 @@ else if (command === "plan-fleet") {
       console.log(
         `Hook relay: ${existsSync(relay) ? relay : "MISSING (run npm run build)"}`,
       );
-      const userSettings = join(homedir(), ".claude", "settings.json");
-      if (existsSync(userSettings)) {
-        try {
-          const parsed = JSON.parse(readFileSync(userSettings, "utf8"));
-          if (parsed.allowedHttpHookUrls)
-            console.log(
-              "WARNING: ~/.claude/settings.json defines allowedHttpHookUrls; add http://127.0.0.1:*/hook/claude or Infinite's Claude hooks will not run.",
-            );
-        } catch {
-          /* unreadable settings are the user's concern */
-        }
-      }
+      const userSettingsWarning = claudeSettingsDoctorLine(join(homedir(), ".claude", "settings.json"));
+      if (userSettingsWarning) console.log(userSettingsWarning);
       if (config.push?.enabled) {
         let mode = "missing";
         if (config.push.accessTokenFile) {
           try {
             mode = (statSync(config.push.accessTokenFile).mode & 0o777).toString(8);
-          } catch {
-            /* reported as missing */
-          }
+          } catch {}
         }
         console.log(
           `Push: enabled · ${config.push.detail} bodies · token file ${config.push.accessTokenFile ?? "none"} (mode ${mode})`,
         );
       } else console.log("Push: disabled");
+      if (config.autonomy?.boundary?.egress) console.log(await egressDoctorLine(config.autonomy.boundary.egress));
+      const githubProxy = await githubProxyDoctorLine(config);
+      if (githubProxy) console.log(githubProxy);
       if ((config.attention?.hooks ?? DEFAULT_HOOKS).codex)
         console.log(
           "Warning: Codex hooks are on. They run with --dangerously-bypass-hook-trust, which also lets hooks defined in a session's working directory run without review. Use them only with repositories you trust.",

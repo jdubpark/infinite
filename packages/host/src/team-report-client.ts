@@ -1,12 +1,12 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import { teamReportEnvelopeSchema, teamReportSchema, type TeamReportEnvelope } from "./team-types.js";
-import { missionReportEnvelopeSchema, missionReportSchema } from "./mission-types.js";
+import { missionReportArgumentsSchema, missionReportEnvelopeSchema, missionReportSchema } from "./mission-types.js";
 
 export class ReportError extends Error {}
 export const MAX_TEAM_REPORT_BYTES = 64 * 1024;
 const bindingSchema = teamReportEnvelopeSchema.pick({ runId: true, memberId: true, revision: true }).strip();
-function reportEnvironment(env: NodeJS.ProcessEnv) {
+export function hookCapability(env: NodeJS.ProcessEnv, route: "team-report" | "team-entry") {
   const { INFINITE_HOOK_URL: url, INFINITE_HOOK_TOKEN: token, INFINITE_TEAM_ASSIGNMENT: assignment } = env;
   if (!url || !token || !assignment) throw new ReportError("Team reporting is unavailable in this process.");
   if (url.length > 2048 || token.length > 512 || /[\x00-\x20\x7f]/.test(token) || assignment.length > 4096)
@@ -15,7 +15,7 @@ function reportEnvironment(env: NodeJS.ProcessEnv) {
   try { endpoint = new URL(url); } catch { throw new ReportError("Invalid team report endpoint."); }
   if (endpoint.protocol !== "http:" || endpoint.hostname !== "127.0.0.1" || !endpoint.port || endpoint.username || endpoint.password || endpoint.pathname !== "/hook" || endpoint.search || endpoint.hash)
     throw new ReportError("Invalid team report endpoint.");
-  endpoint.pathname = "/hook/team-report";
+  endpoint.pathname = `/hook/${route}`;
   let binding: z.infer<typeof bindingSchema>;
   try { binding = bindingSchema.parse(JSON.parse(assignment)); }
   catch { throw new ReportError("Invalid team assignment."); }
@@ -31,7 +31,6 @@ function canonical(value: unknown): string {
   if (encoded === undefined) throw new ReportError("Invalid report value.");
   return encoded;
 }
-/** A custom UUIDv8 pins retries to the same validated assignment and report, across processes. */
 function reportIdentity(value: unknown) {
   const bytes = createHash("sha256").update("infinite-team-report:v1\0").update(canonical(value)).digest().subarray(0, 16);
   bytes[6] = (bytes[6] & 0x0f) | 0x80;
@@ -39,12 +38,12 @@ function reportIdentity(value: unknown) {
   const hex = bytes.toString("hex");
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
-/** Accept a raw report or an explicit retry envelope, always bound to this worker's assignment. */
 export function createReportEnvelope(input: unknown, env: NodeJS.ProcessEnv = process.env): TeamReportEnvelope {
-  const { binding } = reportEnvironment(env);
+  const { binding } = hookCapability(env, "team-report");
   let envelope: TeamReportEnvelope;
   if (input !== null && typeof input === "object" && !Array.isArray(input) && "report" in input) {
     envelope = teamReportEnvelopeSchema.parse(input);
+    teamReportSchema.parse(envelope.report);
   } else {
     const report = teamReportSchema.parse(input);
     envelope = teamReportEnvelopeSchema.parse({ ...binding, report, requestId: reportIdentity({ ...binding, report }) });
@@ -54,20 +53,10 @@ export function createReportEnvelope(input: unknown, env: NodeJS.ProcessEnv = pr
   if (Buffer.byteLength(JSON.stringify(envelope)) > MAX_TEAM_REPORT_BYTES) throw new ReportError("Report exceeds 64 KiB.");
   return envelope;
 }
-/** HTTP 204 is sent by the worker only after its authenticated journal append has succeeded. */
 export async function submitTeamReport(input: unknown, env: NodeJS.ProcessEnv = process.env): Promise<TeamReportEnvelope> {
-  const { endpoint, token } = reportEnvironment(env);
+  const { endpoint, token } = hookCapability(env, "team-report");
   const envelope = createReportEnvelope(input, env);
-  let response: Response;
-  try {
-    response = await fetch(endpoint, {
-      method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-      body: JSON.stringify(envelope), signal: AbortSignal.timeout(10000), redirect: "error",
-    });
-  } catch {
-    // A rejection can follow a durable append whose acknowledgement was lost, so delivery stays unconfirmed, not failed.
-    throw new ReportError("Team report delivery was not confirmed: the report endpoint gave this process no answer. A sandbox or network policy may block local connections, or the acknowledgement was lost. Stop and request user attention; inspect this member's recorded report before retrying the identical report, and do not bypass or submit a different report.");
-  }
+  const response = await postTeamReport(endpoint, token, envelope);
   if (response.status >= 400 && response.status < 500) {
     const detail = (await response.text()).trim().slice(0, 2000);
     throw new ReportError(detail || `Report refused (${response.status}). Inspect this member's recorded report; do not bypass the refusal.`);
@@ -76,6 +65,16 @@ export async function submitTeamReport(input: unknown, env: NodeJS.ProcessEnv = 
   if (response.status !== 204)
     throw new ReportError(`Report refused or unconfirmed (${response.status}). Stop and inspect this member's recorded report; do not bypass the refusal or submit a different report.`);
   return envelope;
+}
+async function postTeamReport(endpoint: URL, token: string, envelope: TeamReportEnvelope): Promise<Response> {
+  try {
+    return await fetch(endpoint, {
+      method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+      body: JSON.stringify(envelope), signal: AbortSignal.timeout(10000), redirect: "error",
+    });
+  } catch {
+    throw new ReportError("Team report delivery was not confirmed: the report endpoint gave this process no answer. A sandbox or network policy may block local connections, or the acknowledgement was lost. Stop and request user attention; inspect this member's recorded report before retrying the identical report, and do not bypass or submit a different report.");
+  }
 }
 export function reportErrorMessage(error: unknown): string {
   if (error instanceof z.ZodError) return ("Invalid team report: " + error.issues.map(issue => `${issue.path.join(".") || "report"}: ${issue.message}`).join("; ")).slice(0, 2000);
@@ -86,7 +85,6 @@ export function reportErrorMessage(error: unknown): string {
 
 export const missionAssignmentSchema = z.object({ missionId: z.uuid(), memberId: z.uuid(), revision: z.number().int().min(1) }).strict();
 export type MissionReportEnvelope = z.infer<typeof missionReportEnvelopeSchema>;
-/** The mission coordinator's capability: the worker's hook channel and its recorded mission assignment. */
 function missionReportEnvironment(env: NodeJS.ProcessEnv) {
   const { INFINITE_HOOK_URL: url, INFINITE_HOOK_TOKEN: token, INFINITE_MISSION_ASSIGNMENT: assignment } = env;
   if (!url || !token || !assignment) throw new ReportError("Mission reporting is unavailable in this process.");
@@ -102,26 +100,27 @@ function missionReportEnvironment(env: NodeJS.ProcessEnv) {
   catch { throw new ReportError("Invalid mission assignment."); }
   return { endpoint, token, binding };
 }
-/** The recorded mission assignment, when this process reports for a mission coordinator. */
 export function missionAssignment(env: NodeJS.ProcessEnv = process.env) {
   try { return missionAssignmentSchema.parse(JSON.parse(env.INFINITE_MISSION_ASSIGNMENT ?? "")); }
   catch { return undefined; }
 }
-/** Accept a raw mission report or an explicit retry envelope, always bound to this coordinator's assignment. */
 export function createMissionReportEnvelope(input: unknown, env: NodeJS.ProcessEnv = process.env): MissionReportEnvelope {
   const { binding } = missionReportEnvironment(env);
+  const object = input !== null && typeof input === "object" && !Array.isArray(input);
   let envelope: MissionReportEnvelope;
-  if (input !== null && typeof input === "object" && !Array.isArray(input) && "report" in input) envelope = missionReportEnvelopeSchema.parse(input);
-  else {
-    const report = missionReportSchema.parse(input);
-    envelope = missionReportEnvelopeSchema.parse({ ...binding, report, requestId: reportIdentity({ ...binding, report }) });
+  if (object && "report" in input && "requestId" in input) {
+    envelope = missionReportEnvelopeSchema.parse(input);
+    missionReportSchema.parse(envelope.report);
+  } else {
+    const { report, note } = object && "report" in input ? missionReportArgumentsSchema.parse(input) : { report: missionReportSchema.parse(input), note: undefined };
+    const content = { report, ...(note === undefined ? {} : { note }) };
+    envelope = missionReportEnvelopeSchema.parse({ ...binding, ...content, requestId: reportIdentity({ ...binding, ...content }) });
   }
   if (envelope.missionId !== binding.missionId || envelope.memberId !== binding.memberId || envelope.revision !== binding.revision)
     throw new ReportError("The report does not match this coordinator's assigned mission and attempt.");
   if (Buffer.byteLength(JSON.stringify(envelope)) > MAX_TEAM_REPORT_BYTES) throw new ReportError("Report exceeds 64 KiB.");
   return envelope;
 }
-/** HTTP 204 is sent by the worker only after its authenticated journal append has succeeded. */
 export async function submitMissionReport(input: unknown, env: NodeJS.ProcessEnv = process.env): Promise<MissionReportEnvelope> {
   const { endpoint, token } = missionReportEnvironment(env);
   const envelope = createMissionReportEnvelope(input, env);
@@ -129,6 +128,10 @@ export async function submitMissionReport(input: unknown, env: NodeJS.ProcessEnv
     method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
     body: JSON.stringify(envelope), signal: AbortSignal.timeout(10000), redirect: "error",
   });
+  if (response.status >= 400 && response.status < 500) {
+    const detail = (await response.text()).trim().slice(0, 2000);
+    throw new ReportError(detail || `Report refused or unconfirmed (${response.status}). Stop and inspect this attempt's recorded report; do not bypass the refusal or submit a different report.`);
+  }
   await response.body?.cancel();
   if (response.status !== 204)
     throw new ReportError(`Report refused or unconfirmed (${response.status}). Stop and inspect this attempt's recorded report; do not bypass the refusal or submit a different report.`);

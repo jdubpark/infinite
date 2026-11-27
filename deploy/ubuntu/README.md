@@ -1,8 +1,18 @@
 # Ubuntu commissioning
 
+![Ubuntu Privilege, Network, Credential and Tenant Isolation Boundaries](../../docs/diagrams/security-boundaries.svg)
+
 This template runs an owner-controlled, single-tenant host. The pilot installation and verified limits are recorded in [Host commissioning](commissioning.md). For multi-tenant development, use the [synthetic-only Proxmox profile](../proxmox/README.md). Operator-confidential multi-tenancy requires the separate [managed tenant architecture](../../docs/multi-tenant.md).
 
 These files describe the deployment template; the commissioning record distinguishes checks performed on the actual server from outstanding work. No paid infrastructure is created by these scripts.
+
+For a separately commissioned second service instance with its own accounts, workspaces, runtime state, and release, follow the [second-instance commissioning runbook](instances.md).
+
+### Related Ubuntu runbooks
+
+- **Isolation & proxies:** [provider ceilings](ceilings.md) · [agent egress proxy & nftables](egress.md) · [GitHub App refresher](github-app.md) · [GitHub credential proxy](github-proxy.md)
+- **Evaluation accounts:** [isolated eval trial account](eval.md) · [isolated grader account](grader.md)
+- **Access, backups & instances:** [public phone relay](public-relay.md) · [encrypted backups](backups.md) · [secondary instances & boundary timer](instances.md) · [Honcho memory qualification](memory/README.md)
 
 ## Prepare the host
 
@@ -63,13 +73,19 @@ Keep the trailing wildcard quoted. This trusts repositories beneath that directo
 
 This group is a single-tenant trust boundary. Agent processes sharing the account and group can access other active workspaces in that group. Separate directories prevent accidental concurrent edits; they do not isolate active projects from one another.
 
-Install provider tools as an unprivileged build user into a staging prefix, then install that prefix at `/opt/infinite-agents/v1`, owned by `infinite-agent` so the agent can replace its own CLIs. Install `agent-wrapper.sh` under `/usr/local/libexec/infinite/` as `claude`, `codex`, `codex-app-server`, `grok`, `opencode`, and optionally `demo`. The prepared Codex backend is built and installed below. The wrappers set encrypted home/cache/temp paths and `SHELL=/bin/bash` for provider tool commands; the service account's login shell can remain disabled. The Codex wrapper sets `npm_config_prefix` to that install so `npm install -g` updates the binary it launches. Use a new version directory when an upgrade must leave existing sessions on the old binaries. Install `transcript-drain.sh` as `/usr/local/libexec/infinite/transcript-drain`, owned `root:root`, mode `0755`, beside the provider wrappers; it runs the final transcript drain after a sudo session exits. Without it, sudo sessions report `finalDrain: "skipped"`.
+Install provider tools as an unprivileged build user into a staging prefix, then install that prefix at `/opt/infinite-agents/v1`, owned by `infinite-agent` so the agent can replace its own CLIs. Install `agent-wrapper.sh` under `/usr/local/libexec/infinite/` as `claude`, `codex`, `codex-app-server`, `grok`, `opencode`, and optionally `demo`. The prepared Codex backend is built and installed below. The wrappers set encrypted home/cache/temp paths and `SHELL=/bin/bash` for provider tool commands; the service account's login shell can remain disabled. The Codex wrapper sets `npm_config_prefix` to that install so `npm install -g` updates the binary it launches. Use a new version directory when an upgrade must leave existing sessions on the old binaries. Install `transcript-drain.sh` as `/usr/local/libexec/infinite/transcript-drain`, owned `root:root`, mode `0755`, beside the provider wrappers; it runs the final transcript drain after a sudo session exits. Without it, sudo sessions report `finalDrain: "skipped"`. Install `process-census.sh` as `/usr/local/libexec/infinite/process-census`, owned `root:root`, mode `0755`, beside it; the sudoers rule permits it, and the host uses it to look for processes left by an earlier API process. Without it, that check reports that it could not finish. When using repository briefings or repository graphs, also install `jevcode-wrapper.sh` as `/usr/local/libexec/infinite/jevcode` and `repository-graph-wrapper.py` as `/usr/local/libexec/infinite/repository-graph` (`root:root`, `0755`); `infinite.sudoers` permits both under `infinite-agent`.
 
 Authenticate each provider as `infinite-agent` on the server. Do not forward a laptop-only credential and expect it to survive the laptop going offline. Keep project credentials narrow and verify the installed CLI version and default permission mode.
 
 On Ubuntu 24.04, check Bubblewrap's namespace support before a Codex tool run. Install `bubblewrap`, `apparmor-profiles`, and `apparmor-utils`. If no loaded profile already attaches to `/usr/bin/bwrap`, install the distribution's `/usr/share/apparmor/extra-profiles/bwrap-userns-restrict` as `/etc/apparmor.d/bwrap-userns-restrict` and load it with `apparmor_parser -r`. Avoid duplicate profiles for that executable. Check a harmless sandbox command as the agent account from an accessible workspace, then verify a real Codex file edit through Infinite. Keep `kernel.apparmor_restrict_unprivileged_userns=1` and Codex sandboxing enabled. [OpenAI Linux sandbox prerequisites](https://learn.chatgpt.com/docs/sandboxing?sandbox-os=ubuntu-debian).
 
-Install `deploy/ubuntu/infinite.sudoers` as `/etc/sudoers.d/infinite` after checking it with `visudo -cf`. Its `env_keep` lines pass the per-session hook listener address and token through to the agent account; without them Claude Code and Codex hooks, and the chat transcript they carry, never reach the worker, and sessions fall back to screen heuristics. `INFINITE_TRUSTED_WORKSPACE` lets the Claude wrapper record folder trust for team members when `teams.trustWorkspaces` is on. Existing sessions keep their old environment; end and recreate them after installing the file.
+Install `deploy/ubuntu/infinite.sudoers` as `/etc/sudoers.d/infinite` after checking it with `visudo -cf`. Its `env_keep` lines pass the per-session hook listener address and token through to the agent account; without them Claude Code and Codex hooks, and the chat transcript they carry, never reach the worker, and sessions fall back to screen heuristics. `INFINITE_TRUSTED_WORKSPACE` lets the Claude wrapper record folder trust for team members when `teams.trustWorkspaces` is on. `INFINITE_MISSION_ASSIGNMENT` carries the owner-authorized mission assignment through sudo to its worker. `INFINITE_GITHUB_GRANT` and `INFINITE_GITHUB_PROXY` carry a session's GitHub grant when the [GitHub credential proxy](github-proxy.md) is configured. Existing sessions keep their old environment; end and recreate them after installing the file.
+
+The proxy variables in that file serve the optional [agent egress proxy](egress.md), which routes sessions through a loopback proxy that records each destination by project and can refuse unlisted hosts. It stays off until its runbook is followed.
+
+## Provider ceilings
+
+The owner installs root-owned provider ceilings with `deploy/ubuntu/install-ceilings.sh`. They limit what Claude Code and Codex may do on their own, and the agent account cannot change them. Read [provider ceilings](ceilings.md) before installing, and run `install-ceilings.sh --check` and `infinite doctor` after.
 
 ## Session environment files
 
@@ -89,7 +105,24 @@ Add `INFINITE_PROJECT_ID` to sudoers `env_keep`, validate the policy with `visud
 
 Build a release from this checkout using `npm ci --workspace @infinite/host --workspace @infinite/web --include-workspace-root` and `npm run build`. Build as an unprivileged build user, then install the resulting tree under `/opt/infinite` with root-owned files. Keep the pinned lockfile. Mobile dependencies are unnecessary on the execution server.
 
-Prepare the Codex backend on the target operating system as the unprivileged build user. The build requires rustup with Rust 1.95.0 installed, plus tar, patch, pkg-config, libssl-dev, libcap-dev, and stock Codex 0.162.0; `codex` must be on the build user's `PATH`. From the checkout, run:
+For an immutable, versioned install placed directly below a directory that
+holds releases, mark each release directory after copying the build and before
+switching the service to it. The marker is a regular file named
+`.infinite-release.json`; it tells the permission agent to protect the shared
+release root. Do not put it in a source checkout or in the directory holding
+releases. A release placed directly below `/` keeps only its own directory
+protected. If the release already has the file, keep it. Otherwise create it,
+with `RELEASE_DIR` set to the absolute path of the release being installed:
+
+```sh
+marker="$RELEASE_DIR/.infinite-release.json"
+[ -e "$marker" ] || [ -L "$marker" ] || (set -C; printf '{}\n' >"$marker")
+```
+
+`set -C` makes the redirect refuse a file that appears between the check and
+the write.
+
+Prepare the Codex backend on the target operating system as the unprivileged build user. The build pins stock Codex `0.162.0` (`scripts/build-codex-handoff.mjs`) independently of newer stock Codex CLIs used for ordinary interactive sessions, and requires rustup with Rust 1.95.0 installed, plus tar, patch, pkg-config, libssl-dev, libcap-dev, and `codex` on the build user's `PATH`. From the checkout, run:
 
 ```sh
 npm run prepare:codex
@@ -132,7 +165,7 @@ The `codex` wrapper adds `--no-daemon` to every interactive launch, including `r
 
 The Codex profile sets `workspaceDir` to the prepared hybrid directory and enables `sharedWorkspace`. Preparation remains host-private until cloud selection grants access to the selected execution tree. Checkpoint blobs and placement receipts stay in the private control directory. Keep `workspaceDir` outside control state and on encrypted storage.
 
-To let clients ask for a model-written digest of a session's chat, add a `summaries` block: `{"model": "gpt-6-luna", "apiKeyFile": "/etc/infinite/openai.key"}`, with the key in a root-owned 0640 file readable by the control user and, optionally, `baseUrl` for another OpenAI-compatible Responses endpoint. The host sends recorded chat messages to that service with `store: false`; leave the block out to send nothing.
+To let clients ask for a model-written digest of a session's chat, add a `summaries` block: `{"model": "gpt-6-luna", "apiKeyFile": "/etc/infinite/openai.key"}`, with the key outside `stateDir` readable only by the control user (`0600` owned by `infinite-host`, or `0640` `root:infinite-host`; see [security](../../docs/security.md#threats-that-remain)) and, optionally, `baseUrl` for another OpenAI-compatible Responses endpoint. The host sends recorded chat messages to that service with `store: false`; leave the block out to send nothing.
 
 To clean up dictated text, add a `dictation` block such as `{"apiKeyFile": "/etc/infinite/openai.key"}`; `model` defaults to `gpt-6-luna`, and `baseUrl` can point to another OpenAI-compatible Responses endpoint.
 
@@ -170,7 +203,7 @@ Check real prompts, tool approvals, output, and visible context on laptop and ph
 
 Use arrow-key controls and Enter to select native permission-menu options. The prompt composer sends pasted text; a pasted option number may be ignored by the provider while Enter accepts its current default. Inspect the selected scope before confirming, and verify the provider's permission mode afterward.
 
-From an agent-run shell, verify that the control directory, vault key, device key delivery file, and worker sockets are unreadable. Confirm native history, workspace, and temporary project data actually reside on the encrypted filesystem. Test an off-host backup restore with separately held keys. These steps are outstanding until performed on the selected server.
+From an agent-run shell, verify that the control directory, vault key, device key delivery file, and worker sockets are unreadable. Confirm native history, workspace, and temporary project data actually reside on the encrypted filesystem. Test an off-host backup restore with separately held keys. Track completed versus remaining server checks in [commissioning.md](commissioning.md).
 
 For hybrid Codex, verify both account memberships and the default ACL with `id infinite-host`, `id infinite-agent`, and `getfacl /srv/infinite-data/workspaces/hybrid`. In a disposable handoff workspace, confirm the agent can edit a host-materialized file and create a new file under `umask 077`; confirm the host can read both through their absolute paths. Then perform a completed tool operation, wait for a verified checkpoint, disconnect the laptop, and verify a cloud edit and the recovered copy after reconnect. Keep this result separate from a cloud-only session continuity check. Do not claim hybrid acceptance from configuration validation alone.
 

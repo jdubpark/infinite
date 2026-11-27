@@ -30,7 +30,6 @@ const LOCKED = "Dictation stopped because the field was locked. Nothing was adde
 type DictationNotice = { message: string; useOriginal?: () => void; postText?: string };
 export type DictationController = {
   supported: boolean;
-  /** The field is read-only; the mic follows it so capture never outlives editing. */
   disabled: boolean;
   state: DictationState;
   notice: DictationNotice | null;
@@ -42,7 +41,6 @@ export function useDictation({ me, value, onChange, maxLength, disabled }: {
   me: Me; value: string; onChange: (value: string) => void; maxLength: number; disabled: boolean;
 }): DictationController {
   const api = useApi();
-  // Read after awaits and from recognizer events, which can outlive the render that started them.
   const valueRef = useRef(value);
   valueRef.current = value;
   const disabledRef = useRef(disabled);
@@ -54,7 +52,6 @@ export function useDictation({ me, value, onChange, maxLength, disabled }: {
   const [notice, setNotice] = useState<DictationNotice | null>(null);
   const supported = typeof window !== "undefined" && Boolean(window.SpeechRecognition ?? window.webkitSpeechRecognition);
 
-  // Ends capture and discards a cleanup reply still in flight; their later events and results are ignored.
   function cancel() {
     generation.current++;
     const active = recognition.current;
@@ -67,13 +64,11 @@ export function useDictation({ me, value, onChange, maxLength, disabled }: {
     setNotice({ message: LOCKED });
   }
   useEffect(() => cancel, []);
-  // A send, a pending retry, or a status change can lock the field while dictation runs.
   useEffect(() => {
     if (disabled && state !== "idle") stopLocked();
   }, [disabled, state]);
 
   function insert(raw: string, cleaned?: { model: string; text: string }, fallbackReason?: string) {
-    // The lock can render before its effect runs, so check it here too.
     if (disabledRef.current) return stopLocked();
     const before = valueRef.current;
     const result = appendDictation(before, cleaned?.text ?? raw, maxLength);
@@ -163,7 +158,6 @@ export function useDictation({ me, value, onChange, maxLength, disabled }: {
     catch { recognition.current = null; setState("idle"); setNotice({ message: "Speech recognition could not start." }); }
   }
 
-  // "Use original" is offered only while the field is editable and still shows the cleaned text.
   const visibleNotice = notice?.useOriginal && (disabled || notice.postText !== value)
     ? { message: notice.message }
     : notice;

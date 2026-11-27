@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { DRAIN_WRAPPER, drainLaunch, runFinalDrain } from "../packages/host/src/final-drain.js";
@@ -90,9 +90,13 @@ test("a drain that outlives the limit is stopped", async () => {
     const script = `require("node:fs").writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); setInterval(() => {}, 1000);`;
     const started = Date.now();
     await runFinalDrain({ command: process.execPath, args: ["-e", script] }, {}, 300);
-    assert.ok(Date.now() - started < 2000, "the drain resolves at its limit");
-    const pid = Number(readFileSync(pidFile, "utf8"));
-    assert.ok(await waitFor(() => !alive(pid), 2000), "the drain process is stopped");
+    const took = Date.now() - started;
+    assert.ok(took >= 280, "the drain runs until its limit");
+    assert.ok(took < 2000, "and resolves there");
+    const written = () => /^\d+$/.exec(existsSync(pidFile) ? readFileSync(pidFile, "utf8") : "")?.[0];
+    await waitFor(() => written() !== undefined, 5000);
+    const text = written();
+    if (text !== undefined) assert.ok(await waitFor(() => !alive(Number(text)), 2000), "the drain process is stopped");
   } finally { rmSync(folder, { recursive: true, force: true }); }
 });
 

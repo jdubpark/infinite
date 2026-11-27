@@ -1,0 +1,16 @@
+[Unit]
+Description=Infinite agent egress firewall rule (see deploy/ubuntu/egress.md)
+After=nftables.service
+Before=infinite.service
+PartOf=nftables.service
+ReloadPropagatedFrom=nftables.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/infinite-egress/firewall.nft
+ExecReload=/usr/sbin/nft -f /etc/infinite-egress/firewall.nft
+ExecStop=-/usr/sbin/nft delete table inet infinite_egress
+
+[Install]
+WantedBy=multi-user.target

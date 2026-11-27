@@ -7,16 +7,14 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { dirname, join, posix, resolve } from "node:path";
 import { createWorkspaceWatch, type WorkspaceWatch } from "./workspace-watch.js";
+import { acquireSharedPoolLease, registerSharedPoolScope, withSharedPoolLease, type SharedPoolLeaseHandle } from "./workspace-pool-gc.js";
 
 const CHUNK_BYTES = 256 * 1024;
 const MAX_ENTRIES = 500000;
 const MAX_MANIFEST_BYTES = 32 * 1024 * 1024;
-// Small enough that a slow uplink still acknowledges each request well within its timeout.
 const BATCH_BYTES = 2 * 1024 * 1024;
 const BATCH_CHUNKS = 512;
-/** Upper bounds a transfer can check before it parses: one content chunk, one chunk batch, and one manifest as JSON. */
 export const WORKSPACE_LIMITS = { chunkBytes: CHUNK_BYTES, batchBytes: BATCH_BYTES, batchChunks: BATCH_CHUNKS, manifestBytes: MAX_MANIFEST_BYTES } as const;
-/** Bytes a batch spends on each chunk's frame: its 32-byte SHA-256 digest and a 4-byte big-endian length. */
 export const CHUNK_FRAME_BYTES = 36;
 const HASH = /^[a-f0-9]{64}$/;
 const execute = promisify(execFile);
@@ -35,7 +33,6 @@ export interface WorkspaceEntry {
   size?: number;
   chunks?: string[];
   target?: string;
-  /** Opaque local stat signature for incremental source reads, not content proof. */
   sourceStamp?: string;
 }
 export interface WorkspaceManifest {
@@ -72,9 +69,6 @@ function abort(signal?: AbortSignal) { signal?.throwIfAborted(); }
 function record(value: unknown): value is Record<string, unknown> { return !!value && typeof value === "object" && !Array.isArray(value); }
 function invalid(): never { throw new Error("Invalid workspace manifest"); }
 
-/* Resolve link chains using only the complete manifest, including intermediate
- * links before '..'. Unknown paths outside the selected roots are never followed.
- */
 function checkLinks(roots: string[], entries: WorkspaceEntry[]) {
   const byPath = new Map<string, WorkspaceEntry>();
   const destinations = new Map<string, string>();
@@ -111,7 +105,6 @@ function checkLinks(roots: string[], entries: WorkspaceEntry[]) {
   return destinations;
 }
 
-/** Validate and normalize before using any paths or allocating destination files. */
 export function validateWorkspaceManifest(value: unknown, expectedRoots?: string[]): WorkspaceManifest {
   if (!record(value) || value.version !== 1 || typeof value.id !== "string" || !HASH.test(value.id) ||
       !Array.isArray(value.roots) || value.roots.length < 1 || value.roots.length > 64 || !value.roots.every(absolutePath) ||
@@ -160,17 +153,8 @@ export function validateWorkspaceManifest(value: unknown, expectedRoots?: string
   return { ...body, id: value.id };
 }
 
-/**
- * An isolated string target preserves the legacy layout. The object form keeps
- * `directory` as the authorization scope and stores only immutable chunks in
- * the explicitly shared pool. Pool objects remain invisible to a scope until
- * its private reference has been published. Objects are not automatically
- * reclaimed because this layer cannot determine which existing manifests and
- * readers still need them.
- */
 export type WorkspaceStoreTarget = string | { directory: string; sharedPoolDirectory: string };
 
-/** `unsynced` collects object shards whose new entries a capture syncs once at its end. */
 type Store = {
   root: string;
   blobs: string;
@@ -225,6 +209,7 @@ async function storeAt(target: WorkspaceStoreTarget): Promise<Store> {
   if (sharedRoot) await privateDirectory(blobs);
   const references = sharedRoot ? join(root, "refs") : undefined;
   if (references) await privateDirectory(references);
+  if (sharedRoot) await registerSharedPoolScope(sharedRoot, root);
   return { root, blobs, localBlobs, sharedRoot, references, shards: new Set(), referenceShards: new Set() };
 }
 async function blobPath(store: Store, hash: string) {
@@ -307,15 +292,13 @@ async function verifyBlob(store: Store, hash: string) {
     store.unsynced?.add(join(store.blobs, hash.slice(0, 2)));
   }
 }
-/** Write back every dirty buffer of the filesystem holding `path`: syncfs on Linux, a full sync elsewhere. */
 async function flushFilesystem(path: string) {
   if (process.platform === "linux") {
-    try { await execute("sync", ["-f", path], { timeout: 600000 }); return; } catch { /* Older coreutils lack -f. */ }
+    try { await execute("sync", ["-f", path], { timeout: 600000 }); return; } catch {}
   }
   await execute("sync", [], { timeout: 600000 });
 }
 async function syncDirectory(path: string) { const handle = await open(path, constants.O_RDONLY | constants.O_DIRECTORY); try { await handle.sync(); } finally { await handle.close(); } }
-/** Sync every directory entry from a storage root to `/`; recursive mkdir may have raced with this writer. */
 async function syncDirectoryChain(path: string) {
   let current = resolve(path);
   for (;;) {
@@ -329,8 +312,6 @@ async function syncSharedPoolHierarchy(store: Store, hashes: Iterable<string>) {
   if (!store.sharedRoot) return;
   const shards = new Set([...hashes].map(hash => join(store.blobs, hash.slice(0, 2))));
   await Promise.all([...shards].map(syncDirectory));
-  // The pool root and its ancestors may have been created by a different writer
-  // that observed this path before its parent directory sync completed.
   await syncDirectory(store.blobs);
   await syncDirectoryChain(store.sharedRoot);
 }
@@ -351,7 +332,6 @@ async function writeBlob(store: Store, hash: string, bytes: Buffer) {
   try {
     try { await handle.writeFile(bytes); await handle.sync(); }
     finally { await handle.close(); }
-    // Shared stores flush the full directory hierarchy when publishing references.
     await rename(temporary, file);
     if (store.unsynced) store.unsynced.add(shard);
     else if (!store.sharedRoot) await syncDirectory(shard);
@@ -391,10 +371,14 @@ export async function putWorkspaceBlob(storeDir: WorkspaceStoreTarget, hash: str
   const data = Buffer.from(base64, "base64");
   if (data.toString("base64") !== base64 || data.length > CHUNK_BYTES) throw new Error("Invalid workspace blob encoding");
   const store = await storeAt(storeDir);
-  await writeBlob(store, hash, data);
-  await publishReferences(store, [hash]);
+  const run = async (lease?: SharedPoolLeaseHandle) => {
+    await writeBlob(store, hash, data);
+    await lease?.assertHeld();
+    await publishReferences(store, [hash]);
+  };
+  if (store.sharedRoot) await withSharedPoolLease(store.sharedRoot, "write", { scope: store.root }, run);
+  else await run();
 }
-/** Frame chunks for one transfer; each is its digest, its length, and its bytes. */
 export function encodeChunkBatch(chunks: { hash: string; bytes: Buffer }[]): Buffer {
   const parts: Buffer[] = [];
   for (const { hash, bytes } of chunks) {
@@ -420,34 +404,53 @@ export function decodeChunkBatch(body: Buffer): { hash: string; bytes: Buffer }[
   }
   return chunks;
 }
-/** Store a batch and sync each touched shard once; every chunk is durable when this resolves. */
 export async function putWorkspaceBlobs(storeDir: WorkspaceStoreTarget, chunks: { hash: string; bytes: Buffer }[]): Promise<void> {
   if (chunks.length > BATCH_CHUNKS) throw new Error("Workspace chunk batch exceeds its bound");
   const store: Store = { ...await storeAt(storeDir), unsynced: new Set() };
-  for (let offset = 0; offset < chunks.length; offset += 16) {
-    // Settle the whole group so no write is still running when a failure is reported.
-    const results = await Promise.allSettled(chunks.slice(offset, offset + 16).map(({ hash, bytes }) => writeBlob(store, hash, bytes)));
-    const failed = results.find(result => result.status === "rejected");
-    if (failed) throw failed.reason;
-  }
-  if (store.references) await publishReferences(store, chunks.map(({ hash }) => hash));
-  else {
-    // A chunk may predate this request or come from a concurrent writer; sync the touched names.
-    await Promise.all([...new Set(chunks.map(({ hash }) => join(store.blobs, hash.slice(0, 2))))].map(syncDirectory));
-    await syncDirectory(store.blobs);
-  }
+  const run = async (lease?: SharedPoolLeaseHandle) => {
+    let leaseError: unknown;
+    for (let offset = 0; offset < chunks.length; offset += 16) {
+      await lease?.refresh();
+      const results = await Promise.allSettled(chunks.slice(offset, offset + 16).map(({ hash, bytes }) => writeBlob(store, hash, bytes)));
+      const failed = results.find(result => result.status === "rejected");
+      if (failed) throw failed.reason;
+    }
+    await lease?.assertHeld();
+    if (store.references) {
+      await publishReferences(store, chunks.map(({ hash }) => hash), () => {
+        if (leaseError) throw leaseError;
+        if (lease && !leaseError) void lease.refresh().catch(error => { leaseError ??= error; });
+      });
+      if (lease && !leaseError) await lease.refresh();
+      if (leaseError) throw leaseError;
+    } else {
+      await Promise.all([...new Set(chunks.map(({ hash }) => join(store.blobs, hash.slice(0, 2))))].map(syncDirectory));
+      await syncDirectory(store.blobs);
+    }
+  };
+  if (store.sharedRoot) await withSharedPoolLease(store.sharedRoot, "write", { scope: store.root }, run);
+  else await run();
 }
-export async function readWorkspaceBlob(storeDir: WorkspaceStoreTarget, hash: string): Promise<string> { return (await readBlob(await storeAt(storeDir), hash)).toString("base64"); }
+export async function readWorkspaceBlob(storeDir: WorkspaceStoreTarget, hash: string): Promise<string> {
+  const store = await storeAt(storeDir);
+  if (store.sharedRoot) {
+    return withSharedPoolLease(store.sharedRoot, "read", { scope: store.root }, async () => (await readBlob(store, hash)).toString("base64"));
+  }
+  return (await readBlob(store, hash)).toString("base64");
+}
 export async function hasWorkspaceBlobs(storeDir: WorkspaceStoreTarget, hashes: string[]): Promise<string[]> {
   if (!Array.isArray(hashes) || hashes.length > MAX_ENTRIES || hashes.some(hash => typeof hash !== "string" || !HASH.test(hash))) throw new Error("Invalid workspace blob request");
   const store = await storeAt(storeDir), missing: string[] = [];
-  for (const hash of new Set(hashes)) {
-    try { await verifyBlob(store, hash); } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT" || (error instanceof Error && error.message === "Corrupt workspace blob")) missing.push(hash);
-      else throw error;
+  const run = async () => {
+    for (const hash of new Set(hashes)) {
+      try { await verifyBlob(store, hash); } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT" || (error instanceof Error && error.message === "Corrupt workspace blob")) missing.push(hash);
+        else throw error;
+      }
     }
-  }
-  return missing;
+    return missing;
+  };
+  return store.sharedRoot ? withSharedPoolLease(store.sharedRoot, "read", { scope: store.root }, run) : run();
 }
 
 async function futurePath(path: string): Promise<string> {
@@ -462,16 +465,10 @@ async function futurePath(path: string): Promise<string> {
 }
 async function openDirectory(path: string) { return open(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW); }
 
-/** Full selected scope, per-file stable reads and a verified metadata pass.
- * This records an observation span, not an atomic filesystem snapshot. Shared
- * writable mappings may escape change notifications and metadata comparisons.
- */
 export async function captureWorkspace(options: {
   roots: string[]; cwd: string; storeDir: WorkspaceStoreTarget; signal?: AbortSignal;
   previous?: WorkspaceManifest; forceFull?: boolean;
-  /** Called at most every 100 ms while entries are walked and chunks written, so a caller can tell a long capture from a stalled one. */
   onProgress?: () => void;
-  /** Sockets, FIFOs and device files have no content to copy; each one is left out and reported here with its root-relative path. */
   onSkipped?: (path: string) => void;
 }): Promise<WorkspaceManifest> {
   abort(options.signal);
@@ -488,7 +485,10 @@ export async function captureWorkspace(options: {
   if (!cwdRoot) throw new Error("Workspace cwd is outside the selected roots");
   const handles: FileHandle[] = [];
   let reported = Date.now();
+  let poolLease: SharedPoolLeaseHandle | undefined;
+  let leaseError: unknown;
   const tick = () => {
+    if (poolLease && !leaseError) void poolLease.refresh().catch(error => { leaseError ??= error; });
     if (!options.onProgress || Date.now() - reported < 100) return;
     reported = Date.now(); options.onProgress();
   };
@@ -668,11 +668,12 @@ export async function captureWorkspace(options: {
   }
   let captureStartedAt = new Date().toISOString();
   try {
+    if (store.sharedRoot) poolLease = await acquireSharedPoolLease(store.sharedRoot, "write", { scope: store.root, signal: options.signal });
     for (const root of roots) handles.push(await openDirectory(root));
     if (process.platform === "darwin") {
       const watched = [...new Set([...roots, ...[...gitProjections.values()].flatMap(item => [item.common, item.selected])])];
       try { watch = await createWorkspaceWatch(watched, join(store.root, "watch-cache")); }
-      catch { abort(options.signal); /* Optional detector; metadata verification still applies. */ }
+      catch { abort(options.signal); }
     }
     const before = watch ? await watch.flush() : undefined;
     if (before && !before.valid) changed();
@@ -691,14 +692,22 @@ export async function captureWorkspace(options: {
     const after = watch ? await watch.flush() : undefined;
     if (after && (!after.valid || after.revision !== before!.revision)) changed();
     abort(options.signal);
+    if (leaseError) throw leaseError;
+    await poolLease?.assertHeld();
     entries.sort((a, b) => a.root - b.root || (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
     const body: Omit<WorkspaceManifest, "id"> = {
       version: 1, capturedAt: new Date().toISOString(), captureStartedAt,
       cwd: { root: cwdRoot.index, path: posix.relative(cwdRoot.root, cwd) }, roots, entries,
     };
-    // Pool objects and their ancestor entries reach disk before scope references.
-    if (store.references) await publishReferences(store, [...written, ...store.requiredReferences!], () => { abort(options.signal); tick(); });
-    else for (const shard of store.unsynced!) { await syncDirectory(shard); tick(); }
+    if (store.references) {
+      await publishReferences(store, [...written, ...store.requiredReferences!], () => {
+        if (leaseError) throw leaseError;
+        abort(options.signal);
+        tick();
+      });
+      if (poolLease && !leaseError) await poolLease.refresh();
+      if (leaseError) throw leaseError;
+    } else for (const shard of store.unsynced!) { await syncDirectory(shard); tick(); }
     store.unsynced!.clear();
     abort(options.signal);
     return validateWorkspaceManifest({ ...body, id: manifestId(body) });
@@ -706,20 +715,13 @@ export async function captureWorkspace(options: {
     if (["ENOENT", "ENOTDIR", "ELOOP", "ESTALE"].includes((error as NodeJS.ErrnoException).code ?? "")) changed();
     throw error;
   } finally {
-    // A failed capture's chunks can be named by a later manifest that finds them already stored.
     await Promise.all([...store.unsynced!].map(shard => syncDirectory(shard).catch(() => {})));
+    await poolLease?.release();
     await watch?.close();
     await Promise.all(handles.map(handle => handle.close()));
   }
 }
 
-/**
- * Describe the tree that materializeWorkspace wrote at `at` from the single-root `manifest`, as it will read once moved to
- * `root`, using one metadata pass instead of reading files: content comes from the manifest, and modes, link targets and
- * stat stamps from disk. `skip` leaves out paths the caller replaced. Call it while only the caller can write the tree;
- * a later change alters a stamp, so a capture that takes this as `previous` reads that file again. Undefined when an
- * entry no longer looks as written; the caller then scans instead.
- */
 export async function describeMaterializedTree(manifest: WorkspaceManifest, at: string, root: string, skip?: (path: string) => boolean): Promise<WorkspaceManifest | undefined> {
   if (manifest.roots.length !== 1) return undefined;
   const entries: WorkspaceEntry[] = [];
@@ -747,17 +749,9 @@ export async function describeMaterializedTree(manifest: WorkspaceManifest, at: 
   try { return validateWorkspaceManifest({ ...body, id: manifestId(body) }); } catch { return undefined; }
 }
 
-/** Publish a complete generation into a previously absent destination.
- * `sharedGroup` prepares shared interior permissions behind a private 02700
- * generation root. Only the coordinator may expose the chosen root at promotion.
- * `previous` MUST be a verified, inactive ready tree with no writers. Never pass
- * an active executor's tree: unchanged files may share an inode until the caller
- * removes the old ready generation. The caller owns that provenance and fence.
- */
 export async function materializeWorkspace(options: {
   manifest: WorkspaceManifest; storeDir: WorkspaceStoreTarget; destination: string; sharedGroup?: boolean;
   previous?: { manifest: WorkspaceManifest; roots: string[] };
-  /** `each` (default) syncs every written file and directory; `once` flushes the filesystem once before publication. */
   flush?: "each" | "once";
 }): Promise<{ cwd: string; roots: string[] }> {
   const each = options.flush !== "once";
@@ -770,7 +764,6 @@ export async function materializeWorkspace(options: {
     for (const root of previousRoots) {
       if (await realpath(root) !== root || !(await lstat(root)).isDirectory()) throw new Error("Previous workspace roots must be canonical directories");
     }
-    // Retain the same source-to-destination layout, including overlapping roots. A single root has no layout to keep.
     const offsets = previousRoots.map((root, index) => manifest.roots[index] === "/" ? root :
       root.endsWith(manifest.roots[index]) ? root.slice(0, -manifest.roots[index].length) : undefined);
     if (previousRoots.length > 1 && offsets.some(offset => offset === undefined || offset !== offsets[0])) throw new Error("Previous workspace root mapping is inconsistent");
@@ -781,8 +774,6 @@ export async function materializeWorkspace(options: {
     if (!previousRoots || old?.kind !== "file" || old.size !== entry.size || old.mode !== entry.mode ||
         JSON.stringify(old.chunks) !== JSON.stringify(entry.chunks)) return false;
     const root = previousRoots[entry.root], source = join(root, entry.path);
-    // Every parent must remain a directory in the inactive tree; never follow a
-    // substituted symlink into another tree when creating a hardlink.
     let parent = root;
     for (const component of entry.path.split("/").slice(0, -1)) {
       parent = join(parent, component);
@@ -799,7 +790,6 @@ export async function materializeWorkspace(options: {
       const after = await lstat(destinationFile, { bigint: true });
       if (!after.isFile() || after.dev !== before.dev || after.ino !== before.ino || after.size !== before.size ||
           after.mode !== before.mode || after.mtimeNs !== before.mtimeNs) throw new Error("Previous workspace changed during file reuse");
-      // Do not chmod, truncate, write, or otherwise mutate the shared file.
       return true;
     } catch (error) {
       if (linked) { await rm(destinationFile, { force: true }); throw error; }
@@ -817,14 +807,15 @@ export async function materializeWorkspace(options: {
   const stage = await mkdtemp(join(parent, ".workspace-"));
   if (options.sharedGroup) await chmod(stage, 0o2700);
   let published = false;
-  /* A shared hierarchy preserves relative links across separately selected roots. */
   const mapped = (base: string, path: string) => join(base, "workspace", path.slice(1));
   const unique = new Map<string, WorkspaceEntry>();
   for (const entry of manifest.entries) unique.set(sourcePath(manifest.roots, entry), entry);
   const paths = [...unique].sort(([a], [b]) => a.length - b.length || a.localeCompare(b));
   const linkTargets = checkLinks(manifest.roots, manifest.entries);
   const directoryModes = new Map<string, number>([[stage, options.sharedGroup ? 0o2700 : 0o700]]);
+  let poolLease: SharedPoolLeaseHandle | undefined;
   try {
+    if (store.sharedRoot) poolLease = await acquireSharedPoolLease(store.sharedRoot, "read", { scope: store.root });
     for (const [path, entry] of paths) {
       if (entry.kind !== "directory") continue;
       await mkdir(mapped(stage, path), { recursive: true, mode: 0o700 });
@@ -844,6 +835,7 @@ export async function materializeWorkspace(options: {
         await symlink(rewritten, file); continue;
       }
       if (await reuseFile(entry, file)) continue;
+      await poolLease?.refresh();
       const handle = await open(file, "wx", 0o600);
       try {
         let total = 0;
@@ -867,5 +859,8 @@ export async function materializeWorkspace(options: {
     await syncDirectory(parent);
     const roots = manifest.roots.map(root => mapped(destination, root));
     return { roots, cwd: join(roots[manifest.cwd.root], manifest.cwd.path) };
-  } finally { if (!published) await rm(stage, { recursive: true, force: true }); }
+  } finally {
+    await poolLease?.release();
+    if (!published) await rm(stage, { recursive: true, force: true });
+  }
 }

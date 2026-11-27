@@ -5,14 +5,15 @@ import { mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmdirSy
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { initialAttention } from "@infinite/attention";
+import type { Blackboard } from "../../packages/host/src/evidence/blackboard.js";
 import type { EventOutbox } from "../../packages/host/src/evidence/outbox.js";
+import type { LinearService } from "../../packages/host/src/linear.js";
 import type { Manager } from "../../packages/host/src/manager.js";
 import type { Config, WorkerState } from "../../packages/host/src/types.js";
-import type { TeamAssignment, TeamModelProfile, TeamReportEnvelope, TeamRun } from "../../packages/host/src/team-types.js";
-import { TeamService } from "../../packages/host/src/teams.js";
+import type { RecordedTeamReportEnvelope, TeamAssignment, TeamModelProfile, TeamRun } from "../../packages/host/src/team-types.js";
+import { TeamService, type TeamServiceOptions } from "../../packages/host/src/teams.js";
 import { Journal, readEvents, unseal, writeSealed } from "../../packages/host/src/vault.js";
 
-/** Real scheduler records and journal, with the worker RPC boundary controlled by the test. */
 export function schedulerFixture() {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "infinite-scheduler-")));
   const key = randomBytes(32), id = randomUUID(), sessionId = randomUUID();
@@ -42,9 +43,9 @@ export function schedulerFixture() {
   let permissionAnswers = 0;
   let reads = 0;
   const manager = {
+    hostLoad: { held: () => undefined },
     list: async () => [],
     meta: (requestedId: string) => {
-      // The base member's session carries its assignment like a real team session, so pre-review live checks pass.
       if (requestedId === sessionId) {
         const base = run.members.find(member => member.sessionId === sessionId)!;
         return { session: { team: { runId: run.id, memberId: base.memberId, revision: base.revision, role: base.role }, cwd: base.cwd, provider: "demo", title: base.title } };
@@ -103,10 +104,15 @@ export function schedulerFixture() {
       current.status = "exited";
       delete current.nativeSession;
     },
-    report: (session: string, envelope: TeamReportEnvelope) => {
+    report: (session: string, envelope: RecordedTeamReportEnvelope) => {
       const currentJournal = journals.get(session);
       assert.ok(currentJournal, "The report session was not launched by this fixture");
       return currentJournal.append("team-report", envelope);
+    },
+    post: (session: string, type: "team-entry" | "team-entry-read", data: object) => {
+      const currentJournal = journals.get(session);
+      assert.ok(currentJournal, "The post session was not launched by this fixture");
+      return currentJournal.append(type, data);
     },
     blockRecordWrites: (kind: "team" | "goal", recordId: string) => {
       const file = join(config.stateDir, `${kind}s`, `${recordId}.sealed`), backup = `${file}.saved`;
@@ -114,8 +120,9 @@ export function schedulerFixture() {
       return () => { rmdirSync(file); renameSync(backup, file); };
     },
     writeTeam: (extra: object = {}) => writeRecord("team", id, { run, prepared: true, fingerprint: "fixture", receipts: {}, ...extra }),
-    openTeam: (options?: { events?: EventOutbox }) => {
-      const service = new TeamService(config, key, manager as unknown as Manager, (_project, start) => start(), undefined, undefined, options);
+    openTeam: (options?: { events?: EventOutbox; entries?: Blackboard; linear?: LinearService; delivery?: TeamServiceOptions["delivery"] }) => {
+      const { linear, ...serviceOptions } = options ?? {};
+      const service = new TeamService(config, key, manager as unknown as Manager, (_project, start) => start(), linear, undefined, options ? serviceOptions : undefined);
       services.push(service); return service;
     },
     close: () => { for (const service of services) service.close(); rmSync(root, { recursive: true, force: true }); },

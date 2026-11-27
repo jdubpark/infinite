@@ -600,7 +600,7 @@ function assembleMissionBrief(workspaceId: string, mission: Mission, teams: Team
   if (subtaskItems.length) sections.splice(sections.findIndex(section => section.kind === "request"), 0, section("tasks", "Tasks", [{ kind: "tasks", items: subtaskItems }]));
   const decisions = [
     ...mission.decisions.map(value => ({ id: value.id, question: value.question, options: value.options, answer: value.answer ?? null,
-      answeredBy: value.answeredBy ?? null, answeredAt: value.answeredAt ?? null, createdAt: value.createdAt } satisfies DecisionSummary)),
+      answeredBy: value.answeredBy ?? null, ...(value.source ? { source: value.source } : {}), answeredAt: value.answeredAt ?? null, createdAt: value.createdAt } satisfies DecisionSummary)),
     ...children.flatMap(team => team.decisions.map(decisionSummary)),
   ].filter((value, index, values) => values.findIndex(candidate => candidate.id === value.id) === index);
   if (decisions.length) insertBefore(sections, "request", section("decisions", "Decisions", [{ kind: "decisions", items: decisions }]));
@@ -823,7 +823,7 @@ function checkSummary(check: TeamRun["checks"][number]): CheckSummary {
 
 function decisionSummary(decision: TeamRun["decisions"][number]): DecisionSummary {
   return { id: decision.id, question: decision.question, options: decision.options, answer: decision.answer ?? null,
-    answeredBy: decision.answeredBy ?? null, answeredAt: decision.answeredAt ?? null, createdAt: decision.createdAt };
+    answeredBy: decision.answeredBy ?? null, ...(decision.source ? { source: decision.source } : {}), answeredAt: decision.answeredAt ?? null, createdAt: decision.createdAt };
 }
 
 function teamDelivery(run: TeamRun): WorkBlock[] | null {

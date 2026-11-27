@@ -1,13 +1,20 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { mkdtempSync, rmSync } from "node:fs";
+import { createServer as createSocketServer } from "node:net";
+import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
-import { PushStore, expoSender } from "../packages/host/src/push.js";
+import { PushStore, expoSender, type PushMessage } from "../packages/host/src/push.js";
 import { Notifier } from "../packages/host/src/notifier.js";
-import type { Attention } from "@infinite/attention";
+import { createApp } from "../packages/host/src/server.js";
+import { socketPath } from "../packages/host/src/ipc.js";
+import { writeSealed } from "../packages/host/src/vault.js";
+import type { Session, WorkerState } from "../packages/host/src/types.js";
+import { describeNow, initialAttention, type Attention, type Prompt } from "@infinite/attention";
+import { schedulerFixture } from "./fixtures/team-scheduler.js";
+import { limitLineup } from "./team-fixture.js";
 
 const att = (state: Attention["state"], promptId?: number): Attention => ({
   state, since: "t", source: "hook", now: state === "needs-you" ? "Do you want to proceed? rm -rf build" : "Finished a turn",
@@ -37,10 +44,10 @@ test("notifier sends once per transition, minimal body, prunes unregistered toke
   const manager = { list: async () => sessions } as never;
   const sender = async (messages: { to: string }[]) => { sent.push(messages); return messages.map((m) => m.to.includes("dead") ? { status: "error" as const, details: { error: "DeviceNotRegistered" } } : { status: "ok" as const, id: "x" }); };
   const notifier = new Notifier(manager, store, sender, { detail: "minimal", events: ["needs-you", "turn-finished", "exited", "recording-error"], intervalMs: 100000 });
-  await notifier.tick();                 // baseline, no sends
+  await notifier.tick();
   sessions[0].attention = att("needs-you", 7);
   await notifier.tick();
-  await notifier.tick();                 // same prompt: no second send
+  await notifier.tick();
   assert.equal(sent.length, 1);
   assert.equal(sent[0].length, 2);
   const first = sent[0][0] as { title: string; body: string; data: { url: string }; collapseId: string; priority: string };
@@ -51,13 +58,13 @@ test("notifier sends once per transition, minimal body, prunes unregistered toke
   assert.equal(first.priority, "high");
   assert.deepEqual(store.list().map((d) => d.token), ["ExponentPushToken[a]"]);
   sessions[0].attention = att("needs-you", 8);
-  await notifier.tick();                 // new prompt id: a new send
+  await notifier.tick();
   assert.equal(sent.length, 2);
   sessions[0].attention = att("turn-finished");
   await notifier.tick();
   assert.equal((sent[2][0] as { body: string }).body, "Retry logic finished a turn");
   sessions[0].attention = att("working");
-  await notifier.tick();                 // working is not a push event
+  await notifier.tick();
   assert.equal(sent.length, 3);
   rmSync(dir, { recursive: true, force: true });
 });
@@ -192,11 +199,11 @@ test("a team run is flagged once when it becomes blocked, never for a run alread
   ];
   const source = { statuses: () => teams };
   const notifier = new Notifier({ list: async () => [] } as never, store, sender, { detail: "minimal", events: ["needs-you", "team-blocked", "team-started"], intervalMs: 100000, machineId: "m1" }, source);
-  await notifier.tick();                 // baseline: the run blocked before startup is not flagged
+  await notifier.tick();
   assert.equal(sent.length, 0);
   teams[1].status = "blocked"; teams[1].reason = "An agent showed no activity twice on the same assignment."; teams[1].resumable = true;
   await notifier.tick();
-  await notifier.tick();                 // still blocked: no second push
+  await notifier.tick();
   assert.equal(sent.length, 1);
   teams[2].status = "blocked"; teams[2].reason = "Needs a decision.";
   await notifier.tick();
@@ -234,7 +241,7 @@ test("goal and team lifecycle events fire once per category transition with prio
   const teams = [{ id: "21111111-1111-4111-8111-111111111111", title: "Build feature", status: "implementing", reason: undefined as string | undefined, resumable: false, goal: false }];
   const events = ["goal-started", "goal-finished", "goal-stuck", "goal-cancelled", "team-started", "team-finished", "team-stuck", "team-cancelled"];
   const notifier = new Notifier({ list: async () => [] } as never, store, sender, { detail: "minimal", events, intervalMs: 100000 }, { statuses: () => teams }, { statuses: () => goals });
-  await notifier.tick(); // Items already present are primed silently.
+  await notifier.tick();
   assert.equal(sent.length, 0);
 
   goals.push({ id: "31111111-1111-4111-8111-111111111111", title: "New goal", status: "running", reason: undefined });
@@ -327,7 +334,6 @@ test("a record first seen already stuck or finished announces that status too", 
   const goals: { id: string; title: string; status: string }[] = [];
   const notifier = new Notifier({ list: async () => [] } as never, store, sender, { detail: "minimal", events: ["team-started", "team-stuck", "goal-finished"], intervalMs: 100000 }, { statuses: () => teams }, { statuses: () => goals });
   await notifier.tick();
-  // A run can fail preparation, and a goal can finish, between two polls.
   teams.push({ id: "71111111-1111-4111-8111-111111111111", title: "Failed setup", status: "blocked", goal: false });
   goals.push({ id: "81111111-1111-4111-8111-111111111111", title: "Quick goal", status: "achieved" });
   await notifier.tick();
@@ -377,7 +383,6 @@ test("notifier holds a team member's prompt while its coordinator can decide and
   );
   try {
     await notifier.tick();
-    // The coordinator holds the prompt: no push while it reviews, none when it answers and the prompt closes.
     owners.set("m1", "coordinator");
     member.attention = att("needs-you", 1);
     await notifier.tick();
@@ -387,7 +392,6 @@ test("notifier holds a team member's prompt while its coordinator can decide and
     await notifier.tick();
     assert.equal(sent.length, 0, "an answered prompt never reaches the owner");
 
-    // The coordinator escalates: the owner hears about it exactly once.
     owners.set("m1", "coordinator");
     member.attention = att("needs-you", 2);
     await notifier.tick();
@@ -397,7 +401,6 @@ test("notifier holds a team member's prompt while its coordinator can decide and
     assert.equal(sent.length, 1);
     assert.equal(sent[0][0].body, "Codex needs your approval in implementer: retire-member");
 
-    // A run that never starts a review within the grace period hands the prompt to the owner.
     member.attention = att("needs-you", 3);
     owners.set("m1", "undecided");
     await notifier.tick();
@@ -405,13 +408,125 @@ test("notifier holds a team member's prompt while its coordinator can decide and
     await notifier.tick();
     assert.equal(sent.length, 2);
 
-    // A prompt without complete one-shot evidence, and any non-team session, push at once.
     member.attention = att("needs-you", 4);
     owners.set("m1", "user");
     solo.attention = att("needs-you", 9);
     await notifier.tick();
     assert.equal(sent.length, 3);
     assert.equal(sent[2].length, 2);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("notifier holds a session's dialog only while the permission agent holds it", async () => {
+  const dir = mkdtempSync("/tmp/inf-push-");
+  const store = new PushStore(dir, randomBytes(32));
+  store.add("owner", "ExponentPushToken[a]", "android");
+  const sent: unknown[][] = [];
+  const sender = async (messages: unknown[]) => { sent.push(messages); return messages.map(() => ({ status: "ok" as const, id: "x" })); };
+  const solo = { id: "s1", title: "Retry logic", provider: "claude", status: "running", attention: att("working") };
+  let holder: "agent" | "owner" | "undecided" = "agent";
+  const asked: [string, number][] = [];
+  const notifier = new Notifier({ list: async () => [solo] } as never, store, sender,
+    { detail: "minimal", events: ["needs-you"], intervalMs: 100000, reviewGraceMs: 0, reviewHoldLimitMs: 100000 },
+    undefined, undefined, undefined, undefined, { holder: (sessionId, promptId) => { asked.push([sessionId, promptId]); return holder; } });
+  try {
+    await notifier.tick();
+    solo.attention = att("needs-you", 1);
+    await notifier.tick();
+    await notifier.tick();
+    assert.equal(sent.length, 0, "a dialog the permission agent can still decide is not pushed");
+    assert.deepEqual(asked.at(-1), ["s1", 1]);
+    solo.attention = att("working");
+    await notifier.tick();
+    assert.equal(sent.length, 0, "an answered dialog never reaches the owner");
+
+    solo.attention = att("needs-you", 2);
+    await notifier.tick();
+    holder = "owner";
+    await notifier.tick();
+    assert.equal(sent.length, 1, "the dialog reaches the owner once it is theirs");
+
+    solo.attention = att("needs-you", 3);
+    await notifier.tick();
+    assert.equal(sent.length, 2, "a dialog that is the owner's from the start is pushed at once");
+
+    holder = "undecided";
+    solo.attention = att("needs-you", 4);
+    await notifier.tick();
+    assert.equal(sent.length, 2, "an undecided dialog gets the review grace");
+    await notifier.tick();
+    assert.equal(sent.length, 3);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("the permission agent's holder decides the push: an agent-held dialog never reaches the owner, one it leaves does", async () => {
+  const dir = mkdtempSync("/tmp/inf-push-");
+  const store = new PushStore(dir, randomBytes(32));
+  store.add("owner", "ExponentPushToken[a]", "android");
+  const sent: { title: string; body: string }[][] = [];
+  const sender = async (messages: { title: string; body: string }[]) => { sent.push(messages); return messages.map(() => ({ status: "ok" as const, id: "x" })); };
+  const member = { id: "m1", title: "implementer: retire-member", provider: "claude", status: "running", attention: att("working") };
+  let holder: "agent" | "owner" | "undecided" = "owner";
+  const asked: number[] = [];
+  const notifier = new Notifier(
+    { list: async () => [member] } as never, store, sender,
+    { detail: "minimal", events: ["needs-you"], intervalMs: 100000, reviewGraceMs: 0, reviewHoldLimitMs: 100000 },
+    { statuses: () => [], promptOwner: () => "user" }, undefined, undefined, undefined,
+    { holder: (_sessionId, promptId) => { asked.push(promptId); return holder; } },
+  );
+  try {
+    await notifier.tick();
+    holder = "agent";
+    member.attention = att("needs-you", 1);
+    await notifier.tick();
+    await notifier.tick();
+    member.attention = att("working");
+    await notifier.tick();
+    assert.equal(sent.length, 0, "a dialog the permission agent answered never reaches the owner");
+    assert.ok(asked.includes(1), "the notifier asks the holder for the open dialog");
+
+    holder = "agent";
+    member.attention = att("needs-you", 2);
+    await notifier.tick();
+    holder = "owner";
+    await notifier.tick();
+    await notifier.tick();
+    assert.equal(sent.length, 1, "a dialog the permission agent leaves to the owner is pushed once");
+
+    holder = "undecided";
+    member.attention = att("needs-you", 3);
+    await notifier.tick();
+    assert.equal(sent.length, 1);
+    await notifier.tick();
+    assert.equal(sent.length, 2, "an undecided dialog reaches the owner after the grace period");
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("a dialog the permission agent leaves to the owner for a class names the class, and only a host class identifier", async () => {
+  const dir = mkdtempSync("/tmp/inf-push-");
+  const store = new PushStore(dir, randomBytes(32));
+  store.add("owner", "ExponentPushToken[a]", "android");
+  const sent: { title: string; body: string }[][] = [];
+  const sender = async (messages: { title: string; body: string }[]) => { sent.push(messages); return messages.map(() => ({ status: "ok" as const, id: "x" })); };
+  const member = { id: "m1", title: "implementer: deploy", provider: "claude", status: "running", attention: att("working") };
+  const classes: Record<number, string | undefined> = { 1: "production-or-staging", 2: undefined, 3: "The model's note: deploy now" };
+  const notifier = new Notifier(
+    { list: async () => [member] } as never, store, sender,
+    { detail: "minimal", events: ["needs-you"], intervalMs: 100000 },
+    { statuses: () => [], promptOwner: () => "user" }, undefined, undefined, undefined,
+    { holder: () => "owner", ownerClass: (_sessionId, promptId) => classes[promptId] as never },
+  );
+  try {
+    await notifier.tick();
+    for (const promptId of [1, 2, 3]) {
+      member.attention = att("needs-you", promptId);
+      await notifier.tick();
+    }
+    assert.deepEqual(sent.map(batch => [batch[0].title, batch[0].body]), [
+      ["Needs your approval", "Claude Code needs your approval in implementer: deploy (production-or-staging)"],
+      ["Needs your approval", "Claude Code needs your approval in implementer: deploy"],
+      ["Needs your approval", "Claude Code needs your approval in implementer: deploy"],
+    ]);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -433,7 +548,7 @@ test("a held prompt survives a session missing from one listing and still reache
     await notifier.tick();
     member.attention = att("needs-you", 1);
     await notifier.tick();
-    sessions.length = 0;               // the listing briefly omits the session
+    sessions.length = 0;
     await notifier.tick();
     sessions.push(member);
     await notifier.tick();
@@ -503,4 +618,264 @@ test("storage alerts once on startup when already high and honor the host-storag
     await disabled.tick();
     assert.equal(sent.length, 1, "host-storage can be disabled");
   } finally { Date.now = originalNow; enabled.stop(); disabled.stop(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("a fuse push for a long project id has a short collapse id", async () => {
+  const dir = mkdtempSync("/tmp/inf-push-");
+  const store = new PushStore(dir, randomBytes(32));
+  store.add("controller", "ExponentPushToken[a]", "android");
+  const sent: { collapseId: string }[][] = [];
+  const sender = async (messages: never[]) => { sent.push(messages); return messages.map(() => ({ status: "ok" as const, id: "x" })); };
+  const long = "p".repeat(200), other = `${"p".repeat(199)}q`;
+  const pending = [long, other, "short"].map((projectId, index) => ({ tripId: `trip-${index}`, scope: "project" as const, projectId, label: "Fixture", cause: "launch-rate" as const, ownerClose: true, openedAt: "2026-11-13T10:00:00.000Z" }));
+  const fuse = { interrupts: () => pending, markAnnounced: () => {} };
+  const notifier = new Notifier({ list: async () => [] } as never, store, sender, { detail: "minimal", events: ["autonomy-interrupt"], intervalMs: 100000 }, undefined, undefined, undefined, fuse);
+  await notifier.tick();
+  const ids = sent[0]!.map(message => message.collapseId);
+  assert.equal(ids.length, 3);
+  for (const id of ids) assert.ok(Buffer.byteLength(id, "utf8") <= 64, id);
+  assert.notEqual(ids[0], ids[1], "two long ids keep different collapse ids");
+  assert.equal(ids[2], "interrupt:fuse:short");
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("a fuse interrupt whose push failed is offered again", async () => {
+  const dir = mkdtempSync("/tmp/inf-push-");
+  const store = new PushStore(dir, randomBytes(32));
+  store.add("controller", "ExponentPushToken[a]", "android");
+  store.add("controller", "ExponentPushToken[b]", "android");
+  let failing = true;
+  let sends = 0;
+  const sender = async (messages: { to: string }[]) => { sends += 1; return messages.map(message => failing || message.to.endsWith("[b]") ? { status: "error" as const, message: "network" } : { status: "ok" as const, id: "x" }); };
+  const pending = [
+    { tripId: "trip-1", scope: "project" as const, projectId: "p", label: "Fixture", cause: "launch-rate" as const, ownerClose: true, openedAt: "2026-11-13T10:00:00.000Z" },
+    { tripId: "trip-2", scope: "host" as const, label: "the host", cause: "unmeasurable" as const, ownerClose: false, openedAt: "2026-11-13T10:00:00.000Z" },
+  ];
+  const marked: string[][] = [];
+  const fuse = { interrupts: () => pending.filter(trip => !marked.flat().includes(trip.tripId)), markAnnounced: (ids: readonly string[]) => { marked.push([...ids]); } };
+  const notifier = new Notifier({ list: async () => [] } as never, store, sender as never, { detail: "minimal", events: ["autonomy-interrupt"], intervalMs: 100000 }, undefined, undefined, undefined, fuse);
+  const clock = notifier as unknown as { monotonic: () => number };
+  const started = 1_000_000;
+  clock.monotonic = () => started;
+  await notifier.tick();
+  assert.equal(sends, 1);
+  assert.deepEqual(marked, [], "no device received either trip, so neither is marked");
+  await notifier.tick();
+  assert.equal(sends, 1);
+  failing = false;
+  clock.monotonic = () => started + 59_000;
+  await notifier.tick();
+  assert.equal(sends, 1);
+  clock.monotonic = () => started + 61_000;
+  await notifier.tick();
+  assert.equal(sends, 2);
+  assert.deepEqual(marked, [["trip-1", "trip-2"]]);
+  await notifier.tick();
+  assert.equal(sends, 2, "announced trips are not sent again");
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("the notifier pushes one fuse interrupt and marks it announced", async () => {
+  const dir = mkdtempSync("/tmp/inf-push-");
+  const store = new PushStore(dir, randomBytes(32));
+  store.add("controller", "ExponentPushToken[a]", "android");
+  const sent: { to: string; title: string; body: string; data: { url: string }; channelId: string; priority: string; collapseId: string }[][] = [];
+  const sender = async (messages: never[]) => { sent.push(messages); return messages.map(() => ({ status: "ok" as const, id: "x" })); };
+  let pending = [{ tripId: "trip-1", scope: "project" as const, projectId: "p", label: "Fixture", cause: "launch-rate" as const, ownerClose: true, openedAt: "2026-11-13T10:00:00.000Z" }];
+  const marked: string[][] = [];
+  const fuse = {
+    interrupts: () => pending,
+    markAnnounced: (ids: readonly string[]) => { marked.push([...ids]); pending = pending.filter(trip => !ids.includes(trip.tripId)); },
+  };
+  const notifier = new Notifier({ list: async () => [] } as never, store, sender, { detail: "minimal", events: ["autonomy-interrupt"], intervalMs: 100000 }, undefined, undefined, undefined, fuse);
+  await notifier.tick();
+  assert.equal(sent.length, 1);
+  assert.deepEqual(sent[0], [{ to: "ExponentPushToken[a]", title: "Spend fuse open",
+    body: "Launches paused for Fixture: it reached its launch limit for the last hour. It stays open until you close it.",
+    data: { url: "/teams" }, channelId: "attention", priority: "high", collapseId: "interrupt:fuse:p" }]);
+  assert.deepEqual(marked, [["trip-1"]]);
+  await notifier.tick();
+  assert.equal(sent.length, 1, "an announced trip is not pushed again");
+
+  pending = [{ tripId: "trip-2", scope: "host" as const, cause: "unmeasurable" as const, ownerClose: false, openedAt: "2026-11-13T10:00:00.000Z" }];
+  const off = new Notifier({ list: async () => [] } as never, store, sender, { detail: "minimal", events: ["needs-you"], intervalMs: 100000 }, undefined, undefined, undefined, fuse);
+  await off.tick();
+  assert.equal(sent.length, 1, "without the autonomy-interrupt event nothing is sent");
+  assert.deepEqual(marked, [["trip-1"]], "and nothing is marked");
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("a headless call that waits names its class, and a call that could not wait is announced once", async () => {
+  const dir = mkdtempSync("/tmp/inf-push-");
+  const store = new PushStore(dir, randomBytes(32));
+  store.add("controller", "ExponentPushToken[a]", "android");
+  const sent: Array<Array<{ title: string; body: string; collapseId: string }>> = [];
+  const session: Record<string, unknown> = { id: "s1", title: "Deploy", provider: "claude", status: "running", attention: att("working") };
+  const notifier = new Notifier({ list: async () => [session] } as never, store,
+    async (messages) => { sent.push(messages as never); return messages.map(() => ({ status: "ok" as const, id: "x" })); },
+    { detail: "minimal", events: ["needs-you"], intervalMs: 100000 });
+  session.permissionChannel = { served: true, notice: { id: "n0", interruptClass: "credentials" } };
+  await notifier.tick();
+  session.attention = att("needs-you", 9);
+  session.permissionChannel = { served: true, waiting: { interruptClass: "production-or-staging" }, notice: { id: "n0" } };
+  await notifier.tick();
+  assert.deepEqual(sent.map(batch => [batch[0].title, batch[0].body]), [["Needs your answer", "Claude Code waits for your answer in Deploy (production-or-staging)"]]);
+  session.attention = att("working");
+  session.permissionChannel = { served: true, notice: { id: "n1", interruptClass: "money" } };
+  await notifier.tick();
+  await notifier.tick();
+  assert.equal(sent.length, 2);
+  assert.equal(sent[1][0].title, "Call denied: needs you");
+  assert.match(sent[1][0].body, /\(money\) that needs your own answer/);
+  assert.equal(sent[1][0].collapseId, "s1:permission");
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("notifier holds a delegated member's complete hook prompt for the review grace period without leaking tool input", async () => {
+  const f = schedulerFixture();
+  const socketDir = realpathSync(mkdtempSync("/tmp/inf-sock-"));
+  chmodSync(socketDir, 0o700);
+  const originalNow = Date.now;
+  let app: ReturnType<typeof createApp> | undefined;
+  let worker: ReturnType<typeof createSocketServer> | undefined;
+  let sock: string | undefined;
+  try {
+    const member = f.run.members[0]!;
+    f.run.status = "implementing";
+    f.run.permissions = { mode: "coordinator", scope: "Approve one-time checks.", maxDecisions: 2 };
+    f.run.lineup = limitLineup;
+    f.writeTeam();
+    mkdirSync(join(f.config.stateDir, "sessions", member.sessionId), { recursive: true, mode: 0o700 });
+    const session: Session = {
+      id: member.sessionId,
+      team: { runId: f.run.id, memberId: member.memberId, revision: member.revision, role: member.role },
+      provider: "demo",
+      title: "Delegated member",
+      projectId: f.run.projectId,
+      cwd: member.cwd,
+      createdAt: "2026-11-26T00:00:00.000Z",
+      status: "running",
+      contextVersion: 1,
+      context: "",
+      initialPrompt: "Run checks",
+    };
+    writeSealed(join(f.config.stateDir, "sessions", member.sessionId, "meta.sealed"), f.key, `${member.sessionId}:meta`, {
+      session,
+      fingerprint: "fixture",
+    });
+    app = createApp({ ...f.config, socketDir }, f.key);
+    const working: WorkerState = {
+      status: "running",
+      seq: 1,
+      screen: "",
+      attention: { ...initialAttention("2026-11-26T00:00:00.000Z", true), state: "working", now: "Running" },
+    };
+    const secretInput = "private-tool-input-token-9f8e7d";
+    const secretCommand = "npm run check --token=secret-cmd-value";
+    const unredactedTail = "UNREDACTED_LAST_MESSAGE_TAIL";
+    const hookPrompt: Prompt = {
+      id: 1,
+      kind: "permission",
+      source: "hook",
+      hash: "a".repeat(64),
+      acceptsText: false,
+      title: "Run command?",
+      options: [
+        { index: 0, label: "Yes, proceed", role: "accept" },
+        { index: 1, label: "No", role: "reject" },
+      ],
+      tool: { name: "Bash", input: { command: secretCommand, secret: secretInput }, inputComplete: true },
+    };
+    const waitingBase: Attention = {
+      ...initialAttention("2026-11-26T00:00:01.000Z", true),
+      state: "needs-you",
+      source: "hook",
+      now: "",
+      lastMessage: `${"x".repeat(320)}${unredactedTail}`,
+      prompt: hookPrompt,
+    };
+    const waitingAttention: Attention = { ...waitingBase, now: describeNow(waitingBase, session.provider) };
+    assert.equal(waitingAttention.now, `Run command? ${secretCommand}`);
+    const waiting: WorkerState = {
+      status: "running",
+      seq: 2,
+      screen: "",
+      attention: waitingAttention,
+    };
+    let current: WorkerState = working;
+    sock = socketPath(app.manager.socketTarget, member.sessionId);
+    worker = createSocketServer(socket => {
+      socket.on("error", () => {});
+      let buffered = "";
+      socket.on("data", chunk => {
+        buffered += chunk;
+        if (buffered.includes("\n")) socket.end(`${JSON.stringify({ result: current })}\n`);
+      });
+    });
+    const activeWorker = worker;
+    const activeSock = sock;
+    await new Promise<void>((resolve, reject) => {
+      activeWorker.once("error", reject);
+      activeWorker.listen(activeSock, () => resolve());
+    });
+    app.pushStore.add("owner", "ExponentPushToken[a]", "android");
+    let now = originalNow();
+    Date.now = () => now;
+    for (const [label, source, detail] of [
+      ["manager minimal", app.manager, "minimal"],
+      ["sessions minimal", app.sessions, "minimal"],
+      ["sessions full", app.sessions, "full"],
+    ] as const) {
+      current = working;
+      const sent: PushMessage[][] = [];
+      const sender = async (messages: PushMessage[]) => {
+        sent.push(messages);
+        return messages.map(() => ({ status: "ok" as const, id: "x" }));
+      };
+      const notifier = new Notifier(
+        source,
+        app.pushStore,
+        sender,
+        { detail, events: ["needs-you"], intervalMs: 100_000, reviewGraceMs: 30_000, reviewHoldLimitMs: 120_000 },
+        app.teams,
+      );
+      await notifier.tick();
+      assert.equal(sent.length, 0, `${label}: primed`);
+
+      current = waiting;
+      await notifier.tick();
+      assert.equal(sent.length, 0, `${label}: held on first tick while coordinator can still take the hook prompt`);
+
+      now += 15_000;
+      await notifier.tick();
+      assert.equal(sent.length, 0, `${label}: still held inside review grace period`);
+
+      now += 15_000;
+      await notifier.tick();
+      assert.equal(sent.length, 1, `${label}: pushed once after review grace expires`);
+      assert.equal(sent[0]!.length, 1);
+      const pushed = sent[0]![0]!;
+      assert.deepEqual(Object.keys(pushed).sort(), ["body", "channelId", "collapseId", "data", "priority", "title", "to"]);
+      assert.deepEqual(Object.keys(pushed.data), ["url"]);
+      assert.equal(pushed.body, detail === "full" ? waitingAttention.now : "Rehearsal needs your approval in Delegated member");
+      const serialized = JSON.stringify(pushed);
+      assert.equal(serialized.includes(secretInput), false, `${label}: push payload never carries raw tool.input fields`);
+      if (detail === "minimal") assert.equal(serialized.includes(secretCommand), false, `${label}: minimal push payload never carries command text`);
+      assert.equal(serialized.includes("inputComplete"), false, `${label}: push payload never carries inputComplete`);
+      assert.equal(serialized.includes(unredactedTail), false, `${label}: push payload never carries unredacted lastMessage`);
+    }
+
+    current = waiting;
+    const redactedRow = (await app.sessions.list()).find(row => row.id === member.sessionId);
+    assert.deepEqual(redactedRow?.attention.prompt?.tool, { name: "Bash", input: {} });
+    assert.equal(redactedRow?.attention.prompt?.tool?.inputComplete, undefined);
+    assert.equal(redactedRow?.attention.lastMessage?.includes(unredactedTail), false);
+  } finally {
+    Date.now = originalNow;
+    if (worker?.listening) await new Promise<void>(resolve => worker!.close(() => resolve()));
+    if (sock) rmSync(sock, { force: true });
+    if (app) await app.closeConnections();
+    rmSync(socketDir, { recursive: true, force: true });
+    f.close();
+  }
 });

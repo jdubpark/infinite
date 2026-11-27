@@ -26,13 +26,6 @@ function canonicalMapping(mapping: IndexedCandidateMapping): IndexedCandidateMap
   };
 }
 
-/**
- * SHA-256 of canonicalMemoryJson({version: 1, mappings}), with every mapping field
- * and its generation partition included and mappings sorted by handle in UTF-16
- * order. The canonical snapshot job computes this before writing any batch; the
- * ledger recomputes it from encrypted persisted mappings at seal. The same format
- * commits each batch. Duplicate handles within a manifest or batch are invalid.
- */
 export function projectionManifestDigest(mappings: readonly IndexedCandidateMapping[]): string {
   const canonical = mappings.map(canonicalMapping).sort((a, b) => a.handle < b.handle ? -1 : a.handle > b.handle ? 1 : 0);
   if (canonical.some((mapping, index) => index > 0 && mapping.handle === canonical[index - 1]!.handle)) {
@@ -41,7 +34,6 @@ export function projectionManifestDigest(mappings: readonly IndexedCandidateMapp
   return canonicalMemoryDigest({ version: 1, mappings: canonical });
 }
 
-/** Durable, encrypted, rebuildable provider metadata only. Never stores canonical content or grants. */
 export class SqliteProjectionLedger implements MemoryProjectionLedger {
   private readonly db: DatabaseSync;
   private readonly indexKey: Buffer;
@@ -260,13 +252,11 @@ export class SqliteProjectionLedger implements MemoryProjectionLedger {
     try {
       const active = this.db.prepare("SELECT generation_key,partition_key FROM projection_active WHERE collection_key=?")
         .get(collection) as { generation_key: string; partition_key: string } | undefined;
-      // CAS the old identity independently of the replacement's current epochs.
       if ((active?.generation_key ?? null) !== expectedGeneration) throw new Error("active generation compare-and-swap failed");
       const replacement = this.db.prepare("SELECT state FROM projection_generations WHERE partition_key=?")
         .get(part) as { state: State } | undefined;
       if (replacement?.state !== "sealed") throw new Error("only a sealed generation can be activated");
       if (active) {
-        // This key retains the old epoch tuple, even when its projection is empty.
         const quarantined = this.db.prepare("UPDATE projection_generations SET state='quarantined',reason_cipher=? WHERE partition_key=?")
           .run(this.encrypt("reason", active.partition_key, "superseded generation awaiting verified retirement"), active.partition_key);
         if (quarantined.changes !== 1) throw new Error("active generation partition is unavailable; rebuild required");
@@ -283,7 +273,6 @@ export class SqliteProjectionLedger implements MemoryProjectionLedger {
   }
 
   close():void{if(this.closed)return;this.closed=true;this.db.close();this.zeroKeys();}
-  /** Called only inside the same transaction that records its event or rebuild cursor. */
   private insertMapping(part: string, mapping: IndexedCandidateMapping): void {
     const canonical = canonicalMemoryJson(canonicalMapping(mapping));
     const handle = this.key("handle", mapping.handle);

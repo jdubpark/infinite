@@ -1,19 +1,12 @@
 import Foundation
 
-// The host's usage contract (`packages/host/src/usage-api.ts`), mirrored field for field. Money is
-// USD in dollars; a figure with `unpriced > 0` is a floor, never an exact amount. A balance exists
-// only when the provider's own API returned one; `nil` renders as "—", never as an estimate.
-
 public struct Money: Codable, Equatable, Sendable {
     public var usd: Double
     public var unpriced: Int
     public init(usd: Double, unpriced: Int = 0) { self.usd = usd; self.unpriced = unpriced }
     public static let zero = Money(usd: 0)
-    /// "≥ $12.40" when some steps carried no price, "—" when nothing priced was measured, otherwise "$12.40".
     public var label: String { display().label }
     public var isFloor: Bool { unpriced > 0 }
-    /// How a figure shows once the work the ledger could not price or see is counted in. A figure is
-    /// never $0 when something was spent that nobody measured; it is a floor when part was measured.
     public enum Display: Equatable, Sendable {
         case absent, floor(Double), exact(Double)
         public var label: String {
@@ -39,37 +32,123 @@ public struct Balance: Codable, Equatable, Sendable {
     public init(amount: Double, currency: String, asOf: String, stale: Bool) { self.amount = amount; self.currency = currency; self.asOf = asOf; self.stale = stale }
 }
 
-public struct AccountView: Codable, Equatable, Sendable, Identifiable {
-    public var id: String
-    public var kind: String
-    public var month: Money?
-    public var planUsd: Double?
-    /// Where a subscription's fee comes from: "config" for the host's default, "owner" once the owner set it.
-    public var planSource: String?
-    public var balance: Balance?
-    public init(id: String, kind: String, month: Money? = nil, planUsd: Double? = nil, planSource: String? = nil, balance: Balance? = nil) {
-        self.id = id; self.kind = kind; self.month = month; self.planUsd = planUsd; self.planSource = planSource; self.balance = balance
-    }
-    public var metered: Bool { kind == "metered" }
-    /// True when the owner overrode the config default; "Reset to default" only makes sense then.
-    public var planSetByOwner: Bool { planSource == "owner" }
+public enum PlanSource: String, Codable, Equatable, Sendable {
+    case config
+    case owner
 }
 
-/// The owner's typed monthly fee, checked the way `PUT /api/usage/accounts/:id/plan` checks it:
-/// 0–100000 dollars with at most two decimals. A leading "$" and one decimal comma are tolerated.
+public enum AccountKind: Equatable, Sendable {
+    case metered(month: Money?)
+    case subscription(planUsd: Double?, source: PlanSource?)
+    case other(kind: String, month: Money?, planUsd: Double?, planSource: String?)
+}
+
+public struct AccountView: Codable, Equatable, Sendable, Identifiable {
+    public var id: String
+    public var billing: AccountKind
+    public var balance: Balance?
+
+    public init(id: String, billing: AccountKind, balance: Balance? = nil) {
+        self.id = id
+        self.billing = billing
+        self.balance = balance
+    }
+
+    public init(id: String, kind: String, month: Money? = nil, planUsd: Double? = nil, planSource: String? = nil, balance: Balance? = nil) {
+        self.id = id
+        self.balance = balance
+        switch kind {
+        case "metered":
+            self.billing = .metered(month: month)
+        case "subscription":
+            self.billing = .subscription(planUsd: planUsd, source: planSource.flatMap(PlanSource.init(rawValue:)))
+        default:
+            self.billing = .other(kind: kind, month: month, planUsd: planUsd, planSource: planSource)
+        }
+    }
+
+    public var kind: String {
+        switch billing {
+        case .metered: return "metered"
+        case .subscription: return "subscription"
+        case .other(let kind, _, _, _): return kind
+        }
+    }
+
+    public var month: Money? {
+        switch billing {
+        case .metered(let month): return month
+        case .subscription: return nil
+        case .other(_, let month, _, _): return month
+        }
+    }
+
+    public var planUsd: Double? {
+        switch billing {
+        case .metered: return nil
+        case .subscription(let planUsd, _): return planUsd
+        case .other(_, _, let planUsd, _): return planUsd
+        }
+    }
+
+    public var planSource: String? {
+        switch billing {
+        case .metered: return nil
+        case .subscription(_, let source): return source?.rawValue
+        case .other(_, _, _, let planSource): return planSource
+        }
+    }
+
+    public var metered: Bool {
+        if case .metered = billing { return true }
+        return false
+    }
+
+    public var planSetByOwner: Bool {
+        switch billing {
+        case .subscription(_, let source): return source == .owner
+        case .other(_, _, _, let planSource): return planSource == "owner"
+        case .metered: return false
+        }
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, kind, month, planUsd, planSource, balance
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let id = try container.decode(String.self, forKey: .id)
+        let kind = try container.decode(String.self, forKey: .kind)
+        let month = try container.decodeIfPresent(Money.self, forKey: .month)
+        let planUsd = try container.decodeIfPresent(Double.self, forKey: .planUsd)
+        let planSource = try container.decodeIfPresent(String.self, forKey: .planSource)
+        let balance = try container.decodeIfPresent(Balance.self, forKey: .balance)
+        self.init(id: id, kind: kind, month: month, planUsd: planUsd, planSource: planSource, balance: balance)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(kind, forKey: .kind)
+        try container.encodeIfPresent(month, forKey: .month)
+        try container.encodeIfPresent(planUsd, forKey: .planUsd)
+        try container.encodeIfPresent(planSource, forKey: .planSource)
+        try container.encodeIfPresent(balance, forKey: .balance)
+    }
+}
+
 public enum PlanFee {
     public static let maxUsd: Double = 100_000
     public static func parse(_ text: String) throws -> Double {
         var cleaned = text.trimmingCharacters(in: .whitespacesAndNewlines)
         if cleaned.hasPrefix("$") { cleaned.removeFirst() }
-        // One comma is a decimal separator, as some keyboards type it; thousands grouping is refused rather than guessed.
         if cleaned.filter({ $0 == "," }).count > 1 || (cleaned.contains(",") && cleaned.contains(".")) {
             throw DesktopError("Use one comma or dot for cents, without thousands separators.")
         }
         cleaned = cleaned.replacingOccurrences(of: ",", with: ".")
         guard !cleaned.isEmpty else { throw DesktopError("Enter a monthly fee in dollars.") }
         let parts = cleaned.split(separator: ".", omittingEmptySubsequences: false)
-        // Digits only, with the point optional; ".5" is fine, "1." and "1.2.3" are not.
         guard parts.count <= 2, parts.allSatisfy({ $0.allSatisfy(\.isNumber) }), parts.count == 1 ? !parts[0].isEmpty : !parts[1].isEmpty else {
             throw DesktopError("Enter a plain dollar amount such as 200 or 19.99.")
         }
@@ -80,7 +159,6 @@ public enum PlanFee {
     }
 }
 
-/// `GET /api/usage`: the month headline and the accounts. The older per-provider fields pass through untouched.
 public struct UsageOverview: Codable, Equatable, Sendable {
     public struct Month: Codable, Equatable, Sendable {
         public var start: String
@@ -96,11 +174,9 @@ public struct UsageOverview: Codable, Equatable, Sendable {
     public var month: Month
     public var accounts: [AccountView]
     public init(month: Month, accounts: [AccountView]) { self.month = month; self.accounts = accounts }
-    /// Metered spend plus every subscription's fixed monthly fee.
     public var withPlansUsd: Double { month.spent.usd + month.plansUsd }
 }
 
-/// `GET /api/usage/daily`: one row per day in the requested timezone, oldest first, stacked by account.
 public struct DailyUsage: Codable, Equatable, Sendable {
     public struct Day: Codable, Equatable, Sendable, Identifiable {
         public var date: String
@@ -116,14 +192,12 @@ public struct DailyUsage: Codable, Equatable, Sendable {
     public var maxUsd: Double { days.map(\.usd).max() ?? 0 }
 }
 
-/// `GET /api/usage/projects`: accrued cost per project with a 30-day sparkline, oldest first.
 public struct ProjectUsageSummary: Codable, Equatable, Sendable, Identifiable {
     public var id: String
     public var name: String
     public var total: Money
     public var month: Money
     public var spark: [Double]
-    /// Sessions and briefings the ledger could not measure; absent on hosts that do not count them yet.
     public var unmeasured: Int?
     public init(id: String, name: String, total: Money, month: Money, spark: [Double], unmeasured: Int? = nil) { self.id = id; self.name = name; self.total = total; self.month = month; self.spark = spark; self.unmeasured = unmeasured }
 }
@@ -132,9 +206,7 @@ public struct UsageProjects: Codable, Equatable, Sendable {
     public init(projects: [ProjectUsageSummary]) { self.projects = projects }
 }
 
-/// `GET /api/usage/projects/:id`: everything attributed to one project, split by kind.
 public struct ProjectUsage: Codable, Equatable, Sendable {
-    /// Dollars spent per kind of work. Counts come from the rows themselves and from `briefings.runs`.
     public struct Kinds: Codable, Equatable, Sendable {
         public var goals: Double
         public var teams: Double
@@ -176,14 +248,12 @@ public struct ProjectUsage: Codable, Equatable, Sendable {
     public var teams: [Team]
     public var sessions: [Session]
     public var briefings: Briefings
-    /// Sessions and briefings the ledger could not measure; absent on hosts that do not count them yet.
     public var unmeasured: Int?
     public init(id: String, name: String, total: Money, byKind: Kinds, goals: [Goal], teams: [Team], sessions: [Session], briefings: Briefings, unmeasured: Int? = nil) {
         self.id = id; self.name = name; self.total = total; self.byKind = byKind; self.goals = goals; self.teams = teams; self.sessions = sessions; self.briefings = briefings; self.unmeasured = unmeasured
     }
 }
 
-/// A task's cost on the team view: every member that worked it, replacements included.
 public struct TaskUsage: Codable, Equatable, Sendable {
     public var usd: Double
     public var unpriced: Int
@@ -218,8 +288,6 @@ public struct Rubric: Codable, Equatable, Sendable {
     }
 }
 
-/// `GET /api/usage/models`: one row per model profile in a role. Cost columns are `nil` for
-/// subscription profiles; `enough` is false below `minAttempts`, where no ranking is shown.
 public struct ModelRow: Codable, Equatable, Sendable, Identifiable {
     public struct RubricMeans: Codable, Equatable, Sendable {
         public var correctness: Double
@@ -253,7 +321,6 @@ public struct ModelRow: Codable, Equatable, Sendable, Identifiable {
     public var owner: OwnerMean?
     public var enough: Bool
     public var id: String { profileId + "/" + role }
-    /// The Wilson 95% interval as a pair, when the host computed one.
     public var interval: (low: Double, high: Double)? {
         guard let rateInterval, rateInterval.count == 2 else { return nil }
         return (rateInterval[0], rateInterval[1])
@@ -276,9 +343,7 @@ public struct Scorecard: Codable, Equatable, Sendable {
     public var roles: [String] { Array(Set(rows.map(\.role))).sorted() }
 }
 
-/// Short figures for the cost views: dollars, tokens, and the change between two periods.
 public enum UsageFormat {
-    /// "$0.42", "$12.50", "$1,284", "$12.9K", "$1.2M". Cents matter below a thousand dollars.
     public static func usd(_ value: Double) -> String {
         let magnitude = abs(value)
         let sign = value < 0 ? "−" : ""
@@ -287,14 +352,11 @@ public enum UsageFormat {
         if magnitude >= 1_000 { return sign + "$" + grouped(magnitude.rounded()) }
         return sign + String(format: "$%.2f", magnitude)
     }
-    /// "31K", "1.2M", "640".
     public static func tokens(_ value: Int) -> String {
         if value >= 1_000_000 { return trim(Double(value) / 1_000_000, decimals: 1) + "M" }
         if value >= 1_000 { return trim(Double(value) / 1_000, decimals: value < 10_000 ? 1 : 0) + "K" }
         return String(value)
     }
-    /// The change from `previous` to `current` as a signed percent ("+18%", "−8%", "0%"); nil when
-    /// there is no previous figure to compare with.
     public static func delta(_ current: Double, previous: Double) -> String? {
         guard previous > 0 else { return nil }
         let percent = (current - previous) / previous * 100
@@ -302,13 +364,10 @@ public enum UsageFormat {
         if rounded == 0 { return "0%" }
         return (rounded > 0 ? "+" : "−") + String(abs(rounded)) + "%"
     }
-    /// The month an ISO instant falls in, read in UTC because the host's month windows start at
-    /// 00:00 UTC; the local zone would name the previous month west of Greenwich.
     public static func monthName(_ iso: String, locale: Locale = .current) -> String? {
         guard let date = parseISO(iso) else { return nil }
         return monthFormatter(locale).string(from: date)
     }
-    /// The month before the one `iso` falls in, in the same UTC reading.
     public static func previousMonthName(_ iso: String, locale: Locale = .current) -> String? {
         guard let date = parseISO(iso), let previous = utcCalendar.date(byAdding: .month, value: -1, to: date) else { return nil }
         return monthFormatter(locale).string(from: previous)
@@ -320,9 +379,7 @@ public enum UsageFormat {
     private static func monthFormatter(_ locale: Locale) -> DateFormatter {
         let f = DateFormatter(); f.locale = locale; f.timeZone = TimeZone(identifier: "UTC"); f.setLocalizedDateFormatFromTemplate("MMMM"); return f
     }
-    /// "0.91" style rate as a percent without decimals: "91%".
     public static func percent(_ rate: Double) -> String { String(Int((rate * 100).rounded())) + "%" }
-    /// A balance in its own currency: "$12.50", "12.50 CNY".
     public static func balance(_ balance: Balance) -> String {
         balance.currency.uppercased() == "USD" ? usd(balance.amount) : String(format: "%.2f ", balance.amount) + balance.currency
     }
@@ -346,11 +403,9 @@ public enum UsageFormat {
 }
 
 extension JSON {
-    /// The host's JSON as a typed contract value; numbers round-trip as JSON numbers, so integer fields decode.
     public func decoded<T: Decodable>(_ type: T.Type = T.self) throws -> T { try JSONDecoder().decode(T.self, from: data()) }
 }
 
-/// The usage routes. Every read sends the device timezone so daily buckets match the owner's day.
 extension RemoteClient {
     private static func query(_ items: [(String, String?)]) -> String {
         let pairs = items.compactMap { key, value -> String? in
@@ -365,24 +420,24 @@ extension RemoteClient {
     }
     public func usageProjects(tz: String) async throws -> UsageProjects { try await request("/usage/projects" + Self.query([("tz", tz)])).decoded() }
     public func usageProject(_ id: String, tz: String) async throws -> ProjectUsage {
-        try await request("/usage/projects/" + (id.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? id) + Self.query([("tz", tz)])).decoded()
+        try await request(Self.usageProjectPath(id, tz: tz)).decoded()
+    }
+    private static let pathSegmentAllowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~")
+    static func usageProjectPath(_ id: String, tz: String) -> String { "/usage/projects/" + pathSegment(id) + query([("tz", tz)]) }
+    static func accountPlanPath(_ account: String) -> String { "/usage/accounts/" + pathSegment(account) + "/plan" }
+    static func pathSegment(_ id: String) -> String {
+        id.addingPercentEncoding(withAllowedCharacters: pathSegmentAllowed) ?? id
     }
     public func usageModels(role: String? = nil) async throws -> Scorecard { try await request("/usage/models" + Self.query([("role", role)])).decoded() }
-    /// Owner only; the host re-reads the balance at most once a minute.
     public func refreshBalances() async throws -> [AccountView] {
         struct Reply: Decodable { var accounts: [AccountView] }
         return try await request("/usage/balances/refresh", body: .object([:])).decoded(Reply.self).accounts
     }
-    /// Owner only: sets a subscription's monthly fee, or `nil` to return to the config default.
-    /// Returns every account as the host now sees it; a refused value arrives as the host's error text.
     public func setPlan(account: String, planUsd: Double?) async throws -> [AccountView] {
         struct Reply: Decodable { var accounts: [AccountView] }
-        // The remote channel refuses percent-encoded paths, so keep the ASCII characters account IDs use.
-        let id = account.addingPercentEncoding(withAllowedCharacters: CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.")) ?? account
         let body: JSON = .object(["planUsd": planUsd.map { .number($0) } ?? .null])
-        return try await request("/usage/accounts/" + id + "/plan", body: body, method: "PUT").decoded(Reply.self).accounts
+        return try await request(Self.accountPlanPath(account), body: body, method: "PUT").decoded(Reply.self).accounts
     }
-    /// Owner only, idempotent per `requestID`. Returns the host's updated team view.
     public func rateTask(team: String, task: String, score: Int, note: String? = nil, requestID: String) async throws -> JSON {
         var body: [String: JSON] = ["requestId": .string(requestID), "score": .number(Double(score))]
         if let note, !note.isEmpty { body["note"] = .string(note) }

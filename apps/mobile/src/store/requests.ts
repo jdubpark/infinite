@@ -8,11 +8,9 @@ export type GoalCreationRequest = {
   nonGoals: string[]; allowedPaths: string[]; evidence: string[]; maxRuns: number; maxMinutes: number; maxMembers: number;
 };
 export type MissionCreationRequest = { requestId: string; groupId: string; objective: string };
-/** A steer, answer, lifecycle action or outcome for one team or goal, sent with the revision it was decided against. */
-export type RunRequest = { requestId: string; revision: number; path: string; label: string; fields: Record<string, string> };
+export type RunRequest = { requestId: string; revision: number; path: string; label: string; fields: Record<string, string | number> };
 type RequestState<Request, Result> = { pending?: Request; result?: Result; message: string };
 
-/** In-memory receipts survive screen changes; only their own request may settle them. */
 function requestStore<Request extends { requestId: string }, Result>() {
   const empty: RequestState<Request, Result> = { message: "" };
   const values = new Map<string, RequestState<Request, Result>>();
@@ -67,5 +65,4 @@ export const lifecycles = requestStore<LifecycleRequest, { id: string }>();
 export const teamCreations = requestStore<TeamCreationRequest, { id: string }>();
 export const goalCreations = requestStore<GoalCreationRequest, { id: string }>();
 export const missionCreations = requestStore<MissionCreationRequest, { id: string }>();
-/** Keyed by machine and run, so a pending request follows its team or goal across screens. */
 export const runRequests = requestStore<RunRequest, { id: string }>();

@@ -6,40 +6,38 @@ import { basename, dirname, join, resolve, sep } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { captureWorkspace, type WorkspaceManifest, type WorkspaceStoreTarget } from "./workspace-checkpoint.js";
+import {
+  collectSharedPool, currentBootId, currentProcessStart, discoverClientWorkspaceScopes,
+  hasLegacyClientWriters, manifestChunkHashes, pruneScopeRefs,
+} from "./workspace-pool-gc.js";
 import { uploadMissingChunks } from "./chunk-upload.js";
 import { shouldCaptureWorkspace, watchWorkspaceChanges } from "./workspace-changes.js";
 
 export interface SyncServiceOptions {
   origin: string; token: string; projectId: string; root: string; stateFile: string; storeDir: string;
   sharedPoolDirectory?: string;
-  /** Stable identity for this laptop daemon, independent of its paired device key. */
   publisherId?: string;
-  /** Startup inactivity bound in milliseconds; defaults to 60 s. */
   startupInactivityMs?: number;
 }
-export interface SyncState { pid: number; projectId: string; root: string; origin: string; startedAt: string; publisherId?: string; lastCommitAt?: string; lastManifest?: string; problem?: string; skipped?: number }
-/** Special files the first capture left out: how many, and up to 20 of their root-relative paths. */
+export interface SyncState {
+  pid: number; projectId: string; root: string; origin: string; startedAt: string;
+  publisherId?: string; lastCommitAt?: string; lastManifest?: string; problem?: string; skipped?: number;
+  poolLeases?: true; bootId?: string; processStart?: string;
+}
 export interface SyncStart { skipped: { count: number; paths: string[] } }
 
-/** Startup inactivity bound: the child reports capture progress, each phase and uploaded chunk, and every report restarts it. */
 const STARTUP_TIMEOUT = 60000;
-/** The host applies the tree inside the commit request; a first apply of a large project can take minutes. */
 const COMMIT_TIMEOUT = 30 * 60 * 1000;
 const STARTUP_ERROR = "The workspace sync service did not complete its first upload. Nothing was applied on the host.";
 const STALLED = "Run infinite sync again to resume; chunks already uploaded are kept.";
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const inside = (root: string, path: string) => path === root || path.startsWith(root.endsWith(sep) ? root : root + sep);
 const printable = (text: string) => text.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").slice(0, 300);
-/**
- * A recorded pid names this service only while that process still runs with `--sync-service`.
- * After a crash the OS may reuse the pid; pid 0 or -1 would signal a whole process group or every process.
- */
 function runningService(pid: unknown): pid is number {
   if (!Number.isInteger(pid) || (pid as number) <= 1) return false;
   try { return execFileSync("ps", ["-o", "command=", "-p", String(pid)], { encoding: "utf8", timeout: 5000, stdio: ["ignore", "pipe", "ignore"] }).includes("--sync-service"); }
   catch { return false; }
 }
-/** Canonical form of a path that may not exist yet: its nearest existing ancestor resolved, the rest appended. */
 function canonical(path: string): string {
   const missing: string[] = [];
   for (let current = resolve(path); ; current = dirname(current)) {
@@ -49,7 +47,6 @@ function canonical(path: string): string {
     }
   }
 }
-/** Manifest ids hash capture times, so content, layout, and modes alone decide whether a push is due. */
 const fingerprint = (manifest: WorkspaceManifest) =>
   createHash("sha256").update(JSON.stringify(manifest.entries.map(({ sourceStamp: _stamp, ...entry }) => entry))).digest("hex");
 
@@ -72,7 +69,6 @@ function validateOptions(options: SyncServiceOptions): SyncServiceOptions {
   return { ...options, origin: origin.origin, root, storeDir, stateFile, sharedPoolDirectory };
 }
 
-/** The recorded service still runs; a record left by a killed service or a reboot does not. */
 export const syncServiceRunning = (state: SyncState) => runningService(state.pid);
 export function readSyncState(stateFile: string): SyncState | undefined {
   try { return JSON.parse(readFileSync(stateFile, "utf8")) as SyncState; }
@@ -99,20 +95,15 @@ function writeState(stateFile: string, state: SyncState) {
   writeFileSync(temporary, JSON.stringify(state, null, 2) + "\n", { mode: 0o600, flag: "wx" });
   renameSync(temporary, stateFile);
 }
-/**
- * Stop the recorded service. A state file whose pid no longer runs the service is stale: it is removed and nothing is signaled.
- * Removing the file also stops a service the signal cannot reach; it exits before its next capture.
- */
 export function stopSyncService(stateFile: string): boolean {
   const state = readSyncState(stateFile);
   if (!state) return false;
   const running = runningService(state.pid);
-  if (running) try { process.kill(state.pid, "SIGTERM"); } catch { /* Already gone. */ }
+  if (running) try { process.kill(state.pid, "SIGTERM"); } catch {}
   rmSync(stateFile, { force: true });
   return running;
 }
 
-/** Launch the detached service and resolve after its first committed generation. */
 export async function startSyncService(options: SyncServiceOptions): Promise<SyncStart> {
   const validated = validateOptions(options);
   const existing = readSyncState(validated.stateFile);
@@ -128,8 +119,6 @@ export async function startSyncService(options: SyncServiceOptions): Promise<Syn
   const child = spawn(process.execPath, [...(file.endsWith(".ts") ? ["--import", import.meta.resolve("tsx")] : []), file, "--sync-service"], {
     cwd: validated.root, detached: true, stdio: ["ignore", "ignore", "ignore", "ipc"],
   });
-  // The device key is passed only through private IPC, never copied into the
-  // service's arguments, environment, or state file.
   const result: SyncStart = { skipped: { count: 0, paths: [] } };
   await new Promise<void>((resolve, reject) => {
     let started = false, ready = false, detached = false, finished = false;
@@ -138,14 +127,13 @@ export async function startSyncService(options: SyncServiceOptions): Promise<Syn
     const fail = (reason?: string, stalled = false) => {
       if (finished) return;
       finished = true; cleanup();
-      if (child.connected) try { child.disconnect(); } catch { /* Already disconnected. */ }
+      if (child.connected) try { child.disconnect(); } catch {}
       child.kill("SIGTERM");
       const killTimer = setTimeout(() => child.kill("SIGKILL"), 4000); killTimer.unref();
       child.once("exit", () => clearTimeout(killTimer));
       reject(new Error(reason ? `${STARTUP_ERROR} ${reason}` : stalled ? `${STARTUP_ERROR} ${STALLED}` : STARTUP_ERROR));
     };
     const failed = () => fail();
-    // A final message can still be queued when the exit arrives; the disconnect that follows it decides.
     const exited = () => { if (!child.connected) fail(); };
     const disconnected = () => {
       if (!detached) { fail(); return; }
@@ -177,22 +165,18 @@ export async function startSyncService(options: SyncServiceOptions): Promise<Syn
 }
 
 class FatalSyncError extends Error {}
-/** A host older than a route answers its catch-all 404 without a code. */
 class MissingRouteError extends FatalSyncError {}
-/** A refusal the host explained: its status and code, and for a failed sync operation, a category. */
 class SyncRequestError extends Error {
   constructor(message: string, readonly status: number, readonly code?: string, readonly category?: string) { super(message); }
 }
 const POLL = 3000;
 const BATCH_TIMEOUT = 120000;
 const BACKOFF_LIMIT = 5 * 60 * 1000;
-/** Apply failures the same content meets again; it is not pushed again until the laptop changes or the owner applies it. */
 const LASTING = new Set(["permission", "cross-device", "special-file", "missing-path"]);
 async function refusal(response: Response): Promise<never> {
   const reply = await response.json().catch(() => ({})) as { error?: unknown; code?: unknown; category?: unknown };
   const reason = typeof reply.error === "string" ? reply.error : `HTTP ${response.status}`;
-  // A revoked key, a removed project, or a manifest over the host's bound will not recover by retrying.
-  if (response.status === 404 && reply.code === undefined) throw new MissingRouteError(`Host refused sync (${response.status}): ${reason}`);
+  if (response.status === 404 && (reply.code === undefined || reply.code === "route-not-found")) throw new MissingRouteError(`Host refused sync (${response.status}): ${reason}`);
   if ([401, 403, 404, 413].includes(response.status)) throw new FatalSyncError(`Host refused sync (${response.status}): ${reason}`);
   throw new SyncRequestError(reason, response.status, typeof reply.code === "string" ? reply.code : undefined, typeof reply.category === "string" ? reply.category : undefined);
 }
@@ -237,11 +221,10 @@ async function runSyncService(): Promise<void> {
     } catch { stop(); }
   };
   let inactivity = STARTUP_TIMEOUT, startup = setTimeout(stop, inactivity);
-  // Until detach, capture progress, each phase and each uploaded chunk restart both sides' inactivity timers.
   const progress = () => {
     if (reported) return;
     startup.refresh();
-    try { process.send?.({ type: "progress" }, () => {}); } catch { /* A lost parent is handled by disconnect. */ }
+    try { process.send?.({ type: "progress" }, () => {}); } catch {}
   };
   process.on("disconnect", disconnected); process.on("message", detach);
   for (const name of ["SIGINT", "SIGTERM", "SIGHUP"] as const) process.on(name, stop);
@@ -263,20 +246,24 @@ async function runSyncService(): Promise<void> {
     if (config.startupInactivityMs) { inactivity = config.startupInactivityMs; clearTimeout(startup); startup = setTimeout(stop, inactivity); }
     const storeDir: WorkspaceStoreTarget = config.sharedPoolDirectory
       ? { directory: config.storeDir, sharedPoolDirectory: config.sharedPoolDirectory } : config.storeDir;
-    const state: SyncState = { pid: process.pid, projectId: config.projectId, root: config.root, origin: config.origin, startedAt: new Date().toISOString(), publisherId: config.publisherId };
+    const hostBoot = currentBootId();
+    const procStart = await currentProcessStart();
+    const state: SyncState = {
+      pid: process.pid, projectId: config.projectId, root: config.root, origin: config.origin,
+      startedAt: new Date().toISOString(), publisherId: config.publisherId, poolLeases: true,
+      ...(hostBoot !== "unsupported" ? { bootId: hostBoot } : {}),
+      ...(procStart !== undefined ? { processStart: procStart } : {}),
+    };
     writeState(config.stateFile, state);
-    // After a stop removed the file, a late write must not bring it back.
     const record = () => { if (!abort.signal.aborted && readSyncState(config.stateFile)?.pid === process.pid) writeState(config.stateFile, state); };
-    // Special files the latest capture left out; the first capture's are reported once, at startup.
     let skipped: string[] = [];
     const ready = () => {
       if (reported) return;
       reported = true;
       process.send?.({ type: "ready", skipped: { count: skipped.length, paths: skipped.slice(0, 20) } }, error => { if (error) stop(); });
     };
-    // `held`: the host kept the last pushed content but cannot apply it for a lasting reason.
     let previous: WorkspaceManifest | undefined, committed: string | undefined, lastFull = 0, failures = 0, pushFailures = 0, held = false;
-    let firstIteration = true, previousIterationFailed = false, lastCaptureStartedAt = 0, lastPendingCheckAt = 0;
+    let firstIteration = true, previousIterationFailed = false, lastCaptureStartedAt = 0, lastPendingCheckAt = 0, lastPoolGcAt = Date.now();
     changeDetector = await watchWorkspaceChanges([config.root], join(config.storeDir, "watch-cache"));
     while (!abort.signal.aborted && readSyncState(config.stateFile)?.pid === process.pid) {
       let content: string | undefined, pushing = false;
@@ -299,7 +286,6 @@ async function runSyncService(): Promise<void> {
             pushing = true; held = false;
             progress();
             const { generation } = await api<{ generation: string }>(config, "begin", abort.signal, {});
-            // A batch request reports nothing until the host has stored it; a heartbeat keeps startup alive meanwhile.
             const uploading = setInterval(progress, Math.min(5000, Math.floor(inactivity / 4)));
             try {
               await uploadMissingChunks({ storeDir, hashes: manifest.entries.flatMap(entry => entry.chunks ?? []), signal: abort.signal, progress, transport: {
@@ -311,7 +297,6 @@ async function runSyncService(): Promise<void> {
                 put: async (hash, bytes, signal) => { await api(config, `blob/${hash}`, signal, undefined, bytes, 60000, generation); },
               } });
             } finally { clearInterval(uploading); }
-            // The host applies inside this request and reports nothing until it finishes; a heartbeat keeps startup alive meanwhile.
             const heartbeat = setInterval(progress, Math.min(5000, Math.floor(inactivity / 4)));
             try { await api(config, "commit", abort.signal, { generation, manifest }, undefined, COMMIT_TIMEOUT, generation); }
             finally { clearInterval(heartbeat); }
@@ -321,12 +306,26 @@ async function runSyncService(): Promise<void> {
           } else if (state.problem && !held) { delete state.problem; record(); }
         }
         if (held && Date.now() - lastPendingCheckAt >= 30000) {
-          // An explicit apply on the host, or a reset, replaces the failure marker; poll at a bounded rate.
           lastPendingCheckAt = Date.now();
           if (await pendingReason(config, abort.signal) !== "apply-failed") { held = false; pushFailures = 0; delete state.problem; record(); }
         } else if (capture && !held && state.problem) { delete state.problem; record(); }
         failures = 0;
+        const hadReported = reported;
         ready();
+        if (hadReported && config.sharedPoolDirectory && previous && content === committed) {
+          await pruneScopeRefs({ scopeDirectory: config.storeDir, keepHashes: manifestChunkHashes([previous]), sharedPoolDirectory: config.sharedPoolDirectory, signal: abort.signal }).catch(() => {});
+          if (Date.now() - lastPoolGcAt >= 60 * 60 * 1000) {
+            lastPoolGcAt = Date.now();
+            await discoverClientWorkspaceScopes(config.sharedPoolDirectory)
+              .then(clientScopes => collectSharedPool({
+                sharedPoolDirectory: config.sharedPoolDirectory!,
+                scopeDirectories: [...new Set([config.storeDir, ...clientScopes])],
+                hasLegacyWriters: () => hasLegacyClientWriters(dirname(config.sharedPoolDirectory!), process.pid),
+                signal: abort.signal,
+              }))
+              .catch(() => {});
+          }
+        }
         previousIterationFailed = false;
       } catch (error) {
         if (abort.signal.aborted) break;
@@ -334,15 +333,12 @@ async function runSyncService(): Promise<void> {
         previousIterationFailed = true;
         failures += 1;
         if (pushing) pushFailures += 1;
-        // A held apply failure stays the reported problem until it is resolved or new content is pushed.
         if (!held || pushing) state.problem = (error instanceof Error ? error.message : "Workspace sync is retrying").slice(0, 200);
-        // The host received this content and kept it pending; pushing the same content again would fail the same way.
         if (pushing && error instanceof SyncRequestError && error.code === "apply-failed" && LASTING.has(error.category ?? "")) { committed = content; held = true; pushFailures = 0; }
         record();
         if (held) ready();
         else if (!reported && failures > 5) { reason = state.problem; break; }
       }
-      // After startup, consecutive failed pushes back off exponentially, from the poll interval to five minutes.
       const wait = reported && pushFailures ? Math.min(BACKOFF_LIMIT, POLL * 2 ** (pushFailures - 1)) : POLL;
       await delay(wait, undefined, { signal: abort.signal }).catch(() => {});
     }
@@ -352,8 +348,8 @@ async function runSyncService(): Promise<void> {
     stop(); clearTimeout(startup);
     process.off("disconnect", disconnected); process.off("message", detach);
     for (const name of ["SIGINT", "SIGTERM", "SIGHUP"] as const) process.off(name, stop);
-    try { if (options && readSyncState(options.stateFile)?.pid === process.pid) rmSync(options.stateFile, { force: true }); } catch { /* Unreadable state is left for the owner. */ }
-    if (process.connected && process.send) try { process.send({ type: "failed", reason }, () => { if (process.connected) process.disconnect(); }); } catch { /* Parent already exited. */ }
+    try { if (options && readSyncState(options.stateFile)?.pid === process.pid) rmSync(options.stateFile, { force: true }); } catch {}
+    if (process.connected && process.send) try { process.send({ type: "failed", reason }, () => { if (process.connected) process.disconnect(); }); } catch {}
   }
 }
 

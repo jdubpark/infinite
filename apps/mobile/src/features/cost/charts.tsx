@@ -4,19 +4,12 @@ import Svg, { Circle, G, Line, Path, Rect } from "react-native-svg";
 import { theme } from "../../theme";
 import { shortDay, usd, type DailyPoint } from "./model";
 
-/**
- * Hand-drawn marks with one fixed grammar: thin bars with a square base and a rounded top, a
- * surface gap between touching fills instead of a stroke, hairline solid rules, and labels in
- * native text so system font scaling still applies. Marks carry colour; text never does.
- */
 const GAP = 2, RADIUS = 4, AXIS_BAND = 16, TOP_LABEL = 14;
 
-/** A segment with a rounded top and a square base, as a path. */
 function cap(x: number, y: number, w: number, h: number, r: number) {
   return `M${x},${y + h} L${x},${y + r} Q${x},${y} ${x + r},${y} L${x + w - r},${y} Q${x + w},${y} ${x + w},${y + r} L${x + w},${y + h} Z`;
 }
 
-/** Thirty days stacked by account; a tap on a band selects that day and dims the rest. */
 export function StackedBars({ days, accounts, colors, selected, onSelect, height = 150 }: {
   days: DailyPoint[]; accounts: string[]; colors: Record<string, string>; selected?: string; onSelect: (date: string | undefined) => void; height?: number;
 }) {
@@ -64,7 +57,6 @@ export function StackedBars({ days, accounts, colors, selected, onSelect, height
   </View>;
 }
 
-/** Thirty values as one 2-unit line ending in a ringed dot; an empty series is a baseline. */
 export function Sparkline({ values, color, width = 64, height = 20 }: { values: number[]; color: string; width?: number; height?: number }) {
   const max = Math.max(0, ...values);
   const inset = 3;
@@ -82,7 +74,6 @@ export function Sparkline({ values, color, width = 64, height = 20 }: { values: 
   </Svg>;
 }
 
-/** An integrated rate on a 0–100% track: the Wilson interval as a band, the point as a ringed dot. */
 export function IntervalBar({ rate, interval, enough, width = 120 }: { rate: number; interval: [number, number] | null; enough: boolean; width?: number }) {
   const clamp = (value: number) => Math.max(0, Math.min(1, value));
   const left = interval ? clamp(interval[0]) * width : 0;

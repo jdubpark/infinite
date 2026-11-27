@@ -1,15 +1,25 @@
+import { inputSourceLabel, decisionAnswerLabel, decisionAuthorityQuestion } from "./team-types.js";
 import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { z } from "zod";
+import { DEFAULT_REPORT_NAME, reportName } from "./config.js";
 import type { Config } from "./types.js";
 import type { ProductGoal } from "./goal-types.js";
 import type { TeamRun, TeamView } from "./team-types.js";
-import type { LinearTrackingView } from "./linear-types.js";
+import type { LinearBridgeStatus, LinearIssueView, LinearLimitView, LinearTrackingView } from "./linear-types.js";
 import { unseal, writeSealed } from "./vault.js";
+import { recommendationLine } from "./question-recommendation.js";
 
 const endpoint = "https://api.linear.app/graphql";
 const freshnessMs = 30000;
+const settledFreshnessMs = 10 * 60000;
+const maxPauseMs = 5 * 60000;
+const fallbackPauseMs = 60000;
+const maxRetryAfterMs = 2 * 3600000;
+const confirmWaitMs = 5000;
+const at = (ms: number) => new Date(Math.ceil(ms / 1000) * 1000).toISOString().replace(".000Z", "Z");
+const rateLimitReason = (retryAt: number) => `Linear is rate-limiting this host's requests. Tracking retries at ${at(retryAt)}; execution waits until Linear confirms current requirements.`;
 const maxResponseBytes = 1024 * 1024;
 const issueFields = "id identifier url title description updatedAt archivedAt team { id } project { id } parent { id } state { id name type }";
 const issueSchema = z.object({
@@ -32,16 +42,9 @@ type Stored = {
   attempted: boolean; issue?: Issue; baseline?: string; checkedAt?: string;
   blocked?: string; error?: string; failures: number; retryAt: number;
   terminal: boolean; comments: Record<string, Comment>;
-  /** The run's Blocked label: queued to add or remove, or applied. Its failures never gate execution. */
-  label?: "add" | "added" | "remove"; labelFailures?: number; labelRetryAt?: number;
-  /** Optional run title update; its retries do not gate execution or share the issue/comment failures. */
+  label?: "add" | "added" | "remove"; labelVersion?: number; labelFailures?: number; labelRetryAt?: number; labelProviderRetryAt?: number;
   retitle?: string; retitleFailures?: number; retitleRetryAt?: number;
-  /** The run's newest title; renames always reconcile toward it. */
   retitleWanted?: string;
-  /**
-   * Rename requests without an acknowledgement. Each may still commit at any time, so only its own response clears it,
-   * and a title change to one of these titles is host-authored. At the limit, further renames wait.
-   */
   retitleSent?: { id: string; title: string }[];
 };
 type Freshness = { requested: number; verified: number; queued: Set<string>; readRequested: boolean };
@@ -51,7 +54,6 @@ const terminalStatuses = new Set(["ready-for-review", "merged", "no-change", "no
 const evidenceStatuses = new Set([...terminalStatuses, "needs-input", "paused"]);
 const RETITLE_SENT_LIMIT = 16;
 const normalized = (value: string | null) => (value ?? "").replace(/\r\n/g, "\n").trim();
-// Linear rewrites prose only; code keeps its bytes, so an edited diff marker or escape inside code still blocks.
 const createMatchNormalized = (value: string | null) => {
   let fenced = false;
   return normalized(value).split("\n").map(line => {
@@ -64,17 +66,21 @@ const createMatchNormalized = (value: string | null) => {
 const scopeHash = (issue: Issue, linearProjectId?: string) => hash({ title: issue.title, description: normalized(issue.description), teamId: issue.team.id,
   ...(linearProjectId !== undefined ? { projectId: issue.project?.id ?? null } : {}), parentId: issue.parent?.id ?? null });
 
-// Only deliberately selected requirements and user directions leave the host.
-// Machine paths sometimes appear in those fields; never publish them as evidence.
-function sharedText(value: string) {
+export function sharedText(value: string) {
   return value.replace(/(?:\/(?:Users|home|tmp|private\/tmp|private\/var|var\/folders)\/|~\/|[A-Za-z]:\\)[^\s<>"'`]+/g, "[local path omitted]");
 }
 
-class LinearFailure extends Error {
+type RateLimitWait = { delay: number; basis: "retry-after" | "reset" | "fallback"; retryAfterSeconds?: number };
+function serverSkew(response: Response) {
+  const date = Date.parse(response.headers.get("date") ?? "");
+  const skew = Number.isFinite(date) ? date - Date.now() : 0;
+  return Math.abs(skew) < 5000 ? 0 : skew;
+}
+
+export class LinearFailure extends Error {
   constructor(readonly retryAfterMs = 0) { super("Linear could not confirm synchronization. Check the connection and host credential; execution is waiting."); }
 }
 
-/** The bridge owns HTTP and its outbox; execution queues only inspect cached gates. */
 export class LinearService {
   private readonly records = new Map<string, Stored>();
   private readonly saved = new Map<string, string>();
@@ -86,6 +92,15 @@ export class LinearService {
   private pumping = false;
   private closed = false;
   private retryUntil = 0;
+  private readonly activeTeams = new Map<string, string | undefined>();
+  private readonly statuses = new Map<string, string>();
+  private readonly usage: { minute: number; requests: number; complexity: number }[] = [];
+  private limits?: LinearBridgeStatus["limits"];
+  private lastLimit?: LinearBridgeStatus["lastRateLimit"];
+  private limitLoggedAt = 0;
+  private limitStreak = 0;
+  private recovering = false;
+  private probe?: Promise<void>;
 
   constructor(private readonly config: Config, private readonly key: Buffer) {
     this.directory = join(config.stateDir, "linear");
@@ -119,17 +134,15 @@ export class LinearService {
   private register(kind: Stored["kind"], value: { id: string; projectId: string; title: string; status: string }, description: string, optedInAtCreation: boolean, existing?: string, parentKey?: string) {
     const recordKey = keyOf(kind, value.id), prior = this.records.get(recordKey);
     if (prior) {
+      this.statuses.set(recordKey, value.status);
       this.configuration(prior);
       if (prior.projectId !== value.projectId || prior.parentKey !== parentKey || (existing && prior.lookup !== existing))
         prior.blocked ??= "The Linear issue binding changed. Start a newly approved run with the intended issue.";
       prior.terminal = terminalStatuses.has(value.status); this.save(prior); return prior;
     }
-    // A current project mapping must never enroll an older local run. Only a
-    // run that persisted its creation-time choice can create a new outbox row.
     if (!optedInAtCreation) return undefined;
     const project = this.config.projects.find(project => project.id === value.projectId);
     if (!project?.linear) return undefined;
-    // Linear requires UUID v4 create IDs; older local IDs may use another UUID version.
     const createId = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i.test(value.id) ? value.id : randomUUID();
     const stored: Stored = { kind, id: value.id, projectId: value.projectId, teamId: project.linear.teamId, ...(project.linear.projectId ? { linearProjectId: project.linear.projectId } : {}),
       endpoint: this.config.linear?.endpoint ?? endpoint, lookup: existing ?? createId, existing: Boolean(existing),
@@ -137,12 +150,13 @@ export class LinearService {
       attempted: false, failures: 0, retryAt: 0, terminal: terminalStatuses.has(value.status), comments: {},
     };
     this.records.set(recordKey, stored); this.fresh.set(recordKey, { requested: 1, verified: 0, queued: new Set(), readRequested: false });
+    this.statuses.set(recordKey, value.status);
     this.configuration(stored); this.save(stored);
     if (parentKey) { const parent = this.records.get(parentKey); if (parent) this.force(parent); }
     return stored;
   }
-  private comment(stored: Stored, event: string, text: string) {
-    const body = sharedText(text), eventKey = hash({ event, body });
+  private comment(stored: Stored, event: string, text: string, keyText = text) {
+    const body = sharedText(text), eventKey = hash({ event, body: sharedText(keyText) });
     if (stored.comments[eventKey]) return;
     if (Object.keys(stored.comments).length >= 256 || Buffer.byteLength(body) > 64000) {
       stored.blocked ??= "Linear evidence exceeded its bounded outbox. Review the saved execution before starting another run.";
@@ -153,16 +167,16 @@ export class LinearService {
   }
   updateGoal(goal: ProductGoal, optedInAtCreation = false): LinearTrackingView | undefined {
     const description = [goal.objective, `Success criteria:\n${goal.successCriteria}`, `Non-goals:\n${goal.nonGoals.join("\n") || "None specified"}`,
-      `Approved paths: ${goal.allowedPaths.join(", ")}`, `Limits: ${goal.maxRuns} feature runs; ${goal.maxMinutes} minutes; ${goal.maxMembers} agent attempts; ${goal.parallelism} parallel members.`,
+      `Approved paths: ${goal.allowedPaths.join(", ")}`, `Limits: ${goal.standing ? `standing objective, a cycle every ${goal.standing.cadenceMinutes} minutes; per cycle` : `${goal.maxRuns} feature runs`}; ${goal.maxMinutes} minutes; ${goal.maxMembers} agent attempts; ${goal.parallelism} parallel members.`,
       ...(goal.evidence.length ? [`Provided evidence:\n${goal.evidence.join("\n")}`] : [])].join("\n\n");
     const stored = this.register("goal", goal, description, optedInAtCreation, goal.linearIssueId);
     if (!stored) return goal.linearIssueId ? { status: "blocked", reason: "Configure Linear for this project before linking an existing issue." } : undefined;
+    this.activeTeams.set(keyOf("goal", goal.id), goal.activeTeamId);
     for (const direction of goal.steering) this.comment(stored, `direction:${direction.revision}`, `User direction for goal revision ${direction.revision}:\n\n${direction.text}\n\nThe approved scope and execution limits remain in force.`);
     for (const outcome of goal.outcomes) this.comment(stored, `outcome:${outcome.revision}`, `User-recorded product outcome: ${outcome.result}\n\n${outcome.summary}\n\nEvidence:\n${outcome.evidence}`);
-    if (evidenceStatuses.has(goal.status)) this.comment(stored, `status:${goal.revision}:${goal.status}`, `Infinite goal execution\n\nStatus: ${goal.status}\nFeature runs: ${goal.cycles.length}\nAgent attempts: ${goal.memberCount}\n\nThis is local execution evidence. Linear's workflow status has not been changed.`);
+    if (evidenceStatuses.has(goal.status)) { const status = (name: string) => `${name} goal execution\n\nStatus: ${goal.status}\nFeature runs: ${goal.cycles.length}\nAgent attempts: ${goal.memberCount}\n\nThis is local execution evidence. Linear's workflow status has not been changed.`; this.comment(stored, `status:${goal.revision}:${goal.status}`, status(reportName(this.config)), status(DEFAULT_REPORT_NAME)); }
     this.save(stored); return this.view(stored);
   }
-  /** `resumable` is the host's current answer for a blocked run; the blocked evidence waits for it. */
   updateTeam(run: TeamRun | TeamView, optedInAtCreation = false, resumable?: boolean): LinearTrackingView | undefined {
     const parentKey = run.goal ? keyOf("goal", run.goal.id) : undefined;
     const stored = this.register("team", run, run.objective, optedInAtCreation, undefined, parentKey);
@@ -188,10 +202,10 @@ export class LinearService {
       clock.queued.add(member.memberId); this.force(stored);
       if (parentKey) { const parent = this.records.get(parentKey); if (parent) this.force(parent); }
     }
-    for (const direction of run.steering) this.comment(stored, `direction:${direction.revision}`, `User direction for feature revision ${direction.revision}:\n\n${direction.text}\n\nThe approved scope and execution limits remain in force.`);
+    for (const direction of run.steering) this.comment(stored, `direction:${direction.revision}`, `${direction.source ? inputSourceLabel(direction.source) : "User"} direction for feature revision ${direction.revision}:\n\n${direction.text}\n\nThe approved scope and execution limits remain in force.`);
     if (!run.missionId) for (const decision of run.decisions) {
-      this.comment(stored, `question:${decision.id}`, `Agent question for feature revision ${decision.revision}:\n\n${decision.question}`);
-      if (decision.answer) this.comment(stored, `answer:${decision.id}`, `${decision.answeredBy === "coordinator" ? "Coordinator" : "User"} answer for feature revision ${decision.revision}:\n\n${decision.answer}`);
+      this.comment(stored, `question:${decision.id}`, `Agent question for feature revision ${decision.revision}:\n\n${decisionAuthorityQuestion(decision)}${decision.recommendation ? `\n\n${recommendationLine(decision.recommendation)}` : ""}`);
+      if (decision.answer) this.comment(stored, `answer:${decision.id}`, `${decision.answeredBy === "connector" ? decisionAnswerLabel(decision) : decision.answeredBy === "coordinator" ? "Coordinator" : "User"} answer for feature revision ${decision.revision}:\n\n${decision.answer}`);
     }
     if (run.brief) this.comment(stored, `brief:${run.revision}`, [`Proposed feature: ${run.brief.title}`, run.brief.problem,
       `Acceptance criteria:\n${run.brief.acceptance.join("\n")}`, `Expected outcome:\n${run.brief.expectedOutcome}`].join("\n\n"));
@@ -206,45 +220,75 @@ export class LinearService {
     }
     if (evidenceStatuses.has(run.status) && (run.status !== "blocked" || resumable !== undefined && !run.missionId)) {
       const checks = run.checks.filter(check => check.revision === run.revision);
-      // A goal's runs are resumed from the goal; the team resume route refuses them.
       const flag = run.status === "blocked" ? `Reason: ${sharedText(run.reason ?? "not recorded")}\nNext step: ${run.goal ? "inspect the goal that owns this run, then approve new work for it if it should continue."
         : resumable ? `run \`infinite team resume ${run.id}\` to replan from the integrated work.` : "inspect the run's evidence, then start a new run to continue."}\n` : "";
-      this.comment(stored, `status:${run.revision}:${run.status}`, `Infinite feature execution\n\nStatus: ${run.status}\n${flag}Agent attempts: ${run.members.length}\nChecks passed: ${checks.filter(check => check.status === "passed").length}/${checks.length}\nIndependent review: ${run.review?.verdict ?? "not recorded"}\n\nChecks and review describe code readiness. They do not establish a product outcome or change Linear's workflow status.`);
+      const status = (name: string) => `${name} feature execution\n\nStatus: ${run.status}\n${flag}Agent attempts: ${run.members.length}\nChecks passed: ${checks.filter(check => check.status === "passed").length}/${checks.length}\nIndependent review: ${run.review?.verdict ?? "not recorded"}\n\nChecks and review describe code readiness. They do not establish a product outcome or change Linear's workflow status.`;
+      this.comment(stored, `status:${run.revision}:${run.status}`, status(reportName(this.config)), status(DEFAULT_REPORT_NAME));
     }
-    // Flag a blocked run on its issue; the label follows the host's status, never the reverse.
-    if (!run.missionId && run.status === "blocked" && stored.label !== "added" && stored.label !== "add") { stored.label = "add"; stored.labelFailures = 0; stored.labelRetryAt = 0; }
-    else if ((run.missionId || run.status !== "blocked") && (stored.label === "added" || stored.label === "add")) { stored.label = "remove"; stored.labelFailures = 0; stored.labelRetryAt = 0; }
+    if (!run.missionId && run.status === "blocked" && stored.label !== "added" && stored.label !== "add") { stored.label = "add"; stored.labelVersion = (stored.labelVersion ?? 0) + 1; stored.labelFailures = 0; stored.labelRetryAt = 0; }
+    else if ((run.missionId || run.status !== "blocked") && (stored.label === "added" || stored.label === "add")) { stored.label = "remove"; stored.labelVersion = (stored.labelVersion ?? 0) + 1; stored.labelFailures = 0; stored.labelRetryAt = 0; }
     this.save(stored); return this.view(stored);
   }
   getGoal(id: string) { return this.get("goal", id); }
-  getTeam(id: string) { return this.get("team", id); }
-  private get(kind: Stored["kind"], id: string) {
+  getTeam(id: string, current = false) { return this.get("team", id, current); }
+  async confirmTeam(id: string): Promise<LinearTrackingView | undefined> {
+    const deadline = Date.now() + confirmWaitMs;
+    while (this.timer && !this.closed && Date.now() < deadline && Date.now() >= this.retryUntil && this.get("team", id, true)?.status === "pending")
+      await new Promise(resolve => setTimeout(resolve, 100));
+    return this.get("team", id, true);
+  }
+  private get(kind: Stored["kind"], id: string, current = false) {
     const stored = this.records.get(keyOf(kind, id));
     if (!stored) return undefined;
-    if (!this.isFresh(stored)) this.clock(stored).readRequested = true;
-    return this.view(stored);
+    if (stored.error || !this.isFresh(stored, this.window(stored, !current))) this.clock(stored).readRequested = true;
+    return this.view(stored, !current);
   }
-  private isFresh(stored: Stored) {
+  private gating(stored: Stored) {
+    if (stored.blocked) return false;
+    if (!stored.terminal) return true;
+    const parent = stored.kind === "team" && stored.parentKey ? this.records.get(stored.parentKey) : undefined;
+    return Boolean(parent && !parent.terminal && !parent.blocked && this.activeTeams.get(stored.parentKey!) === stored.id);
+  }
+  private window(stored: Stored, relaxed: boolean) {
+    const restartable = stored.kind === "team" && !stored.blocked && this.statuses.get(keyOf(stored.kind, stored.id)) === "blocked";
+    return relaxed && !restartable && !this.gating(stored) ? settledFreshnessMs : freshnessMs;
+  }
+  private isFresh(stored: Stored, windowMs = freshnessMs) {
     const clock = this.clock(stored);
-    return Boolean(stored.issue && stored.checkedAt && Date.now() - Date.parse(stored.checkedAt) < freshnessMs && clock.verified === clock.requested);
+    return Boolean(stored.issue && stored.checkedAt && Date.now() - Date.parse(stored.checkedAt) < windowMs && clock.verified === clock.requested);
   }
   private pendingComments(stored: Stored) { return Object.values(stored.comments).some(comment => !comment.delivered); }
-  private pendingLabel(stored: Stored) { return (stored.label === "add" || stored.label === "remove") && (stored.labelRetryAt ?? 0) <= Date.now(); }
-  // Unanswered requests are never evicted; at the cap further optional renames wait rather than lose that evidence.
+  private pendingLabel(stored: Stored) { return (stored.label === "add" || stored.label === "remove") && (stored.labelRetryAt ?? 0) <= Date.now() && (stored.labelProviderRetryAt ?? 0) <= Date.now(); }
   private pendingRetitle(stored: Stored) { return Boolean(stored.retitle && (stored.retitleRetryAt ?? 0) <= Date.now() && (stored.retitleSent?.length ?? 0) < RETITLE_SENT_LIMIT); }
-  private view(stored: Stored): LinearTrackingView {
+  private view(stored: Stored, relaxed = false): LinearTrackingView {
     this.configuration(stored);
-    const { issue } = stored;
-    const view: LinearTrackingView = { status: "pending", ...(stored.checkedAt ? { checkedAt: stored.checkedAt } : {}),
-      ...(issue ? { issue: { id: issue.id, identifier: issue.identifier, url: issue.url, title: issue.title, description: issue.description, state: { name: issue.state.name, type: issue.state.type }, updatedAt: issue.updatedAt } } : {}) };
-    if (stored.blocked) return { ...view, status: "blocked", reason: stored.blocked };
+    const issue: LinearIssueView | undefined = stored.issue ? {
+      id: stored.issue.id, identifier: stored.issue.identifier, url: stored.issue.url,
+      title: stored.issue.title, description: stored.issue.description,
+      state: { name: stored.issue.state.name, type: stored.issue.state.type }, updatedAt: stored.issue.updatedAt,
+    } : undefined;
+    const checked = stored.checkedAt ? { checkedAt: stored.checkedAt } : {};
+    const withIssue = issue ? { issue } : {};
+    if (stored.blocked) return { status: "blocked", reason: stored.blocked, ...checked, ...withIssue };
+    const waiting = (status: "pending" | "error", reason: string): LinearTrackingView => {
+      const retryAt = this.retryUntil > Date.now() ? Math.max(this.retryUntil, stored.retryAt) : 0;
+      const waitReason = retryAt ? rateLimitReason(retryAt) : reason;
+      const retry = retryAt ? { retryAt: at(retryAt) } : {};
+      if (status === "error") return { status: "error", reason: waitReason, ...checked, ...retry, ...withIssue };
+      return { status: "pending", reason: waitReason, ...checked, ...retry, ...withIssue };
+    };
     if (stored.parentKey) {
-      const parent = this.records.get(stored.parentKey), gate = parent ? this.view(parent) : undefined;
-      if (!gate || gate.status !== "synced") return { ...view, status: gate?.status ?? "pending", reason: gate?.reason ?? "Waiting for the parent goal's Linear issue." };
+      const parent = this.records.get(stored.parentKey), current = !relaxed || this.gating(stored);
+      if (parent && current && !this.isFresh(parent)) this.clock(parent).readRequested = true;
+      const gate = parent ? this.view(parent, !current) : undefined;
+      if (gate?.status === "blocked") return { status: "blocked", reason: gate.reason, ...checked, ...withIssue };
+      if (!gate || gate.status !== "synced") return waiting(gate?.status === "error" ? "error" : "pending", gate?.reason ?? "Waiting for the parent goal's Linear issue.");
     }
-    if (stored.error) return { ...view, status: "error", reason: stored.error };
-    if (!this.isFresh(stored) || this.pendingComments(stored)) return { ...view, reason: "Waiting for Linear to confirm current requirements and execution evidence." };
-    return { ...view, status: "synced" };
+    if (stored.error) return waiting("error", stored.error);
+    if (!issue || !this.isFresh(stored, this.window(stored, relaxed)) || this.pendingComments(stored)) {
+      return waiting("pending", "Waiting for Linear to confirm current requirements and execution evidence.");
+    }
+    return { status: "synced", issue, ...checked };
   }
   start() {
     if (this.timer || this.closed) return;
@@ -278,15 +322,12 @@ export class LinearService {
     const prior = stored.issue;
     if (!created) {
       const sent = Boolean(stored.retitleSent?.some(value => value.title === issue.title)) && issue.title !== prior?.title;
-      // Keep legacy scope hashes stable, but a title-only exception must also preserve an unconfigured project.
       if ((stored.retitle || stored.retitleSent?.length || sent) && prior && (issue.project?.id ?? null) !== (prior.project?.id ?? null))
         stored.blocked ??= "The Linear issue requirements or parent changed. Review the updated issue and start a newly approved run.";
       if (!stored.blocked && sent && stored.baseline && prior && stored.baseline === scopeHash(prior, stored.linearProjectId)
         && scopeHash(issue, stored.linearProjectId) === scopeHash({ ...prior, title: issue.title }, stored.linearProjectId)) {
         stored.baseline = scopeHash(issue, stored.linearProjectId);
-        // Seeing the sent title land proves one of its requests committed, so its failure backoff no longer applies.
         stored.retitleFailures = 0; stored.retitleRetryAt = 0;
-        // A rename that landed late is accepted, then the issue is renamed back to the newest title.
         if (stored.retitleWanted && issue.title !== stored.retitleWanted) stored.retitle ??= stored.retitleWanted;
       }
       if (!stored.blocked && stored.retitleWanted !== undefined && issue.title === stored.retitleWanted) {
@@ -301,7 +342,6 @@ export class LinearService {
     if (Date.now() < this.retryUntil) return;
     const records = [...this.records.values()];
     for (const stored of records) this.configuration(stored);
-    // One pump serializes all writes made with the host's configured key.
     const initial = records.filter(value => {
       if (value.issue || value.blocked || value.retryAt > Date.now()) return false;
       if (!value.parentKey) return true;
@@ -314,10 +354,24 @@ export class LinearService {
     }
     const due = records.filter(stored => stored.issue && this.configuration(stored) && stored.retryAt <= Date.now() && !this.isFresh(stored)
       && (stored.blocked ? this.clock(stored).readRequested
-        : !stored.terminal || this.pendingComments(stored) || this.pendingLabel(stored) || this.pendingRetitle(stored) || this.clock(stored).readRequested || this.clock(stored).requested !== this.clock(stored).verified));
-    for (let index = 0; index < Math.min(due.length, 1000); index += 100) {
+        : this.gating(stored) || this.pendingComments(stored) || this.pendingLabel(stored) || this.pendingRetitle(stored) || this.clock(stored).readRequested || this.clock(stored).requested !== this.clock(stored).verified));
+    const batches: Stored[][] = [];
+    let bytes = 0;
+    const size = (stored: Stored) => Buffer.byteLength(JSON.stringify(stored.issue)) + 256;
+    const fits = (stored: Stored) => batches.length > 0 && batches.at(-1)!.length < 100 && bytes + size(stored) <= maxResponseBytes / 2;
+    for (const stored of due) {
+      if (fits(stored)) batches.at(-1)!.push(stored); else { batches.push([stored]); bytes = 0; }
+      bytes += size(stored);
+    }
+    const age = (stored: Stored) => Date.now() - Date.parse(stored.checkedAt!);
+    for (const stored of records.filter(value => value.issue && value.checkedAt && !value.blocked && value.retryAt <= Date.now() && !due.includes(value)
+      && age(value) > this.window(value, true) / 2).sort((a, b) => age(b) - age(a))) {
+      if (!fits(stored)) break;
+      batches.at(-1)!.push(stored); bytes += size(stored);
+    }
+    for (const batch of batches.slice(0, 10)) {
       if (this.closed) return;
-      const batch = due.slice(index, index + 100), generations = batch.map(stored => this.clock(stored).requested);
+      const generations = batch.map(stored => this.clock(stored).requested);
       try {
         const issues = await this.issues([...new Set(batch.map(stored => stored.issue!.id))]);
         if (this.closed) return;
@@ -336,7 +390,7 @@ export class LinearService {
     }
     for (const stored of records.filter(value => value.issue && !value.blocked && value.retryAt <= Date.now() && this.isFresh(value))) {
       if (this.closed) return;
-      if (this.pendingRetitle(stored) && Date.now() >= this.retryUntil) {
+      if (this.pendingRetitle(stored) && this.open()) {
         try { await this.applyRetitle(stored); }
         catch (error) {
           if (this.closed) return;
@@ -351,10 +405,17 @@ export class LinearService {
         }
         this.success(stored);
       } catch (error) { this.failure(stored, error); continue; }
-      if (this.pendingLabel(stored) && Date.now() >= this.retryUntil) {
-        try { await this.applyLabel(stored); }
+      if (this.pendingLabel(stored) && this.open()) {
+        const intent = stored.label;
+        if (intent !== "add" && intent !== "remove") continue;
+        const version = stored.labelVersion ?? 0;
+        try { await this.applyLabel(stored, intent, version); }
         catch (error) {
           if (this.closed) return;
+          const retryAt = error instanceof LinearFailure && error.retryAfterMs > 0 ? Date.now() + error.retryAfterMs : 0;
+          const providerDeferred = retryAt > (stored.labelProviderRetryAt ?? 0);
+          if (providerDeferred) stored.labelProviderRetryAt = retryAt;
+          if (stored.label !== intent || (stored.labelVersion ?? 0) !== version) { if (providerDeferred) this.save(stored); continue; }
           stored.labelFailures = (stored.labelFailures ?? 0) + 1;
           const backoff = Math.min(30 * 60000, 30000 * 2 ** Math.min(stored.labelFailures - 1, 6));
           stored.labelRetryAt = Date.now() + Math.max(backoff, error instanceof LinearFailure ? error.retryAfterMs : 0); this.save(stored);
@@ -388,7 +449,6 @@ export class LinearService {
   }
   private async applyRetitle(stored: Stored) {
     const prior = stored.issue!, title = stored.retitle!, generation = this.clock(stored).requested;
-    // The desired title can change during the request; retain the attempted title even if its acknowledgement is lost.
     const attempt = { id: randomUUID(), title }, delivery = { sent: false, answered: false };
     stored.retitleSent = [...(stored.retitleSent ?? []), attempt]; this.save(stored);
     let updated: Issue;
@@ -398,39 +458,40 @@ export class LinearService {
       if (this.closed) return;
       updated = z.object({ success: z.literal(true), issue: issueSchema }).parse(data.issueUpdate).issue;
     } catch (error) {
-      // Only a request that may still commit keeps its evidence.
       if (!delivery.sent || delivery.answered) { stored.retitleSent = stored.retitleSent?.filter(value => value.id !== attempt.id); this.save(stored); }
       throw error;
     }
     this.accept(stored, updated, generation);
-    // Only this request is resolved; another unanswered request for the same title may still commit later.
     stored.retitleSent = stored.retitleSent?.filter(value => value.id !== attempt.id); this.save(stored);
   }
-  // Label requests are optional: a rate limit on them backs off only the label, never the shared transport.
-  private async applyLabel(stored: Stored) {
-    const adding = stored.label === "add", teamId = stored.issue!.team.id, cached = this.labels.has(teamId);
+  private async applyLabel(stored: Stored, intent: "add" | "remove", version: number) {
+    const adding = intent === "add", teamId = stored.issue!.team.id, cached = this.labels.has(teamId);
+    const current = () => stored.label === intent && (stored.labelVersion ?? 0) === version;
     const change = async (labelId: string) => {
       const mutation = adding ? "issueAddLabel" : "issueRemoveLabel", operation = adding ? "InfiniteLinearIssueAddLabel" : "InfiniteLinearIssueRemoveLabel";
       const data = await this.graphql(operation, `mutation ${operation}($id: String!, $labelId: String!) { ${mutation}(id: $id, labelId: $labelId) { success } }`, { id: stored.issue!.id, labelId }, false);
       z.object({ success: z.literal(true) }).parse(data[mutation]);
     };
     let labelId = await this.blockedLabel(teamId, adding);
-    if (this.closed) return;
+    if (this.closed || !current()) return;
     if (labelId) {
       try { await change(labelId); }
       catch (error) {
-        // A rate limit keeps its delay; any other failure may mean the cached label was deleted in Linear.
         if (error instanceof LinearFailure && error.retryAfterMs > 0) throw error;
+        if (!current()) return;
         this.labels.delete(teamId);
         if (!cached || this.closed) throw error;
         labelId = await this.blockedLabel(teamId, adding);
+        if (this.closed || !current()) return;
         if (labelId) await change(labelId);
       }
-      if (this.closed) return;
+      if (this.closed || !current()) return;
     }
-    stored.label = adding ? "added" : undefined; stored.labelFailures = 0; stored.labelRetryAt = 0; this.save(stored);
+    if (!current()) return;
+    stored.label = adding ? "added" : undefined; stored.labelFailures = 0; stored.labelRetryAt = 0;
+    if ((stored.labelProviderRetryAt ?? 0) <= Date.now()) stored.labelProviderRetryAt = undefined;
+    this.save(stored);
   }
-  /** The team's own Blocked label, else a workspace one; created in the team only when adding. */
   private async blockedLabel(teamId: string, create: boolean) {
     const cached = this.labels.get(teamId);
     if (cached) return cached;
@@ -447,7 +508,7 @@ export class LinearService {
   private async issues(ids: string[]) {
     const result = new Map<string, Issue>(); let after: string | undefined;
     for (let page = 0; page < 3; page++) {
-      const data = await this.graphql("InfiniteLinearIssues", `query InfiniteLinearIssues($filter: IssueFilter!, $first: Int!, $after: String) { issues(filter: $filter, includeArchived: true, first: $first, after: $after) { nodes { ${issueFields} } pageInfo { hasNextPage endCursor } } }`, { filter: { id: { in: ids } }, first: 100, ...(after ? { after } : {}) });
+      const data = await this.graphql("InfiniteLinearIssues", `query InfiniteLinearIssues($filter: IssueFilter!, $first: Int!, $after: String) { issues(filter: $filter, includeArchived: true, first: $first, after: $after) { nodes { ${issueFields} } pageInfo { hasNextPage endCursor } } }`, { filter: { id: { in: ids } }, first: Math.min(100, Math.max(1, ids.length)), ...(after ? { after } : {}) });
       const connection = z.object({ nodes: z.array(issueSchema).max(100), pageInfo: z.object({ hasNextPage: z.boolean(), endCursor: z.string().nullable() }) }).parse(data.issues);
       for (const issue of connection.nodes) {
         if (!ids.includes(issue.id) || result.has(issue.id)) throw new LinearFailure();
@@ -479,7 +540,9 @@ export class LinearService {
     const result = z.object({ success: z.literal(true), comment: commentSchema }).parse(data.commentCreate);
     verify(result.comment);
   }
-  /** `shared` rate limits pause every request; an optional request reports its delay to its caller instead. */
+  request(operationName: string, query: string, variables: unknown): Promise<Record<string, unknown>> {
+    return this.graphql(operationName, query, variables);
+  }
   private async graphql(operationName: string, query: string, variables: unknown, shared = true, delivery?: { sent: boolean; answered: boolean }): Promise<Record<string, unknown>> {
     if (this.closed) throw new LinearFailure();
     if (Date.now() < this.retryUntil) throw new LinearFailure(this.retryUntil - Date.now());
@@ -490,12 +553,15 @@ export class LinearService {
     let token: string;
     try { token = readFileSync(api.apiKeyFile, "utf8").trim(); } catch { throw new LinearFailure(); }
     if (!token || token.length > 8192 || /\s/.test(token)) throw new LinearFailure();
+    const admission = await this.admit(shared);
     const controller = new AbortController(); this.requests.add(controller);
     const timeout = setTimeout(() => controller.abort(), 10000); timeout.unref();
     try {
       if (delivery) delivery.sent = true;
+      this.tally(1, 0);
       const response = await fetch(url, { method: "POST", redirect: "error", signal: controller.signal,
         headers: { Authorization: token, "Content-Type": "application/json" }, body: JSON.stringify({ operationName, query, variables }) });
+      const seen = this.observe(response, operationName);
       const reader = response.body?.getReader();
       if (!reader) throw new LinearFailure();
       const chunks: Buffer[] = []; let bytes = 0;
@@ -505,22 +571,110 @@ export class LinearService {
         if (bytes > maxResponseBytes) { await reader.cancel(); throw new LinearFailure(); }
         chunks.push(Buffer.from(value));
       }
-      const body = z.object({ data: z.record(z.string(), z.unknown()).nullable().optional(), errors: z.array(z.unknown()).optional() }).parse(JSON.parse(Buffer.concat(chunks).toString("utf8")));
-      // A complete answer below 500 means the mutation either ran (its result follows) or was refused; it cannot commit later.
-      if (delivery) delivery.answered = response.status < 500;
-      if (!response.ok || body.errors?.length || !body.data) {
-        const limited = response.status === 429 || body.errors?.some(error => z.object({ extensions: z.object({ code: z.literal("RATELIMITED") }) }).safeParse(error).success);
+      let body: { data?: Record<string, unknown> | null; errors?: unknown[] } | undefined;
+      try { body = z.object({ data: z.record(z.string(), z.unknown()).nullable().optional(), errors: z.array(z.unknown()).optional() }).parse(JSON.parse(Buffer.concat(chunks).toString("utf8"))); }
+      catch (error) { if (response.status !== 429) throw error; }
+      if (delivery && (body || response.status === 429)) delivery.answered = response.status < 500;
+      if (!response.ok || !body || body.errors?.length || !body.data) {
+        const limited = response.status === 429 || body?.errors?.some(error => z.object({ extensions: z.object({ code: z.literal("RATELIMITED") }) }).safeParse(error).success);
         if (limited) {
-          const resets = ["x-ratelimit-requests-reset", "x-ratelimit-endpoint-requests-reset", "x-ratelimit-complexity-reset"].map(name => Number(response.headers.get(name))).filter(value => Number.isFinite(value) && value > Date.now());
-          const retry = Number(response.headers.get("retry-after"));
-          const delay = Math.max(1000, ...resets.map(value => value - Date.now()), Number.isFinite(retry) ? retry * 1000 : 0);
-          if (shared) this.retryUntil = Date.now() + delay;
-          throw new LinearFailure(delay);
+          this.limitStreak++;
+          const wait = this.limitDelay(response, seen);
+          if (shared) { this.retryUntil = Math.max(this.retryUntil, Date.now() + wait.delay); this.recovering = true; }
+          this.limited(operationName, response, wait, shared);
+          throw new LinearFailure(wait.delay);
         }
+        this.answered(admission.probe);
         throw new LinearFailure();
       }
+      this.answered(admission.probe);
       return body.data;
     } catch (error) { throw error instanceof LinearFailure ? error : new LinearFailure(); }
-    finally { clearTimeout(timeout); this.requests.delete(controller); }
+    finally { clearTimeout(timeout); this.requests.delete(controller); admission.release(); }
+  }
+  private async admit(shared: boolean): Promise<{ probe: boolean; release: () => void }> {
+    for (;;) {
+      if (this.closed) throw new LinearFailure();
+      if (Date.now() < this.retryUntil) throw new LinearFailure(this.retryUntil - Date.now());
+      if (!this.recovering) return { probe: false, release: () => {} };
+      if (!shared) throw new LinearFailure(fallbackPauseMs);
+      if (!this.probe) {
+        let done!: () => void;
+        this.probe = new Promise<void>(resolve => { done = resolve; });
+        return { probe: true, release: () => { this.probe = undefined; done(); } };
+      }
+      await this.probe;
+    }
+  }
+  private answered(probe: boolean) {
+    if (!probe && this.recovering) return;
+    this.limitStreak = 0;
+    this.recovering = false;
+  }
+  private limitDelay(response: Response, { requests, complexity, endpoint, cost }: ReturnType<LinearService["observe"]>): RateLimitWait {
+    const retryAfter = response.headers.get("retry-after")?.trim();
+    const stated = !retryAfter ? undefined : /^\d{1,10}$/.test(retryAfter) ? Number(retryAfter) * 1000
+      : /[A-Za-z]/.test(retryAfter) && Number.isFinite(Date.parse(retryAfter)) ? Date.parse(retryAfter) - Date.now() - serverSkew(response) : undefined;
+    if (stated !== undefined) {
+      const delay = Math.min(maxRetryAfterMs, Math.max(1000, stated));
+      return { delay, basis: "retry-after", retryAfterSeconds: Math.ceil(delay / 1000) };
+    }
+    const families = [requests, complexity, endpoint].filter((value): value is LinearLimitView => Boolean(value?.resetAt));
+    const spent = families.filter(value => value.remaining !== undefined && (value.remaining <= 0
+      || value === complexity && cost !== undefined && value.remaining < cost));
+    const resets = (spent.length ? spent : families).map(value => Date.parse(value.resetAt!) - Date.now()).filter(value => value > 0);
+    if (resets.length) return { delay: Math.min(maxPauseMs, Math.max(1000, ...resets)), basis: "reset" };
+    return { delay: Math.min(maxPauseMs, fallbackPauseMs * 2 ** Math.min(this.limitStreak - 1, 4)), basis: "fallback" };
+  }
+  private observe(response: Response, operation: string) {
+    const count = (name: string) => {
+      const value = response.headers.get(name)?.trim();
+      return value && /^\d{1,16}(?:\.\d{1,6})?$/.test(value) ? Number(value) : undefined;
+    };
+    const skew = serverSkew(response);
+    const family = (prefix: string): LinearLimitView | undefined => {
+      const limit = count(`${prefix}-limit`), remaining = count(`${prefix}-remaining`), raw = count(`${prefix}-reset`);
+      if (limit === undefined && remaining === undefined && raw === undefined) return undefined;
+      const reset = raw === undefined ? undefined : raw >= 1e12 && raw < 1e14 ? raw : raw >= 1e9 && raw < 1e11 ? raw * 1000 : undefined;
+      return { ...(limit !== undefined ? { limit } : {}), ...(remaining !== undefined ? { remaining } : {}),
+        ...(reset !== undefined ? { resetAt: new Date(reset - skew).toISOString() } : {}) };
+    };
+    const requests = family("x-ratelimit-requests"), complexity = family("x-ratelimit-complexity"), endpoint = family("x-ratelimit-endpoint-requests");
+    const cost = count("x-complexity"), name = response.headers.get("x-ratelimit-endpoint-name")?.trim(), observedAt = new Date().toISOString();
+    if (cost !== undefined) this.tally(0, cost);
+    if (!requests && !complexity && !endpoint && cost === undefined) return { requests, complexity, endpoint, cost };
+    this.limits = { observedAt, operation, ...(requests ? { requests } : {}), ...(complexity ? { complexity } : {}), ...(cost !== undefined ? { lastComplexity: cost } : {}),
+      ...(endpoint ? { endpoint: { ...endpoint, ...(name && /^[A-Za-z][A-Za-z0-9_.-]{0,99}$/.test(name) ? { name } : {}), observedAt } }
+        : this.limits?.endpoint ? { endpoint: this.limits.endpoint } : {}) };
+    return { requests, complexity, endpoint, cost };
+  }
+  private limited(operation: string, response: Response, { delay, basis, retryAfterSeconds }: RateLimitWait, shared: boolean) {
+    this.lastLimit = { at: new Date().toISOString(), operation, httpStatus: response.status,
+      ...(retryAfterSeconds !== undefined ? { retryAfterSeconds } : {}), waitSeconds: Math.ceil(delay / 1000), basis, shared };
+    if (Date.now() - this.limitLoggedAt < 60000) return;
+    this.limitLoggedAt = Date.now();
+    const limit = (label: string, value?: LinearLimitView) => value ? `${label} ${value.remaining ?? "?"}/${value.limit ?? "?"} left, resets ${value.resetAt ?? "unknown"}` : `${label} not reported`;
+    const sent = this.lastHour();
+    console.warn(`Linear rate limit on ${operation} (HTTP ${response.status}): ${shared ? "the host's Linear requests pause" : "this optional request backs off"} until ${at(Date.now() + delay)}. `
+      + `${limit("Requests", this.limits?.requests)}; ${limit("complexity", this.limits?.complexity)}${this.limits?.endpoint ? `; ${limit(`endpoint ${this.limits.endpoint.name ?? "limit"}`, this.limits.endpoint)}` : ""}. `
+      + `This host sent ${sent.requests} requests (${sent.complexity} complexity points reported) in the last hour.`);
+  }
+  private open() { return Date.now() >= this.retryUntil && !this.recovering; }
+  private tally(requests: number, complexity: number) {
+    const minute = Math.floor(Date.now() / 60000);
+    while (this.usage.length && this.usage[0].minute <= minute - 60) this.usage.shift();
+    let bucket = this.usage.at(-1);
+    if (!bucket || bucket.minute !== minute) { bucket = { minute, requests: 0, complexity: 0 }; this.usage.push(bucket); }
+    bucket.requests += requests; bucket.complexity += complexity;
+  }
+  private lastHour() {
+    const minute = Math.floor(Date.now() / 60000), live = this.usage.filter(bucket => bucket.minute > minute - 60);
+    return { requests: live.reduce((sum, bucket) => sum + bucket.requests, 0), complexity: Math.ceil(live.reduce((sum, bucket) => sum + bucket.complexity, 0)) };
+  }
+  status(): LinearBridgeStatus {
+    const records = [...this.records.values()];
+    return { configured: Boolean(this.config.linear), records: { total: records.length, gating: records.filter(stored => this.gating(stored)).length },
+      sentLastHour: this.lastHour(), ...(this.limits ? { limits: structuredClone(this.limits) } : {}),
+      ...(this.retryUntil > Date.now() ? { pausedUntil: at(this.retryUntil) } : {}), ...(this.lastLimit ? { lastRateLimit: { ...this.lastLimit } } : {}) };
   }
 }

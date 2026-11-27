@@ -24,15 +24,11 @@ MAX_LOG = 32_000
 _ACTIVE_CHILD: subprocess.Popen[bytes] | None = None
 _INTERRUPTED = False
 
-
 class BuildError(RuntimeError):
     pass
 
-
 def _safe_path(path: Path, *, allow_missing: bool = True) -> Path:
     supplied = path.expanduser().absolute()
-    # Resolve caller-provided parent directories (system temporary roots may
-    # themselves be symlink aliases), but never follow a cache-root symlink.
     missing: list[str] = []
     parent = supplied.parent
     while not parent.exists():
@@ -59,7 +55,6 @@ def _safe_path(path: Path, *, allow_missing: bool = True) -> Path:
         raise BuildError("cache root is not a directory")
     return path
 
-
 def _git(repo: Path, *args: str, timeout: float = 30) -> bytes:
     try:
         result = subprocess.run(
@@ -77,7 +72,6 @@ def _git(repo: Path, *args: str, timeout: float = 30) -> bytes:
         raise BuildError((str(detail).strip() or str(exc))[-1000:]) from exc
     return result.stdout
 
-
 def _resolve(repo: Path, ref: str) -> str:
     try:
         value = _git(repo, "rev-parse", "--verify", "--end-of-options", ref + "^{commit}").decode().strip()
@@ -86,7 +80,6 @@ def _resolve(repo: Path, ref: str) -> str:
     if len(value) not in (40, 64) or any(c not in "0123456789abcdef" for c in value.lower()):
         raise BuildError("git returned an invalid commit id")
     return value.lower()
-
 
 def _tree(repo: Path, head: str) -> tuple[dict[str, tuple[str, str]], list[str]]:
     raw = _git(repo, "ls-tree", "-r", "-z", "--full-tree", head)
@@ -108,20 +101,17 @@ def _tree(repo: Path, head: str) -> tuple[dict[str, tuple[str, str]], list[str]]
             files[name] = (oid, mode)
     return files, warnings
 
-
 def _is_resolution_input(path: str) -> bool:
     name = PurePosixPath(path).name.lower()
     if name in {"package.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock", "jsconfig.json"}:
         return True
     return name == "tsconfig.json" or (name.startswith("tsconfig.") and name.endswith(".json"))
 
-
 def _is_js_ts_source(path: str) -> bool:
     return PurePosixPath(path).suffix.lower() in {
         ".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs",
         ".ejs", ".ets", ".vue", ".svelte", ".astro",
     }
-
 
 def _read_json(path: Path) -> dict[str, Any] | None:
     try:
@@ -132,19 +122,16 @@ def _read_json(path: Path) -> dict[str, Any] | None:
     except (OSError, ValueError):
         return None
 
-
 def _graph_schema(value: dict[str, Any] | None) -> int | None:
     graph_meta = value.get("graph") if value else None
     schema = graph_meta.get("schema_version") if isinstance(graph_meta, dict) else None
     return schema if isinstance(schema, int) and not isinstance(schema, bool) else None
-
 
 def _write_graph_root(output: Path, source: Path) -> None:
     marker = output / ".graphify_root"
     if marker.is_symlink() or (marker.exists() and not marker.is_file()):
         raise BuildError("invalid Graphify source-root marker")
     marker.write_text(str(source.resolve()), encoding="utf-8")
-
 
 def _atomic_json(path: Path, value: dict[str, Any]) -> None:
     fd, temp_name = tempfile.mkstemp(prefix=".meta-", dir=path.parent)
@@ -161,7 +148,6 @@ def _atomic_json(path: Path, value: dict[str, Any]) -> None:
         except FileNotFoundError:
             pass
 
-
 def _current(root: Path) -> Path | None:
     path = root / "current"
     try:
@@ -177,6 +163,90 @@ def _current(root: Path) -> Path | None:
     except FileNotFoundError:
         return None
 
+MAX_MAP_AREAS = 120
+MAX_MAP_LINKS = 400
+MAX_MAP_BYTES = 262_144
+OTHER_AREA = "other"
+
+def _relative_source(value: Any) -> PurePosixPath | None:
+    if not isinstance(value, str) or not value or "\0" in value or value.startswith("/"):
+        return None
+    path = PurePosixPath(value)
+    if not path.name or any(part == ".." for part in path.parts):
+        return None
+    return path
+
+def _area_of(parts: tuple[str, ...], depth: int) -> str:
+    return "/".join(parts[:depth]) if parts else "."
+
+def _code_map(graph_path: Path) -> dict[str, Any] | None:
+    """Reduce a Graphify graph to directory areas and weighted cross-area links.
+
+    Returns None when the graph is missing, unreadable, or malformed. Callers keep
+    the receipt either way.
+    """
+    try:
+        graph = _read_json(graph_path)
+        if graph is None:
+            return None
+        nodes = graph.get("nodes")
+        edges = graph.get("edges") if "edges" in graph else graph.get("links", [])
+        if not isinstance(nodes, list) or not isinstance(edges, list):
+            return None
+        mapped: list[tuple[Any, PurePosixPath]] = []
+        for node in nodes:
+            if not isinstance(node, dict) or node.get("external") is True:
+                continue
+            source = _relative_source(node.get("source_file"))
+            if source is not None:
+                mapped.append((node.get("id"), source))
+        if not mapped:
+            return {"areas": [], "links": [], "truncated": {"areas": False, "links": False}}
+        max_depth = max(len(source.parent.parts) for _, source in mapped)
+        depth = next((d for d in range(max_depth, 0, -1)
+                      if len({_area_of(s.parent.parts, d) for _, s in mapped}) <= MAX_MAP_AREAS), 1)
+        area_of_file = {source: _area_of(source.parent.parts, depth) for _, source in mapped}
+        file_counts: dict[str, set[PurePosixPath]] = {}
+        symbol_counts: dict[str, int] = {}
+        for _, source in mapped:
+            area = area_of_file[source]
+            file_counts.setdefault(area, set()).add(source)
+            symbol_counts[area] = symbol_counts.get(area, 0) + 1
+        overflow = len(symbol_counts) > MAX_MAP_AREAS
+        remap = {area: area for area in symbol_counts}
+        if overflow:
+            ranked = sorted((a for a in symbol_counts if a != OTHER_AREA), key=lambda a: (-symbol_counts[a], a))
+            kept = set(ranked[:MAX_MAP_AREAS - 1])
+            remap = {area: area if area in kept else OTHER_AREA for area in symbol_counts}
+        areas: dict[str, dict[str, Any]] = {}
+        for area, files in file_counts.items():
+            target = remap[area]
+            entry = areas.setdefault(target, {"files": set(), "symbols": 0})
+            entry["files"].update(files)
+            entry["symbols"] += symbol_counts[area]
+        node_area: dict[str, str] = {}
+        for node_id, source in mapped:
+            if isinstance(node_id, str) and node_id not in node_area:
+                node_area[node_id] = remap[area_of_file[source]]
+        weights: dict[tuple[str, str], int] = {}
+        for edge in edges:
+            if not isinstance(edge, dict):
+                continue
+            first, second = node_area.get(edge.get("source")), node_area.get(edge.get("target"))
+            if first is None or second is None or first == second:
+                continue
+            key = (first, second) if first < second else (second, first)
+            weights[key] = weights.get(key, 0) + 1
+        ranked_links = sorted(weights.items(), key=lambda item: (-item[1], item[0][0], item[0][1]))
+        return {
+            "areas": [{"id": area, "files": len(entry["files"]), "symbols": entry["symbols"]}
+                      for area, entry in sorted(areas.items())],
+            "links": [{"source": key[0], "target": key[1], "weight": weight}
+                      for key, weight in ranked_links[:MAX_MAP_LINKS]],
+            "truncated": {"areas": overflow, "links": len(ranked_links) > MAX_MAP_LINKS},
+        }
+    except Exception:
+        return None
 
 def _result(status: str, *, graph: Path | None = None, head: str | None = None,
             requested: str | None = None, mode: str | None = None,
@@ -190,8 +260,14 @@ def _result(status: str, *, graph: Path | None = None, head: str | None = None,
         result["reason"] = reason[:500]
     if warnings:
         result["warnings"] = list(dict.fromkeys(w[:200] for w in warnings))[:8]
+    if status in ("ready", "unchanged") and graph is not None:
+        code_map = _code_map(graph)
+        if code_map is not None:
+            if len(json.dumps(code_map, separators=(",", ":")).encode("utf-8")) > MAX_MAP_BYTES:
+                result["mapStatus"] = "too-large"
+            else:
+                result["map"] = code_map
     return result
-
 
 def _run(command: list[str], *, cwd: Path, env: dict[str, str], timeout: float,
          logs: Path, label: str) -> None:
@@ -241,19 +317,15 @@ def _run(command: list[str], *, cwd: Path, env: dict[str, str], timeout: float,
     if code:
         raise BuildError("Graphify command failed; see bounded private logs")
 
-
 def _handle_sigterm(_signum: int, _frame: Any) -> None:
     global _INTERRUPTED
     _INTERRUPTED = True
     child = _ACTIVE_CHILD
     if child is not None and child.poll() is None:
         try:
-            # Graphify runs in a private process group, so terminate its full
-            # descendant tree when the host stops this builder.
             os.killpg(child.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
-
 
 def _ensure_safe_entries(root: Path) -> None:
     for name in ("lock", "generations", "logs", "current"):
@@ -276,14 +348,12 @@ def _ensure_safe_entries(root: Path) -> None:
                 if directory_name == "logs" and not child.is_file():
                     raise BuildError("invalid log entry")
 
-
 def _assert_no_symlinks(path: Path) -> None:
     if path.is_symlink():
         raise BuildError("symlink in cached generation")
     if path.is_dir():
         for child in path.iterdir():
             _assert_no_symlinks(child)
-
 
 def _version(executable: str) -> str:
     try:
@@ -296,7 +366,6 @@ def _version(executable: str) -> str:
     if not value or len(value) > 100:
         raise BuildError("invalid Graphify version response")
     return value
-
 
 def _dependent_sources(graph_path: Path, affected_sources: set[str],
                        live_sources: set[str], initial_target_ids: set[str] | None = None) -> set[str]:
@@ -332,7 +401,6 @@ def _dependent_sources(graph_path: Path, affected_sources: set[str],
         target_ids = node_ids_for(newly_affected)
     return affected_files
 
-
 def _newly_resolved_dependents(baseline_graph_path: Path, current_graph_path: Path,
                                changed_sources: set[str], live_sources: set[str],
                                already_affected: set[str]) -> set[str]:
@@ -350,10 +418,6 @@ def _newly_resolved_dependents(baseline_graph_path: Path, current_graph_path: Pa
                         and isinstance(n.get("id"), str)}
     resolved_ids: set[str] = set()
     for external_id in external_ids:
-        # Graphify names unresolved module anchors `ref_<module>` but emits a
-        # concrete file anchor as `<module>` when that source is added. Compare
-        # the normalized module identity as well as exact node IDs so `ref_api`
-        # correctly maps to the new `api` anchor and its `api_*` declarations.
         aliases = {external_id}
         if external_id.startswith("ref_"):
             aliases.add(external_id[4:])
@@ -369,10 +433,6 @@ def _newly_resolved_dependents(baseline_graph_path: Path, current_graph_path: Pa
         and n["id"] not in previous_provider_ids for n in new_nodes
     )
     if introduced_js_provider:
-        # Unresolved module IDs omit the importing directory. New concrete IDs
-        # include it, so string normalization cannot safely resolve these links.
-        # Revisit unresolved JS/TS consumers only when a provider is introduced;
-        # ordinary body edits still reuse their unchanged graph entries.
         unresolved_consumers = {
             edge["source_file"] for edge in baseline.get("links", [])
             if isinstance(edge, dict) and edge.get("target") in external_ids
@@ -382,7 +442,6 @@ def _newly_resolved_dependents(baseline_graph_path: Path, current_graph_path: Pa
         affected.update(unresolved_consumers)
         affected.update(_dependent_sources(baseline_graph_path, unresolved_consumers, live_sources))
     return affected - already_affected
-
 
 def build(args: argparse.Namespace) -> dict[str, Any]:
     repo = Path(args.repo).expanduser().resolve(strict=True)
@@ -511,9 +570,6 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
                 if baseline_ok and baseline:
                     _assert_no_symlinks(baseline / "source")
                     _assert_no_symlinks(baseline / "out" / "graphify-out")
-                    # Source blobs are immutable once committed. Hard links make
-                    # warm snapshots cheap; changed files are replaced via a new
-                    # inode and deletions unlink only this generation's name.
                     shutil.copytree(baseline / "source", source, copy_function=os.link)
                     shutil.copytree(baseline / "out" / "graphify-out", out / "graphify-out", copy_function=shutil.copy2)
                     _write_graph_root(out / "graphify-out", source)
@@ -612,9 +668,6 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
                 temp_link = root / (".current-" + gen_id)
                 os.symlink("generations/" + gen_id, temp_link)
                 os.replace(temp_link, root / "current")
-                # Keep the prior generation for 24 hours so already-returned
-                # immutable paths survive normal queued-agent runs. Keep at most
-                # two newer generations regardless of age.
                 now = time.time()
                 generations_by_age = sorted(generations.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
                 for index, old in enumerate(generations_by_age):
@@ -636,7 +689,6 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             return _result("failed", graph=graph, head=(meta or {}).get("head"),
                            requested=requested, reason=str(exc))
 
-
 def main() -> int:
     signal.signal(signal.SIGTERM, _handle_sigterm)
     parser = argparse.ArgumentParser()
@@ -657,7 +709,6 @@ def main() -> int:
             result = _result("failed", reason=str(exc))
     sys.stdout.write(json.dumps(result, separators=(",", ":")) + "\n")
     return 0 if result["status"] in ("ready", "unchanged") else 2 if result["status"] == "busy" else 1
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

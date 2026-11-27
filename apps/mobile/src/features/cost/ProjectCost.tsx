@@ -5,13 +5,13 @@ import { connectionKey, type Connection } from "../../api/client";
 import { LiveStatus, TopBar } from "../../components/Glass";
 import { Glyph } from "../../components/Icon";
 import { theme } from "../../theme";
+import { HaltBanner } from "../halt/HaltBanner";
 import { Section, t } from "../teams/parts";
 import { StackedBars } from "./charts";
 import { accountColors, accountName, usd, type Money } from "./model";
 import { DayCaption, KindChips, Legend, MoneyText } from "./parts";
 import { useDaily, useProject } from "./useCost";
 
-/** One project's accrued cost, its last thirty days, and the goals, runs, sessions, and briefings behind it. */
 export function ProjectCost({ connection, id }: { connection: Connection; id: string }) {
   const router = useRouter(), machine = connectionKey(connection);
   const project = useProject(connection, id), daily = useDaily(connection, id);
@@ -20,13 +20,12 @@ export function ProjectCost({ connection, id }: { connection: Connection; id: st
   const colors = accountColors(accounts);
   const top = <TopBar backLabel="Cost" onBack={() => { if (router.canGoBack()) router.back(); else router.replace({ pathname: "/cost", params: { machine } }); }}
     right={<LiveStatus online={project.online} loading={project.loading} seen={project.seen} />} />;
-  if (!project.data) return <View style={s.fill}>{top}<View style={s.empty}>
+  if (!project.data) return <View style={s.fill}>{top}<HaltBanner connection={connection} place={{ projectIds: [id] }} style={s.halt} /><View style={s.empty}>
     {project.loading ? <ActivityIndicator color={theme.colors.forest} /> : <Text style={t.note}>Could not load this project’s cost.</Text>}
   </View></View>;
   const cost = project.data;
   const open = (pathname: "/goal/[id]" | "/team/[id]" | "/session/[id]", target: string) => router.push({ pathname, params: { id: target, machine } });
   const briefings = cost.briefings.runs > 0 || cost.briefings.unmeasured > 0;
-  // Older hosts report only the briefings' unmeasured count.
   const unmeasured = cost.unmeasured ?? cost.briefings.unmeasured;
   return <View style={s.fill}>
     {top}
@@ -34,6 +33,7 @@ export function ProjectCost({ connection, id }: { connection: Connection; id: st
     <ScrollView style={s.fill} contentContainerStyle={s.body}
       refreshControl={<RefreshControl refreshing={project.refreshing || daily.refreshing} onRefresh={() => { project.refresh(); daily.refresh(); }} tintColor={theme.colors.forest} colors={[theme.colors.forest]} />}>
       <Text style={t.title} accessibilityRole="header">{cost.name}</Text>
+      <HaltBanner connection={connection} place={{ projectIds: [id] }} />
       <View style={s.head}>
         <MoneyText value={{ ...cost.total, unmeasured }} style={s.total} prefixStyle={s.totalPrefix} />
         <Text style={t.note}>accrued{unmeasured ? ` · ${unmeasured} unmeasured` : ""}</Text>
@@ -73,6 +73,7 @@ function CostRow({ label, detail, total, onPress }: { label: string; detail?: st
 const s = StyleSheet.create({
   fill: { flex: 1 },
   empty: { padding: 30, alignItems: "center" },
+  halt: { marginHorizontal: 16, marginTop: 2 },
   body: { paddingHorizontal: 16, paddingTop: 2, gap: 10, paddingBottom: 28 },
   head: { flexDirection: "row", alignItems: "baseline", gap: 8 },
   total: { fontSize: 34, lineHeight: 40, fontWeight: "600", letterSpacing: -0.8, color: theme.colors.ink },

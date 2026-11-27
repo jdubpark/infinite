@@ -1,5 +1,3 @@
-// One dictation field built from the web client's real hook and controls. The recognizer and the
-// host's cleanup route are stand-ins that tests/web-dictation-lifecycle.test.ts drives through `window.dictation`.
 import { useState } from "react";
 import { createRoot } from "react-dom/client";
 import { ApiContext, type Api, type Me } from "../../apps/web/src/api";
@@ -25,7 +23,6 @@ class FakeRecognition {
   stop() {
     setTimeout(() => this.onend?.());
   }
-  // Browsers report an aborted recognizer as an "aborted" error followed by the end event.
   abort() {
     this.aborted = true;
     setTimeout(() => { this.onerror?.({ error: "aborted" }); this.onend?.(); });

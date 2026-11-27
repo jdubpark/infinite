@@ -39,7 +39,6 @@ test("OpenCode HTTP attachment pins context and fences delayed writes and approv
     assert.equal(events.status, 200); const reader = events.body!.getReader();
     assert.ok(!new TextDecoder().decode((await reader.read()).value).includes("ses_foreign"));
     await reader.cancel();
-    // Start sending a body, then change control before the request is complete.
     const slow = request(host.origin + "/api" + path + `/opencode/session/${info.sessionId}/prompt_async`, { method: "POST", headers: { Authorization: `Bearer ${host.tokens.owner}`, ...owner.headers, "Content-Type": "application/json" } });
     const response = new Promise<number>(resolve => slow.on("response", res => { res.resume(); resolve(res.statusCode!); }));
     slow.write('{"parts":[');
@@ -114,14 +113,12 @@ test("OpenCode step-finish parts in the native event stream are journaled as usa
     assert.equal(usage[0].data.modelSource, "reported");
     assert.equal(usage[0].data.reportedCost, 0.25);
     assert.equal(usage[0].data.tokens.input, 100);
-    // A step that finishes before OpenCode names its model, in a session started without --model.
     await waitFor(async () => (await host.fetchApi(path)).body.attention, a => a.lastMessage === "Reply to usage");
     const early = await fetch(host.origin + "/api" + path + `/opencode/session/${info.sessionId}/prompt_async`, { method: "POST", headers: { Authorization: `Bearer ${host.tokens.owner}`, ...owner.headers, "Content-Type": "application/json" }, body: JSON.stringify({ parts: [{ type: "text", text: "usage-early" }] }) });
     assert.equal(early.status, 204);
     const both = await waitFor(async () => (await host.fetchApi(path + "/events?types=usage")).body.events, events => events.length > 1);
     assert.deepEqual([both[1].data.partId, both[1].data.providerId, both[1].data.modelId, both[1].data.modelSource], ["prt_native_early", "unknown", "unknown", "unknown"]);
     assert.equal(both[1].data.tokens.input, 70, "The tokens are kept");
-    // An unobserved model is never priced, even with a reported cost.
     const row = await waitFor(async () => (await host.fetchApi("/sessions")).body.sessions.find((s: any) => s.id === id), s => s?.usage?.messages === 2);
     assert.deepEqual(row.usage.pricing, { configured: 0, catalog: 1, provider: 0, unknown: 1 });
     assert.ok(row.usage.cost > 0 && row.usage.cost < 0.25, "the catalog price takes precedence over the reported fallback");

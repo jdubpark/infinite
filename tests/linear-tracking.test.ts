@@ -204,6 +204,74 @@ test("new goal and child issues use the configured Linear project and reject mis
   }
 });
 
+test("goal and feature comments begin with the configured report name", { timeout: 90000 }, async () => {
+  const linear = await startLinearServer();
+  const root = mkdtempSync(join(tmpdir(), "infinite-linear-name-"));
+  const source = join(root, "source"), receipts = join(root, "receipts");
+  mkdirSync(join(source, "features"), { recursive: true }); mkdirSync(receipts, { mode: 0o700 });
+  writeFileSync(join(source, "features/progress.json"), '{"completed":0}\n');
+  writeFileSync(join(source, "check.mjs"), 'import assert from "node:assert/strict";\nassert.ok(true);\n');
+  git(source, "init", "--initial-branch=main"); git(source, "add", "features", "check.mjs");
+  git(source, "-c", "user.name=Example Developer", "-c", "user.email=dev@example.invalid", "-c", "core.hooksPath=/dev/null", "commit", "-m", "Initial fixture");
+  const apiKeyFile = join(root, "linear-key"); writeFileSync(apiKeyFile, linear.apiKey, { mode: 0o600 });
+  const host = await startHost({ agents: {
+    claude: { command: process.execPath, args: [resolve("tests/fixtures/goal-agent.mjs"), "no-change", receipts, "claude"] },
+    codex: { command: process.execPath, args: [resolve("tests/fixtures/goal-agent.mjs"), "no-change", receipts, "codex"] },
+  }, config: {
+    teams: { workspaceDir: join(root, "teams"), lineup },
+    linear: { apiKeyFile, endpoint: linear.endpoint, reportName: "Northwind" },
+    projects: [{ id: "rehearsal", name: "Rehearsal", path: source,
+      team: { checks: [{ command: process.execPath, args: ["check.mjs"] }] },
+      linear: { teamId: linear.teamId } }],
+  } });
+  try {
+    const created = await host.fetchApi("/goals", "owner", { requestId: randomUUID(), projectId: "rehearsal", title: "Review progress", objective: "Review the progress fixture", successCriteria: "Record whether more work is justified", allowedPaths: ["features"], maxMinutes: 5 });
+    assert.equal(created.status, 200, JSON.stringify(created.body));
+    await waitFor(async () => [...linear.comments.values()].map(item => item.body), bodies => bodies.some(body => body.startsWith("Northwind goal execution\n")) && bodies.some(body => body.startsWith("Northwind feature execution\n")), 60000);
+    assert.ok([...linear.comments.values()].every(item => !/^Infinite (goal|feature) execution/.test(item.body)));
+  } finally {
+    await host.stop(); await linear.close(); rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a status comment already sent under the default name is not posted again after the name is set", { timeout: 90000 }, async () => {
+  const linear = await startLinearServer();
+  const root = mkdtempSync(join(tmpdir(), "infinite-linear-name-"));
+  const source = join(root, "source"), receipts = join(root, "receipts");
+  mkdirSync(join(source, "features"), { recursive: true }); mkdirSync(receipts, { mode: 0o700 });
+  writeFileSync(join(source, "features/progress.json"), '{"completed":0}\n');
+  writeFileSync(join(source, "check.mjs"), 'import assert from "node:assert/strict";\nassert.ok(true);\n');
+  git(source, "init", "--initial-branch=main"); git(source, "add", "features", "check.mjs");
+  git(source, "-c", "user.name=Example Developer", "-c", "user.email=dev@example.invalid", "-c", "core.hooksPath=/dev/null", "commit", "-m", "Initial fixture");
+  const apiKeyFile = join(root, "linear-key"); writeFileSync(apiKeyFile, linear.apiKey, { mode: 0o600 });
+  const host = await startHost({ agents: {
+    claude: { command: process.execPath, args: [resolve("tests/fixtures/goal-agent.mjs"), "no-change", receipts, "claude"] },
+    codex: { command: process.execPath, args: [resolve("tests/fixtures/goal-agent.mjs"), "no-change", receipts, "codex"] },
+  }, config: {
+    teams: { workspaceDir: join(root, "teams"), lineup },
+    linear: { apiKeyFile, endpoint: linear.endpoint },
+    projects: [{ id: "rehearsal", name: "Rehearsal", path: source,
+      team: { checks: [{ command: process.execPath, args: ["check.mjs"] }] },
+      linear: { teamId: linear.teamId } }],
+  } });
+  try {
+    const created = await host.fetchApi("/goals", "owner", { requestId: randomUUID(), projectId: "rehearsal", title: "Review progress", objective: "Review the progress fixture", successCriteria: "Record whether more work is justified", allowedPaths: ["features"], maxMinutes: 5 });
+    assert.equal(created.status, 200, JSON.stringify(created.body));
+    await waitFor(async () => [...linear.comments.values()].filter(item => item.body.startsWith("Infinite goal execution\n")), list => list.length > 0, 60000);
+    await host.stopApi();
+    host.config.linear = { apiKeyFile, endpoint: linear.endpoint, reportName: "Northwind" };
+    writeFileSync(join(host.root, "config.json"), JSON.stringify(host.config));
+    await host.start();
+    await waitFor(async () => (await host.fetchApi("/goals")).body, body => body.goals.length > 0, 15000);
+    await new Promise(resolve => setTimeout(resolve, 3000));
+    const all = [...linear.comments.values()].map(item => item.body);
+    assert.ok(all.some(body => body.startsWith("Infinite goal execution\n")), "The goal comment was sent under the default name");
+    assert.ok(!all.some(body => body.startsWith("Northwind goal execution\n")), "The renamed host does not post the same goal status again");
+  } finally {
+    await host.stop(); await linear.close(); rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("legacy tracking baselines survive restart while changed requirements still block", { timeout: 90000 }, async () => {
   const linear = await startLinearServer();
   const root = mkdtempSync(join(tmpdir(), "infinite-linear-baseline-"));
@@ -294,7 +362,6 @@ test("team objectives with bare URLs sync on create and lost-response reconcilia
     assert.match(recoveredIssue.description, /\* Recovered requirement$/);
     assert.ok(!recoveredIssue.description.endsWith("\n"), "Linear drops the trailing newline on recovered create");
 
-    // Code is never rewritten by Linear, so an edit to it while the create acknowledgement is lost must still block.
     for (const [index, [before, after]] of [["```diff\n- allowRemote = true\n```", "```diff\n+ allowRemote = true\n```"], ["Match `a\\.b` only", "Match `a.b` only"]].entries()) {
       linear.dropNextResponse("InfiniteLinearIssueCreate");
       const edited = run(`Review the code change\n${before}`);
@@ -404,7 +471,6 @@ test("a lost issue title acknowledgement is reconciled by the next read", { time
     assert.equal(linear.issues.get(issueId)?.title, "Model title", "Linear committed the title even though the acknowledgement was lost");
     linear.restore();
 
-    // A queued member forces the next authoritative issue read after the lost acknowledgement.
     service.updateTeam({ ...run, title: "Model title", members: [{ memberId: randomUUID(), status: "queued" }] } as unknown as TeamRun, true);
     const reconciled = await waitFor(() => service.getTeam(run.id), value => value?.status === "synced" && value.issue?.title === "Model title", 15000);
     assert.equal(reconciled.status, "synced");
@@ -430,7 +496,6 @@ test("a rename that commits after a newer one is accepted and reverted; an owner
     service.start();
     assert.equal(await waitFor(() => service.getTeam(run.id)?.status, status => status === "synced" || status === "blocked", 15000), "synced");
 
-    // The first rename fails before Linear commits it; while it backs off, a read of the unchanged issue must not retry it early.
     linear.holdNextTitleUpdate();
     service.updateTeam({ ...run, title: "Model title" }, true);
     await waitFor(() => updates(), count => count === 1, 15000);
@@ -440,7 +505,6 @@ test("a rename that commits after a newer one is accepted and reverted; an owner
     await new Promise(resolve => setTimeout(resolve, 300));
     assert.equal(updates(), 1, "A routine read does not reset the rename backoff");
 
-    // A newer title is confirmed, then the held older request commits late.
     service.updateTeam({ ...run, title: "Brief title" }, true);
     await waitFor(() => service.getTeam(run.id), value => value?.status === "synced" && value.issue?.title === "Brief title", 15000);
     linear.commitHeldTitleUpdate();
@@ -448,7 +512,6 @@ test("a rename that commits after a newer one is accepted and reverted; an owner
     const restored = await waitFor(() => service.getTeam(run.id), value => value?.status === "blocked" || (value?.status === "synced" && linear.issues.get(run.id)?.title === "Brief title" && value.issue?.title === "Brief title"), 15000);
     assert.equal(restored.status, "synced", restored.reason);
 
-    // Brief title's request was acknowledged, so an owner setting it again is an edit the host did not make.
     service.updateTeam({ ...run, title: "Final title" }, true);
     await waitFor(() => service.getTeam(run.id), value => value?.status === "synced" && value.issue?.title === "Final title", 15000);
     linear.editIssue(run.id, { title: "Brief title" });
@@ -464,19 +527,16 @@ test("an unanswered rename stays host-authored across a restart and a later ackn
   const updates = () => f.linear.calls.filter(call => call.operation === "InfiniteLinearIssueUpdate").length;
   try {
     await f.start();
-    // B1 fails before committing; B2 (the same title) is acknowledged; then C is acknowledged.
     f.linear.holdNextTitleUpdate();
     f.service.updateTeam({ ...f.run, title: "Model title" }, true);
     await waitFor(() => updates(), count => count === 1);
     f.linear.restore();
     f.service.close();
     f.restart();
-    // The persisted rename backoff (30 s after one failure) survives the restart before B2 is sent.
     await waitFor(() => f.service.getTeam(f.run.id), value => value?.status === "synced" && value.issue?.title === "Model title", 45000);
     assert.equal(updates(), 2);
     f.service.updateTeam({ ...f.run, title: "Brief title" }, true);
     await waitFor(() => f.service.getTeam(f.run.id), value => value?.status === "synced" && value.issue?.title === "Brief title", 15000);
-    // B1 commits much later; it is still an unanswered host request, so the run continues and is renamed back.
     f.linear.commitHeldTitleUpdate();
     f.service.updateTeam({ ...f.run, title: "Brief title", members: [{ memberId: randomUUID(), status: "queued" }] } as unknown as TeamRun, true);
     const result = await waitFor(() => f.service.getTeam(f.run.id), value => value?.status === "blocked"
@@ -532,8 +592,6 @@ test(`a superseded title with a lost acknowledgement survives restart and sends 
     await waitFor(() => f.linear.lostResponses.length, count => count === 1);
     assert.equal(f.linear.issues.get(f.run.id)?.title, "Model title");
     assert.equal(f.service.getTeam(f.run.id)?.status, "synced", "A lost rename acknowledgement must not gate execution");
-    // The desired title changes while the cached issue still has the original title.
-    // Repeat the update as list/get polling does, including when reverting to that original.
     for (let i = 0; i < 2; i++) f.service.updateTeam({ ...f.run, title: successor }, true);
     f.service.close();
     f.linear.restore();
@@ -618,14 +676,12 @@ test("a blocked run's issue gets its reason, next step and a Blocked label until
     await waitFor(async () => applied(), names => names.length === 0, 15000);
     assert.equal(linear.labels.size, 1);
 
-    // The cached label was deleted in Linear: the next block looks it up again instead of failing until restart.
     linear.labels.clear();
     run.status = "blocked"; run.revision = 5; run.reason = "The host restarted during a workspace or verification operation.";
     service.updateTeam(run, true, false);
     await waitFor(async () => applied(), names => names.includes("Blocked"), 15000);
     assert.equal(linear.labels.size, 1, "A replacement label is created once");
 
-    // A rate-limited label request backs off only the label; other evidence keeps flowing.
     linear.rateLimitLabelLookups(true);
     const lookups = linear.calls.filter(call => call.operation === "InfiniteLinearLabels").length;
     const second = { ...run, id: randomUUID(), title: "Second run", status: "implementing", revision: 1, reason: undefined } as unknown as TeamRun;
@@ -641,7 +697,6 @@ test("a blocked run's issue gets its reason, next step and a Blocked label until
     assert.equal(service.getTeam(second.id)?.status, "synced");
     linear.rateLimitLabelLookups(false);
 
-    // A rate-limited change on a cached label keeps its delay: no recovery lookup, no immediate retry.
     linear.rateLimitLabelChanges(true);
     const third = { ...run, id: randomUUID(), title: "Third run", status: "implementing", revision: 1, reason: undefined } as unknown as TeamRun;
     service.updateTeam(third, true);
@@ -656,7 +711,6 @@ test("a blocked run's issue gets its reason, next step and a Blocked label until
     assert.equal(linear.calls.filter(call => call.operation === "InfiniteLinearLabels").length, before.lookups, "A rate limit is not mistaken for a deleted label");
     linear.rateLimitLabelChanges(false);
 
-    // A label failure never gates execution: tracking stays synced while the label waits to retry.
     linear.failLabelLookups(true);
     const fresh = new LinearService({ ...config, stateDir: join(root, "isolated-state") } as Config, randomBytes(32));
     const other = { ...run, id: randomUUID(), title: "Another run", status: "implementing", revision: 1 } as unknown as TeamRun;
@@ -687,10 +741,37 @@ test("a run that blocks while no client is reading still gets its reason and nex
     await f.host.stopApi(); await f.host.start();
     const created = await f.host.fetchApi("/teams", "owner", f.create());
     assert.ok([200, 201].includes(created.status), JSON.stringify(created.body));
-    // No list or get from here on: only the scheduler can supply the blocked evidence.
     const blocked = await waitFor(async () => [...linear.comments.values()].find(comment => comment.body.includes("Status: blocked")), Boolean, 90000);
     assert.match(blocked!.body, /Reason: An agent exited without a valid structured report\./);
     assert.match(blocked!.body, /Next step: inspect the run's evidence, then start a new run to continue\./);
     await waitFor(async () => [...linear.issueLabels.values()].some(applied => applied.size > 0), Boolean, 15000);
   } finally { await f.close(); await linear.close(); }
+});
+
+test("an intent decision's Linear comments hold no checker text", { timeout: 45000 }, async () => {
+  const linear = await startLinearServer();
+  const root = mkdtempSync(join(tmpdir(), "infinite-linear-intent-"));
+  const config = { stateDir: join(root, "state"), linear: { apiKeyFile: join(root, "linear-key"), endpoint: linear.endpoint },
+    projects: [{ id: "intent", name: "Intent", path: root, linear: { teamId: linear.teamId } }] } as unknown as Config;
+  writeFileSync(config.linear!.apiKeyFile, linear.apiKey, { mode: 0o600 });
+  const service = new LinearService(config, randomBytes(32));
+  const sentinel = ["intent", "question", "sentinel"].join("-");
+  const run = { id: randomUUID(), projectId: "intent", title: "Export", objective: "Ship the export.", status: "implementing", revision: 1,
+    members: [], checks: [], steering: [], decisions: [] } as unknown as TeamRun;
+  try {
+    service.start();
+    service.updateTeam(run, true);
+    await waitFor(async () => service.getTeam(run.id)?.status, status => status === "synced", 15000);
+    const issue = service.getTeam(run.id)!.issue!.id;
+    run.decisions = [{ id: "decision", revision: 1, question: `Checker text: ${sentinel}`, intentQuestions: ["q1", "q2"], options: [], memberId: "member",
+      createdAt: new Date().toISOString(), answer: "Use the stated defaults", answeredBy: "owner", answeredAt: new Date().toISOString() }] as TeamRun["decisions"];
+    service.updateTeam(run, true);
+    const question = await waitFor(async () => [...linear.comments.values()].find(comment => comment.issue.id === issue && comment.body.includes("Agent question")), Boolean, 15000);
+    assert.match(question!.body, /The intent check's questions q1, q2/);
+    assert.doesNotMatch(question!.body, new RegExp(sentinel));
+    const answer = await waitFor(async () => [...linear.comments.values()].find(comment => comment.issue.id === issue && comment.body.includes("User answer")), Boolean, 15000);
+    assert.match(answer!.body, /Use the stated defaults/);
+    assert.doesNotMatch(answer!.body, new RegExp(sentinel));
+    assert.deepEqual(linear.violations, []);
+  } finally { service.close(); await linear.close(); rmSync(root, { recursive: true, force: true }); }
 });

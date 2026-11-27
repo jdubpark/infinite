@@ -162,11 +162,18 @@ Each workspace's maintenance state is its own encrypted file under `understandin
 a separate rolling store of at most 16 generations per project within 8 MiB.
 Team briefs stay visible after their member workspace is cleaned up, as long as
 the repository binding still matches and a head is recorded. Those briefs
-retain checkout/session provenance and generation/retention times. Mission
-coordinator briefs are withheld from that single-repository artifact store
-until complete multi-repository provenance is available; mission work remains
-readable. Read responses stay below the encrypted transport limit and disclose
-omitted records. Use the paged detail routes above, and the catalog and component detail
+retain checkout/session provenance and generation/retention times. Mission coordinator briefs bind every participating repository in the mission's
+`repoProjectIds` set with each checkout's enrolled path, identity, and pinned
+`HEAD` commit, and expose the pinned `(head, repoIdentity)` map on the retained
+artifact. A retained mission brief stays visible across all participating
+repositories in its workspace only while every bound repository matches its
+pinned head and identity and the mission's bound repository set is unchanged;
+advancing any bound repository's `HEAD`, changing a repository's identity,
+splitting repositories across workspaces, or mismatching the pinned set
+invalidates the brief on read and bypasses cached summaries. Legacy
+single-repository v1 artifacts remain readable for project and single-repository
+team sessions and are never accepted as mission coordinator bindings. Read
+responses stay below the encrypted transport limit and disclose omitted records. Use the paged detail routes above, and the catalog and component detail
 endpoints, for content omitted from the overview. Response omission never deletes stored content.
 
 Reading Understanding never schedules a model job, changes execution status or

@@ -44,7 +44,6 @@ export async function handleRoutineClientCommand(positional: string[], options: 
   if (verb === "create") {
     if (positional.length !== 1 || !options["--file"]) throw new Error("Usage: infinite routine create --file FILE [--request-id UUID] [--json]");
     const input = readRoutineFile(String(options["--file"]), options["--request-id"] === undefined ? undefined : String(options["--request-id"]));
-    // Print before the network call so an interrupted/ambiguous request can be retried with this same identity.
     console.error(`[Infinite] Creating routine ${input.requestId}`);
     const result = await api.json<Routine>("/routines", input);
     if (options["--json"]) console.log(JSON.stringify(result, null, 2)); else printRoutine(result);

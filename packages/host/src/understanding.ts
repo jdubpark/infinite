@@ -1,30 +1,48 @@
 import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, readdirSync, realpathSync, statSync, unlinkSync, type Stats } from "node:fs";
-import { isAbsolute, relative, resolve, sep, join } from "node:path";
+import { realpath, stat } from "node:fs/promises";
+import { resolve, join } from "node:path";
 import { z } from "zod";
 import { parseMermaid } from "@infinite/remote";
 import type { Diagram, GeneratedCatalogPage, GeneratedPlan, GeneratedProject, UnderstandingArtifact, UnderstandingLink, UnderstandingPlan, UnderstandingRepository, UnderstandingWork, WorkspaceUnderstanding, WorkspaceKnowledge } from "@infinite/remote";
 import { MAX_RESPONSE_BYTES } from "@infinite/remote/protocol";
-import { expectedIdentity, readGit } from "./checkout-identity.js";
+import { expectedIdentityAsync, readGitAsync } from "./checkout-identity.js";
 import type { RepositorySummary, RepositoryBriefings } from "./repository-briefings.js";
 import type { Manager } from "./manager.js";
 import type { Project, Session, Config } from "./types.js";
-import type { ProjectGroup, ProjectGroupList } from "./project-group-types.js";
+import type { ProjectGroup, ProjectGroupList, ProjectGroupRepo } from "./project-group-types.js";
 import type { MissionService } from "./missions.js";
+import type { Mission } from "./mission-types.js";
 import type { TeamService } from "./teams.js";
+import type { TeamRun } from "./team-types.js";
 import type { GoalService } from "./goals.js";
 import { writeSealed, unseal } from "./vault.js";
 import { CatalogError } from "./understanding-catalog.js";
+import { isMissingSessionError } from "./mission-coordinator.js";
 import { pageOf } from "./understanding-pages.js";
+import {
+  bindingSchema,
+  captureMissionPinnedRepositoriesAsync,
+  captureProjectBinding,
+  entryMatchesCheckouts,
+  isMissionBindingEntry,
+  pathInside,
+  pinnedSourcesFromBinding,
+  pinnedSourcesSchema,
+  projectIdSchema,
+  readGitHead,
+  sessionAppliesToRepository,
+  validateMissionPinnedBinding,
+  type Binding,
+  type ProjectBinding,
+  type SessionMetaLookup,
+} from "./understanding-binding.js";
 
 const MAX_GENERATIONS_PER_PROJECT = 16;
 const MAX_STORE_BYTES = 8 * 1024 * 1024;
-// Runtime output is capped at 1 MiB before sealing. Keep one bounded generation
-// of publication headroom so a full store can advance without deleting evidence first.
 const MAX_ARTIFACT_BYTES = 2 * 1024 * 1024;
 const TEMPORARY_ARTIFACT = /^[0-9a-f-]{36}\.sealed\.[0-9a-f]{16}\.tmp$/;
 const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
-const projectIdSchema = z.string().regex(/^[a-z0-9-]{1,80}$/);
 const citationSchema = z.object({ source: z.string().min(1).max(1024), line: z.number().int().positive() }).strict();
 const claimSchema = z.object({ text: z.string().min(1).max(900), citations: z.array(citationSchema).max(6) }).strict();
 const MAX_DIAGRAM_NODES = 48, MAX_DIAGRAM_EDGES = 120;
@@ -57,34 +75,26 @@ const artifactSchema = z.object({
   head: z.string().regex(/^[a-f0-9]{40,64}$/).nullable(), base: z.string().regex(/^[a-f0-9]{40,64}$/).nullable(),
   fingerprint: z.string().regex(/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/), generatedAt: z.string().datetime({ offset: true }), retainedAt: z.string().datetime({ offset: true }),
   coverage: z.array(z.string().max(500)).max(100), brief: briefSchema, evidence: evidenceSchema,
-}).strict();
-const bindingSchema = z.object({
-  projectId: projectIdSchema, sourceKind: z.enum(["project", "team"]), enrolledPath: z.string().min(1).max(4096), root: z.string().min(1).max(4096),
-  sourceCwd: z.string().min(1).max(4096),
-  projectDevice: z.string().max(80), projectInode: z.string().max(80), rootDevice: z.string().max(80), rootInode: z.string().max(80), repoIdentity: z.string().max(128),
-  sourceCwdDevice: z.string().max(80), sourceCwdInode: z.string().max(80),
-  runId: z.string().uuid().optional(), memberId: z.string().uuid().optional(),
+  pinnedSources: pinnedSourcesSchema.optional(),
 }).strict();
 const entrySchema = z.object({ binding: bindingSchema, artifact: artifactSchema }).strict();
-type Binding = z.infer<typeof bindingSchema>;
 type Entry = z.infer<typeof entrySchema>;
 type State = { version: 1; generations: Entry[] };
 type Capture = { binding: Binding };
-type ProjectBinding = { enrolledPath: string; projectDevice: string; projectInode: string; repoIdentity: string };
 
 export interface UnderstandingSources {
   config: Config;
   key: Buffer;
   manager: Manager;
   groups: { list(): ProjectGroupList; get(id: string): ProjectGroup };
-  missions: Pick<MissionService, "understandingRecords" | "understandingOwnsSession">;
+  missions: Pick<MissionService, "understandingRecords" | "understandingOwnsSession">
+    & Partial<Pick<MissionService, "understandingRepoPaths">>;
   teams: Pick<TeamService, "understandingRecords" | "understandingOwnsSession">;
   goals: Pick<GoalService, "understandingRecords">;
   briefings?: Pick<RepositoryBriefings, "useRetention" | "understandingStatuses">;
   knowledge?: { read(id: string): WorkspaceKnowledge };
 }
 
-/** Read model and retained, source-bound repository brief generations. Reads never schedule work. */
 export class UnderstandingService {
   private readonly directory: string;
   private state: State = { version: 1, generations: [] };
@@ -97,6 +107,9 @@ export class UnderstandingService {
     sources.briefings?.useRetention({
       capture: (session, location) => this.capture(session, location.root),
       persist: (session, location, summary, captured) => this.persist(session, location.root, summary, captured),
+      cacheKey: async (session, location) => session.team?.role === "mission-coordinator" ? digest(await this.capture(session, location.root)) : undefined,
+      captureKey: captured => (captured as Capture | undefined)?.binding.missionRole === "mission-coordinator" ? digest(captured) : undefined,
+      available: async (session, location) => session.team?.role === "mission-coordinator" ? this.missionSourceAvailable(session, location.root) : true,
     });
   }
 
@@ -134,9 +147,10 @@ export class UnderstandingService {
     return project;
   }
 
-  private inside(root: string, candidate: string) {
-    const child = relative(root, candidate);
-    return child === "" || (!child.startsWith(`..${sep}`) && child !== ".." && !isAbsolute(child));
+  private groupForProject(projectId: string): ProjectGroup {
+    return this.sources.groups.list().groups.find(group =>
+      group.repos.some(repo => repo.checkouts.some(checkout => checkout.projectId === projectId)),
+    ) ?? this.sources.groups.get(projectId);
   }
 
   private ownedTeamSession(session: Session): { runId: string; memberId: string } | undefined {
@@ -144,7 +158,7 @@ export class UnderstandingService {
     if (!assignment) return undefined;
     const projectId = session.projectId;
     if (assignment.role === "mission-coordinator") {
-      return this.sources.missions.understandingOwnsSession(assignment.runId, assignment.memberId, session.id, projectId)
+      return this.sources.missions.understandingOwnsSession(assignment.runId, assignment.memberId, session.id, projectId, session.cwd)
         ? { runId: assignment.runId, memberId: assignment.memberId } : undefined;
     }
     if (this.sources.teams.understandingOwnsSession(assignment.runId, assignment.memberId, session.id, projectId))
@@ -152,31 +166,80 @@ export class UnderstandingService {
     return undefined;
   }
 
+  private async missionSourceAvailable(session: Session, rootInput: string): Promise<boolean> {
+    try {
+      if (session.workspace || session.executionLocation === "laptop") return false;
+      const live = this.sources.manager.meta(session.id).session;
+      if (live.projectId !== session.projectId || live.cwd !== session.cwd || digest(live.team ?? null) !== digest(session.team ?? null)) return false;
+      const project = this.project(session.projectId);
+      const canonicalProject = await realpath(resolve(project.path));
+      const root = await realpath(rootInput);
+      if (!pathInside(canonicalProject, root)) return false;
+      const owner = this.ownedTeamSession(session);
+      if (!owner) return false;
+      const mission = this.sources.missions.understandingRecords().find(item => item.id === owner.runId);
+      if (!mission || !mission.repoProjectIds.includes(project.id)) return false;
+      const group = this.groupForProject(project.id);
+      const groupProjectIds = new Set(group.repos.flatMap(repo => repo.checkouts.map(checkout => checkout.projectId)));
+      const ids = [...new Set(mission.repoProjectIds)].sort((a, b) => a.localeCompare(b));
+      if (!ids.length || ids.length > 64) return false;
+      const recordedPaths = this.sources.missions.understandingRepoPaths?.(owner.runId);
+      if (recordedPaths !== undefined) {
+        const recordedIds = Object.keys(recordedPaths).sort((a, b) => a.localeCompare(b));
+        if (recordedIds.length !== ids.length || !recordedIds.every((value, index) => value === ids[index])) return false;
+      }
+      for (const projectId of ids) {
+        const item = this.sources.config.projects.find(entry => entry.id === projectId);
+        if (!item || !groupProjectIds.has(projectId)) return false;
+        const enrolledPath = await realpath(resolve(item.path));
+        if (recordedPaths !== undefined && await realpath(resolve(recordedPaths[projectId]!)) !== enrolledPath) return false;
+      }
+      return true;
+    } catch { return false; }
+  }
+
   private async capture(session: Session, rootInput: string): Promise<Capture> {
     if (session.workspace || session.executionLocation === "laptop") throw new Error("source-unavailable");
-    // V1 artifacts bind one repository. A mission coordinator's inseparable
-    // multi-repository context needs a full pinned-source binding before retention.
-    if (session.team?.role === "mission-coordinator") throw new Error("mission-brief-source-unavailable");
     const live = this.sources.manager.meta(session.id).session;
     if (live.projectId !== session.projectId || live.cwd !== session.cwd || digest(live.team ?? null) !== digest(session.team ?? null)) throw new Error("session-source-rebound");
     const project = this.project(session.projectId);
     const enrolledPath = resolve(project.path);
-    const canonicalProject = realpathSync(enrolledPath);
-    const root = realpathSync(rootInput);
-    const sourceCwd = realpathSync(session.cwd);
-    if (!this.inside(root, sourceCwd)) throw new Error("source-cwd-outside-root");
+    const canonicalProject = await realpath(enrolledPath);
+    const root = await realpath(rootInput);
+    const sourceCwd = await realpath(session.cwd);
+    const isMissionCoordinator = session.team?.role === "mission-coordinator";
+    if (!isMissionCoordinator && !pathInside(root, sourceCwd)) throw new Error("source-cwd-outside-root");
     const sourceKind = session.team ? "team" : "project";
     let runId: string | undefined, memberId: string | undefined;
     if (sourceKind === "team") {
       const owner = this.ownedTeamSession(session);
       if (!owner) throw new Error("team-source-unproven");
       runId = owner.runId; memberId = owner.memberId;
+      if (isMissionCoordinator) {
+        if (!pathInside(canonicalProject, root)) throw new Error("source-outside-project");
+        const mission = this.sources.missions.understandingRecords().find(item => item.id === runId);
+        if (!mission || !mission.repoProjectIds.includes(project.id)) throw new Error("mission-brief-source-unavailable");
+        const group = this.groupForProject(project.id);
+        const recordedPaths = this.sources.missions.understandingRepoPaths?.(runId);
+        const pinnedRepositories = await captureMissionPinnedRepositoriesAsync(mission.repoProjectIds, this.sources.config.projects, group, recordedPaths);
+        const primary = Object.hasOwn(pinnedRepositories, project.id) ? pinnedRepositories[project.id] : undefined;
+        if (!primary) throw new Error("mission-brief-source-unavailable");
+        const [rootStat, cwdStat] = await Promise.all([stat(root), stat(sourceCwd)]);
+        return { binding: bindingSchema.parse({
+          projectId: project.id, sourceKind, enrolledPath: primary.enrolledPath, root, sourceCwd,
+          projectDevice: primary.projectDevice, projectInode: primary.projectInode,
+          rootDevice: String(rootStat.dev), rootInode: String(rootStat.ino),
+          sourceCwdDevice: String(cwdStat.dev), sourceCwdInode: String(cwdStat.ino),
+          repoIdentity: primary.repoIdentity, runId, memberId,
+          missionRole: "mission-coordinator", pinnedRepositories,
+        }) };
+      }
       const member = this.sources.teams.understandingRecords().find(run => run.id === runId)?.members.find(item => item.memberId === memberId && item.sessionId === session.id);
       if (member && resolve(member.cwd) !== resolve(session.cwd)) throw new Error("team-source-rebound");
-    } else if (!this.inside(canonicalProject, root)) throw new Error("source-outside-project");
-    const projectStat = statSync(canonicalProject), rootStat = statSync(root), cwdStat = statSync(sourceCwd);
-    const identity = expectedIdentity(project, readGit);
-    const group = this.sources.groups.get(project.id);
+    } else if (!pathInside(canonicalProject, root)) throw new Error("source-outside-project");
+    const [projectStat, rootStat, cwdStat] = await Promise.all([stat(canonicalProject), stat(root), stat(sourceCwd)]);
+    const identity = await expectedIdentityAsync({ ...project, path: canonicalProject }, readGitAsync);
+    const group = this.groupForProject(project.id);
     const repo = group.repos.find(value => value.checkouts.some(checkout => checkout.projectId === project.id));
     const expectedKey = repo?.key;
     if (!identity || (expectedKey && identity.key !== expectedKey)) throw new Error("source-identity-changed");
@@ -191,6 +254,39 @@ export class UnderstandingService {
     const capture = captured as Capture;
     const current = await this.capture(session, root);
     if (digest(capture) !== digest(current)) throw new Error("The enrolled source changed while its brief was generated.");
+    const pinnedRepositories = capture.binding.pinnedRepositories;
+    if (pinnedRepositories) {
+      const primary = Object.hasOwn(pinnedRepositories, session.projectId) ? pinnedRepositories[session.projectId] : undefined;
+      if (!primary || summary.repository.head !== primary.head) throw new Error("The enrolled source changed while its brief was generated.");
+      if (summary.repository.decision.action !== "run") {
+        const captureDigest = digest(capture.binding);
+        const expectedPinnedSourcesDigest = digest(pinnedSourcesFromBinding(pinnedRepositories));
+        const matching = this.state.generations.some(entry =>
+          entry.artifact.sessionId === session.id
+          && entry.artifact.sourceProjectId === session.projectId
+          && entry.artifact.head === primary.head
+          && entry.artifact.fingerprint === summary.repository.fingerprint
+          && entry.artifact.generatedAt === summary.repository.generatedAt
+          && entry.artifact.brief.summary === summary.repository.brief.summary
+          && entry.artifact.pinnedSources !== undefined
+          && digest(entry.artifact.pinnedSources) === expectedPinnedSourcesDigest
+          && digest(entry.binding) === captureDigest,
+        );
+        if (matching) return;
+        throw new Error("The briefing engine skipped refresh while a bound mission repository changed.");
+      }
+    } else if (summary.repository.decision.action !== "run") {
+      const matchesTuple = (entry: Entry) =>
+        entry.artifact.sourceProjectId === session.projectId
+        && entry.artifact.fingerprint === summary.repository.fingerprint
+        && entry.artifact.generatedAt === summary.repository.generatedAt
+        && entry.artifact.brief.summary === summary.repository.brief.summary;
+      const leakedMission = this.state.generations.some(entry => isMissionBindingEntry(entry.binding, entry.artifact.pinnedSources) && matchesTuple(entry));
+      const matchedSingleRepo = this.state.generations.some(entry => !isMissionBindingEntry(entry.binding, entry.artifact.pinnedSources) && matchesTuple(entry));
+      if (leakedMission && !matchedSingleRepo) {
+        throw new Error("The briefing engine returned a skipped mission brief for a single-repository session.");
+      }
+    }
     const brief = summary.repository.brief;
     const artifactId = randomUUID();
     const retained = retainedDiagrams(artifactId, brief.diagrams);
@@ -201,6 +297,7 @@ export class UnderstandingService {
       coverage: [...summary.repository.coverage.slice(0, Math.max(0, 100 - retained.coverage.length)), ...retained.coverage],
       brief: { summary: brief.summary, architecture: brief.architecture, changes: brief.changes, checks: brief.checks, review: brief.review, guidance: brief.guidance, unknowns: brief.unknowns, diagrams: retained.diagrams },
       evidence: summary.repository.evidence.map(item => ({ source: item.source, line: item.line, text: item.text })),
+      ...(pinnedRepositories ? { pinnedSources: pinnedSourcesFromBinding(pinnedRepositories) } : {}),
     });
     const entry = entrySchema.parse({ binding: capture.binding, artifact });
     let candidate: State;
@@ -208,15 +305,11 @@ export class UnderstandingService {
     try {
       mkdirSync(this.directory, { recursive: true, mode: 0o700 });
       const sizes = new Map(readdirSync(this.directory).filter(name => /^[0-9a-f-]{36}\.sealed$/.test(name)).map(name => [name.slice(0, -7), statSync(join(this.directory, name)).size]));
-      // Only known unacknowledged writes or validated, superseded generations
-      // can be reclaimed before publication; the current acknowledged set stays intact.
       for (const id of this.pendingPrune) {
         this.removeTemporaryArtifact(id);
         if (sizes.has(id)) { unlinkSync(join(this.directory, `${id}.sealed`)); sizes.delete(id); }
         this.pendingPrune.delete(id);
       }
-      // Interrupted writes from an earlier process still consume disk even when
-      // their UUID is not ours to clean up during this attempt.
       const temporaryBytes = readdirSync(this.directory).filter(name => TEMPORARY_ARTIFACT.test(name))
         .reduce((total, name) => total + statSync(join(this.directory, name)).size, 0);
       const currentBytes = [...sizes.values()].reduce((total, size) => total + size, temporaryBytes);
@@ -228,7 +321,7 @@ export class UnderstandingService {
     } catch (error) {
       this.pendingPrune.add(artifact.id);
       try { this.removeTemporaryArtifact(artifact.id); }
-      catch { /* Retry this exact prefix before any subsequent publication. */ }
+      catch {}
       this.storageError = "The latest brief could not be durably retained; prior snapshots remain available.";
       throw error;
     }
@@ -247,33 +340,30 @@ export class UnderstandingService {
       if (name.startsWith(`${id}.sealed.`) && TEMPORARY_ARTIFACT.test(name)) unlinkSync(join(this.directory, name));
   }
 
-  private projectBinding(project: Project, expectedKey: string | undefined): ProjectBinding | undefined {
-    try {
-      const enrolledPath = realpathSync(project.path), info = statSync(enrolledPath);
-      const identity = expectedIdentity(project, readGit);
-      if (!identity || (expectedKey && identity.key !== expectedKey)) return undefined;
-      return { enrolledPath, projectDevice: String(info.dev), projectInode: String(info.ino), repoIdentity: digest(identity.key) };
-    } catch { return undefined; }
-  }
-
-  private visibleEntry(entry: Entry, project: ProjectBinding): boolean {
+  private visibleSingleRepoEntry(
+    entry: Entry,
+    project: ProjectBinding,
+    missionsById: ReadonlyMap<string, Mission>,
+    teamsById: ReadonlyMap<string, TeamRun>,
+  ): boolean {
     const expected = entry.binding;
     if (expected.projectId !== entry.artifact.sourceProjectId || expected.sourceKind !== entry.artifact.sourceKind ||
         project.enrolledPath !== expected.enrolledPath || project.projectDevice !== expected.projectDevice ||
         project.projectInode !== expected.projectInode || project.repoIdentity !== expected.repoIdentity) return false;
     let cwd = expected.sourceCwd;
-    // Team member workspaces are deleted after a run. When the session record or run membership is gone,
-    // or the workspace paths no longer resolve, the matching repository binding and a recorded head suffice.
     const retained = !!entry.artifact.head;
     if (expected.sourceKind === "team") {
       let session: Session | undefined;
       try { session = this.sources.manager.meta(entry.artifact.sessionId).session; } catch { session = undefined; }
-      if (!session) return retained;
+      if (!session) {
+        if (expected.runId && missionsById.has(expected.runId)) return false;
+        return retained;
+      }
       if (session.team?.role === "mission-coordinator") return false;
       if (session.projectId !== expected.projectId || !session.team || session.team.runId !== expected.runId || session.team.memberId !== expected.memberId) return false;
       const owner = this.ownedTeamSession(session);
       if (!owner || owner.runId !== expected.runId || owner.memberId !== expected.memberId) return false;
-      const run = this.sources.teams.understandingRecords().find(item => item.id === owner.runId);
+      const run = teamsById.get(owner.runId);
       const member = run?.members.find(item => item.memberId === owner.memberId && item.sessionId === session.id);
       if (!member) return retained;
       if (resolve(member.cwd) !== resolve(session.cwd)) return false;
@@ -282,14 +372,18 @@ export class UnderstandingService {
     let root: string, sourceCwd: string, rootStat: Stats, cwdStat: Stats;
     try { root = realpathSync(expected.root); sourceCwd = realpathSync(cwd); rootStat = statSync(root); cwdStat = statSync(sourceCwd); }
     catch (error) { if (expected.sourceKind === "team") return retained; throw error; }
-    if (!this.inside(root, sourceCwd) || (expected.sourceKind === "project" && !this.inside(project.enrolledPath, root))) return false;
+    if (!pathInside(root, sourceCwd) || (expected.sourceKind === "project" && !pathInside(project.enrolledPath, root))) return false;
     return root === expected.root && String(rootStat.dev) === expected.rootDevice && String(rootStat.ino) === expected.rootInode &&
       sourceCwd === expected.sourceCwd && String(cwdStat.dev) === expected.sourceCwdDevice && String(cwdStat.ino) === expected.sourceCwdInode;
   }
 
   private repoIds(group: ProjectGroup) { return new Set(group.repos.flatMap(repo => repo.checkouts.map(checkout => checkout.projectId))); }
 
-  private workRows(group: ProjectGroup): UnderstandingWork[] {
+  private workRows(
+    group: ProjectGroup,
+    missions = this.sources.missions.understandingRecords(),
+    teams = this.sources.teams.understandingRecords(),
+  ): UnderstandingWork[] {
     const ids = this.repoIds(group), rows: UnderstandingWork[] = [];
     const add = (value: Omit<UnderstandingWork, "briefIds" | "links" | "scope"> & { briefIds?: string[]; links?: UnderstandingLink[] }) => {
       const matching = value.repositoryIds.filter(id => ids.has(id));
@@ -300,10 +394,9 @@ export class UnderstandingService {
         briefIds: scope === "partial" ? [] : value.briefIds ?? [], links: scope === "partial" ? [] : value.links ?? [] });
     };
     const column = (status: string): UnderstandingWork["column"] => status === "needs-input" || status === "blocked" ? "needs-input" : status === "ready-for-review" ? "review" : ["cancelled", "merged", "no-change", "achieved", "no-opportunity", "limit-reached"].includes(status) ? "ended" : "working";
-    for (const mission of this.sources.missions.understandingRecords()) add({ id: `mission:${mission.id}`, sourceId: mission.id, kind: "mission", title: mission.title, objective: mission.objective,
+    for (const mission of missions) add({ id: `mission:${mission.id}`, sourceId: mission.id, kind: "mission", title: mission.title, objective: mission.objective,
       reportedSummary: mission.result?.summary ?? mission.reason ?? null, status: mission.status, column: column(mission.status), updatedAt: mission.updatedAt,
       repositoryIds: [...mission.repoProjectIds], briefIds: [], links: [] });
-    const teams = this.sources.teams.understandingRecords();
     for (const team of teams) {
       if (team.missionId || team.goal) continue;
       const links: UnderstandingLink[] = [];
@@ -332,28 +425,65 @@ export class UnderstandingService {
     return this.workRows(this.workspace(id));
   }
 
-  /** Unbounded read: complete request text and every retained snapshot. Overview and pages both derive from it. */
   private build(id: string): WorkspaceUnderstanding {
     const group = this.workspace(id);
-    // One membership snapshot and one Git capture per checkout per request. Never reuse
-    // these across reads: a rebind or same-path replacement must invalidate the next read.
+    const missionRecords = this.sources.missions.understandingRecords();
+    const teamRecords = this.sources.teams.understandingRecords();
+    const missionsById = new Map(missionRecords.map(item => [item.id, item] as const));
+    const teamsById = new Map(teamRecords.map(item => [item.id, item] as const));
+    const groupRepoByCheckout = new Map<string, ProjectGroupRepo>();
+    for (const repo of group.repos) for (const checkout of repo.checkouts) groupRepoByCheckout.set(checkout.projectId, repo);
     const projects = new Map<string, ProjectBinding | undefined>();
+    const heads = new Map<string, string | null | undefined>();
     const bindings = new Map<string, boolean>();
-    const rows = this.workRows(group);
+    const liveProjectBinding = (projectId: string): ProjectBinding | undefined => {
+      if (!projects.has(projectId)) {
+        const project = this.sources.config.projects.find(item => item.id === projectId);
+        const repo = groupRepoByCheckout.get(projectId);
+        projects.set(projectId, project && repo ? captureProjectBinding(project, repo.key) : undefined);
+      }
+      return projects.get(projectId);
+    };
+    const liveRepoHead = (enrolledPath: string): string | null | undefined => {
+      if (!heads.has(enrolledPath)) heads.set(enrolledPath, readGitHead(enrolledPath));
+      return heads.get(enrolledPath);
+    };
+    const readSession = (sessionId: string): SessionMetaLookup => {
+      try { return { state: "found", session: this.sources.manager.meta(sessionId).session }; }
+      catch (error) { return isMissingSessionError(error) ? { state: "missing" } : { state: "unreadable" }; }
+    };
+    const recordedRepoPaths = (missionId: string) => this.sources.missions.understandingRepoPaths?.(missionId);
+    const rows = this.workRows(group, missionRecords, teamRecords);
     const currentWork = rows.filter(item => item.scope === "complete");
     const briefingStates = new Map((this.sources.briefings?.understandingStatuses() ?? []).map(value => [value.sessionId, value]));
     const repositories: UnderstandingRepository[] = group.repos.map(repo => {
       const checkoutIds = repo.checkouts.map(checkout => checkout.projectId), checkouts = new Set(checkoutIds);
       const current = this.state.generations.filter(entry => {
-        if (!checkouts.has(entry.artifact.sourceProjectId)) return false;
-        const project = this.sources.config.projects.find(item => item.id === entry.artifact.sourceProjectId);
-        if (!project) return false;
-        if (!projects.has(project.id)) projects.set(project.id, this.projectBinding(project, repo.key));
-        const currentProject = projects.get(project.id);
-        if (!currentProject) return false;
-        const key = digest([entry.binding, entry.artifact.sourceProjectId, entry.artifact.sourceKind, entry.binding.sourceKind === "team" ? entry.artifact.sessionId : null]);
+        if (!entryMatchesCheckouts(entry.binding, entry.artifact.sourceProjectId, checkouts)) return false;
+        const key = digest([
+          entry.binding,
+          entry.artifact.sourceProjectId,
+          entry.artifact.sourceKind,
+          entry.artifact.head,
+          entry.artifact.pinnedSources ?? null,
+          entry.binding.sourceKind === "team" ? entry.artifact.sessionId : null,
+        ]);
         if (!bindings.has(key)) {
-          try { bindings.set(key, this.visibleEntry(entry, currentProject)); } catch { bindings.set(key, false); }
+          try {
+            if (isMissionBindingEntry(entry.binding, entry.artifact.pinnedSources)) {
+              bindings.set(key, validateMissionPinnedBinding(entry.binding, entry.artifact, {
+                missionsById,
+                recordedRepoPaths,
+                liveProjectBinding,
+                liveRepoHead,
+                readSession,
+                ownedTeamSession: session => this.ownedTeamSession(session),
+              }));
+            } else {
+              const currentProject = liveProjectBinding(entry.artifact.sourceProjectId);
+              bindings.set(key, currentProject ? this.visibleSingleRepoEntry(entry, currentProject, missionsById, teamsById) : false);
+            }
+          } catch { bindings.set(key, false); }
         }
         return bindings.get(key)!;
       }).map(entry => entry.artifact).sort((a, b) => b.retainedAt.localeCompare(a.retainedAt) || a.id.localeCompare(b.id));
@@ -363,11 +493,11 @@ export class UnderstandingService {
         if (state.state === "failed" && current.length && state.updatedAt <= Date.parse(current[0]!.retainedAt)) continue;
         try {
           const session = this.sources.manager.meta(sessionId).session;
-          if (!checkouts.has(session.projectId)) continue;
+          if (!sessionAppliesToRepository(session, checkouts, groupRepoByCheckout, missionsById)) continue;
           if (session.team && !this.ownedTeamSession(session)) continue;
           activeStates.push(state.state);
           if (state.state === "failed") failedReasons.push(state.error?.split("Reason: ").slice(1).join("Reason: ") || state.error || "unknown");
-        } catch { /* closed or unavailable sessions do not alter retained artifact visibility */ }
+        } catch {}
       }
       const planned: UnderstandingPlan[] = currentWork.filter(work => work.repositoryIds.some(projectId => checkouts.has(projectId))).map(work => ({
         workId: work.id, kind: work.kind, title: work.title, text: work.objective ?? "", status: work.status, updatedAt: work.updatedAt, source: "request" as const, excerpt: false,
@@ -402,7 +532,6 @@ export class UnderstandingService {
     return pageOf(this.build(workspaceId).work, cursor, item => item.id);
   }
 
-  /** Derived at read time from recorded work. Never stored, so the owner catalog revision is untouched. */
   generatedPage(workspaceId: string, cursor?: string): GeneratedCatalogPage {
     const group = this.workspace(workspaceId);
     const repositoryOf = new Map(group.repos.flatMap(repo => repo.checkouts.map(checkout => [checkout.projectId, repo.projectId] as const)));
@@ -420,7 +549,6 @@ export class UnderstandingService {
   }
 }
 
-/** Parse and validate writer diagrams at persist time; retain source when the parsed graph is outside the artifact schema. */
 export function retainedDiagrams(artifactId: string, sources: { title: string; kind: "system" | "change"; mermaid: string; citations: { source: string; line: number }[] }[]): { diagrams: Diagram[]; coverage: string[] } {
   const diagrams: Diagram[] = [], coverage: string[] = [];
   sources.forEach((source, index) => {
@@ -462,14 +590,12 @@ function excerptOf(plan: UnderstandingPlan): UnderstandingPlan {
 
 const shown = (category: string, included: number, total: number) => `${category}: ${included} of ${total} shown here; the rest are available on the detail pages.`;
 
-/** One first-come budget, spent in a fixed order on whole records. Anything left out is
- * reachable through the paged detail endpoints, and the catalog is never emptied. */
 export function boundedResponse(value: WorkspaceUnderstanding): WorkspaceUnderstanding {
   const bytes = (item: unknown) => Buffer.byteLength(JSON.stringify(item)) + 1;
   let remaining = MAX_RESPONSE_BYTES - 64 * 1024;
   const take = (item: unknown) => { const size = bytes(item); if (size > remaining) return false; remaining -= size; return true; };
   const coverage = [...value.coverage];
-  remaining -= bytes({ ...value, knowledge: undefined, work: [], repositories: [], coverage }) + 8192; // Room for the omission lines.
+  remaining -= bytes({ ...value, knowledge: undefined, work: [], repositories: [], coverage }) + 8192;
 
   const repositories = value.repositories.map(source => ({ ...source, current: [], planned: [], coverage: [] }) as UnderstandingRepository);
   for (const repo of repositories) remaining -= bytes(repo);
@@ -481,7 +607,7 @@ export function boundedResponse(value: WorkspaceUnderstanding): WorkspaceUnderst
   const addArtifact = (repo: UnderstandingRepository, source: UnderstandingArtifact) => {
     const artifact: UnderstandingArtifact = { ...source, coverage: [...source.coverage], evidence: [] };
     if (!take(artifact)) return;
-    remaining -= 256; // Reserve the evidence line.
+    remaining -= 256;
     repo.current.push(artifact); selected.push({ source, artifact });
   };
   const sourceOf = (repo: UnderstandingRepository) => value.repositories.find(item => item.id === repo.id)!;

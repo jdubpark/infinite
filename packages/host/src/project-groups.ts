@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { mkdirSync, readFileSync } from "node:fs";
@@ -40,8 +40,9 @@ type LegacyGroup = Omit<StoredGroup, "kind" | "hidden" | "members" | "detached" 
   primary?: Record<string, string>;
   repos?: Array<{ projectId: string }>;
 };
-type Stored = { groups: Record<string, LegacyGroup>; receipts: Record<string, GroupReceipt>; tombstones?: string[] };
-type CurrentStored = { groups: Record<string, StoredGroup>; receipts: Record<string, GroupReceipt>; tombstones: string[] };
+type OwnerMoves = { id: string; counts: Record<string, number> };
+type Stored = { groups: Record<string, LegacyGroup>; receipts: Record<string, GroupReceipt>; tombstones?: string[]; ownerMoves?: OwnerMoves };
+type CurrentStored = { groups: Record<string, StoredGroup>; receipts: Record<string, GroupReceipt>; tombstones: string[]; ownerMoves: OwnerMoves };
 type StateWriter = (file: string, key: Buffer, scope: string, value: unknown) => void;
 type ProjectGroupServiceOptions = {
   git?: GitReader;
@@ -49,14 +50,18 @@ type ProjectGroupServiceOptions = {
   now?: () => number;
 };
 
-/** A keyed read that ignores inherited properties, so a checkout id such as `constructor` cannot alias a prototype member. */
 const own = <T>(map: Record<string, T>, key: string): T | undefined => Object.hasOwn(map, key) ? map[key] : undefined;
 const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
 const notFound = () => new TeamError(404, "project-group-not-found", "This project group does not exist.");
 const repoConflict = (projectId: string) => new TeamError(409, "project-group-repo-conflict", `Repository ${projectId} already belongs to an owner-created group.`);
 const primaryInvalid = () => new TeamError(400, "project-group-primary-invalid", "Choose one primary checkout per repository from this project.");
+const validOwnerMoves = (value: unknown): value is OwnerMoves => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const { id, counts } = value as Partial<OwnerMoves>;
+  return typeof id === "string" && /^[a-f0-9-]{36}$/.test(id) && Boolean(counts) && typeof counts === "object" && !Array.isArray(counts)
+    && Object.values(counts as Record<string, unknown>).every(count => Number.isSafeInteger(count) && (count as number) > 0);
+};
 
-/** Owner-managed project groups. Groups organize checkout identity without changing repository policy or context. */
 export class ProjectGroupService {
   private readonly directory: string;
   private readonly file: string;
@@ -70,6 +75,7 @@ export class ProjectGroupService {
   private pending?: CurrentStored;
   private pendingIdentities?: Record<string, CheckoutIdentity>;
   private needsMigration = false;
+  private ownerMovesUnsaved = false;
   private readonly failedCaptureAt = new Map<string, number>();
 
   constructor(
@@ -126,10 +132,14 @@ export class ProjectGroupService {
         : stored.tombstones;
       if (!Array.isArray(tombstones) || tombstones.some(id => typeof id !== "string" || !projectGroupIdSchema.safeParse(id).success))
         throw new Error("Invalid project-group tombstones");
-      this.state = { groups, receipts: stored.receipts, tombstones: [...new Set(tombstones)] };
+      if (stored.ownerMoves !== undefined && !validOwnerMoves(stored.ownerMoves)) throw new Error("Invalid project-group owner moves");
+      this.ownerMovesUnsaved = stored.ownerMoves === undefined;
+      this.state = { groups, receipts: stored.receipts, tombstones: [...new Set(tombstones)], ownerMoves: stored.ownerMoves ?? { id: randomUUID(), counts: {} } };
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") this.state = { groups: {}, receipts: {}, tombstones: [] };
-      else throw error;
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        this.state = { groups: {}, receipts: {}, tombstones: [], ownerMoves: { id: randomUUID(), counts: {} } };
+        this.ownerMovesUnsaved = true;
+      } else throw error;
     }
 
     try {
@@ -162,6 +172,7 @@ export class ProjectGroupService {
     this.state = candidate;
     this.pending = undefined;
     this.needsMigration = false;
+    this.ownerMovesUnsaved = false;
   }
 
   private persistIdentities(candidate: Record<string, CheckoutIdentity>) {
@@ -198,7 +209,6 @@ export class ProjectGroupService {
     return group.members.filter(id => own(identities, id)?.key === key).length;
   }
 
-  /** Capture missing identities, then place every identified checkout in exactly one stored group. */
   private reconcile() {
     this.reconcilePending();
     let identityChanged = false;
@@ -206,8 +216,6 @@ export class ProjectGroupService {
     const time = this.clock();
     for (const project of this.config.projects) {
       const known = own(identities, project.id), source = this.sourceIdentity(project);
-      // A scanned identity gives way to the source record once the project follows GitHub: the record names the
-      // repository the host fetches, and the checkout's own metadata may carry no remote at all.
       if (known && !(source && known.from === "host-scan" && known.key !== source.key)) continue;
       const attemptedAt = this.failedCaptureAt.get(project.id);
       if (attemptedAt !== undefined && time - attemptedAt < 60_000) continue;
@@ -385,9 +393,31 @@ export class ProjectGroupService {
   }
 
   private record(candidate: CurrentStored, requestId: string, fingerprint: string, result: ProjectGroup) {
+    const ids = new Set([
+      ...this.config.projects.map(project => project.id),
+      ...[this.state, candidate].flatMap(state => Object.values(state.groups).flatMap(group => group.members)),
+    ]);
+    for (const id of ids) {
+      const before = this.findContaining(this.state, id), after = this.findContaining(candidate, id);
+      const moved = before !== undefined
+        ? after?.id !== before.id
+        : after !== undefined && (after.id !== id || own(this.state.groups, after.id) !== undefined);
+      if (moved) candidate.ownerMoves.counts[id] = (own(candidate.ownerMoves.counts, id) ?? 0) + 1;
+    }
     candidate.receipts[requestId] = { fingerprint, result: structuredClone(result) };
     this.persist(candidate);
     return structuredClone(result);
+  }
+
+  ownerMoveMark(projectId: string): string {
+    this.reconcile();
+    if (this.ownerMovesUnsaved) this.persist(structuredClone(this.state));
+    return `${this.state.ownerMoves.id}:${own(this.state.ownerMoves.counts, projectId) ?? 0}`;
+  }
+
+  storedHolder(projectId: string): string | undefined {
+    this.reconcile();
+    return this.findContaining(this.state, projectId)?.id;
   }
 
   private findContaining(candidate: CurrentStored, projectId: string) {
@@ -430,7 +460,6 @@ export class ProjectGroupService {
     return { groups, suggestions: this.suggestions(groups) };
   }
 
-  /** Resolve a stored group id, a host project id, or an ungrouped implicit project. */
   get(idOrProjectId: string): ProjectGroup {
     this.reconcile();
     projectGroupIdSchema.parse(idOrProjectId);
@@ -442,7 +471,6 @@ export class ProjectGroupService {
     return holding ? this.storedGroup(holding) : this.implicit(project);
   }
 
-  /** Return the named project holding an enrolled checkout, including an implicit project. */
   containing(projectId: string): { id: string; name: string } | undefined {
     this.reconcile();
     const project = this.config.projects.find(value => value.id === projectId);
@@ -451,7 +479,6 @@ export class ProjectGroupService {
     return group ? { id: group.id, name: group.name } : { id: project.id, name: project.name };
   }
 
-  /** Capture the current holder for every enrolled project after one reconciliation. */
   membershipSnapshot(): ReadonlyMap<string, { id: string; name: string }> {
     this.reconcile();
     const enrolled = new Set(this.config.projects.map(project => project.id));
@@ -508,7 +535,6 @@ export class ProjectGroupService {
       const project = this.config.projects.find(value => value.id === id);
       if (!project) throw notFound();
       current = this.findContaining(candidate, id);
-      // A retired group id never aliases the group that now holds its checkout: a stale update is refused, not redirected.
       if (current && candidate.tombstones.includes(id)) throw notFound();
       if (!current) {
         const groupId = candidate.tombstones.includes(id) ? this.slug(project.name, candidate) : id;

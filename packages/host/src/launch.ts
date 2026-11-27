@@ -1,11 +1,65 @@
+import { createHash } from "node:crypto";
 import { HANDOFF_INSTRUCTIONS } from "./handoff-types.js";
-import type { AgentProfile, Provider } from "./types.js";
+import { sessionExecutionIdentity, type AgentProfile, type Config, type ExecutionIdentity, type Provider, type SessionPurpose } from "./types.js";
 import { dirname, join } from "node:path";
 import { teamModelProfileSchema, type TeamModelProfile } from "./team-types.js";
+import { parseMissionCoordinatorProvider, type MissionCoordinatorProvider } from "./mission-types.js";
+export { parseMissionCoordinatorProvider };
+import { TeamError } from "./team-workspace.js";
 import { codexTrustArgs } from "./workspace-trust.js";
 import { sudoShape } from "./sudo-profile.js";
+import { EGRESS_ENVIRONMENT_NAMES } from "./egress.js";
+import { CLAUDE_CODE_MODE_ENV, codeModeEnabled } from "./code-mode.js";
 
-/** Only model controls are added here; the configured provider permissions remain unchanged. */
+const HOST_LAUNCH_FIELDS = ["executionIdentity", "purpose", "configId", "team", "teamCwd", "teamModelProfile", "recordedCodeMode"] as const;
+
+export function hasHostLaunchFields(request: object): boolean {
+  return HOST_LAUNCH_FIELDS.some(field => field in request);
+}
+
+export function stripHostLaunchFields<T extends object>(request: T): T {
+  const cleaned = { ...request } as Record<string, unknown>;
+  for (const field of HOST_LAUNCH_FIELDS) delete cleaned[field];
+  return cleaned as T;
+}
+
+export function sessionRequestFingerprint(request: { requestId: string }, targetId: string): string {
+  const canonical = targetId === request.requestId ? request : { ...request, requestId: targetId };
+  return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
+}
+
+export function matchesSessionRequestFingerprint(
+  storedFingerprint: string,
+  request: { requestId: string; purpose?: SessionPurpose; executionIdentity?: ExecutionIdentity },
+  targetId: string,
+  resolvedIdentity: ExecutionIdentity,
+): boolean {
+  if (storedFingerprint === sessionRequestFingerprint(request, targetId)) return true;
+  if (request.executionIdentity === undefined) return false;
+  if (sessionExecutionIdentity({ purpose: request.purpose }) !== resolvedIdentity) return false;
+  const { executionIdentity: _executionIdentity, ...legacy } = request;
+  return storedFingerprint === sessionRequestFingerprint(legacy, targetId);
+}
+
+export function sessionAgentProfile(config: Pick<Config, "agents" | "eval">, provider: Provider, executionIdentity: ExecutionIdentity = "production"): AgentProfile | undefined {
+  if (executionIdentity !== "eval") return config.agents[provider];
+  const agents = config.eval?.member?.agents;
+  const profile = agents && (provider === "claude" || provider === "codex" || provider === "opencode") ? agents[provider] : undefined;
+  if (!profile) throw new TeamError(409, "eval-identity-missing", "The eval identity has no launch profile for this provider.");
+  return profile;
+}
+
+export function memberCodeModeExpected(config: Pick<Config, "agents" | "codeMode">): boolean {
+  const profile = config.agents.claude;
+  if (!profile) return false;
+  const shape = headlessLaunch("claude", profile);
+  return codeModeEnabled(config.codeMode?.claude, "claude", { headless: shape.headless, served: shape.headless && shape.unservable === undefined, excluded: false });
+}
+
+export function withoutSharedContext<T extends { text: string; sources: readonly unknown[] }>(context: T, executionIdentity: ExecutionIdentity = "production"): T {
+  return executionIdentity === "eval" ? { ...context, text: "", sources: [] } : context;
+}
+
 export function teamModelLaunch(profile: AgentProfile, input: TeamModelProfile): AgentProfile {
   const selection = teamModelProfileSchema.parse(input);
   let providerArgs = profile.args;
@@ -29,8 +83,6 @@ export function teamModelLaunch(profile: AgentProfile, input: TeamModelProfile):
   });
   if (conflict) throw new Error("Move model and effort settings from the provider profile into the team lineup. Remove fallback-model arguments before starting a mixed-model team.");
   if (selection.provider === "opencode") {
-    // Run mode owns the conversation, working directory, and prompt. Preserve
-    // provider policy flags, but refuse alternate commands and session routing.
     const switches = new Set(["--pure", "--print-logs", "--thinking", "--auto", "--no-auto"]);
     const values = new Set(["--agent", "--format", "--title", "--log-level"]);
     for (let index = 0; index < providerArgs.length; index++) {
@@ -45,7 +97,6 @@ export function teamModelLaunch(profile: AgentProfile, input: TeamModelProfile):
     }
     const wrapper = profile.args.slice(0, profile.args.length - providerArgs.length);
     return { ...profile, args: [...wrapper, "run", ...providerArgs,
-      // JSON events carry the per-message token and cost usage the worker records.
       ...(providerArgs.some(arg => arg === "--format" || arg.startsWith("--format=")) ? [] : ["--format", "json"]),
       "--model", selection.model,
       ...(selection.variant ? ["--variant", selection.variant] : []),
@@ -56,7 +107,6 @@ export function teamModelLaunch(profile: AgentProfile, input: TeamModelProfile):
   ] };
 }
 
-/** Restrict the permission reviewer to its one report channel in a noninteractive run. */
 export function permissionCoordinatorLaunch(provider: Provider, profile: AgentProfile): AgentProfile {
   if (provider !== "claude") throw new Error("Permission coordinator requires Claude Code.");
   const sudo = /(^|\/)sudo$/.test(profile.command);
@@ -143,37 +193,29 @@ export function permissionCoordinatorLaunch(provider: Provider, profile: AgentPr
   return { ...profile, args: merged };
 }
 
-/** Keep a mission coordinator read-only while retaining only its structured report channel. */
-export function missionCoordinatorLaunch(provider: Provider, profile: AgentProfile): AgentProfile {
-  if (provider === "claude") {
-    // Like the permission coordinator: dontAsk denies anything not listed, so the coordinator can read and report only.
-    const args: string[] = [];
-    const valueFlags = new Set(["--permission-mode", "--settings", "--agents", "--plugin-dir", "--permission-prompt-tool"]);
-    // Variadic flags lose every value, so no stray value can become the positional prompt.
-    const listFlags = new Set(["--allowedTools", "--allowed-tools", "--disallowedTools", "--disallowed-tools", "--tools", "--mcp-config"]);
-    for (let index = 0; index < profile.args.length; index++) {
-      const arg = profile.args[index], flag = arg.split("=")[0];
-      if (["--dangerously-skip-permissions", "--allow-dangerously-skip-permissions", "--session-id", "--resume", "-r", "--continue", "-c"].includes(flag))
-        throw new Error(`Mission coordinator profile cannot configure ${flag}.`);
-      if (arg.startsWith("-c") && arg !== "--" && !arg.startsWith("--"))
-        throw new Error("Mission coordinator profile cannot configure -c.");
-      if (arg.startsWith("-r") && !arg.startsWith("--"))
-        throw new Error("Mission coordinator profile cannot configure -r.");
-      if (valueFlags.has(flag)) { if (!arg.includes("=")) index++; continue; }
-      if (listFlags.has(flag)) {
-        if (!arg.includes("=")) while (index + 1 < profile.args.length && !profile.args[index + 1].startsWith("-")) index++;
-        continue;
-      }
-      args.push(arg);
+export function missionCoordinatorLaunch(provider: MissionCoordinatorProvider, profile: AgentProfile): AgentProfile {
+  if (provider !== "claude") throw new Error("Mission coordinators require Claude Code.");
+  const args: string[] = [];
+  const valueFlags = new Set(["--permission-mode", "--settings", "--agents", "--plugin-dir", "--permission-prompt-tool"]);
+  const listFlags = new Set(["--allowedTools", "--allowed-tools", "--disallowedTools", "--disallowed-tools", "--tools", "--mcp-config"]);
+  for (let index = 0; index < profile.args.length; index++) {
+    const arg = profile.args[index], flag = arg.split("=")[0];
+    if (["--dangerously-skip-permissions", "--allow-dangerously-skip-permissions", "--session-id", "--resume", "-r", "--continue", "-c"].includes(flag))
+      throw new Error(`Mission coordinator profile cannot configure ${flag}.`);
+    if (arg.startsWith("-c") && arg !== "--" && !arg.startsWith("--"))
+      throw new Error("Mission coordinator profile cannot configure -c.");
+    if (arg.startsWith("-r") && !arg.startsWith("--"))
+      throw new Error("Mission coordinator profile cannot configure -r.");
+    if (valueFlags.has(flag)) { if (!arg.includes("=")) index++; continue; }
+    if (listFlags.has(flag)) {
+      if (!arg.includes("=")) while (index + 1 < profile.args.length && !profile.args[index + 1].startsWith("-")) index++;
+      continue;
     }
-    // A flag follows the variadic tool list so it cannot absorb a later positional prompt.
-    args.push("--permission-mode", "dontAsk", "--tools", "Read,Glob,Grep",
-      "--allowedTools", "Read", "Glob", "Grep", "mcp__infinite_team__mission_report", "--strict-mcp-config", "--disable-slash-commands");
-    return { ...profile, args };
+    args.push(arg);
   }
-  // Codex merges inherited MCP server tables, so a coordinator could keep write-capable tools
-  // outside its read-only sandbox. Codex coordinators wait until that can be enforced.
-  throw new Error("Mission coordinators require Claude Code.");
+  args.push("--permission-mode", "dontAsk", "--tools", "Read,Glob,Grep",
+    "--allowedTools", "Read", "Glob", "Grep", "mcp__infinite_team__mission_report", "--strict-mcp-config", "--disable-slash-commands");
+  return { ...profile, args };
 }
 
 const CLAUDE_EVENTS = [
@@ -189,6 +231,8 @@ const CLAUDE_EVENTS = [
   "StopFailure",
   "SessionEnd",
 ];
+const tomlString = (value: string) => JSON.stringify(value).replace(/\x7f/g, "\\u007f");
+
 const CODEX_EVENTS = [
   "SessionStart",
   "UserPromptSubmit",
@@ -198,6 +242,92 @@ const CODEX_EVENTS = [
   "Stop",
   "Interrupt",
 ];
+
+export const PERMISSION_CHECK_TIMEOUT_S = 30;
+export const PERMISSION_REQUEST_TIMEOUT_S = 360;
+
+export function headlessChannelArgs(relayPath: string, providerRun: number, signalHooks: boolean, codeMode = false): string[] {
+  const development = relayPath.endsWith(".ts");
+  const run = (script: string, ...words: string[]) =>
+    [process.execPath, ...(development ? ["--import", import.meta.resolve("tsx")] : []), script, ...words].join(" ");
+  const channel = join(dirname(relayPath), development ? "permission-hook.ts" : "permission-hook.js");
+  const signal = { type: "command", command: run(relayPath, "claude"), timeout: 10 };
+  const check = { type: "command", command: run(channel, "check", String(providerRun)), timeout: PERMISSION_CHECK_TIMEOUT_S };
+  const decide = { type: "command", command: run(channel, "request", String(providerRun)), timeout: PERMISSION_REQUEST_TIMEOUT_S };
+  const hooks: Record<string, { hooks: object[] }[]> = {};
+  for (const event of CLAUDE_EVENTS) {
+    const relayed = signalHooks && event !== "PermissionRequest";
+    const handlers = [...(relayed ? [signal] : []), ...(event === "PreToolUse" ? [check] : event === "PermissionRequest" ? [decide] : [])];
+    if (handlers.length) hooks[event] = [{ hooks: handlers }];
+  }
+  return ["--setting-sources", "", "--settings", JSON.stringify({ disableAllHooks: false, hooks,
+    ...(codeMode ? { env: { [CLAUDE_CODE_MODE_ENV]: "1" } } : {}),
+  })];
+}
+
+export interface HeadlessLaunch {
+  headless: boolean;
+  unservable?: string;
+  allowlist: string[];
+}
+
+export function headlessLaunch(provider: Provider, profile: AgentProfile): HeadlessLaunch {
+  let args = profile.args;
+  if (/(^|\/)sudo$/.test(profile.command)) {
+    const shape = sudoShape(profile.args);
+    if (!shape.ok) return { headless: false, allowlist: [] };
+    args = shape.providerArgs;
+  }
+  if (provider === "opencode" || provider === "codex") {
+    const headless = provider === "opencode" ? args.includes("run") : args.includes("exec");
+    return headless ? { headless, allowlist: [], unservable: `${provider === "opencode" ? "OpenCode" : "Codex"} has no verified headless permission channel.` } : { headless: false, allowlist: [] };
+  }
+  if (provider !== "claude") return { headless: false, allowlist: [] };
+  const allowlist: string[] = [];
+  let headless = false, mode: string | undefined, conflict: string | undefined;
+  const conflicts = new Set(["--settings", "--setting-sources", "--permission-prompt-tool", "--dangerously-skip-permissions",
+    "--allow-dangerously-skip-permissions", "--fork-session", "--no-session-persistence", "--bare", "--safe-mode"]);
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index], equals = arg.indexOf("=");
+    const flag = equals < 0 ? arg : arg.slice(0, equals);
+    if (flag === "-p" || flag === "--print") headless ||= equals < 0 || arg.slice(equals + 1) === "true";
+    else if (flag === "--permission-mode") mode = equals < 0 ? args[++index] : arg.slice(equals + 1);
+    else if (flag === "--allowedTools" || flag === "--allowed-tools") {
+      if (equals >= 0) allowlist.push(...(arg.slice(equals + 1).match(/(?:[^\s,(]+(?:\([^)]*\))?)+/g) ?? []));
+      else while (index + 1 < args.length && !args[index + 1].startsWith("-")) allowlist.push(args[++index]);
+    } else if (conflicts.has(flag)) conflict ??= flag;
+  }
+  if (!headless) return { headless: false, allowlist };
+  if (conflict) return { headless, allowlist, unservable: `The launch profile sets ${conflict}, which the permission channel cannot combine with its own settings.` };
+  if (mode !== undefined && mode !== "default")
+    return { headless, allowlist, unservable: mode === "dontAsk"
+      ? "Permission mode dontAsk refuses an open call before the PermissionRequest hook fires."
+      : `Permission mode ${mode} was not verified with the permission channel.` };
+  return { headless, allowlist };
+}
+
+export function headlessResumeProfile(profile: AgentProfile, nativeSessionId: string): AgentProfile {
+  if (!/^[A-Za-z0-9_-]{1,200}$/.test(nativeSessionId)) throw new Error("Invalid native conversation id");
+  let prefix = 0;
+  if (/(^|\/)sudo$/.test(profile.command)) {
+    const shape = sudoShape(profile.args);
+    if (!shape.ok) throw new Error("The sudo provider profile cannot be resumed in place");
+    prefix = shape.options.length + 2;
+  }
+  const kept: string[] = [];
+  const rest = profile.args.slice(prefix);
+  for (let index = 0; index < rest.length; index++) {
+    const arg = rest[index], equals = arg.indexOf("=");
+    const flag = equals < 0 ? arg : arg.slice(0, equals);
+    if (flag === "--continue" || flag === "-c") continue;
+    if (flag === "--resume" || flag === "-r" || flag === "--session-id") {
+      if (equals < 0 && index + 1 < rest.length && !rest[index + 1].startsWith("-")) index++;
+      continue;
+    }
+    kept.push(arg);
+  }
+  return { ...profile, args: [...profile.args.slice(0, prefix), ...kept, "--resume", nativeSessionId] };
+}
 
 export function buildLaunch(
   provider: Provider,
@@ -210,8 +340,15 @@ export function buildLaunch(
   teamModelProfile?: TeamModelProfile,
   handoffSessionId?: string,
   trustedCwd?: string,
+  entryTools?: boolean,
+  channel: number | false = false,
+  egressConfigured = false,
+  codeMode = false,
+  nativeArgCount = 0,
 ): AgentProfile {
   const args = [...profile.args];
+  const hostEgressEnvVars = egressConfigured ? EGRESS_ENVIRONMENT_NAMES : [];
+  const withEntryTools = Boolean(team && entryTools && !handoffSessionId);
   if (handoffSessionId) {
     if (!hooks || !["claude", "codex"].includes(provider)) throw new Error("Handoff requires an authenticated provider channel");
     const development = relayPath.endsWith(".ts");
@@ -221,7 +358,8 @@ export function buildLaunch(
       env: { INFINITE_HOOK_URL: "${INFINITE_HOOK_URL}", INFINITE_HOOK_TOKEN: "${INFINITE_HOOK_TOKEN}", INFINITE_HANDOFF_SESSION: handoffSessionId },
     } } }));
     else {
-      for (const [key, value] of Object.entries({ command: process.execPath, args: serverArgs, env_vars: ["INFINITE_HOOK_URL", "INFINITE_HOOK_TOKEN"], "env.INFINITE_HANDOFF_SESSION": handoffSessionId }))
+      const envVars = ["INFINITE_HOOK_URL", "INFINITE_HOOK_TOKEN", ...hostEgressEnvVars];
+      for (const [key, value] of Object.entries({ command: process.execPath, args: serverArgs, env_vars: envVars, "env.INFINITE_HANDOFF_SESSION": handoffSessionId }))
         args.push("-c", `mcp_servers.infinite_handoff.${key}=${JSON.stringify(value)}`);
     }
   }
@@ -237,6 +375,7 @@ export function buildLaunch(
         INFINITE_HOOK_TOKEN: "${INFINITE_HOOK_TOKEN}",
         INFINITE_TEAM_ASSIGNMENT: "${INFINITE_TEAM_ASSIGNMENT}",
         INFINITE_MISSION_ASSIGNMENT: "${INFINITE_MISSION_ASSIGNMENT:-}",
+        ...(withEntryTools ? { INFINITE_TEAM_ENTRY_TOOLS: "1" } : {}),
       },
     } } }));
   }
@@ -247,45 +386,56 @@ export function buildLaunch(
     for (const [key, value] of Object.entries({
       command: process.execPath,
       args: serverArgs,
-      env_vars: ["INFINITE_HOOK_URL", "INFINITE_HOOK_TOKEN", "INFINITE_TEAM_ASSIGNMENT", "INFINITE_MISSION_ASSIGNMENT", "INFINITE_PROJECT_ID"],
+      env_vars: ["INFINITE_HOOK_URL", "INFINITE_HOOK_TOKEN", "INFINITE_TEAM_ASSIGNMENT", "INFINITE_PROJECT_ID", ...hostEgressEnvVars],
       "tools.report.approval_mode": "approve",
-      "tools.mission_report.approval_mode": "approve",
+      ...(withEntryTools ? {
+        "env.INFINITE_TEAM_ENTRY_TOOLS": "1",
+        "tools.entry_post.approval_mode": "approve",
+        "tools.entry_list.approval_mode": "approve",
+        "tools.entry_get.approval_mode": "approve",
+      } : {}),
     })) args.push("-c", `mcp_servers.infinite_team.${key}=${JSON.stringify(value)}`);
   }
-  // Dev runs the relay from TypeScript through tsx; builds run the compiled file. The tsx
-  // loader is passed as an absolute URL because the agent's cwd is the project, not this repo.
   const relay = relayPath.endsWith(".ts")
     ? ["node", "--import", import.meta.resolve("tsx"), relayPath]
     : ["node", relayPath];
-  if (hooks && provider === "claude" && enabled.claude) {
-    // A command hook, not an HTTP hook: the relay runs in the agent's account and is the only
-    // process that can read the transcript the worker asks for in its reply.
+  const codeModeRequest = codeMode && provider === "claude" && channel === false ? { env: { [CLAUDE_CODE_MODE_ENV]: "1" } } : undefined;
+  if (hooks && provider === "claude" && enabled.claude && channel === false) {
     const handler = { type: "command", command: [...relay, "claude"].join(" "), timeout: 10 };
     const settings = {
+      disableAllHooks: false,
       hooks: Object.fromEntries(
         CLAUDE_EVENTS.map((e) => [e, [{ hooks: [handler] }]]),
       ),
+      ...codeModeRequest,
     };
     args.push("--settings", JSON.stringify(settings));
+  } else if (codeModeRequest && nativeArgCount <= profile.args.length && !profile.args.some(arg => arg === "--settings" || arg.startsWith("--settings="))) {
+    args.splice(profile.args.length - nativeArgCount, 0, "--settings", JSON.stringify(codeModeRequest));
   }
-  if (hooks && provider === "codex" && enabled.codex) {
-    const command = [...relay, "codex"].join(" ");
-    for (const event of CODEX_EVENTS)
+  if (hooks && provider === "claude" && channel !== false) args.push(...headlessChannelArgs(relayPath, channel, enabled.claude, codeMode));
+  if (team && provider === "claude" && channel === false) {
+    if (profile.args.some(arg => arg === "--setting-sources" || arg.startsWith("--setting-sources=")))
+      throw new Error("A Claude team launch chooses its own setting sources; remove --setting-sources from the profile.");
+    args.push("--setting-sources", "user");
+  }
+  if (hooks && provider === "codex") {
+    args.push("-c", `notify=[${[...relay, "codex-notify"].map(tomlString).join(",")}]`);
+    if (enabled.codex) {
+      const command = [...relay, "codex"].join(" ");
+      for (const event of CODEX_EVENTS)
+        args.push(
+          "-c",
+          `hooks.${event}=[{hooks=[{type="command",command=${tomlString(command)}}]}]`,
+        );
+      args.push("--dangerously-bypass-hook-trust");
       args.push(
         "-c",
-        `hooks.${event}=[{hooks=[{type="command",command="${command}"}]}]`,
+        `tui.notifications=["agent-turn-complete","approval-requested","async-question"]`,
       );
-    args.push("--dangerously-bypass-hook-trust");
-    args.push(
-      "-c",
-      `notify=[${[...relay, "codex-notify"].map((a) => `"${a}"`).join(",")}]`,
-    );
-    args.push(
-      "-c",
-      `tui.notifications=["agent-turn-complete","approval-requested","async-question"]`,
-    );
-    args.push("-c", `tui.notification_method="osc9"`);
-    args.push("-c", `tui.notification_condition="always"`);
+      args.push("-c", `tui.notification_method="osc9"`);
+      args.push("-c", `tui.notification_condition="always"`);
+    }
   }
   if (trustedCwd && provider === "codex") args.push(...codexTrustArgs(trustedCwd));
   if (prompt)

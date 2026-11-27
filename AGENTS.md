@@ -49,8 +49,11 @@ If you find existing private information while working, remove or replace it and
 - In a network-off provider sandbox, the `tsx` CLI cannot open its IPC socket and tests that start a host cannot listen; run focused tests that start no server with `node --import tsx --test FILE`, and leave the rest to the host-run checks.
 - Run `npm run check` (typecheck, tests, builds) before declaring host or shared-package work complete.
 - For the phone app, also run `npm run lint -w @infinite/mobile` and `npx tsc --noEmit` in `apps/mobile`.
+- New durable state logic gets a seeded simulator. This covers a record the host writes and reloads, a request receipt, and any state machine that must survive a restart. The simulator generates operations and faults from a printed seed, checks named invariants after every step, and has one mutation per invariant that it must catch. Extend an existing simulator when one covers the module (`tests/outcome-projector-sim.test.ts`, `tests/search-engine-sim.test.ts`). Keep example tests for behaviour a simulator cannot reach, such as a real process or a real socket. Do not delete an existing test to make room for one.
+- Compare a rewrite or a port with the code it replaces on generated inputs before the old code is removed. State improvement work as a measured baseline, a numeric target, and the command that measures both.
 - Product, design, and protocol context: `PRODUCT.md`, `DESIGN.md`, `docs/architecture.md`, `docs/security.md`.
-- Do not weaken the honesty rules in `PRODUCT.md`: the host never infers task completion or approves a provider permission on its own. A strong coordinator may decide current one-shot requests only under explicit owner delegation, with recorded scope and guarded delivery.
+- To drive the running product and capture evidence, follow `.agents/skills/verify-infinite/SKILL.md`.
+- Do not weaken the honesty rules in `PRODUCT.md`: the host never infers task completion or approves a provider permission on its own. A separate permission agent may decide current one-shot requests only under the owner's recorded workspace delegation, with guarded delivery; it never decides its own request, and the owner's five interrupt classes always need the owner's own answer. Until the earlier repository-level delegation is removed, a strong coordinator may decide current one-shot requests of a team run that the permission agent does not serve, only under explicit owner delegation, with recorded scope and guarded delivery.
 
 ## Repository summaries and architecture review
 

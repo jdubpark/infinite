@@ -8,7 +8,6 @@ import { nativeCatalogSender, NATIVE_COMPRESSION, NATIVE_MAX_BUFFERED, NATIVE_MA
 
 export type MissionManagedSessionGuard = (sessionId: string) => boolean | Promise<boolean>;
 
-/** Native protocols grant owner capabilities. Browser cookies and narrower device roles cannot attach. */
 export function connectNativeFrontends(server: Server, manager: Manager, authenticate: (token: string) => PairedDevice | undefined, missionManaged?: MissionManagedSessionGuard) {
   const sockets = new WebSocketServer({ noServer: true, maxPayload: NATIVE_MAX_MESSAGE, perMessageDeflate: NATIVE_COMPRESSION });
   const upstreams = new Set<WebSocket>();
@@ -35,18 +34,15 @@ export function connectNativeFrontends(server: Server, manager: Manager, authent
         ![origin.host, `127.0.0.1:${manager.config.port}`, `localhost:${manager.config.port}`].includes(req.headers.host ?? "")) { deny(); return; }
     void (async () => {
       try {
-        // Mission-owned sessions reject human native attachment before the
-        // owner-role check. Executor tunnel upgrades retain their own authority.
         if (!executor && device && missionManaged && await missionManaged(match[1])) { denyMissionManaged(); return; }
         if (!device || device.role !== "owner") { deny(); return; }
         manager.meta(match[1]);
-        const backend = await workerCall<{ url: string; token: string }>(manager.config.runDir, match[1], executor ? {
+        const backend = await workerCall<{ url: string; token: string }>(manager.socketTarget, match[1], executor ? {
           op: "executor-connect", token: executorToken as string,
         } : {
           op: "native-connect", actor: controlActor(device, clientId!), leaseId: leaseId!,
         });
         if (socket.destroyed) return;
-        // The worker supplies an authenticated loopback gate, never an arbitrary owner URL.
         if (!(executor ? /^ws:\/\/127\.0\.0\.1:\d+\/device$/ : /^ws:\/\/127\.0\.0\.1:\d+\/$/).test(backend.url)) throw new Error("Invalid native endpoint");
         sockets.handleUpgrade(req, socket, head, frontend => {
           const upstream = new WebSocket(backend.url, { headers: { Authorization: `Bearer ${backend.token}` }, maxPayload: NATIVE_MAX_MESSAGE, perMessageDeflate: false, handshakeTimeout: 10000 });

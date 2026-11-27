@@ -1,7 +1,5 @@
 import React, { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { Terminal } from "@xterm/xterm";
-import { FitAddon } from "@xterm/addon-fit";
 import {
   ArrowLeft,
   ArrowDown,
@@ -14,18 +12,21 @@ import {
   Infinity as InfinityIcon,
   KeyRound,
   Laptop,
+  ListChecks,
   LogOut,
   Pause,
   Plus,
   RefreshCw,
+  Scale,
   Send,
   ShieldCheck,
   TerminalSquare,
   Target,
   Users,
+  Waypoints,
   WifiOff,
 } from "lucide-react";
-import { useApi, ago, ApiError, isControlRefusal, isMissionManaged, missionManagedLine, names, pendingLabel, sourceLabel, type ControlLease, type Me, type ProjectDetail, type ProjectSourceStatus, type ProjectSyncStatus, type Session, type LogEvent } from "./api";
+import { useApi, ago, ApiError, isControlRefusal, isMissionManaged, missionManagedLine, names, pendingLabel, postDecisionAnswer, readSessions, sourceLabel, type Me, type ProjectDetail, type ProjectSourceStatus, type ProjectSyncStatus, type Session, type LogEvent } from "./api";
 import { clearDrafts, readDraft, settleDraft, useSessionDraft, writeDraft, type PendingInput } from "./drafts";
 import { creations, lifecycles } from "./requests";
 import { MachinePicker, MachineProvider, useMachines } from "./machines";
@@ -35,12 +36,19 @@ import { SessionPicker, sessionStatus, useSessionLocation, type SessionTab } fro
 import "@fontsource/instrument-sans/400.css";
 import "@fontsource/instrument-sans/500.css";
 import "@fontsource/instrument-sans/600.css";
-import "@xterm/xterm/css/xterm.css";
-import { foreground, useLiveRefresh } from "./live-refresh";
+import { TerminalView } from "./terminal-view";
+import { useLiveRefresh } from "./live-refresh";
 import { useSessionControl } from "./session-control";
-import { TeamCreate, TeamDetail, TeamList, TeamPicker, clearTeamRequests, type TeamView } from "./teams";
+import { TeamCreate, TeamDetail, TeamList, TeamPicker, clearTeamRequests, type TeamListItem } from "./teams";
 import { GoalCreate, GoalDetail, GoalList, GoalPicker, clearGoalRequests, type ProductGoal } from "./goals";
+import { MissionPage, clearMissionRequests } from "./missions";
 import { CostPage, CostPicker } from "./cost";
+import { PermissionDetail, PermissionOverview, PermissionPicker, clearPermissionRequests, decisionLogAvailable } from "./permissions";
+import { SwarmView } from "./swarm/SwarmView";
+import { haltNotice, type HaltPlace, type HaltView } from "./halt";
+import { HaltBanner } from "./halt-banner";
+import { useDecisionQueueFeed } from "./decision-queue-feed";
+import { clearDecisionQueueRequests, DecisionQueueView } from "./decision-queue";
 import "./style.css";
 
 const time = (value: string) =>
@@ -48,7 +56,6 @@ const time = (value: string) =>
     hour: "2-digit",
     minute: "2-digit",
   });
-// Switching sessions paints the last view immediately, but never restores authority.
 const sessionViews = new Map<string, { session: Session; events: LogEvent[]; cursor: number; seen: string }>();
 
 function Mark() {
@@ -67,13 +74,15 @@ function App() {
   const [key, setKey] = useState("");
   const [error, setError] = useState("");
   const [sessions, setSessions] = useState<Session[]>([]);
-  const [teams, setTeams] = useState<TeamView[]>([]);
+  const [teams, setTeams] = useState<TeamListItem[]>([]);
   const [goals, setGoals] = useState<ProductGoal[]>([]);
+  const [halt, setHalt] = useState<HaltView | null>(null);
   const route = useSessionLocation(machines.active.id);
   const selected = route.id, creating = route.creating;
   const [bootstrapError, setBootstrapError] = useState(false);
   const [attempt, setAttempt] = useState(0);
   const [busy, setBusy] = useState(false);
+  const [swarmFocus, setSwarmFocus] = useState(false);
   useEffect(() => {
     let current = true;
     setBootstrapError(false);
@@ -89,19 +98,25 @@ function App() {
     return () => { current = false; window.removeEventListener("online", retry); };
   }, [attempt]);
   const host = useLiveRefresh(async (current) => {
-    const data = await api<{ sessions: Session[] }>("/sessions");
-    if (current()) setSessions(data.sessions.sort((a, b) => b.createdAt.localeCompare(a.createdAt)));
+    const rows = await readSessions(api);
+    if (current()) setSessions([...rows].sort((a, b) => b.createdAt.localeCompare(a.createdAt)));
   }, 1800, me);
   const teamFeed = useLiveRefresh(async current => {
-    const data = await api<{ teams: TeamView[] }>("/teams");
+    const data = await api<{ teams: TeamListItem[] }>("/teams?view=list");
     if (current()) setTeams(data.teams.sort((a, b) => b.createdAt.localeCompare(a.createdAt)));
   }, 1800, me?.teams ? me : null);
   const goalFeed = useLiveRefresh(async current => {
     const data = await api<{ goals: ProductGoal[] }>("/goals");
     if (current()) setGoals(data.goals.sort((a, b) => b.createdAt.localeCompare(a.createdAt)));
   }, 1800, me?.goals ? me : null);
+  const haltFeed = useLiveRefresh(async current => {
+    const view = await api<HaltView>("/halt");
+    if (current()) setHalt(view);
+  }, 1800, me);
+  const decisionFeed = useDecisionQueueFeed(api, me ? `${machines.active.id}:${me.role}` : null, route.decisions ? 1800 : 10000);
   const connected = host.fresh;
   const lastSeen = host.seen;
+  const decisionCount = decisionFeed.failed || decisionFeed.stale ? 0 : decisionFeed.queue?.decisions.length ?? 0;
   async function login(event: React.FormEvent) {
     event.preventDefault();
     setBusy(true);
@@ -172,8 +187,18 @@ function App() {
       </main>
     );
   const active = sessions.filter((s) => s.status === "running").length;
+  const screenProject = selected ? sessions.find(session => session.id === selected)?.projectId
+    : route.teamId ? teams.find(team => team.id === route.teamId)?.projectId
+      : route.goalId ? goals.find(goal => goal.id === route.goalId)?.projectId
+        : route.costProjectId;
+  const haltPlace: HaltPlace = selected || route.teamId || route.goalId || route.costProjectId ? { projectIds: screenProject ? [screenProject] : [] } : "overview";
+  const projectName = (id: string) => me.projects.find(project => project.id === id)?.name ?? id;
+  const permissionsShown = route.permissions && decisionLogAvailable(me);
+  const swarmShown = route.swarm || !(selected || creating || route.teams || route.goals || route.missionId || route.decisions || route.cost || permissionsShown);
+  const swarm = <SwarmView me={me} sessions={sessions} teams={teams} fresh={host.fresh && (!me.teams || teamFeed.fresh)} stale={host.stale || Boolean(me.teams && teamFeed.stale)} seen={host.seen}
+    view={route.swarmView} setView={route.navigateSwarm} openSession={route.navigate} openTeam={route.navigateTeam} openMission={route.navigateMission} onCreate={me.role === "owner" ? route.create : undefined} focus={swarmFocus} setFocus={setSwarmFocus} />;
   return (
-    <div className={`app ${selected || creating || route.teams || route.goals || route.cost ? "has-detail" : ""}`}>
+    <div className={`app ${selected || creating || route.teams || route.goals || route.missionId || route.decisions || route.cost || route.swarm || (permissionsShown && (route.decisionId || route.permissionOverview)) ? "has-detail" : ""}${swarmShown ? " swarm-shown" : ""}${swarmShown && swarmFocus ? " swarm-focus" : ""}`}>
       <aside className="sidebar">
         <Mark />
         <MachinePicker />
@@ -182,16 +207,19 @@ function App() {
           <ShieldCheck size={15} />
         </div>
         <nav className="workspace-navigation" aria-label="Workspace views">
-          <button aria-current={!route.teams && !route.goals && !route.cost ? "page" : undefined} onClick={() => route.navigate(null)}><TerminalSquare size={16} />Sessions</button>
+          <button aria-current={route.swarm ? "page" : undefined} onClick={() => route.navigateSwarm()}><Waypoints size={16} />Swarm</button>
+          <button aria-current={!route.teams && !route.goals && !route.missionId && !route.decisions && !route.cost && !route.swarm && !permissionsShown ? "page" : undefined} onClick={() => route.navigate(null)}><TerminalSquare size={16} />Sessions</button>
+          <button aria-current={route.decisions ? "page" : undefined} aria-label={decisionCount ? `Decisions, ${decisionCount} waiting` : "Decisions"} onClick={route.navigateDecisions}><ListChecks size={16} aria-hidden="true" />Decisions<span className="decision-nav-count">{decisionCount ? `${decisionCount} waiting` : ""}</span></button>
           <button aria-current={route.teams ? "page" : undefined} onClick={() => route.navigateTeam(null)}><Users size={16} />Teams</button>
           <button aria-current={route.goals ? "page" : undefined} onClick={() => route.navigateGoal(null)}><Target size={16} />Goals</button>
           {me.usage?.enabled && <button aria-current={route.cost ? "page" : undefined} onClick={() => route.navigateCost()}><Coins size={16} />Cost</button>}
         </nav>
+        <HaltBanner className="halt-rail" compact notice={haltNotice(halt, "overview")} name={projectName} owner={me.role === "owner"} />
         <div className="rail-heading">
           <h2>
-            {route.cost ? "Projects by cost" : <>{route.goals ? "Goals" : route.teams ? "Teams" : "Sessions"} <span>{route.goals ? goals.length : route.teams ? teams.length : sessions.length}</span></>}
+            {permissionsShown ? "Permission decisions" : route.cost ? "Projects by cost" : <>{route.goals ? "Goals" : route.teams ? "Teams" : "Sessions"} <span>{route.goals ? goals.length : route.teams ? teams.length : sessions.length}</span></>}
           </h2>
-          {me.role === "owner" && !route.cost && (
+          {me.role === "owner" && !route.cost && !permissionsShown && (
             <button
               className="icon-button"
               aria-label={route.goals ? "New goal" : route.teams ? "New team" : "New session"}
@@ -201,7 +229,7 @@ function App() {
             </button>
           )}
         </div>
-        {route.cost ? <CostPicker selected={route.costProjectId} onSelect={id => route.navigateCost("projects", id)} /> : route.goals ? <GoalPicker goals={goals} selected={route.goalId} loading={Boolean(me.goals) && !goalFeed.seen && !goalFeed.failed} onSelect={route.navigateGoal} /> : route.teams ? <TeamPicker teams={teams} selected={route.teamId} loading={Boolean(me.teams) && !teamFeed.seen && !teamFeed.failed} onSelect={route.navigateTeam} /> : <SessionPicker sessions={sessions} showUsage={me.usage?.enabled === true} selected={selected} loading={!host.seen && !host.failed} onSelect={route.navigate} />}
+        {permissionsShown ? <PermissionPicker selected={route.decisionId} onSelect={route.navigatePermissions} onOverview={route.navigatePermissionOverview} /> : route.cost ? <CostPicker selected={route.costProjectId} onSelect={id => route.navigateCost("projects", id)} /> : route.goals ? <GoalPicker goals={goals} selected={route.goalId} loading={Boolean(me.goals) && !goalFeed.seen && !goalFeed.failed} onSelect={route.navigateGoal} /> : route.teams ? <TeamPicker teams={teams} selected={route.teamId} loading={Boolean(me.teams) && !teamFeed.seen && !teamFeed.failed} onSelect={route.navigateTeam} /> : <SessionPicker sessions={sessions} showUsage={me.usage?.enabled === true} selected={selected} loading={!host.seen && !host.failed} onSelect={route.navigate} />}
         <div className="host-status">
           <div>
             {me.environment === "cloud" ? (
@@ -226,6 +254,11 @@ function App() {
             )}
           </p>
           {lastSeen && <small>Last checked {time(lastSeen)}</small>}
+          {decisionLogAvailable(me) && (
+            <button className="text-button host-permissions" aria-current={permissionsShown ? "page" : undefined} onClick={() => route.navigatePermissions(null)}>
+              <Scale size={14} />Permission decisions
+            </button>
+          )}
         </div>
         <button
           className="logout"
@@ -238,7 +271,10 @@ function App() {
             setTeams([]);
             setGoals([]);
             clearGoalRequests(machines.active.id);
+            clearMissionRequests(machines.active.id);
             clearTeamRequests(machines.active.id);
+            clearDecisionQueueRequests(machines.active.id);
+            clearPermissionRequests(machines.active.id);
             creations.clear(machines.active.id);
             lifecycles.clearMachine(machines.active.id);
             clearDrafts(machines.active.id);
@@ -253,19 +289,19 @@ function App() {
           <div className="breadcrumb">
             <button
               className="back icon-button"
-              onClick={() => route.costProjectId ? route.navigateCost("projects") : route.goalId || route.creatingGoal ? route.navigateGoal(null) : route.teamId || route.creatingTeam ? route.navigateTeam(null) : route.navigate(null)}
-              aria-label={route.costProjectId ? "Back to projects" : route.goalId || route.creatingGoal ? "Back to goals" : route.teamId || route.creatingTeam ? "Back to teams" : "Back to sessions"}
+              onClick={() => route.missionId || route.decisions ? route.navigateSwarm() : permissionsShown ? route.navigatePermissions(null) : route.costProjectId ? route.navigateCost("projects") : route.goalId || route.creatingGoal ? route.navigateGoal(null) : route.teamId || route.creatingTeam ? route.navigateTeam(null) : route.navigate(null)}
+              aria-label={route.missionId || route.decisions ? "Back to Swarm" : permissionsShown ? "Back to decisions" : route.costProjectId ? "Back to projects" : route.goalId || route.creatingGoal ? "Back to goals" : route.teamId || route.creatingTeam ? "Back to teams" : "Back to sessions"}
             >
               <ArrowLeft size={20} />
             </button>
-            <span>Workspace</span>
+            <span>{permissionsShown ? "Host" : "Workspace"}</span>
             <ChevronRight size={13} />
             <strong>
-              {route.cost ? (route.costProjectId ? "Project cost" : route.costView === "models" ? "Models" : "Cost") : route.creatingGoal ? "New goal" : route.goalId ? "Goal" : route.goals ? "Goals" : route.creatingTeam ? "New team" : route.teamId ? "Team" : route.teams ? "Teams" : creating ? "New session" : selected ? "Session" : "Overview"}
+              {route.missionId ? "Mission" : route.decisions ? "Decisions" : permissionsShown ? (route.decisionId ? "Decision" : "Permissions") : route.cost ? (route.costProjectId ? "Project cost" : route.costView === "models" ? "Models" : "Cost") : route.creatingGoal ? "New goal" : route.goalId ? "Goal" : route.goals ? "Goals" : route.creatingTeam ? "New team" : route.teamId ? "Team" : route.teams ? "Teams" : creating ? "New session" : selected ? "Session" : "Swarm"}
             </strong>
           </div>
           <div className="refresh-status">
-          <button className="text-button" onClick={() => { host.refresh(); if (me.teams) teamFeed.refresh(); if (me.goals) goalFeed.refresh(); }} disabled={host.refreshing} aria-busy={host.refreshing}>
+          <button className="text-button" onClick={() => { host.refresh(); haltFeed.refresh(); decisionFeed.refresh(); if (me.teams) teamFeed.refresh(); if (me.goals) goalFeed.refresh(); }} disabled={host.refreshing} aria-busy={host.refreshing}>
             <RefreshCw className={host.refreshing ? "is-refreshing" : ""} size={14} /> Refresh
           </button>
           <span className={`connection ${connected ? "" : "offline"}`}>
@@ -279,7 +315,8 @@ function App() {
             {host.seen ? "This device is offline or the host is unreachable. Showing the last received state. Work may still be running; controls are disabled until a fresh connection arrives." : "Can’t reach the host. Sessions haven’t loaded; controls are disabled until a fresh connection arrives."}
           </div>
         )}
-        {route.cost ? <CostPage me={me} view={route.costView} projectId={route.costProjectId} navigate={route.navigateCost} /> : route.creatingGoal ? <GoalCreate me={me} connected={connected} done={id => { goalFeed.refresh(); route.navigateGoal(id); }} /> : route.goalId ? <GoalDetail key={route.goalId} id={route.goalId} me={me} connected={connected} teams={teams} teamsStale={teamFeed.stale} refreshGoals={goalFeed.refresh} openTeam={route.navigateTeam} /> : route.goals ? <GoalList goals={goals} me={me} fresh={goalFeed.fresh} stale={goalFeed.stale} loading={Boolean(me.goals) && !goalFeed.seen && !goalFeed.failed} failed={goalFeed.failed} seen={goalFeed.seen} onCreate={route.createGoal} onSelect={route.navigateGoal} /> : route.creatingTeam ? <TeamCreate me={me} connected={connected} done={id => { teamFeed.refresh(); route.navigateTeam(id); }} /> : route.teamId ? <TeamDetail key={route.teamId} id={route.teamId} me={me} connected={connected} sessions={sessions} refreshTeams={teamFeed.refresh} openSession={route.navigate} /> : route.teams ? <TeamList teams={teams} me={me} fresh={teamFeed.fresh} stale={teamFeed.stale} loading={Boolean(me.teams) && !teamFeed.seen && !teamFeed.failed} failed={teamFeed.failed} seen={teamFeed.seen} onCreate={route.createTeam} onSelect={route.navigateTeam} refresh={teamFeed.refresh} openCost={() => route.navigateCost()} /> : creating ? (
+        {!route.missionId && <HaltBanner className="halt-main" notice={haltNotice(halt, haltPlace)} name={projectName} owner={me.role === "owner"} />}
+        {route.missionId ? <MissionPage key={route.missionId} id={route.missionId} me={me} connected={connected} openTeam={route.navigateTeam} halt={halt} /> : route.decisions ? <DecisionQueueView key={machines.active.id} queue={decisionFeed.queue} readAt={decisionFeed.readAt} current={decisionFeed.current} stale={decisionFeed.stale} failed={decisionFeed.failed} failureSince={decisionFeed.failureSince} unavailable={decisionFeed.unavailable} role={me.role} promptAnswers={me.capabilities?.answer !== false} projects={me.projects} refresh={decisionFeed.refresh} confirmAnswered={decisionFeed.confirmAnswered} navigateSession={route.navigate} answer={async (decision, request) => { await postDecisionAnswer(api, decision.answerPath, request); }} /> : route.swarm ? swarm : permissionsShown ? (route.decisionId ? <PermissionDetail key={route.decisionId} id={route.decisionId} me={me} openSession={route.navigate} onSelect={route.navigatePermissions} /> : <PermissionOverview onSelect={route.navigatePermissions} />) : route.cost ? <CostPage me={me} view={route.costView} projectId={route.costProjectId} navigate={route.navigateCost} /> : route.creatingGoal ? <GoalCreate me={me} connected={connected} done={id => { goalFeed.refresh(); route.navigateGoal(id); }} /> : route.goalId ? <GoalDetail key={route.goalId} id={route.goalId} me={me} connected={connected} teams={teams} teamsStale={teamFeed.stale} refreshGoals={goalFeed.refresh} openTeam={route.navigateTeam} /> : route.goals ? <GoalList goals={goals} me={me} fresh={goalFeed.fresh} stale={goalFeed.stale} loading={Boolean(me.goals) && !goalFeed.seen && !goalFeed.failed} failed={goalFeed.failed} seen={goalFeed.seen} onCreate={route.createGoal} onSelect={route.navigateGoal} /> : route.creatingTeam ? <TeamCreate me={me} connected={connected} done={id => { teamFeed.refresh(); route.navigateTeam(id); }} /> : route.teamId ? <TeamDetail key={route.teamId} id={route.teamId} me={me} connected={connected} sessions={sessions} refreshTeams={teamFeed.refresh} openSession={route.navigate} /> : route.teams ? <TeamList teams={teams} me={me} fresh={teamFeed.fresh} stale={teamFeed.stale} loading={Boolean(me.teams) && !teamFeed.seen && !teamFeed.failed} failed={teamFeed.failed} seen={teamFeed.seen} onCreate={route.createTeam} onSelect={route.navigateTeam} refresh={teamFeed.refresh} openCost={() => route.navigateCost()} /> : creating ? (
           <Create
             me={me}
             done={route.navigate}
@@ -294,78 +331,7 @@ function App() {
             tab={route.tab}
             setTab={route.selectTab}
           />
-        ) : (
-          <div className="overview">
-            <div className="overview-title">
-              <h1>Room to step away.</h1>
-              <p>
-                Your work stays with the host.
-                <br />
-                Open a session to catch up or give it a new direction.
-              </p>
-            </div>
-            <div className="overview-rule">
-              <span>
-                {active} active {active === 1 ? "session" : "sessions"}
-              </span>
-              <span>
-                {me.environment === "local"
-                  ? "Running on this computer"
-                  : "Running on your cloud server"}
-              </span>
-            </div>
-            {sessions.length ? (
-              sessions.map((session) => (
-                <button
-                  className="overview-session"
-                  key={session.id}
-                  onClick={() => route.navigate(session.id)}
-                >
-                  <span className={`provider-avatar ${session.provider}`}>
-                    {names[session.provider]?.slice(0, 1)}
-                  </span>
-                  <span>
-                    <strong>{session.title}</strong>
-                    <small>
-                      {names[session.provider]} · started{" "}
-                      {time(session.createdAt)}
-                      {session.archivedAt ? " · archived" : ""}
-                    </small>
-                  </span>
-                  <span className="session-status">
-                    <span className={`dot ${session.status}`} />
-                    {sessionStatus(session)}
-                  </span>
-                  <ArrowUpRight size={20} />
-                </button>
-              ))
-            ) : (
-              <div className="empty-workspace">
-                <TerminalSquare size={42} strokeWidth={1.2} />
-                <h2>A session that stays.</h2>
-                <p>
-                  Start a rehearsal to test disconnects without using an AI
-                  provider, or launch an installed agent.
-                </p>
-                {me.role === "owner" && (
-                  <button className="primary" onClick={route.create}>
-                    Start a session
-                    <Plus size={17} />
-                  </button>
-                )}
-              </div>
-            )}
-            <div className="overview-bottom">
-              <ShieldCheck size={20} />
-              <p>
-                <strong>A private connection to your work.</strong>
-                <br />
-                Session records are encrypted at rest. The execution host can
-                read active work.
-              </p>
-            </div>
-          </div>
-        )}
+        ) : swarm}
       </main>
     </div>
   );
@@ -397,14 +363,11 @@ function Create({
   const promptDictation = useDictation({ me, value: prompt, onChange: setPrompt, maxLength: 24000, disabled: busy || Boolean(request) || me.role !== "owner" });
   const [project, setProject] = useState<ProjectDetail | null>(null);
   const [applying, setApplying] = useState(false);
-  // An apply failure belongs to the workspace it was sent for.
   const [syncError, setSyncError] = useState<{ projectId: string; message: string } | null>(null);
   const [refreshingSource, setRefreshingSource] = useState(false);
   const [sourceError, setSourceError] = useState<{ projectId: string; message: string } | null>(null);
-  // The age text changes on every poll, so only a new pending reason or an applied generation is announced.
   const [syncNotice, setSyncNotice] = useState("");
   const syncSeen = useRef<{ projectId?: string; pending?: string; applied?: string }>({});
-  // Only a cloud host receives laptop sync; a local host is the laptop.
   const syncs = me.environment === "cloud";
   useEffect(() => {
     if (!project) return;
@@ -422,13 +385,11 @@ function Create({
     setSourceError(null);
     setSyncNotice("");
     if (!projectId || !syncs) return;
-    // Hiding the tab stops the 5-second read and starts a new generation, so an earlier reply cannot replace a later one.
     let active = true, generation = 0;
     let timer: ReturnType<typeof setInterval> | undefined;
     const load = () => {
       const started = generation;
       const current = () => active && started === generation;
-      // An unchanged detail keeps its object, so the panel does not re-render.
       api<ProjectDetail>(`/projects/${projectId}`).then(detail => { if (current()) setProject(previous => JSON.stringify(previous) === JSON.stringify(detail) ? previous : detail); }).catch(() => { if (current()) setProject(null); });
     };
     const schedule = () => {
@@ -583,97 +544,6 @@ function Create({
     </div>
   );
 }
-function TerminalView({ id, readOnly }: { id: string; readOnly: boolean }) {
-  const api = useApi();
-  const element = useRef<HTMLDivElement>(null);
-  const [error, setError] = useState("");
-  useEffect(() => {
-    const terminal = new Terminal({
-      convertEol: false,
-      disableStdin: true,
-      fontSize: 13,
-      fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
-      scrollback: 10000,
-      theme: {
-        background: "#202923",
-        foreground: "#e4e9de",
-        cursor: "#e4e9de",
-      },
-    });
-    const fit = new FitAddon();
-    terminal.loadAddon(fit);
-    terminal.open(element.current!);
-    fit.fit();
-    const observer = new ResizeObserver(() => fit.fit());
-    observer.observe(element.current!);
-    let active = true,
-      cursor = 0,
-      retry = 1800,
-      // Hiding the tab starts a new generation: output from an earlier read is dropped, and returning reads again at once.
-      generation = 0,
-      inFlight: number | undefined;
-    let timer: ReturnType<typeof setTimeout>;
-    const poll = async () => {
-      clearTimeout(timer);
-      if (!active || inFlight === generation || document.visibilityState === "hidden") return;
-      const started = generation;
-      const current = () => active && started === generation;
-      inFlight = started;
-      try {
-        const page = await api<{
-          events: LogEvent[];
-          cursor: number;
-          more: boolean;
-        }>(`/sessions/${id}/events?after=${cursor}`);
-        if (!current()) return;
-        for (const event of page.events)
-          if (event.type === "output") terminal.write(String(event.data.text));
-        cursor = page.cursor;
-        setError("");
-        retry = 1800;
-        timer = setTimeout(poll, page.more ? 0 : 800);
-      } catch {
-        if (current()) {
-          setError("Waiting for the host. Recorded output will resume here.");
-          // Retries back off while the host is unreachable, so an offline tab does not poll every 1.8 seconds.
-          timer = setTimeout(poll, retry);
-          retry = Math.min(retry * 2, 15000);
-        }
-      } finally {
-        if (inFlight === started) inFlight = undefined;
-      }
-    };
-    const resume = () => { generation++; void poll(); };
-    // Coming back online or to the window retries at once instead of waiting out the backoff.
-    const retryNow = () => { if (inFlight === undefined) void poll(); };
-    document.addEventListener("visibilitychange", resume);
-    window.addEventListener("online", retryNow);
-    window.addEventListener("focus", retryNow);
-    void poll();
-    return () => {
-      active = false;
-      clearTimeout(timer);
-      document.removeEventListener("visibilitychange", resume);
-      window.removeEventListener("online", retryNow);
-      window.removeEventListener("focus", retryNow);
-      observer.disconnect();
-      terminal.dispose();
-    };
-  }, [id]);
-  return (
-    <div className="terminal-shell">
-      <div className="terminal-caption">
-        {readOnly ? "Recorded terminal · read-only" : "Recorded terminal · use the composer to send input"}
-      </div>
-      <div className="terminal" ref={element} />
-      {error && (
-        <p className="terminal-error" role="status">
-          {error}
-        </p>
-      )}
-    </div>
-  );
-}
 function SessionView({
   id,
   me,
@@ -726,7 +596,6 @@ function SessionView({
     setSession(detail);
     setLoadError("");
     control.observe(detail, revision);
-    // Catch up from a bounded recent window, not the recording's first event.
     const after = cursor.current ?? Math.max(0, detail.seq - 200);
     const page = await api<{ events: LogEvent[]; cursor: number; more: boolean }>(
       `/sessions/${id}/events?after=${after}&types=lifecycle,input-intent,input-result,signal&limit=100`);
@@ -739,7 +608,7 @@ function SessionView({
       if (sessionViews.size > 20) sessionViews.delete(sessionViews.keys().next().value!);
     }
     return page.more ? 0 : 1100;
-  }, 1100, id, () => control.forget(true));
+  }, 1100, id, control.unavailable);
   useLayoutEffect(() => {
     const output = screen.current, viewport = body.current;
     if (!output || !viewport) return;
@@ -765,15 +634,12 @@ function SessionView({
     composer.current.style.height = `${Math.min(170, composer.current.scrollHeight)}px`;
   }, [text, tab, session !== null]);
   const requiresControl = session?.capabilities?.inputControl === 1;
-  // A mission coordinator runs managed sessions. People get the terminal fallback only while a provider prompt is open.
   const managed = Boolean(session?.managedBy);
   const managedLocked = managed && session?.attention?.state !== "needs-you";
   const answerable = connected && view.fresh && session?.status === "running" && me.role !== "viewer";
   const controlled = !requiresControl || Boolean(control.lease);
   const canSteer = answerable && !managedLocked && controlled;
-  // Provider prompts stay with the owner. Their answers need no control lease, because a managed session cannot be claimed.
   const canAnswer = answerable && (managed || controlled) && me.capabilities?.answer !== false;
-  // Input closes with the prompt, so a lease held across it goes back to the host.
   useEffect(() => {
     if (managedLocked && control.lease) void control.release();
   }, [managedLocked, control.lease]);
@@ -801,7 +667,6 @@ function SessionView({
     dictation.dismiss();
     const current = readDraft(cacheKey);
     const retrying = current.pending !== null;
-    // Only the terminal views permit typing directly into an open dialog.
     const request: PendingInput = current.pending ?? { requestId: crypto.randomUUID(), text: current.text, submit: true, ...(tab === "terminal" || tab === "screen" ? { force: true } : {}) };
     writeDraft(cacheKey, { text: current.text, pending: request });
     try {
@@ -821,7 +686,6 @@ function SessionView({
       );
     } catch (e) {
       if (isMissionManaged(e)) {
-        // Refused, not delivered: keep the draft in the tab and drop the pending request.
         settleDraft(cacheKey, request.requestId, false);
         setError(e.message);
         view.refresh();
@@ -912,6 +776,7 @@ function SessionView({
             Started {time(session.createdAt)} <span>·</span>{" "}
             {session.pid ? `PID ${session.pid}` : "No live process"}
           </p>
+          {session.outputTailIncomplete && <p className="session-meta">The recording may be missing the session’s last output.</p>}
           {session.execution && (
             <p className="session-meta">
               <span className="session-freshness-label">{view.stale ? "Last received tools:" : "Tools:"}</span>{" "}{session.execution.location === "cloud" ? "Cloud" : "Laptop"} <span>·</span>{" "}
@@ -962,7 +827,7 @@ function SessionView({
           setFollowing(false);
       }}>
         {tab === "chat" ? <Conversation id={id} /> : tab === "files" ? <ProjectFiles id={id} online={connected && view.fresh} /> : tab === "terminal" ? (
-          <TerminalView id={id} readOnly={managedLocked} />
+          <TerminalView id={id} readOnly={managedLocked} terminalSize={session.terminalSize} />
         ) : tab === "context" ? (
           <Context session={session} me={me} connected={connected && view.fresh} />
         ) : (
@@ -1037,7 +902,6 @@ function SessionView({
           </div>
         </div>
         <div className="composer-feedback">
-          {/* One fixed slot: delivery errors, control messages, and receipts win; send, keys, and typing clear the dictation outcome. */}
           {dictation.notice && !error && !control.message && !notice ? <DictationNotice dictation={dictation} /> : <span className={error ? "error" : control.message ? "quiet control-message" : "receipt"} role={error ? "alert" : "status"} title={error || control.message || notice}>
             {!error && !control.message && notice && <Check size={14} aria-hidden="true" />}{error || control.message || notice}
           </span>}

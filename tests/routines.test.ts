@@ -1,14 +1,17 @@
-import test from "node:test";
+import test, { afterEach, beforeEach, mock } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { RoutineService } from "../packages/host/src/routines.js";
 import type { CreateRoutine, Routine } from "../packages/host/src/routine-types.js";
 import type { CreateGoal, ProductGoal } from "../packages/host/src/goal-types.js";
+import type { ProjectSignal, SignalKind, SignalReader } from "../packages/host/src/signals/types.js";
 import type { Config } from "../packages/host/src/types.js";
 import { TeamError } from "../packages/host/src/teams.js";
+import { teamProjectSchema } from "../packages/host/src/team-types.js";
+import { unseal } from "../packages/host/src/vault.js";
 
 const lineup = {
   coordinator: { id: "coord", label: "Coordinator", provider: "claude", model: "model", effort: "high", tier: "strong" },
@@ -44,7 +47,9 @@ function setup(overrides: { busy?: (id: string) => Promise<boolean>; launch?: (r
   return { root, config, key, goals, launched, createService, create };
 }
 const action = (revision: number) => ({ requestId: randomUUID(), revision });
-const wait = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+const advance = (ms: number) => mock.timers.tick(ms);
+beforeEach(() => mock.timers.enable({ apis: ["Date"], now: Date.now() }));
+afterEach(() => mock.timers.reset());
 
 test("routine launch intent survives restart and replays the same goal request after an uncertain acknowledgement", async () => {
   const f = setup();
@@ -55,7 +60,7 @@ test("routine launch intent survives restart and replays the same goal request a
       startGoal: async (request, admit) => { ids.push(request.requestId); admit(); if (firstCall) { firstCall = false; throw new Error("ack lost"); } return ({ id: request.requestId, status: "running", cycles: [], ...request } as unknown as ProductGoal); },
     });
     const created = await first.create(f.create());
-    await wait(30); await first.tick();
+    advance(30); await first.tick();
     assert.equal(first.get(created.id).status, "blocked");
     first.close();
     const restarted = new RoutineService(f.config, f.key, { get: id => { const goal = f.goals.get(id); if (!goal) throw new TeamError(404, "goal-not-found", "missing"); return goal; } } as never, {
@@ -84,24 +89,216 @@ test("changed project authority blocks launch and resume does not renew the appr
   } finally { service.close(); rmSync(f.root, { recursive: true, force: true }); }
 });
 
+test("outcome settings stay out of the routine approval digest", async () => {
+  const f = setup(); const service = f.createService();
+  try {
+    await service.create(f.create()); advance(30); await service.tick();
+    f.config.teams!.outcomes = { holdDays: 14, retentionDays: 365 };
+    await service.tick();
+    const active = service.list()[0]!;
+    assert.equal(active.status, "running");
+    f.config.teams!.stallMinutes = 30;
+    await service.tick();
+    assert.equal(service.list()[0]!.status, "blocked");
+  } finally { service.close(); rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("blackboard switches change the routine approval digest", async () => {
+  const f = setup(); const service = f.createService();
+  try {
+    await service.create(f.create()); advance(30); await service.tick();
+    f.config.teams!.blackboard = { tools: true };
+    await service.tick();
+    assert.equal(service.list()[0]!.status, "blocked");
+  } finally { service.close(); rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("eval settings stay out of the routine approval digest", async () => {
+  const f = setup(); const service = f.createService();
+  try {
+    await service.create(f.create()); advance(30); await service.tick();
+    f.config.projects[0]!.team!.eval = { capture: true, retentionDays: 90, mine: true, focusedTest: { command: "node", args: ["{files}", "--test-reporter-destination={report}"] }, reportFormat: "junit", gradingPaths: ["package.json"] };
+    f.config.eval = { grader: { prefix: { command: "sudo", args: ["-n", "-u", "infinite-grader", "--", "/usr/local/libexec/infinite/grader-command"] }, root: "/var/lib/infinite-grader" } };
+    await service.tick();
+    assert.equal(service.list()[0]!.status, "running");
+    f.config.projects[0]!.team!.features = { areas: [{ id: "host", paths: ["src"] }] };
+    await service.tick();
+    assert.equal(service.list()[0]!.status, "blocked");
+  } finally { service.close(); rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("the main check setting stays out of the routine approval digest", async () => {
+  const f = setup(); const service = f.createService();
+  try {
+    await service.create(f.create()); advance(30); await service.tick();
+    f.config.projects[0]!.team!.mainCheck = { minutes: 20 };
+    await service.tick();
+    assert.equal(service.list()[0]!.status, "running", "turning the main check on does not block the routine");
+  } finally { service.close(); rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("trial settings leave the routine digest alone", async () => {
+  const f = setup(); const service = f.createService();
+  try {
+    await service.create(f.create()); advance(30); await service.tick();
+    const profile = { id: "trial-a", label: "Trial A", provider: "claude" as const, model: "model", effort: "high" as const, tier: "strong" as const };
+    f.config.projects[0]!.team!.eval = { trialsPerDay: 4, trialMinutes: 60, candidateProfiles: [profile], capture: true, reportFormat: "junit", focusedTest: { command: "node", args: ["{files}", "--test-reporter-destination={report}"] } };
+    f.config.eval = { member: { prefix: { command: "sudo", args: ["-n", "-u", "infinite-eval", "--", "/usr/local/libexec/infinite/eval-command"] }, root: "/var/lib/infinite-eval", agents: { claude: { command: "claude", args: [] } } } };
+    await service.tick();
+    assert.equal(service.list()[0]!.status, "running");
+    f.config.projects[0]!.team!.features = { areas: [{ id: "host", paths: ["src"] }] };
+    await service.tick();
+    assert.equal(service.list()[0]!.status, "blocked", "the feature map still moves the digest");
+  } finally { service.close(); rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("routing settings change the approval digest, and their absence keeps it", async () => {
+  const f = setup(); const service = f.createService();
+  try {
+    await service.create(f.create()); advance(30); await service.tick();
+    assert.equal(service.list()[0]!.status, "running");
+    f.config.projects[0]!.team!.routing = undefined;
+    await service.tick();
+    assert.equal(service.list()[0]!.status, "running");
+    f.config.projects[0]!.team!.routing = { mode: "shadow" };
+    await service.tick();
+    assert.equal(service.list()[0]!.status, "blocked");
+  } finally { service.close(); rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("the objective switch is inside the routine approval digest", async () => {
+  const f = setup(); let service = f.createService();
+  try {
+    const team = teamProjectSchema.parse(f.config.projects[0]!.team);
+    assert.equal(Object.hasOwn(team, "objective"), false, "the schema adds no objective key by default");
+    f.config.projects[0]!.team = team;
+    await service.create(f.create()); advance(30); await service.tick();
+    assert.equal(service.list()[0]!.status, "running");
+    service.close(); service = f.createService(); await service.tick();
+    assert.equal(service.list()[0]!.status, "running");
+    f.config.projects[0]!.team = teamProjectSchema.parse({ ...team, objective: { prompts: "off" } });
+    await service.tick();
+    assert.equal(service.list()[0]!.status, "blocked");
+  } finally { service.close(); rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("the intent check settings are inside the routine approval digest", async () => {
+  const f = setup(); let service = f.createService();
+  try {
+    await service.create(f.create()); advance(30); await service.tick();
+    assert.equal(service.list()[0]!.status, "running");
+    service.close(); service = f.createService(); await service.tick();
+    assert.equal(service.list()[0]!.status, "running", "a reload keeps the stored authority with both keys absent");
+    f.config.projects[0]!.team = { ...f.config.projects[0]!.team!, objective: { intentCheck: "off" } };
+    await service.tick();
+    assert.equal(service.list()[0]!.status, "blocked");
+    const second = await service.create(f.create()); advance(30); await service.tick();
+    assert.equal(service.get(second.id).status, "running", "a second routine starts under the current authority");
+    f.config.teams!.lineup = { ...f.config.teams!.lineup!, evaluators: [{ id: "astra", label: "Astra", provider: "codex", model: "astra", effort: "high", tier: "strong" }] } as never;
+    await service.tick();
+    assert.equal(service.get(second.id).status, "blocked", "the lineup's evaluators change the authority digest");
+  } finally { service.close(); rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("member trace settings are outside the routine approval digest", async () => {
+  const f = setup(); const service = f.createService();
+  try {
+    await service.create(f.create()); advance(30); await service.tick();
+    assert.equal(service.list()[0]!.status, "running");
+    f.config.teams!.memberTraces = { enabled: true, memberBytes: 1000, runBytes: 5000 };
+    await service.tick();
+    assert.equal(service.list()[0]!.status, "running", "turning member traces on keeps the approval");
+    f.config.teams!.trustWorkspaces = false;
+    await service.tick();
+    assert.equal(service.list()[0]!.status, "blocked", "a teams setting that changes the work still blocks it");
+  } finally { service.close(); rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("the register setting is inside the routine approval digest", async () => {
+  const f = setup(); let service = f.createService();
+  try {
+    await service.create(f.create()); advance(30); await service.tick();
+    assert.equal(service.list()[0]!.status, "running");
+    service.close(); service = f.createService(); await service.tick();
+    assert.equal(service.list()[0]!.status, "running", "a reload keeps the stored authority with the key absent");
+    f.config.projects[0]!.team = { ...f.config.projects[0]!.team!, objective: { register: "on" } };
+    await service.tick();
+    assert.equal(service.list()[0]!.status, "blocked", "writing the register key blocks the active routine");
+  } finally { service.close(); rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("the evaluator setting is inside the routine approval digest", async () => {
+  const f = setup(); let service = f.createService();
+  try {
+    await service.create(f.create()); advance(30); await service.tick();
+    assert.equal(service.list()[0]!.status, "running");
+    service.close(); service = f.createService(); await service.tick();
+    assert.equal(service.list()[0]!.status, "running", "a reload keeps the stored authority with the key absent");
+    f.config.projects[0]!.team = { ...f.config.projects[0]!.team!, objective: { evaluator: "on" } };
+    await service.tick();
+    assert.equal(service.list()[0]!.status, "blocked", "writing the evaluator key blocks the active routine");
+  } finally { service.close(); rmSync(f.root, { recursive: true, force: true }); }
+});
+
 test("a pending project run prevents overlap and launch is skipped when the approved budget cannot fit", async () => {
   const f = setup({ busy: async () => true }); const service = f.createService();
   try {
-    const created = await service.create(f.create()); await wait(30); await service.tick();
+    const created = await service.create(f.create()); advance(30); await service.tick();
     assert.equal(f.launched.length, 0); assert.match(service.get(created.id).reason!, /active work/);
   } finally { service.close(); rmSync(f.root, { recursive: true, force: true }); }
-  const second = setup(); const service2 = second.createService();
+  const second = setup({ busy: async () => true }); const service2 = second.createService();
   try {
     const req = second.create({ expiresAt: new Date(Date.now() + 1000).toISOString(), startsAt: new Date(Date.now() + 10).toISOString() });
-    const created = await service2.create(req); await wait(30); await service2.tick();
+    const created = await service2.create(req); advance(30); await service2.tick();
     assert.equal(service2.get(created.id).status, "expired"); assert.equal(second.launched.length, 0);
   } finally { service2.close(); rmSync(second.root, { recursive: true, force: true }); }
+});
+
+test("a routine may start now but not a millisecond earlier", async () => {
+  const f = setup(); const service = f.createService();
+  try {
+    const at = Date.now();
+    await assert.rejects(service.create(f.create({ startsAt: new Date(at - 1).toISOString() })),
+      { status: 400, code: "invalid-routine-window", message: "Routine start time cannot be in the past." });
+    assert.equal(service.list().length, 0, "a refused routine is not stored");
+    const created = await service.create(f.create({ startsAt: new Date(at).toISOString() }));
+    assert.equal(created.status, "scheduled");
+    assert.equal(created.nextRunAt, new Date(at).toISOString());
+  } finally { service.close(); rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("a routine starts at its start time and not a millisecond before", async () => {
+  const f = setup(); const service = f.createService();
+  try {
+    const created = await service.create(f.create({ startsAt: new Date(Date.now() + 60_000).toISOString() }));
+    advance(59_999); await service.tick();
+    assert.equal(f.launched.length, 0, "nothing starts a millisecond before the start time");
+    assert.deepEqual(service.get(created.id), created);
+    advance(1); await service.tick();
+    assert.equal(f.launched.length, 1, "the start time itself is due");
+    assert.equal(service.get(created.id).status, "running");
+  } finally { service.close(); rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("a waiting signal does not start a routine before its start time", async () => {
+  const f = setup(); const service = f.createService(); const signals = inbox();
+  service.useSignals(signals.reader, () => []);
+  try {
+    const created = await service.create(f.create({ startsAt: new Date(Date.now() + 60_000).toISOString(), wakeOn: ["owner"] }));
+    const early = signals.add("owner");
+    advance(59_999); await service.tick();
+    assert.equal(f.launched.length, 0, "a wake waits for the start time");
+    assert.deepEqual(service.get(created.id).pendingWake?.signals.map(signal => signal.id), [early.id]);
+    advance(1); await service.tick();
+    assert.equal(f.launched.length, 1, "the wake starts the routine at its start time");
+    assert.deepEqual(service.get(created.id).occurrences[0]!.wake, { signalIds: [early.id], dropped: 0 });
+  } finally { service.close(); rmSync(f.root, { recursive: true, force: true }); }
 });
 
 test("pause and cancel stop future triggers while preserving the active goal reference", async () => {
   const f = setup(); const service = f.createService();
   try {
-    const created = await service.create(f.create()); await wait(30); await service.tick();
+    const created = await service.create(f.create()); advance(30); await service.tick();
     const active = service.get(created.id); assert.equal(active.status, "running"); assert.ok(active.activeGoalId);
     const paused = await service.pause(created.id, action(active.revision));
     assert.match(paused.reason!, /active goal retains/); assert.equal(paused.activeGoalId, active.activeGoalId);
@@ -124,7 +321,7 @@ test("owner actions are idempotent and stale revisions are rejected", async () =
 test("needs-input and failed goals block progression while retaining the child for owner review", async () => {
   const f = setup(); const service = f.createService();
   try {
-    const created = await service.create(f.create()); await wait(30); await service.tick();
+    const created = await service.create(f.create()); advance(30); await service.tick();
     const active = service.get(created.id); const goal = f.goals.get(active.activeGoalId!)!;
     f.goals.set(goal.id, { ...goal, status: "needs-input", reason: "owner input required" });
     await service.tick();
@@ -144,7 +341,7 @@ test("needs-input and failed goals block progression while retaining the child f
 test("an achieved child with unmerged cycles cannot unlock another routine occurrence", async () => {
   const f = setup(); const service = f.createService();
   try {
-    const created = await service.create(f.create()); await wait(30); await service.tick();
+    const created = await service.create(f.create()); advance(30); await service.tick();
     const routine = service.get(created.id), child = f.goals.get(routine.activeGoalId!)!;
     f.goals.set(child.id, { ...child, status: "achieved", cycles: [{ teamId: randomUUID(), cycle: 1, goalRevision: 1, status: "ready-for-review", startedAt: new Date().toISOString(), memberCount: 1 }] });
     await service.tick();
@@ -168,7 +365,7 @@ test("a cancelled routine reconciles an accepted uncertain launch after restart 
     },
   });
   try {
-    const created = await service.create(f.create()); await wait(30); await service.tick();
+    const created = await service.create(f.create()); advance(30); await service.tick();
     const blocked = service.get(created.id);
     const cancelled = await service.cancel(created.id, action(blocked.revision));
     assert.equal(cancelled.status, "cancelled");
@@ -193,14 +390,14 @@ test("a confirmed launch is reconciled after approval expiry without creating a 
       admit(); acceptedId = request.requestId;
       const goal = { ...request, id: request.requestId, status: "running", cycles: [], activeTeamId: "team-active" } as unknown as ProductGoal;
       f.goals.set(goal.id, goal);
-      service!.close(); // Simulate shutdown after GoalService accepts, before the routine receipt is saved.
+      service!.close();
       return goal;
     },
   });
   const realNow = Date.now;
   try {
     const created = await service.create(f.create({ expiresAt: new Date(Date.now() + 10 * 60_000).toISOString() }));
-    await wait(30); await service.tick(); service.close();
+    advance(30); await service.tick(); service.close();
     Date.now = () => realNow() + 11 * 60_000;
     const restarted = new RoutineService(f.config, f.key, { get: id => { const goal = f.goals.get(id); if (!goal) throw new TeamError(404, "goal-not-found", "missing"); return goal; } } as never, {
       isProjectBusy: async () => false,
@@ -221,7 +418,7 @@ test("a settled no-opportunity recurs on cadence and completes at the approved o
   const f = setup(); const service = f.createService(); const realNow = Date.now;
   try {
     const created = await service.create(f.create({ maxOccurrences: 2 }));
-    await wait(30); Date.now = () => realNow() + 60_000; await service.tick();
+    advance(30); Date.now = () => realNow() + 60_000; await service.tick();
     let routine = service.get(created.id), first = f.goals.get(routine.activeGoalId!)!;
     f.goals.set(first.id, { ...first, status: "no-opportunity", cycles: [] });
     await service.tick();
@@ -240,5 +437,209 @@ test("a settled no-opportunity recurs on cadence and completes at the approved o
     assert.equal(routine.status, "completed");
     assert.equal(routine.occurrences.length, 2);
     assert.equal(f.launched.length, 2);
+  } finally { Date.now = realNow; service.close(); rmSync(f.root, { recursive: true, force: true }); }
+});
+
+function inbox() {
+  const signals: ProjectSignal[] = [];
+  let reads = 0, unreadable = false;
+  const reader: SignalReader = {
+    head: () => unreadable ? undefined : signals.at(-1)?.seq ?? 0,
+    after: (projectId, seq, options) => {
+      if (unreadable) return [];
+      reads++;
+      return signals.filter(signal => signal.projectId === projectId && signal.seq > seq && (!options?.kinds || options.kinds.includes(signal.kind))).slice(0, options?.limit ?? 50);
+    },
+  };
+  const add = (kind: SignalKind, runId?: string) => {
+    const base = { seq: signals.length + 1, id: randomUUID(), projectId: "demo", key: randomUUID(), at: new Date().toISOString() };
+    const signal: ProjectSignal = kind === "owner" ? { ...base, kind, text: "owner wake" } : { ...base, kind, ...(runId ? { runId } : {}) };
+    signals.push(signal);
+    return signal;
+  };
+  return { reader, add, reads: () => reads, down: (value: boolean) => { unreadable = value; } };
+}
+const settle = (f: ReturnType<typeof setup>, goalId: string, cycles: ProductGoal["cycles"] = []) =>
+  f.goals.set(goalId, { ...f.goals.get(goalId)!, status: cycles.length ? "achieved" : "no-opportunity", cycles });
+
+test("a waiting signal starts one early occurrence after the gap, and signals during a run start one follow-on", async () => {
+  const f = setup(); const service = f.createService(); const signals = inbox(); const realNow = Date.now;
+  service.useSignals(signals.reader, () => []);
+  const at = (minutes: number) => { Date.now = () => realNow() + minutes * 60_000; };
+  try {
+    const created = await service.create(f.create({ intervalMinutes: 60, maxOccurrences: 3, wakeOn: ["owner"] }));
+    assert.equal(service.get(created.id).signalCursor, 0);
+    at(1); await service.tick();
+    const firstGoal = service.get(created.id).activeGoalId!;
+    const first = signals.add("owner");
+    await service.tick();
+    assert.deepEqual(service.get(created.id).pendingWake?.signals.map(signal => signal.id), [first.id]);
+    settle(f, firstGoal); await service.tick();
+    assert.ok(service.get(created.id).occurrences[0]!.endedAt);
+
+    at(3); await service.tick();
+    assert.equal(f.launched.length, 1, "the 5-minute gap since the occurrence ended still holds");
+    at(7); await service.tick();
+    let routine = service.get(created.id);
+    assert.equal(f.launched.length, 2);
+    assert.deepEqual(routine.occurrences[1]!.wake, { signalIds: [first.id], dropped: 0 });
+    assert.equal(routine.pendingWake, undefined);
+    assert.ok(Date.parse(routine.nextRunAt) > Date.now(), "nextRunAt is set as a normal start sets it");
+    const { requestId: _first, ...template } = f.launched[0]!, { requestId: _second, ...early } = f.launched[1]!;
+    assert.deepEqual(early, template, "the goal template is unchanged");
+
+    const during = [signals.add("owner"), signals.add("owner")];
+    await service.tick();
+    settle(f, routine.activeGoalId!); await service.tick();
+    at(13); await service.tick();
+    routine = service.get(created.id);
+    assert.equal(f.launched.length, 3, "two signals during a run start one follow-on");
+    assert.deepEqual(routine.occurrences[2]!.wake?.signalIds, during.map(signal => signal.id));
+  } finally { Date.now = realNow; service.close(); rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("signals that arrive together start one occurrence, however many there are", async () => {
+  const f = setup(); const service = f.createService(); const signals = inbox(); const realNow = Date.now;
+  service.useSignals(signals.reader, () => []);
+  const at = (minutes: number) => { Date.now = () => realNow() + minutes * 60_000; };
+  try {
+    const created = await service.create(f.create({ intervalMinutes: 60, maxOccurrences: 3, wakeOn: ["owner"], expiresAt: new Date(realNow() + 3 * 3_600_000).toISOString() }));
+    at(1); await service.tick();
+    settle(f, service.get(created.id).activeGoalId!); await service.tick();
+    at(10);
+    const batch = Array.from({ length: 51 }, () => signals.add("owner"));
+    await service.tick();
+    assert.equal(f.launched.length, 1, "more signals wait than the pass read, so nothing starts yet");
+    await service.tick();
+    const routine = service.get(created.id);
+    assert.equal(f.launched.length, 2);
+    assert.deepEqual(routine.occurrences[1]!.wake, { signalIds: batch.slice(-20).map(signal => signal.id), dropped: 31 });
+    assert.equal(routine.signalCursor, 51);
+    assert.equal(routine.pendingWake, undefined);
+    settle(f, routine.activeGoalId!); await service.tick();
+    at(20); await service.tick();
+    assert.equal(f.launched.length, 2, "the rest of the batch starts no second occurrence");
+  } finally { Date.now = realNow; service.close(); rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("an unreadable inbox starts nothing early and never uses up a waiting batch", async () => {
+  let duringBusyCheck = () => {};
+  const f = setup({ busy: async () => { duringBusyCheck(); return false; } }); const service = f.createService(); const signals = inbox(); const realNow = Date.now;
+  service.useSignals(signals.reader, () => []);
+  const at = (minutes: number) => { Date.now = () => realNow() + minutes * 60_000; };
+  try {
+    const created = await service.create(f.create({ intervalMinutes: 60, maxOccurrences: 4, wakeOn: ["owner"], expiresAt: new Date(realNow() + 5 * 3_600_000).toISOString() }));
+    at(1); await service.tick();
+    settle(f, service.get(created.id).activeGoalId!); await service.tick();
+
+    at(10);
+    const early = signals.add("owner");
+    duringBusyCheck = () => signals.down(true);
+    await service.tick();
+    assert.equal(f.launched.length, 1);
+    duringBusyCheck = () => {};
+    signals.down(false);
+    await service.tick();
+    assert.equal(f.launched.length, 2);
+    assert.deepEqual(service.get(created.id).occurrences[1]!.wake, { signalIds: [early.id], dropped: 0 });
+    settle(f, service.get(created.id).activeGoalId!); await service.tick();
+
+    at(69);
+    const batch = Array.from({ length: 51 }, () => signals.add("owner"));
+    await service.tick();
+    assert.equal(f.launched.length, 2);
+    signals.down(true);
+    at(71); await service.tick();
+    let routine = service.get(created.id);
+    assert.equal(f.launched.length, 3, "the schedule does not wait for the inbox");
+    assert.equal(routine.occurrences[2]!.wake, undefined);
+    assert.equal(routine.pendingWake?.signals.length, 20, "the half-read batch still waits");
+
+    signals.down(false);
+    settle(f, routine.activeGoalId!); await service.tick();
+    at(77); await service.tick();
+    routine = service.get(created.id);
+    assert.equal(f.launched.length, 4);
+    assert.deepEqual(routine.occurrences[3]!.wake, { signalIds: batch.slice(-20).map(signal => signal.id), dropped: 31 });
+    assert.equal(routine.pendingWake, undefined);
+  } finally { Date.now = realNow; service.close(); rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("a routine ignores signals about its own goals' runs", async () => {
+  const f = setup(); const service = f.createService(); const signals = inbox(); const realNow = Date.now;
+  const ownRun = randomUUID();
+  service.useSignals(signals.reader, goalIds => goalIds.flatMap(id => f.goals.get(id)?.cycles.map(cycle => cycle.teamId) ?? []));
+  const at = (minutes: number) => { Date.now = () => realNow() + minutes * 60_000; };
+  try {
+    const created = await service.create(f.create({ intervalMinutes: 60, wakeOn: ["delivery-landed"] }));
+    at(1); await service.tick();
+    const goalId = service.get(created.id).activeGoalId!;
+    const cycles = [{ teamId: ownRun, cycle: 1, goalRevision: 1, status: "merged", startedAt: new Date().toISOString(), memberCount: 1 }] as ProductGoal["cycles"];
+    f.goals.set(goalId, { ...f.goals.get(goalId)!, cycles });
+    signals.add("delivery-landed", ownRun);
+    await service.tick();
+    assert.equal(service.get(created.id).pendingWake, undefined);
+    assert.equal(service.get(created.id).signalCursor, 1, "the cursor moves past the dropped signal");
+    settle(f, goalId, cycles); await service.tick();
+    at(7); await service.tick();
+    assert.equal(f.launched.length, 1);
+    signals.add("delivery-landed", randomUUID());
+    await service.tick();
+    assert.equal(f.launched.length, 2, "another run's landing does wake it");
+  } finally { Date.now = realNow; service.close(); rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("the busy rule and the occurrence cap win over a waiting signal", async () => {
+  let busy = false;
+  const f = setup({ busy: async () => busy }); const service = f.createService(); const signals = inbox(); const realNow = Date.now;
+  service.useSignals(signals.reader, () => []);
+  const at = (minutes: number) => { Date.now = () => realNow() + minutes * 60_000; };
+  try {
+    const created = await service.create(f.create({ intervalMinutes: 60, maxOccurrences: 2, wakeOn: ["owner", "revert"], expiresAt: new Date(realNow() + 3 * 3_600_000).toISOString() }));
+    at(1); await service.tick();
+    settle(f, service.get(created.id).activeGoalId!);
+    const waiting = signals.add("revert");
+    await service.tick();
+    busy = true;
+    at(7); await service.tick();
+    assert.equal(f.launched.length, 1);
+    assert.equal(service.get(created.id).wakeDeferred, true);
+    busy = false;
+    at(8); await service.tick();
+    assert.equal(f.launched.length, 1, "after a busy refusal the wake waits for the next interval");
+    at(68); await service.tick();
+    let routine = service.get(created.id);
+    assert.equal(f.launched.length, 2);
+    assert.deepEqual(routine.occurrences[1]!.wake?.signalIds, [waiting.id]);
+
+    settle(f, routine.activeGoalId!); await service.tick();
+    routine = service.get(created.id);
+    assert.equal(routine.status, "completed");
+    signals.add("owner");
+    at(80); await service.tick();
+    assert.equal(f.launched.length, 2);
+    assert.equal(service.get(created.id).signalCursor, routine.signalCursor, "an ended routine reads nothing and keeps its cursor");
+  } finally { Date.now = realNow; service.close(); rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("a routine without wakeOn keeps its approval fingerprint and reads no signals", async () => {
+  const f = setup(); const service = f.createService(); const signals = inbox(); const realNow = Date.now;
+  service.useSignals(signals.reader, () => []);
+  signals.add("owner");
+  try {
+    Date.now = () => Date.parse("2029-12-31T23:00:00.000Z");
+    const request = {
+      requestId: "6f1d2c3b-4a5e-4f60-8a7b-9c0d1e2f3a4b",
+      goal: { projectId: "demo", title: "Small task", objective: "Do the bounded work", successCriteria: "The requested change is available", allowedPaths: ["src"], maxRuns: 1, maxMinutes: 5, maxMembers: 4 },
+      intervalMinutes: 5, maxOccurrences: 2, startsAt: "2030-01-01T00:00:00.000Z", expiresAt: "2030-01-20T00:00:00.000Z",
+    };
+    const created = await service.create(request);
+    Date.now = () => Date.parse("2030-01-01T00:01:00.000Z");
+    await service.tick(); await service.tick();
+    const stored = unseal<{ routine: Routine; fingerprint: string }>(f.key, `routine:${created.id}`, readFileSync(join(f.config.stateDir, "routines", `${created.id}.sealed`), "utf8"));
+    assert.equal(stored.fingerprint, "f0153ac51484bc8d9c5c0eedb7f0f6b7c22b6fd2e9ddd504a7bca85ea52cf604");
+    assert.equal(stored.routine.status, "running");
+    for (const field of ["wakeOn", "signalCursor", "pendingWake", "wakeDeferred"]) assert.equal(field in stored.routine, false, field);
+    assert.equal(signals.reads(), 0);
   } finally { Date.now = realNow; service.close(); rmSync(f.root, { recursive: true, force: true }); }
 });

@@ -32,10 +32,10 @@ const product = group("product", "Product", [repository("Product repo", [
 ])]);
 const projects: ProjectGroupList = { groups: [product, project("docs", "Docs", true)], suggestions: [] };
 const board: Board = { items: [
-  { kind: "mission", id: "m1", title: "A long mission title that should be shortened", groupId: "product", projectName: "Product", column: "needs-input", status: "needs-input", detail: "Waiting for a decision", updatedAt: "2026-10-19T00:00:00.000Z", subtasks: { total: 3, running: 1, done: 1 } },
-  { kind: "team", id: "t1", title: "Implement feature", projectName: "Docs", column: "working", status: "working", detail: "Writing code", updatedAt: "2026-10-19T00:00:00.000Z" },
-  { kind: "mission", id: "m2", title: "Review change", groupId: "product", projectName: "Product", column: "review", status: "ready-for-review", detail: "Finished", updatedAt: "2026-10-19T00:00:00.000Z" },
-  { kind: "team", id: "t2", title: "Merged work", projectName: "Docs", column: "ended", status: "merged", detail: "Merged", updatedAt: "2026-10-19T00:00:00.000Z" },
+  { kind: "mission", id: "m1", title: "A long mission title that should be shortened", groupId: "product", projectName: "Product", column: "needs-input", status: "needs-input", detail: "Waiting for a decision", createdAt: "2026-10-19T00:00:00.000Z", updatedAt: "2026-10-19T00:00:00.000Z", subtasks: { total: 3, running: 1, done: 1 } },
+  { kind: "team", id: "t1", title: "Implement feature", groupId: "docs", projectName: "Docs", column: "working", status: "working", detail: "Writing code", createdAt: "2026-10-19T00:00:00.000Z", updatedAt: "2026-10-19T00:00:00.000Z" },
+  { kind: "mission", id: "m2", title: "Review change", groupId: "product", projectName: "Product", column: "review", status: "ready-for-review", detail: "Finished", createdAt: "2026-10-19T00:00:00.000Z", updatedAt: "2026-10-19T00:00:00.000Z" },
+  { kind: "team", id: "t2", title: "Merged work", groupId: "docs", projectName: "Docs", column: "ended", status: "merged", detail: "Merged", createdAt: "2026-10-19T00:00:00.000Z", updatedAt: "2026-10-19T00:00:00.000Z" },
 ] };
 
 const plain = (lines: string[]) => lines.join("\n").replace(/\u001b\[[0-9;]*m/g, "");
@@ -108,6 +108,25 @@ const quietly = async <T>(run: () => Promise<T>): Promise<T> => {
 };
 const config = { origin: "https://host.example.test", token: "test-token" };
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+test("mission progress resumes at the supplied cursor and prints the next cursor for automation", async () => {
+  const paths: string[] = [];
+  const lines: string[] = [];
+  const page = { cursor: "next-cursor", observations: [], resync: { required: true, reason: "host-restarted" }, snapshot: {
+    mission: { id: "m1", title: "Repair", revision: 2, status: "running" }, subtasks: [],
+  } };
+  const api = { json: async (path: string, body?: unknown) => { assert.equal(body, undefined); paths.push(path); return page; } };
+  const log = console.log;
+  console.log = (value: string) => { lines.push(value); };
+  try {
+    await handleBoardClientCommand("mission", ["progress", "m1"], { "--after": "old/cursor", "--json": true }, config, api as never, "/unused");
+    assert.deepEqual(JSON.parse(lines[0]!), page);
+    await handleBoardClientCommand("mission", ["progress", "m1"], {}, config, api as never, "/unused");
+  } finally { console.log = log; }
+  assert.deepEqual(paths, ["/missions/m1/progress?cursor=old%2Fcursor", "/missions/m1/progress"]);
+  assert.match(lines[1]!, /host-restarted/);
+  assert.match(lines[1]!, /next-cursor/);
+});
 
 test("start posts the group alone for a group id and the checkout for a checkout id", async () => {
   for (const [flag, expected] of [

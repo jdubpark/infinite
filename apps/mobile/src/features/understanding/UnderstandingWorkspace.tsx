@@ -7,6 +7,8 @@ import { Chip, LiveStatus, Segmented, type SegmentOption, TopBar } from "../../c
 import { Glyph } from "../../components/Icon";
 import type { UnderstandingRepository, UnderstandingWork, WorkspaceUnderstanding } from "@infinite/remote";
 import { theme } from "../../theme";
+import { HaltBanner } from "../halt/HaltBanner";
+import { workspaceHaltScope } from "../halt/model";
 import { KnowledgePanel } from "./KnowledgePanel";
 import { SystemOverview } from "./SystemOverview";
 import { clearUnderstandingSummary, readUnderstandingSummary, saveUnderstandingSummary } from "./offline-cache";
@@ -14,16 +16,16 @@ import { clearUnderstandingSummary, readUnderstandingSummary, saveUnderstandingS
 type ViewMode = "work" | "system";
 type ReadResult = { scope: string; state: "ready" | "missing" | "upgrade" | "denied"; groupName: string; data?: WorkspaceUnderstanding; error?: string; cachedAt?: string };
 
+type Checkout = { projectId: string; name: string };
+
 const views: SegmentOption<ViewMode>[] = [
   { value: "work", label: "Work", glyph: "stack" },
   { value: "system", label: "System", glyph: "target" },
 ];
 
-/** Read-only Work and System views for one explicitly grouped workspace. */
 export function UnderstandingWorkspace({ connection, workspaceId }: { connection: Connection; workspaceId: string }) {
   const router = useRouter();
   const params = useLocalSearchParams<{ machine?: string; view?: string; component?: string }>();
-  // Keep credential changes inside the in-memory poll scope so stale responses cannot cross pairings.
   const key = `${connectionKey(connection)}|${connection.url}|${connection.relay?.machineId ?? "direct"}|${connection.token}|${connection.access?.clientId ?? ""}|${connection.access?.clientSecret ?? ""}`;
   const scope = `${key}\u0000${workspaceId}`;
   const scroll = useRef<ScrollView>(null);
@@ -31,14 +33,24 @@ export function UnderstandingWorkspace({ connection, workspaceId }: { connection
   const stopped = useRef("");
   const last = useRef<ReadResult | null>(null);
   const [view, setView] = useState<ViewMode>(params.view === "system" ? "system" : "work");
+  const [membership, setMembership] = useState<{ scope: string; checkouts: Checkout[] }>();
+  const membershipIssued = useRef(0);
+  const membershipApplied = useRef(0);
 
   const poll = usePoll(async () => {
     if (stopped.current === scope && last.current?.scope === scope) return last.current;
+    const ticket = ++membershipIssued.current;
+    const keepMembership = (checkouts: Checkout[]) => {
+      if (ticket < membershipApplied.current) return;
+      membershipApplied.current = ticket;
+      setMembership({ scope, checkouts });
+    };
     let confirmedGroupName = "";
     try {
       const groups = await api<ProjectGroupList>(connection, "/project-groups");
       const group = groups.groups.find(candidate => candidate.id === workspaceId);
       if (!group) {
+        keepMembership([]);
         await clearUnderstandingSummary(connection, workspaceId);
         const result: ReadResult = { scope, state: "missing", groupName: "", error: "This workspace is no longer available on this machine." };
         last.current = result;
@@ -46,6 +58,7 @@ export function UnderstandingWorkspace({ connection, workspaceId }: { connection
         return result;
       }
       confirmedGroupName = group.name;
+      keepMembership(group.repos.flatMap(repo => repo.checkouts.map(({ projectId, name }) => ({ projectId, name }))));
       const data = await api<WorkspaceUnderstanding>(connection, `/project-groups/${encodeURIComponent(workspaceId)}/understanding`);
       if (data.schemaVersion !== 1 || data.workspace.id !== workspaceId) {
         const result: ReadResult = { scope, state: "upgrade", groupName: group.name, error: "This host returned an unsupported Understanding version." };
@@ -84,12 +97,12 @@ export function UnderstandingWorkspace({ connection, workspaceId }: { connection
     if (last.current?.scope !== scope) last.current = null;
   }, [scope]);
 
-  // usePoll deliberately retains its last value across dependency changes. Only show a value that
-  // belongs to the current machine and workspace so a late response can never flash across scope.
   const result = poll.data?.scope === scope ? poll.data : null;
   const data = result?.state === "ready" ? result.data : undefined;
   const repoById = new Map(data?.repositories.map(repo => [repo.id, repo]) ?? []);
   const groupName = result?.groupName || data?.workspace.name || "Workspace";
+  const checkouts = membership?.scope === scope ? membership.checkouts : [];
+  const haltScope = workspaceHaltScope(data?.repositories ?? [], checkouts);
   const back = () => router.canGoBack() ? router.back() : router.replace({ pathname: "/(tabs)/understanding", params: { ...(params.machine ? { machine: params.machine } : {}) } });
   const revealKnowledge = (anchor: View | null) => {
     requestAnimationFrame(() => {
@@ -102,6 +115,7 @@ export function UnderstandingWorkspace({ connection, workspaceId }: { connection
   return <View style={s.fill}>
     <TopBar backLabel="Understand" onBack={back} title={groupName} right={<LiveStatus online={poll.online && result?.state === "ready" && !result.cachedAt} loading={poll.loading} seen={poll.seen} stale={poll.stale} />} />
     <Segmented options={views} value={view} onChange={setView} style={s.segment} />
+    <HaltBanner connection={connection} place={{ projectIds: haltScope.projectIds }} names={haltScope.name} style={s.halt} />
     <ScrollView ref={scroll} contentContainerStyle={s.content} keyboardShouldPersistTaps="handled"
       refreshControl={<RefreshControl refreshing={poll.refreshing} onRefresh={() => { stopped.current = ""; poll.refresh(); }} tintColor={theme.colors.forest} colors={[theme.colors.forest]} />}>
       <View ref={content}>
@@ -191,13 +205,11 @@ function MembershipMap({ workspace, repositories, onPress }: { workspace: string
 
 function SystemView({ data, connection, workspaceId, readGeneration, offline, onComponentNavigate, initialComponent }: { data: WorkspaceUnderstanding; connection: Connection; workspaceId: string; readGeneration: string; offline: boolean; onComponentNavigate: (anchor: View | null) => void; initialComponent?: string }) {
   const anchor = useRef<View>(null);
-  // A `component` route param (from a work brief) opens that component once, when the view mounts.
   const [open, setOpen] = useState({ id: initialComponent ?? "", nonce: initialComponent ? 1 : 0 });
   return <View style={s.stack}>
     <SystemOverview connection={connection} workspaceId={workspaceId} data={data} offline={offline}
       onOpenComponent={id => { setOpen(previous => ({ id, nonce: previous.nonce + 1 })); onComponentNavigate(anchor.current); }} />
     <View ref={anchor}><KnowledgePanel onComponentNavigate={() => onComponentNavigate(anchor.current)} key={`${connectionKey(connection)}|${connection.url}|${connection.token}|${workspaceId}`} connection={connection} workspaceId={workspaceId} knowledge={data.knowledge} readGeneration={readGeneration} defaultArea="components" openComponentId={open.id} openComponentNonce={open.nonce} repositories={data.repositories} work={data.work} offline={offline} /></View>
-    {/* Only the pointers to the detail pages; the source-separation sentences belong to the Work tab. */}
     {data.coverage.filter(line => line.includes("shown here")).map((line, index) => <Text key={`coverage-${index}`} style={s.note}>{line}</Text>)}
     <Text style={s.note}>Generated from the code and the work records. It does not mean anything is deployed or approved.</Text>
   </View>;
@@ -209,6 +221,7 @@ function date(value: string) { const parsed = new Date(value); return Number.isN
 const s = StyleSheet.create({
   fill: { flex: 1, backgroundColor: theme.colors.paper },
   segment: { marginHorizontal: 16, marginBottom: 6 },
+  halt: { marginHorizontal: 16, marginBottom: 4 },
   content: { paddingHorizontal: 16, paddingTop: 10, paddingBottom: 36 },
   stack: { gap: 12 },
   intro: { fontSize: 13, lineHeight: 19, color: theme.colors.secondaryInk },

@@ -7,7 +7,6 @@ import { bytesToHex, hexToBytes, utf8ToBytes } from "@noble/hashes/utils.js";
 export const REMOTE_VERSION = 1;
 export const MAX_REQUEST_BYTES = 96 * 1024;
 export const MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
-// Hex encoding keeps the protocol independent of Buffer and native base64 APIs.
 export const MAX_FRAME_BYTES = MAX_RESPONSE_BYTES * 2 + 4096;
 export const MAX_PENDING_REQUESTS = 8;
 export const MAX_TERMINAL_STREAMS = 4;
@@ -28,12 +27,12 @@ export interface RemoteRequest {
   headers?: Record<string, string>; body?: unknown;
 }
 export interface RemoteResponse { type: "response"; id: string; status: number; body: unknown }
-/** Terminal messages retain the existing host gateway's input and lease rules. */
 export type TerminalInput =
   | { op: "raw"; requestId: string; text: string; leaseId?: string }
   | { op: "input"; requestId: string; text: string; submit: false; leaseId?: string }
   | { op: "resize"; cols: number; rows: number; leaseId?: string }
-  | { op: "control"; requestId: string; action: "claim" | "renew" | "release"; leaseId?: string; takeover?: boolean };
+  | { op: "control"; requestId: string; action: "claim"; leaseId?: string; takeover?: boolean }
+  | { op: "control"; requestId: string; action: "renew" | "release"; leaseId?: string; takeover?: false };
 export type RemoteTerminalCommand =
   | { type: "terminal-open"; id: string; token: string; sessionId: string; clientId: string; after: number; snapshot: boolean }
   | { type: "terminal-send"; id: string; token: string; streamId: string; message: TerminalInput }
@@ -131,7 +130,6 @@ export function acceptServerHello(key: Uint8Array, client: ClientHello, value: u
   return hello;
 }
 
-/** Fresh nonces bind both directional keys to this handshake and machine. No forward secrecy. */
 export function createCipherChannel(key: Uint8Array, client: ClientHello, server: ServerHello, side: "client" | "server"): CipherChannel {
   const context = sha256(transcript(client, server));
   const keys = hkdf(sha256, key, context, encode(`${domain}:directional-keys`), 64);

@@ -1,6 +1,12 @@
 import SwiftUI
 import InfiniteCore
 
+func directionSourceLabel(_ source: JSON) -> String {
+    if source["kind"].string == "github-review" { return "Owner (GitHub review)" }
+    if source["kind"].string == "connector" { return source["name"].string.isEmpty ? "Connector" : source["name"].string }
+    return source.string == "coordinator" ? "Mission coordinator" : "You"
+}
+
 func teamColor(_ team: TeamRun) -> Color {
     switch team.projectState {
     case .pending: return team.status == "ready-for-review" ? Palette.review : Palette.attention
@@ -11,11 +17,23 @@ func teamColor(_ team: TeamRun) -> Color {
     case .cancelled, .aborted: return .secondary
     }
 }
+func teamColor(_ seed: TeamSeed) -> Color {
+    switch seed.typedStatus {
+    case .readyForReview: return Palette.review
+    case .needsInput: return Palette.attention
+    case .blocked: return Palette.error
+    case .paused: return Palette.paused
+    case .merged: return Palette.done
+    case .cancelled, .noChange: return .secondary
+    case .unknown(let raw) where raw.isEmpty:
+        return seed.column == BoardColumn.needsInput.rawValue ? Palette.attention : .secondary
+    case .planning, .discovering, .implementing, .integrating, .verifying, .reviewing, .delivering, .unknown:
+        return seed.column == BoardColumn.needsInput.rawValue ? Palette.attention : Palette.running
+    }
+}
 private let teamClock: DateFormatter = { let f = DateFormatter(); f.dateStyle = .short; f.timeStyle = .short; return f }()
 func teamDate(_ value: String) -> String { ISO8601DateFormatter.flexible.date(from: value).map(teamClock.string(from:)) ?? value }
 
-/// Everything a person needs to follow and steer one run: open decisions, member sessions that
-/// need them, the work plan, the host's check and review evidence, and a direction composer.
 struct TeamDetailView: View {
     @ObservedObject var app: AppModel
     @ObservedObject var model: TeamModel
@@ -23,8 +41,7 @@ struct TeamDetailView: View {
     @State private var confirmDiscard = false
     @State private var expandedTasks: Set<String> = []
     @State private var fullRequest = false
-    private var team: TeamRun { model.run }
-    private var continuationEligible: Bool {
+    private func continuationEligible(_ team: TeamRun) -> Bool {
         team.status == "blocked" && team.value["continuable"].bool && !team.managedByMission
             && team.value["goal"] == .null && team.value["deliveryReceipt"] == .null && team.value["pullRequest"] == .null
     }
@@ -35,28 +52,36 @@ struct TeamDetailView: View {
             ScrollViewReader { proxy in
                 ScrollView {
                     VStack(alignment: .leading, spacing: 22) {
-                        banners
-                        if team.status == "ready-for-review" && !model.managed { reviewPanel }
-                        decisions
-                        attention
-                        section("Run map") {
-                            RunDiagram(team: team) { id in
-                                expandedTasks.insert(id)
-                                withAnimation { proxy.scrollTo(id, anchor: .top) }
+                        switch model.loadState {
+                        case .loading(_, let error):
+                            loadingContent(error: error)
+                        case .listSeed(let team, let error):
+                            banners(team)
+                            loadingContent(error: error)
+                        case .loaded(let team, _):
+                            banners(team)
+                            if team.status == "ready-for-review" && !model.managed { reviewPanel(team) }
+                            decisions(team)
+                            attention(team)
+                            section("Run map") {
+                                RunDiagram(team: team) { id in
+                                    expandedTasks.insert(id)
+                                    withAnimation { proxy.scrollTo(id, anchor: .top) }
+                                }
                             }
+                            request(team)
+                            plan(team)
+                            evidence(team)
+                            membersSection(team)
+                            output(team)
+                            history(team)
                         }
-                        request
-                        plan
-                        evidence
-                        membersSection
-                        output
-                        history
                     }.padding(20).frame(maxWidth: 900, alignment: .leading)
                 }.frame(maxWidth: .infinity, maxHeight: .infinity)
             }
             Divider()
             if model.managed {
-                MissionManagedNote(missionID: team.missionID) { app.selectedMissionID = $0 }.padding(12)
+                MissionManagedNote(missionID: model.missionID) { app.openMission($0) }.padding(12)
             } else {
                 composer.padding(12)
             }
@@ -74,48 +99,106 @@ struct TeamDetailView: View {
         } message: { Text("The host may already have applied this request. Clearing it does not undo anything.") }
     }
 
-    private var header: some View {
-        HStack(spacing: 10) {
-            if let mission = app.teamOpenedFrom {
-                Button { app.selectedMissionID = mission } label: { Image(systemName: "chevron.left") }
-                    .buttonStyle(.borderless).help("Back to the mission").accessibilityLabel("Back to the mission")
+    @ViewBuilder private func loadingContent(error: String?) -> some View {
+        if let error {
+            VStack(alignment: .leading, spacing: 10) {
+                note("Could not load team details: \(error)", color: .orange)
+                Button("Retry") { Task { await model.retryLoad() } }.controlSize(.small).disabled(model.isRetrying)
             }
-            StatusGlyph(team: team, size: 16)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(team.title).font(.system(size: 14, weight: .semibold)).lineLimit(1)
-                Text("\(app.projectName(team.projectID)) · \(lead) · Revision \(team.revision) · up to \(team.parallelism) implementer\(team.parallelism == 1 ? "" : "s")")
-                    .font(.caption).foregroundStyle(.secondary).lineLimit(1)
-            }
-            Spacer(minLength: 8)
-            HStack(spacing: 5) {
-                Image(systemName: "wifi.exclamationmark").font(.caption).foregroundStyle(.orange)
-                    .frame(width: 12).opacity(model.displayStale ? 1 : 0)
-                Text(team.statusLabel).font(.caption.weight(.medium)).lineLimit(1)
-            }.padding(.horizontal, 9).padding(.vertical, 4)
-                .glassSurface(in: Capsule(), tint: teamColor(team))
-                .help(model.displayStale ? "Updates unavailable. Controls stay disabled until the next successful refresh." : "")
-            if model.role == "owner" && team.status != "cancelled" && !model.managed {
-                Menu {
-                    let resumes = team.status == "paused" || (team.offersResume && !model.offersContinue)
-                    if resumes || !["blocked", "ready-for-review"].contains(team.status) {
-                        Button(resumes ? "Resume team" : "Pause team") { Task { await model.perform(resumes ? "resume" : "pause") } }.disabled(!model.canOwn)
-                    }
-                    Button("Cancel team…", role: .destructive) { confirmCancel = true }.disabled(!model.canOwn)
-                } label: { Image(systemName: "ellipsis.circle") }.menuStyle(.borderlessButton).fixedSize().help("Team actions")
+        } else {
+            HStack(spacing: 10) {
+                ProgressView().controlSize(.small)
+                Text("Loading team details…").font(.callout).foregroundStyle(.secondary)
             }
         }
     }
-    private var lead: String {
+
+    private func loadingSubtitle(seed: TeamSeed, error: String?) -> String {
+        let detail = error == nil ? "Loading team details…" : "Updates unavailable"
+        return seed.projectID.isEmpty ? detail : "\(app.projectName(seed.projectID)) · \(detail)"
+    }
+
+    private var header: some View {
+        HStack(spacing: 10) {
+            if let mission = app.teamOpenedFrom {
+                Button { app.openMission(mission) } label: { Image(systemName: "chevron.left") }
+                    .buttonStyle(.borderless).help("Back to the mission").accessibilityLabel("Back to the mission")
+            }
+            StatusGlyph(teamLoadState: model.loadState, size: 16)
+            switch model.loadState {
+            case .loading(let seed, let error):
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(seed.title.isEmpty ? seed.id : seed.title).font(.system(size: 14, weight: .semibold)).lineLimit(1)
+                    Text(loadingSubtitle(seed: seed, error: error))
+                        .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                }
+                Spacer(minLength: 8)
+                if error == nil {
+                    ProgressView().controlSize(.small)
+                }
+                if !seed.statusLabel.isEmpty {
+                    HStack(spacing: 5) {
+                        Image(systemName: "wifi.exclamationmark").font(.caption).foregroundStyle(.orange)
+                            .frame(width: 12).opacity(model.displayStale || error != nil ? 1 : 0)
+                        Text(seed.statusLabel).font(.caption.weight(.medium)).lineLimit(1)
+                    }.padding(.horizontal, 9).padding(.vertical, 4)
+                        .glassSurface(in: Capsule(), tint: teamColor(seed))
+                        .help(model.displayStale || error != nil ? "Updates unavailable. Controls stay disabled until the next successful refresh." : "")
+                } else if model.displayStale || error != nil {
+                    Text("Updates unavailable").font(.caption).foregroundStyle(.orange)
+                }
+            case .listSeed(let team, let error):
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(team.title).font(.system(size: 14, weight: .semibold)).lineLimit(1)
+                    Text("\(app.projectName(team.projectID)) · \(lead(team)) · Revision \(team.revision) · up to \(team.parallelism) implementer\(team.parallelism == 1 ? "" : "s")")
+                        .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                }
+                Spacer(minLength: 8)
+                if error == nil {
+                    ProgressView().controlSize(.small)
+                }
+                HStack(spacing: 5) {
+                    Image(systemName: "wifi.exclamationmark").font(.caption).foregroundStyle(.orange)
+                        .frame(width: 12).opacity(model.displayStale || error != nil ? 1 : 0)
+                    Text(team.statusLabel).font(.caption.weight(.medium)).lineLimit(1)
+                }.padding(.horizontal, 9).padding(.vertical, 4)
+                    .glassSurface(in: Capsule(), tint: teamColor(team))
+                    .help(model.displayStale || error != nil ? "Updates unavailable. Controls stay disabled until the next successful refresh." : "")
+            case .loaded(let team, _):
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(team.title).font(.system(size: 14, weight: .semibold)).lineLimit(1)
+                    Text("\(app.projectName(team.projectID)) · \(lead(team)) · Revision \(team.revision) · up to \(team.parallelism) implementer\(team.parallelism == 1 ? "" : "s")")
+                        .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                }
+                Spacer(minLength: 8)
+                HStack(spacing: 5) {
+                    Image(systemName: "wifi.exclamationmark").font(.caption).foregroundStyle(.orange)
+                        .frame(width: 12).opacity(model.displayStale ? 1 : 0)
+                    Text(team.statusLabel).font(.caption.weight(.medium)).lineLimit(1)
+                }.padding(.horizontal, 9).padding(.vertical, 4)
+                    .glassSurface(in: Capsule(), tint: teamColor(team))
+                    .help(model.displayStale ? "Updates unavailable. Controls stay disabled until the next successful refresh." : "")
+                if model.role == "owner" && team.status != "cancelled" && !model.managed {
+                    Menu {
+                        let resumes = team.status == "paused" || (team.offersResume && !model.offersContinue)
+                        if resumes || !["blocked", "ready-for-review"].contains(team.status) {
+                            Button(resumes ? "Resume team" : "Pause team") { Task { await model.perform(resumes ? "resume" : "pause") } }.disabled(!model.canOwn)
+                        }
+                        Button("Cancel team…", role: .destructive) { confirmCancel = true }.disabled(!model.canOwn)
+                    } label: { Image(systemName: "ellipsis.circle") }.menuStyle(.borderlessButton).fixedSize().help("Team actions")
+                }
+            }
+        }
+    }
+    private func lead(_ team: TeamRun) -> String {
         team.hasLineup ? "Coordinator: \(team.lineup["coordinator"]["label"].string)" : providerName(team.provider)
     }
 
-    @ViewBuilder private var banners: some View {
+    @ViewBuilder private func banners(_ team: TeamRun) -> some View {
         if !team.reason.isEmpty { note(team.reason, color: .orange) }
     }
 
-    /// The team's claim of readiness, the evidence behind it at a glance, and what to do next.
-    /// Nothing here approves or merges; the person decides outside the host or sends a direction.
-    private var reviewPanel: some View {
+    private func reviewPanel(_ team: TeamRun) -> some View {
         let checks = team.currentChecks
         let passed = checks.filter { $0["status"].string == "passed" }.count
         let failed = checks.contains { $0["status"].string == "failed" }
@@ -153,7 +236,7 @@ struct TeamDetailView: View {
         .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.blue.opacity(0.25)))
     }
 
-    private var request: some View {
+    private func request(_ team: TeamRun) -> some View {
         section("Your request") {
             VStack(alignment: .leading, spacing: 4) {
                 Text(team.objective).font(.callout).textSelection(.enabled).lineLimit(fullRequest ? nil : 2).fixedSize(horizontal: false, vertical: true)
@@ -162,12 +245,10 @@ struct TeamDetailView: View {
         }
     }
 
-    /// A mission's subteam answers its questions through the coordinator, so its open decisions carry no answer controls here.
-    @ViewBuilder private var decisions: some View {
+    @ViewBuilder private func decisions(_ team: TeamRun) -> some View {
         let open = team.openDecisions
         if !open.isEmpty && !model.managed {
             section("Decisions for you", count: open.count) {
-                // Keyed by decision ID so a typed draft never moves to another question after a poll.
                 ForEach(open, id: \.["id"].string) { decision in
                     let asker = team.member(decision["memberId"].string).map { TeamRun.roleName($0["role"].string) } ?? "Team"
                     DecisionCard(decision: decision, caption: "\(asker) · revision \(decision["revision"].int) · \(teamDate(decision["createdAt"].string))",
@@ -178,8 +259,7 @@ struct TeamDetailView: View {
         }
     }
 
-    /// Provider permission prompts belong to the member's own session; the team never answers them.
-    @ViewBuilder private var attention: some View {
+    @ViewBuilder private func attention(_ team: TeamRun) -> some View {
         let ids = Set(team.activeMembers.map { $0["sessionId"].string })
         let waiting = app.sessions.filter { ids.contains($0.id) && $0.needsYou }
         if !waiting.isEmpty {
@@ -197,7 +277,7 @@ struct TeamDetailView: View {
         }
     }
 
-    @ViewBuilder private var plan: some View {
+    @ViewBuilder private func plan(_ team: TeamRun) -> some View {
         section("Work plan", count: team.tasks.count) {
             if team.tasks.isEmpty { Text("The coordinator has not reported a work plan yet.").font(.callout).foregroundStyle(.secondary) }
             ForEach(Array(team.tasks.enumerated()), id: \.offset) { _, task in
@@ -208,7 +288,7 @@ struct TeamDetailView: View {
         }
     }
 
-    @ViewBuilder private var membersSection: some View {
+    @ViewBuilder private func membersSection(_ team: TeamRun) -> some View {
         DisclosureGroup("Team members (\(team.members.count))") {
             if team.hasLineup { LineupView(lineup: team.lineup) }
             ForEach(Array(team.members.enumerated()), id: \.offset) { _, member in
@@ -231,7 +311,7 @@ struct TeamDetailView: View {
         }.font(.subheadline.weight(.semibold))
     }
 
-    @ViewBuilder private var evidence: some View {
+    @ViewBuilder private func evidence(_ team: TeamRun) -> some View {
         section("Checks · run by the host") {
             if team.checks.isEmpty { Text("No check results recorded yet.").font(.callout).foregroundStyle(.secondary) }
             ForEach(Array(team.checks.enumerated()), id: \.offset) { _, check in
@@ -263,7 +343,7 @@ struct TeamDetailView: View {
         }
     }
 
-    @ViewBuilder private var output: some View {
+    @ViewBuilder private func output(_ team: TeamRun) -> some View {
         DisclosureGroup("Branch and commits") {
             Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 6) {
                 GridRow { Text("Branch").foregroundStyle(.secondary); mono(team.branch) }
@@ -274,13 +354,13 @@ struct TeamDetailView: View {
         }.font(.subheadline.weight(.semibold))
     }
 
-    @ViewBuilder private var history: some View {
+    @ViewBuilder private func history(_ team: TeamRun) -> some View {
         let answered = team.answeredDecisions
         if !team.steering.isEmpty || !answered.isEmpty {
-            section("Your directions and decisions") {
+            section("Directions and decisions") {
                 ForEach(Array(team.steering.enumerated()), id: \.offset) { _, entry in
                     VStack(alignment: .leading, spacing: 3) {
-                        Text("Direction · revision \(entry["revision"].int) · \(teamDate(entry["at"].string))").font(.caption).foregroundStyle(.secondary)
+                        Text("\(directionSourceLabel(entry["source"])) · direction · revision \(entry["revision"].int) · \(teamDate(entry["at"].string))").font(.caption).foregroundStyle(.secondary)
                         Text(entry["text"].string).font(.callout).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
                     }
                 }
@@ -288,7 +368,8 @@ struct TeamDetailView: View {
                     VStack(alignment: .leading, spacing: 3) {
                         Text("Decision · revision \(decision["revision"].int)").font(.caption).foregroundStyle(.secondary)
                         Text(decision["question"].string).font(.callout).fixedSize(horizontal: false, vertical: true)
-                        Text("\(decision["answeredBy"].string == "coordinator" ? "Mission coordinator" : "Your answer"): \(decision["answer"].string)").font(.callout.weight(.medium)).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                        Text("\(decision["answeredBy"].string == "connector" ? (decision["source"]["name"].string.isEmpty ? "Connector" : decision["source"]["name"].string) : decision["answeredBy"].string == "coordinator" ? "Mission coordinator" : "Your answer"): \(decision["answer"].string)").font(.callout.weight(.medium)).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                        if let note = DecisionRecommendation(decision["recommendation"])?.comparisonNote { Text(note).font(.caption).foregroundStyle(.secondary) }
                     }
                 }
             }
@@ -354,8 +435,8 @@ struct TeamDetailView: View {
                 }
             }
             if model.role == "viewer" { Text("This device can view the team. An owner or controller can answer decisions and send direction.").font(.caption).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading) }
-            else if team.status == "cancelled" { Text("This run is cancelled. Its work and evidence remain available above.").font(.caption).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading) }
-            else if continuationEligible {
+            else if case .loaded(let team, _) = model.loadState, team.status == "cancelled" { Text("This run is cancelled. Its work and evidence remain available above.").font(.caption).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading) }
+            else if case .loaded(let team, _) = model.loadState, continuationEligible(team) {
                 if model.role == "owner" {
                     VStack(alignment: .leading, spacing: 8) {
                         Text("Direction for continuation (optional)").font(.caption.weight(.semibold))
@@ -376,12 +457,14 @@ struct TeamDetailView: View {
                 } else { Text("Only an owner can continue this blocked run.").font(.caption).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading) }
             }
             else {
+                let statusNotice = !model.notice.isEmpty ? model.notice : (model.loadError ?? (!model.isLoaded ? "Loading team details…" : "A direction records a new revision; the team replans from its integrated work."))
+                let noticeError = model.noticeIsError || (model.notice.isEmpty && model.loadError != nil)
                 PromptEditor(text: Binding(get: { model.direction }, set: { model.direction = $0 }), placeholder: "Give the team a direction or change the requirements…",
                              enabled: model.canSteer, transparent: true, submit: { Task { await model.steer() } })
                     .frame(height: 64).glassSurface(in: RoundedRectangle(cornerRadius: 14, style: .continuous))
                 HStack(spacing: 12) {
-                    Text(model.notice.isEmpty ? "A direction records a new revision; the team replans from its integrated work." : model.notice)
-                        .font(.system(size: 11)).foregroundStyle(model.noticeIsError ? Color.orange : .secondary).lineLimit(2).textSelection(.enabled)
+                    Text(statusNotice)
+                        .font(.system(size: 11)).foregroundStyle(noticeError ? Color.orange : .secondary).lineLimit(2).textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading).frame(height: 28, alignment: .leading)
                     Button { Task { await model.steer() } } label: {
                         Group { if model.busy { ProgressView().controlSize(.small) } else { Label("Send direction", systemImage: "arrow.up") } }.frame(width: 112)
@@ -408,8 +491,6 @@ struct TeamDetailView: View {
     }
 }
 
-/// The one line that stands in for steering and owner controls on a run or session a mission's coordinator
-/// runs. With an opener it is a button that goes to the mission, where the owner talks to the coordinator.
 struct MissionManagedNote: View {
     let missionID: String
     var openMission: ((String) -> Void)? = nil
@@ -428,10 +509,8 @@ struct MissionManagedNote: View {
     }
 }
 
-/// A question a member or a mission coordinator asked, answered by its options or in words.
 struct DecisionCard: View {
     let decision: JSON
-    /// Who asked and when, above the question.
     let caption: String
     let disabled: Bool
     let answer: (String) -> Void
@@ -443,9 +522,28 @@ struct DecisionCard: View {
                 Text(caption).font(.caption).foregroundStyle(.secondary)
             }
             Text(decision["question"].string).font(.system(size: 13, weight: .medium)).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+            let recommendation = DecisionRecommendation(decision["recommendation"])
             let options = decision["options"].array.map(\.string)
+            if let recommendation {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Recommended by the agent").font(.caption).foregroundStyle(.secondary)
+                    Text(recommendation.answers.joined(separator: ", ")).font(.callout.weight(.medium)).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                    if !recommendation.reason.isEmpty { Text(recommendation.reason).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true) }
+                    if options.isEmpty {
+                        Button("Use the recommended answer") { answer(recommendation.firstAnswer) }.disabled(disabled).padding(.top, 2)
+                    }
+                }
+            }
             if !options.isEmpty {
-                HStack(spacing: 8) { ForEach(Array(options.enumerated()), id: \.offset) { _, option in Button(option) { answer(option) }.disabled(disabled) } }
+                HStack(spacing: 8) {
+                    ForEach(Array(options.enumerated()), id: \.offset) { _, option in
+                        if recommendation?.recommends(option) == true {
+                            Button(option) { answer(option) }.buttonStyle(.borderedProminent).disabled(disabled).accessibilityLabel("\(option), recommended")
+                        } else {
+                            Button(option) { answer(option) }.disabled(disabled)
+                        }
+                    }
+                }
             }
             HStack {
                 TextField("Write your answer…", text: $text).textFieldStyle(.roundedBorder).disabled(disabled).onSubmit { submit() }
@@ -456,8 +554,6 @@ struct DecisionCard: View {
     private func submit() { let value = text; text = ""; answer(value) }
 }
 
-/// One line per task; expanding shows the agent's own report and the brief it worked from.
-/// A metered task carries what it cost; the owner can rate any task from here.
 struct TaskCard: View {
     let task: JSON
     let team: TeamRun
@@ -507,7 +603,6 @@ struct TaskCard: View {
             }
         }.padding(10).background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 8))
     }
-    /// What the task cost across every attempt, from the host's ledger.
     private func spend(_ usage: TaskUsage) -> some View {
         HStack(spacing: 6) {
             Text("Spent").font(.caption).foregroundStyle(.secondary)
@@ -547,8 +642,6 @@ private func agentLabel(_ task: JSON, _ team: TeamRun) -> String {
     return providerName(member?["provider"].string.isEmpty == false ? member!["provider"].string : team.provider)
 }
 
-/// The run as a pipeline: plan, the tasks in dependency columns, then integration, checks,
-/// review, and the person. Tapping a task opens its card below.
 struct RunDiagram: View {
     let team: TeamRun
     let select: (String) -> Void
@@ -608,7 +701,6 @@ struct StageNode: View {
     }
 }
 
-/// One number with where it came from, so host facts and agent claims never blur.
 struct SignalTile: View {
     let value: String
     let label: String
@@ -651,7 +743,6 @@ struct ReviewStepRow: View {
     }
 }
 
-/// Requested model settings are what the host asked for; provider policy may still override them.
 struct ProfileLine: View {
     let profile: JSON
     var body: some View {
@@ -680,7 +771,6 @@ struct LineupView: View {
     }
 }
 
-/// Starts a run: an outcome, a workspace with configured checks, and the agents to use.
 struct TeamCreateView: View {
     @ObservedObject var app: AppModel
     @Environment(\.dismiss) private var dismiss
@@ -692,6 +782,7 @@ struct TeamCreateView: View {
     @State private var busy = false
     @State private var error = ""
     @State private var clearPending = false
+    @State private var clearTarget: PendingClearTarget?
     private var providers: [String] { app.teamProviders }
     private var selectedProject: JSON? { app.projects.first { $0["id"].string == project } }
     private var projectReady: Bool { app.teamWorkspaceReady(project) }
@@ -736,7 +827,9 @@ struct TeamCreateView: View {
             if !useLineup && provider == "demo" { Text("Rehearsal uses a local test process. It does not call an AI model or implement a real feature.").font(.caption).foregroundStyle(.orange) }
             if pending {
                 Text("A team request is pending. Retry uses its original request identity. Check the team list before starting a different one.").font(.callout).foregroundStyle(.orange)
-                Button("Clear after checking teams…") { clearPending = true }.disabled(busy)
+                Button("Clear after checking teams…") {
+                    if let id = app.pendingTeamCreation.pendingID { clearTarget = PendingClearTarget(profileID: app.activeID, requestID: id); clearPending = true }
+                }.disabled(busy)
             }
             if !error.isEmpty { Text(error).foregroundStyle(.red).textSelection(.enabled) }
             HStack {
@@ -753,8 +846,11 @@ struct TeamCreateView: View {
             }
         }.padding(26).frame(width: 560)
         .alert("Clear the pending team request?", isPresented: $clearPending) {
-            Button("Keep pending", role: .cancel) {}
-            Button("I checked the teams") { app.clearTeamCreation() }
+            Button("Keep pending", role: .cancel) { clearTarget = nil }
+            Button("I checked the teams") {
+                app.clearTeamCreation(expectedProfileID: clearTarget?.profileID, expectedRequestID: clearTarget?.requestID)
+                clearTarget = nil
+            }
         } message: { Text("The server may already have started this team. Clearing does not stop it.") }
         .onAppear {
             project = app.defaultTeamWorkspace

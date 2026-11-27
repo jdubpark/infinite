@@ -1,13 +1,17 @@
-import { appendFileSync } from "node:fs";
+import { appendFileSync, existsSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 
 const receiptPath = process.argv[2];
-// Optional mode after the receipt path: fail (exit 1), skip (an unrefreshed brief), empty (no brief yet)
-// or disabled (the repository is not opted in).
-const mode = ["fail", "skip", "empty", "disabled", "invalid", "large"].includes(process.argv[3]) ? process.argv[3] : null;
+const gated = process.argv[3] === "gate";
+const gateSession = gated ? process.argv[4] : null;
+const gateEntered = gated ? process.argv[5] : null;
+const gateRelease = gated ? process.argv[6] : null;
+const mode = !gated && ["fail", "skip", "empty", "disabled", "invalid", "large"].includes(process.argv[3]) ? process.argv[3] : null;
 const fail = mode === "fail";
-const args = process.argv.slice(mode ? 4 : 3);
+const args = process.argv.slice(gated ? 7 : mode ? 4 : 3);
 const repo = args[args.indexOf("--repo") + 1];
+const sessionIndex = args.indexOf("--session");
+const session = sessionIndex >= 0 ? args[sessionIndex + 1] : null;
 const baseIndex = args.indexOf("--base");
 const base = baseIndex >= 0 ? args[baseIndex + 1] : null;
 const input = await new Promise((resolve, reject) => {
@@ -17,6 +21,10 @@ const input = await new Promise((resolve, reject) => {
   process.stdin.on("end", () => resolve(value));
   process.stdin.on("error", reject);
 });
+if (gated && session === gateSession) {
+  writeFileSync(gateEntered, "entered");
+  while (!existsSync(gateRelease)) await new Promise(resolve => setTimeout(resolve, 20));
+}
 appendFileSync(receiptPath, `${JSON.stringify({ args, input })}\n`);
 if (fail) process.exit(1);
 

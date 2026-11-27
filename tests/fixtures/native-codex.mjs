@@ -1,7 +1,7 @@
-// Provider-boundary fixture. Real Codex commissioning is a separate manual check.
 import { createServer } from "node:http";
 import { createHash, randomUUID } from "node:crypto";
 import { writeFileSync, appendFileSync, existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { WebSocket, WebSocketServer } from "ws";
 
@@ -24,9 +24,13 @@ if (args[0] === "exec-server") {
           appendFileSync("agent-edit.txt", contents + "\n");
           client.send(JSON.stringify({ id: request.id, result: { contents, cwd: process.cwd() } }));
         } else if (request.method === "fixture/uncertain-edit") {
-          // An observable effect without a reply exercises the real broker's
-          // uncertain-operation guard. The fixture never supplies its decision.
           appendFileSync("uncertain-effect.txt", "performed\n");
+        } else if (request.method === "fs/getMetadata") {
+          const target = typeof request.params?.path === "string" ? request.params.path : join(process.cwd(), "AGENTS.md");
+          client.send(JSON.stringify({ id: request.id, result: { exists: existsSync(target), isFile: existsSync(target) } }));
+        } else if (request.method === "fs/readFile") {
+          const target = typeof request.params?.path === "string" ? request.params.path : join(process.cwd(), "AGENTS.md");
+          client.send(JSON.stringify({ id: request.id, result: { contents: existsSync(target) ? readFileSync(target, "utf8") : "" } }));
         } else client.send(JSON.stringify({ id: request.id, result: { cwd: pathToFileURL(process.cwd()).href } }));
       });
     });
@@ -37,16 +41,31 @@ if (args[0] === "exec-server") {
   });
 } else if (args[0] === "app-server") {
   const expectedHash = option("--ws-token-sha256");
+  const stateFile = process.env.FIXTURE_THREAD_STATE_FILE;
+  const omitStartEnvironments = process.env.FIXTURE_OMIT_START_ENVIRONMENTS === "1";
+  const omitReadEnvironments = process.env.FIXTURE_OMIT_READ_ENVIRONMENTS === "1";
+  const omitReadFlagFile = process.env.FIXTURE_OMIT_READ_FLAG_FILE;
+  const omitResumeEnvironments = process.env.FIXTURE_OMIT_RESUME_ENVIRONMENTS === "1";
+  const holdFrontendReadFile = process.env.FIXTURE_HOLD_FRONTEND_READ_FILE;
+  const floodDuringStartRead = process.env.FIXTURE_FLOOD_DURING_START_READ === "1";
+  const startupWriteAttempt = process.env.FIXTURE_STARTUP_WRITE_ATTEMPT === "1";
   const http = createServer();
   const wss = new WebSocketServer({ noServer: true });
-  const history = [];
-  let threadId, activeTurn, selections, activeSelections, releaseHeldTurn, replayCompletedTurn;
+  const saved = stateFile && existsSync(stateFile) ? JSON.parse(readFileSync(stateFile, "utf8")) : undefined;
+  const history = Array.isArray(saved?.history) ? [...saved.history] : [];
+  let threadId = saved?.threadId, activeTurn, selections = saved?.selections, activeSelections = saved?.selections, releaseHeldTurn, replayCompletedTurn;
+  let discoveredInstructions, startupWriteBlocked;
+  let flooded = false;
+  const saveState = () => {
+    if (!stateFile) return;
+    writeFileSync(stateFile, JSON.stringify({ threadId, history, selections }));
+  };
   const environments = new Map();
-  const execute = (environmentId, method) => new Promise((resolve, reject) => {
+  const execute = (environmentId, method, params) => new Promise((resolve, reject) => {
     const environment = environments.get(environmentId);
     const ws = new WebSocket(environment.execServerUrl, { headers: { Authorization: `Bearer ${environment.authBearerToken}` } });
     ws.on("error", reject);
-    ws.on("open", () => ws.send(JSON.stringify({ id: 1, method })));
+    ws.on("open", () => ws.send(JSON.stringify({ id: 1, method, ...(params !== undefined ? { params } : {}) })));
     ws.on("message", data => {
       const response = JSON.parse(data.toString());
       if (response.error) reject(new Error(response.error.message)); else resolve(response.result);
@@ -55,7 +74,13 @@ if (args[0] === "exec-server") {
   });
   const foreignId = randomUUID();
   const broadcast = message => { for (const client of wss.clients) if (client.readyState === WebSocket.OPEN) client.send(JSON.stringify(message)); };
-  const thread = () => ({ id: threadId, turns: history.map(text => ({ text })), ...(selections ? { environments: selections, cwd: selections[0].cwd } : {}) });
+  const thread = (includeEnvironments = true) => ({
+    id: threadId,
+    turns: history.map(text => ({ text })),
+    ...(includeEnvironments && selections ? { environments: selections, cwd: selections[0].cwd } : {}),
+    ...(discoveredInstructions !== undefined ? { discoveredInstructions } : {}),
+    ...(startupWriteBlocked !== undefined ? { startupWriteBlocked } : {}),
+  });
   http.on("upgrade", (req, socket, head) => {
     const token = req.headers.authorization?.replace(/^Bearer /, "") ?? "";
     if (createHash("sha256").update(token).digest("hex") !== expectedHash) { socket.end("HTTP/1.1 403 Forbidden\r\n\r\n"); return; }
@@ -76,20 +101,37 @@ if (args[0] === "exec-server") {
           environments.set(params.environmentId, params); reply({});
           if (clientName === "infinite_execution" && replayCompletedTurn) {
             const replay = { threadId, turnId: replayCompletedTurn };
-            // Delay this connection's copy until selection registration; the
-            // persistent observer has already recorded this turn's completion.
             client.send(JSON.stringify({ method: "turn/started", params: { threadId, turn: { id: replay.turnId, status: "inProgress" } } }));
             client.send(JSON.stringify({ method: "turn/completed", params: { threadId, turn: { id: replay.turnId, status: "completed" } } }));
             writeFileSync("provider-lifecycle-replay.json", JSON.stringify(replay));
             replayCompletedTurn = undefined;
           }
         }
-        else if (method === "environment/info") reply(await execute(params.environmentId, "fixture/info"));
+        else if (method === "environment/info") reply(await execute(params.environmentId, "environment/info"));
         else if (method === "thread/start") {
-          threadId = randomUUID(); selections = params.environments;
-          reply({ thread: thread() }); broadcast({ method: "thread/started", params: { thread: thread() } });
+          threadId = randomUUID(); selections = params.environments; activeSelections = params.environments;
+          if (selections?.length && process.env.FIXTURE_STARTUP_DISCOVERY === "1") {
+            const env = selections[0];
+            const instructionsPath = join(env.cwd, "AGENTS.md");
+            const meta = await execute(env.environmentId, "fs/getMetadata", { path: instructionsPath });
+            if (meta?.exists) {
+              const file = await execute(env.environmentId, "fs/readFile", { path: instructionsPath });
+              discoveredInstructions = file?.contents ?? "";
+            }
+            if (startupWriteAttempt) {
+              try {
+                await execute(env.environmentId, "fs/writeFile", { path: join(env.cwd, "pwn.txt"), contents: "bad" });
+                startupWriteBlocked = false;
+              } catch {
+                startupWriteBlocked = true;
+              }
+            }
+          }
+          saveState();
+          const startThread = thread(!omitStartEnvironments);
+          reply({ thread: startThread }); broadcast({ method: "thread/started", params: { thread: startThread } });
         }
-        else if (method === "thread/settings/update") { if (params.environments) selections = params.environments; reply({}); }
+        else if (method === "thread/settings/update") { if (params.environments) selections = params.environments; saveState(); reply({}); }
         else if (method === "fixture/release-turn") {
           const release = releaseHeldTurn;
           if (!release) { reply({ released: false }); return; }
@@ -99,13 +141,53 @@ if (args[0] === "exec-server") {
           if (params.turnId !== activeTurn) reply({ status: "targetUnavailable" });
           else { if (params.environments) activeSelections = params.environments; reply({ status: "applied" }); }
         }
-        else if (method === "thread/read" || method === "thread/resume") reply({ thread: thread(), pid: process.pid });
+        else if (method === "thread/read" || method === "thread/resume") {
+          const omitReadNow = omitReadEnvironments || Boolean(omitReadFlagFile && existsSync(omitReadFlagFile));
+          const includeEnvs = method === "thread/read" ? !omitReadNow : (!omitStartEnvironments && !omitResumeEnvironments);
+          if (method === "thread/read" && clientName === "infinite_execution" && floodDuringStartRead && !flooded) {
+            flooded = true;
+            const big = "x".repeat(15 * 1024 * 1024);
+            const payload = JSON.stringify({ method: "fixture/flood", params: { threadId, chunk: big } });
+            const targets = [...wss.clients].filter(peer => peer !== client && peer.readyState === WebSocket.OPEN);
+            for (const peer of targets) {
+              for (let i = 0; i < 5; i++) {
+                if (peer.readyState !== WebSocket.OPEN) break;
+                await new Promise(done => peer.send(payload, () => done()));
+              }
+            }
+            const until = Date.now() + 2000;
+            while (Date.now() < until && targets.some(peer => peer.readyState === WebSocket.OPEN)) {
+              await new Promise(done => setTimeout(done, 25));
+            }
+          }
+          if (method === "thread/read" && clientName !== "infinite_execution" && holdFrontendReadFile && existsSync(holdFrontendReadFile)) {
+            const snapshot = thread(includeEnvs);
+            const waitRelease = () => {
+              if (!existsSync(holdFrontendReadFile)) {
+                reply({ thread: snapshot, pid: process.pid });
+              } else {
+                setTimeout(waitRelease, 15);
+              }
+            };
+            waitRelease();
+            return;
+          }
+          if (method === "thread/resume" && selections?.length && process.env.FIXTURE_STARTUP_DISCOVERY === "1" && environments.has(selections[0].environmentId)) {
+            const env = selections[0];
+            const instructionsPath = join(env.cwd, "AGENTS.md");
+            const meta = await execute(env.environmentId, "fs/getMetadata", { path: instructionsPath });
+            if (meta?.exists) {
+              const file = await execute(env.environmentId, "fs/readFile", { path: instructionsPath });
+              discoveredInstructions = file?.contents ?? "";
+            }
+          }
+          reply({ thread: thread(includeEnvs), pid: process.pid });
+        }
         else if (method === "thread/list") reply({ data: [thread(), { id: foreignId }], nextCursor: "next" });
         else if (method === "thread/loaded/list") reply({ data: [threadId, foreignId] });
-        // Real provider plugin catalogs can exceed 12 MB before a turn starts.
         else if (method === "plugin/list") reply({ catalog: "a".repeat(13 * 1024 * 1024) });
         else if (method === "turn/start") {
-          const text = params.input.map(item => item.text ?? "").join(""); history.push(text);
+          const text = params.input.map(item => item.text ?? "").join(""); history.push(text); saveState();
           const turnId = randomUUID(); activeTurn = turnId; activeSelections = params.environments ?? selections;
           const complete = (status = "completed", error) => {
             if (activeTurn === turnId) activeTurn = undefined;
@@ -175,6 +257,5 @@ if (args[0] === "exec-server") {
     input += data.toString().replace(/\x1b\[20[01]~/g, "");
     if (input.includes("\r") && threadId) { call("turn/start", { threadId, input: [{ type: "text", text: input.split("\r")[0] }] }); input = ""; }
   });
-  // A native TUI can exit without cleaning up its terminal modes.
   process.stdout.write("\x1b[?2004h\x1b[?1003h\x1b[?1006h\x1b[?1004h\x1b[?25l");
 }

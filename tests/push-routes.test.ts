@@ -35,6 +35,7 @@ test("/api/me reports capabilities by role", { timeout: 30000 }, async () => {
     assert.deepEqual((await host.fetchApi("/me", "controller")).body.capabilities, {
       signals: true, answer: true, push: false, workspaceMirror: 1, mirrorForget: 1,
       desktop: { resources: 1, files: 1, fileTransfer: 1, chunkBytes: 49152, maxFileBytes: 268435456 },
+      swarmContext: 1,
     });
     assert.equal((await host.fetchApi("/me", "viewer")).body.capabilities.answer, false);
   } finally {
@@ -63,7 +64,7 @@ test("readConfig validates the push access token file", () => {
     assert.throws(() => readConfig(write({ enabled: true, accessTokenFile: secret(join(root, "state", "inside"), 0o600) })), /Push access token file/);
     const defaults = readConfig(write({ enabled: true, accessTokenFile: secret(join(root, "other", "good"), 0o600) })).config.push;
     assert.equal(defaults?.enabled, true);
-    assert.deepEqual(defaults?.events, ["needs-you", "recording-error", "goal-started", "goal-finished", "goal-stuck", "goal-cancelled", "team-started", "team-finished", "team-stuck", "team-cancelled", "host-storage"]);
+    assert.deepEqual(defaults?.events, ["needs-you", "recording-error", "goal-started", "goal-finished", "goal-stuck", "goal-cancelled", "team-started", "team-finished", "team-stuck", "team-cancelled", "host-storage", "autonomy-interrupt", "main-check"]);
     assert.equal(defaults?.events.includes("turn-finished"), false);
     assert.equal(defaults?.events.includes("exited"), false);
     assert.equal(readConfig(write({ enabled: false })).config.push?.enabled, false);

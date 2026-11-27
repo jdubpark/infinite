@@ -22,13 +22,11 @@ const STORE_MODULE = "store";
 const STORE_VERSION = 1;
 const VAULT_KEY_CHECK = "infinite-evidence-key-check-v1";
 const MAX_VAULT_KEY_CHECK_BYTES = 512;
-/** The host is the only writer, so a locked file is abnormal. A write fails fast, and the sweep and its callers retry. */
 const DEFAULT_BUSY_TIMEOUT_MS = 250;
 const MAX_BUSY_TIMEOUT_MS = 60_000;
 const MODULE_NAME = /^[a-z][a-z0-9-]{0,39}$/;
 const MAX_REMEMBERED_FAILURES = 64;
 
-/** A new store is built under `<file>.creating-<pid>-<uuid>` and linked into place when complete. */
 const TEMP_INFIX = ".creating-";
 const TEMP_SUFFIX = /^([1-9][0-9]{0,9})-[0-9a-f-]{36}(-journal)?$/;
 
@@ -40,25 +38,17 @@ const MAX_EVENT_PAGE = 500;
 const MAX_EVENT_KINDS = 32;
 const MAX_TASK_ID_LENGTH = 512;
 const MAX_AT_LENGTH = 64;
-/** A plain column holds only an opaque identifier, never a name, a path, or free text. */
 const OPAQUE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 
-/**
- * A statement that starts with one of these words is refused, wherever it stands in the text. Each one would
- * end or restart the store's transaction, attach a file, vacuum, or change the connection. Inside a trigger
- * body, a statement that starts with END closes the trigger instead.
- */
 const REFUSED_KEYWORDS: ReadonlySet<string> = new Set([
   "BEGIN", "COMMIT", "END", "ROLLBACK", "SAVEPOINT", "RELEASE", "ATTACH", "DETACH", "VACUUM", "PRAGMA",
 ]);
 const SQL_WORD = /[A-Za-z_][A-Za-z0-9_$]*/y;
-/** A Tcl-style parameter such as `$name(...)`. SQLite reads it as one token, so a `;` inside it ends nothing. */
 const TCL_PARAMETER = /[$@:#][A-Za-z0-9_$:\u0080-\uffff]*\(/y;
 
 const EVIDENCE_CODES: ReadonlySet<string> = new Set<EvidenceErrorCode>([
-  "unavailable", "nested-write", "invalid-event", "event-too-large", "invalid-module", "invalid-statement",
+  "unavailable", "nested-write", "invalid-event", "event-too-large", "invalid-module", "invalid-statement", "unreadable",
 ]);
-/** The errno names a log line may carry. Anything else is logged as "unexpected". */
 const ERRNO_TOKENS: ReadonlySet<string> = new Set([
   "EACCES", "EPERM", "ENOENT", "ENOTDIR", "EISDIR", "EEXIST", "ENOSPC", "EDQUOT", "EROFS", "EIO",
   "EMFILE", "ENFILE", "EBUSY", "ELOOP", "ENAMETOOLONG", "EXDEV", "ENOTSUP", "EOPNOTSUPP",
@@ -94,7 +84,6 @@ type SqliteModule = typeof import("node:sqlite");
 type OpenReason = "key-check-failed" | "unsupported-key-version" | "open-failed";
 type OpenDetail = "sqlite-missing" | "store-schema-unreadable" | "store-schema-version";
 
-/** A refusal with a fixed reason and an optional fixed detail. Neither ever holds a path. */
 class OpenFailure extends Error {
   constructor(readonly reason: OpenReason, readonly detail?: OpenDetail) {
     super(reason);
@@ -116,15 +105,10 @@ type EventRow = {
   encrypted_data: string;
 };
 
-/** The sealed part of an event row. */
 type SealedEvent = { key: string; taskId?: string; data: Record<string, unknown> };
 
 export type EventQuery = { runId?: string; kinds?: string[]; after?: number; limit: number };
 
-/**
- * The host's evidence database (umbrella contract C1). The host process is its only writer.
- * An open failure leaves the store unavailable with a fixed reason. It never throws past the constructor.
- */
 export class EvidenceStore {
   private readonly databasePath: string;
   private readonly busyTimeoutMs: number;
@@ -169,10 +153,6 @@ export class EvidenceStore {
     return { state: "unavailable", reason: this.reason ?? "open-failed", modules };
   }
 
-  /**
-   * Adds one design's tables. A stored version above the module's own makes that module unavailable
-   * and runs nothing. Otherwise the migration and the version record commit together.
-   */
   register(module: EvidenceModule): void {
     assertModule(module);
     if (this.modules.has(module.name)) {
@@ -207,7 +187,6 @@ export class EvidenceStore {
     }
   }
 
-  /** Reads committed rows through a read-only connection, so no statement here can change the file. */
   read<T>(fn: (db: EvidenceDb) => T): T {
     const reader = this.reader();
     return fn(this.view(reader, () => {
@@ -215,7 +194,6 @@ export class EvidenceStore {
     }));
   }
 
-  /** One `BEGIN IMMEDIATE` transaction on the writer. A throw rolls back and rethrows. */
   write<T>(fn: (tx: EvidenceTx) => T): T {
     const db = this.ready();
     if (this.activeTx) {
@@ -237,7 +215,6 @@ export class EvidenceStore {
       exec: sql => {
         guard();
         db.exec(checkedSql(sql));
-        // `exec` runs every statement in the text, so a later COMMIT shows only as an ended transaction.
         assertTransactionOpen(db);
       },
       seal: (table, rowId, value) => {
@@ -251,7 +228,6 @@ export class EvidenceStore {
       try {
         const result = fn(tx);
         if (isThenable(result)) {
-          // The rest of an async callback would run outside the transaction. Its later failure is not a crash.
           result.then(undefined, () => undefined);
           throw new TypeError("An evidence write callback must be synchronous");
         }
@@ -269,7 +245,6 @@ export class EvidenceStore {
     }
   }
 
-  /** `write` for callers that must never fail because of the store. */
   tryWrite(fn: (tx: EvidenceTx) => void): boolean {
     try {
       this.write(fn);
@@ -280,10 +255,6 @@ export class EvidenceStore {
     }
   }
 
-  /**
-   * Appends one event inside the caller's write. A repeated key returns the stored `seq`.
-   * A stored row never changes, and data is never truncated.
-   */
   appendEvent(tx: EvidenceTx, event: Omit<RunEvent, "seq">): { seq: number; inserted: boolean } {
     if (!this.activeTx || tx !== this.activeTx) {
       throw new TypeError("appendEvent needs the transaction of the current evidence write");
@@ -317,13 +288,11 @@ export class EvidenceStore {
     return { seq: stored.seq, inserted: false };
   }
 
-  /** Committed events in `seq` order. `limit` is clamped to 1 through 500. */
   events(query: EventQuery): { events: RunEvent[]; cursor: number; more: boolean } {
     const checked = checkEventQuery(query);
     return this.read(db => readEvents(db, query, checked));
   }
 
-  /** `events` through a given connection. A write transaction sees its own uncommitted rows this way. */
   eventsIn(db: EvidenceDb, query: EventQuery): { events: RunEvent[]; cursor: number; more: boolean } {
     return readEvents(db, query, checkEventQuery(query));
   }
@@ -336,20 +305,10 @@ export class EvidenceStore {
     });
   }
 
-  /**
-   * Removes a run's events and calls each ready module's hook, in one transaction.
-   * Returns false when the store or the delete failed. It never throws, because the sweep repeats it.
-   */
   deleteRun(runId: string): boolean {
     return this.removeRun(runId) === "deleted";
   }
 
-  /**
-   * Deletes stored runs that `isLive` rejects and returns how many it deleted. A run whose liveness
-   * check throws is kept. A delete that fails for one run, such as a failing module hook, does not stop
-   * the others. A locked or unavailable database stops the sweep, so it costs one busy timeout.
-   * The next sweep continues. It never throws.
-   */
   sweep(isLive: (runId: string) => boolean): number {
     if (!this.db) return 0;
     let runIds: Set<string>;
@@ -375,10 +334,6 @@ export class EvidenceStore {
     return removed;
   }
 
-  /**
-   * Status with sizes and row counts. Module counts are keyed `module.name`. A store whose rows cannot be
-   * read reports `unavailable`, so it never looks like an empty healthy store. It never throws.
-   */
   describe(): EvidenceDescription {
     let status = this.status();
     let events = 0;
@@ -411,7 +366,6 @@ export class EvidenceStore {
     };
   }
 
-  /** Closing during a write rolls that write back first, so the file stays consistent. */
   close(): void {
     const db = this.db;
     if (!db) return;
@@ -429,7 +383,6 @@ export class EvidenceStore {
     return this.db;
   }
 
-  /** "stop" means the failure is not about this run: the database is locked or the store is unavailable. */
   private removeRun(runId: string): "deleted" | "failed" | "stop" {
     if (typeof runId !== "string" || runId.length === 0) return "failed";
     try {
@@ -448,7 +401,6 @@ export class EvidenceStore {
     }
   }
 
-  /** The read-only connection, opened when first needed and checked like the writer. */
   private reader(): DatabaseSync {
     this.ready();
     if (this.readDb) return this.readDb;
@@ -467,34 +419,9 @@ export class EvidenceStore {
   }
 
   private view(db: DatabaseSync, guard: () => void): EvidenceDb {
-    return {
-      get: <R = Record<string, unknown>>(sql: string, ...params: SQLInputValue[]) => {
-        const values = plainParameters(params);
-        guard();
-        return db.prepare(checkedSql(sql)).get(...values) as R | undefined;
-      },
-      all: <R = Record<string, unknown>>(sql: string, ...params: SQLInputValue[]) => {
-        const values = plainParameters(params);
-        guard();
-        return db.prepare(checkedSql(sql)).all(...values) as R[];
-      },
-      open: <R>(table: string, rowId: string, sealed: string) => {
-        guard();
-        return openRow<R>(this.rowKey, table, rowId, sealed);
-      },
-      index: (cls, value) => {
-        guard();
-        return blindIndex(this.indexKey, cls, value);
-      },
-    };
+    return evidenceView(db, { rowKey: this.rowKey, indexKey: this.indexKey }, guard);
   }
 
-  /**
-   * Follows the open sequence of `MemoryStoreService`. A missing file is built under a temporary
-   * name and linked into place, so a crash never leaves a half-built store at the final name.
-   * The final file must then pass the key check on a read-only connection and again on the writer
-   * before any PRAGMA or schema change.
-   */
   private open(): DatabaseSync {
     const sqlite = process.getBuiltinModule("node:sqlite");
     if (!sqlite || typeof sqlite.DatabaseSync !== "function") throw new OpenFailure("open-failed", "sqlite-missing");
@@ -513,7 +440,7 @@ export class EvidenceStore {
     try {
       database = new sqlite.DatabaseSync(path, { timeout: this.busyTimeoutMs });
       this.authenticate(database);
-      assertStoreVersion(database);
+      assertEvidenceStoreVersion(database);
       narrowModes(path);
       database.exec([
         "PRAGMA journal_mode=WAL;",
@@ -530,11 +457,6 @@ export class EvidenceStore {
     }
   }
 
-  /**
-   * Builds the store under a temporary name and links it to the final name. When another host linked
-   * first, its file takes the normal existing-file path. When another host removed the temporary file
-   * as a leftover before the link, the build runs once more.
-   */
   private create(sqlite: SqliteModule, path: string): void {
     try {
       this.buildAndLink(sqlite, path);
@@ -544,7 +466,6 @@ export class EvidenceStore {
     }
   }
 
-  /** The temporary name carries this process ID, so a later open removes it only once this process has exited. */
   private buildAndLink(sqlite: SqliteModule, path: string): void {
     const temp = `${path}${TEMP_INFIX}${process.pid}-${randomUUID()}`;
     try {
@@ -568,27 +489,7 @@ export class EvidenceStore {
   }
 
   private authenticate(database: DatabaseSync): void {
-    let check: MetaRow | undefined;
-    let version: MetaRow | undefined;
-    try {
-      check = database.prepare(KEY_CHECK_SQL).get(MAX_VAULT_KEY_CHECK_BYTES) as MetaRow | undefined;
-      version = database.prepare("SELECT value FROM store_meta WHERE key='key_version'").get() as MetaRow | undefined;
-    } catch (error) {
-      throw new OpenFailure(unreadableDatabase(error) ? "key-check-failed" : "open-failed");
-    }
-    // The version row is read first only to name the refusal. Either way nothing is changed.
-    if (version !== undefined && version.value !== String(EVIDENCE_KEY_VERSION)) {
-      throw new OpenFailure("unsupported-key-version");
-    }
-    let opened: unknown;
-    try {
-      if (!check || typeof check.value !== "string") throw new Error("missing key check");
-      opened = openRow<unknown>(this.rowKey, "store_meta", "vault_key_check", check.value);
-    } catch {
-      throw new OpenFailure("key-check-failed");
-    }
-    if (opened !== VAULT_KEY_CHECK) throw new OpenFailure("key-check-failed");
-    if (version === undefined) throw new OpenFailure("unsupported-key-version");
+    authenticateEvidence(database, this.rowKey);
   }
 
   private initialize(database: DatabaseSync): void {
@@ -666,7 +567,6 @@ function assertModule(module: EvidenceModule): void {
     && (module.deleteRun === undefined || typeof module.deleteRun === "function")
     && (module.runIds === undefined || typeof module.runIds === "function")
     && (module.counts === undefined || typeof module.counts === "function")
-    // A module that deletes run rows must list its runs, so the sweep finds rows that a failed delete left.
     && (module.deleteRun === undefined || module.runIds !== undefined);
   const valid = hooksValid
     && typeof module.name === "string" && MODULE_NAME.test(module.name) && module.name !== STORE_MODULE
@@ -676,7 +576,6 @@ function assertModule(module: EvidenceModule): void {
   if (!valid) throw new EvidenceError("invalid-module", "The evidence module definition is invalid.");
 }
 
-/** A hook that returns a promise would keep working after its transaction ended, so it fails. */
 function synchronousHook<T>(result: T): T {
   if (isThenable(result)) {
     result.then(undefined, () => undefined);
@@ -685,11 +584,6 @@ function synchronousHook<T>(result: T): T {
   return result;
 }
 
-/**
- * Scans the whole text before any of it runs, because `exec` runs every statement in it. A statement whose
- * first keyword is refused fails the call, and so does a Tcl-style parameter. `assertInTransaction` and
- * the COMMIT check stay as a second line of defense.
- */
 function checkedSql(sql: string): string {
   if (typeof sql !== "string") throw new TypeError("Evidence SQL must be a string");
   if (!allowedStatements(sql)) {
@@ -698,11 +592,6 @@ function checkedSql(sql: string): string {
   return sql;
 }
 
-/**
- * Splits the text into statements at each `;` outside quoted text and comments, the way SQLite does, and
- * checks the first keyword of each. Text is skipped as inert only where SQLite skips it, so when the two
- * disagree, this scan sees more statements than SQLite runs, never fewer.
- */
 function allowedStatements(sql: string): boolean {
   let words: string[] = [];
   let inTrigger = false;
@@ -727,7 +616,6 @@ function allowedStatements(sql: string): boolean {
     } else if (char === "[") {
       index = skipPast(sql, "]", index + 1);
     } else if (char === "-" && sql[index + 1] === "-") {
-      // SQLite ends this comment at a newline only. A carriage return does not end it.
       index = skipPast(sql, "\n", index + 2);
     } else if (char === "/" && sql[index + 1] === "*") {
       index = skipPast(sql, "*/", index + 2);
@@ -746,7 +634,6 @@ function allowedStatements(sql: string): boolean {
   return statementAllowed();
 }
 
-/** Skips quoted text, where a doubled quote stands for itself. Unterminated text runs to the end. */
 function skipQuoted(sql: string, start: number, quote: string): number {
   let index = start + 1;
   while (index < sql.length) {
@@ -762,12 +649,6 @@ function skipPast(sql: string, end: string, from: number): number {
   return found === -1 ? sql.length : found + end.length;
 }
 
-/**
- * Whether SQLite still has the write's transaction open. A statement can end it, for example an
- * `INSERT OR ROLLBACK` that conflicts. Node versions with `isTransaction` answer directly. Without it, a plain
- * BEGIN is refused inside a transaction. When BEGIN succeeds nothing was open, so the probe is rolled back.
- * Any other BEGIN failure counts as ended, so the write fails closed.
- */
 export function transactionOpen(db: DatabaseSync): boolean {
   const flag = (db as { isTransaction?: unknown }).isTransaction;
   if (typeof flag === "boolean") return flag;
@@ -780,11 +661,6 @@ export function transactionOpen(db: DatabaseSync): boolean {
   return false;
 }
 
-/**
- * Copies each bound value into a plain value before anything runs. A null, number, bigint, or string is kept as
- * it is, and bytes are copied into a new buffer. Any other value is refused without reading its properties or
- * calling its code, so binding a statement never runs caller code and never ends the transaction.
- */
 function plainParameters(params: readonly unknown[]): SQLInputValue[] {
   return params.map(value => {
     if (value === null || typeof value === "number" || typeof value === "bigint" || typeof value === "string") {
@@ -801,7 +677,6 @@ function assertTransactionOpen(db: DatabaseSync): void {
   }
 }
 
-/** A COMMIT with no transaction to commit means a statement already ended it. */
 function commit(db: DatabaseSync): void {
   try {
     db.exec("COMMIT");
@@ -813,28 +688,18 @@ function commit(db: DatabaseSync): void {
   }
 }
 
-/**
- * Why `appendEvent` would refuse this event, or undefined when it would accept it. Pure, and it never
- * throws, so a caller can drop an event the store can never take before it starts a write.
- */
 export function eventProblem(event: Omit<RunEvent, "seq">): "invalid-event" | "event-too-large" | undefined {
   try {
     const fault = examineEvent(event);
     if (fault === "too-large") return "event-too-large";
     return fault === undefined ? undefined : "invalid-event";
   } catch {
-    // An envelope read that throws, such as a throwing getter, is never an event.
     return "invalid-event";
   }
 }
 
 type EventFault = "envelope" | "data" | "too-large";
 
-/**
- * The check that `appendEvent` and `eventProblem` share. It makes the same property reads, in the same order,
- * and the same single serialization pass that `appendEvent` made before the check was shared, so the stored row
- * does not change. Errors from reading the envelope propagate. Data that cannot be serialized is a `data` fault.
- */
 function examineEvent(event: Omit<RunEvent, "seq">): EventFault | undefined {
   if (!validEvent(event)) return "envelope";
   let data: string;
@@ -846,7 +711,6 @@ function examineEvent(event: Omit<RunEvent, "seq">): EventFault | undefined {
   return Buffer.byteLength(data, "utf8") > MAX_EVENT_DATA_BYTES ? "too-large" : undefined;
 }
 
-/** Whether a value is an event kind: lower-case segments joined by dots, at least two, at most 64 characters. */
 export function isEventKind(kind: unknown): kind is string {
   return typeof kind === "string" && kind.length <= MAX_EVENT_KIND_LENGTH && EVENT_KIND.test(kind);
 }
@@ -872,7 +736,6 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 
 type CheckedEventQuery = { after: number; kinds?: string[]; limit: number };
 
-/** Reads the query's properties in the order `events` always did. The run ID is read again by `readEvents`. */
 function checkEventQuery(query: EventQuery): CheckedEventQuery {
   const after = query.after ?? 0;
   if (!Number.isSafeInteger(after) || after < 0) {
@@ -938,8 +801,53 @@ function toEvent(db: EvidenceDb, row: EventRow): RunEvent {
   };
 }
 
-/** A core schema written by a newer host is not read by this one. */
-function assertStoreVersion(database: DatabaseSync): void {
+export function authenticateEvidence(database: DatabaseSync, rowKey: Buffer): void {
+  let check: MetaRow | undefined;
+  let version: MetaRow | undefined;
+  try {
+    check = database.prepare(KEY_CHECK_SQL).get(MAX_VAULT_KEY_CHECK_BYTES) as MetaRow | undefined;
+    version = database.prepare("SELECT value FROM store_meta WHERE key='key_version'").get() as MetaRow | undefined;
+  } catch (error) {
+    throw new OpenFailure(unreadableDatabase(error) ? "key-check-failed" : "open-failed");
+  }
+  if (version !== undefined && version.value !== String(EVIDENCE_KEY_VERSION)) {
+    throw new OpenFailure("unsupported-key-version");
+  }
+  let opened: unknown;
+  try {
+    if (!check || typeof check.value !== "string") throw new Error("missing key check");
+    opened = openRow<unknown>(rowKey, "store_meta", "vault_key_check", check.value);
+  } catch {
+    throw new OpenFailure("key-check-failed");
+  }
+  if (opened !== VAULT_KEY_CHECK) throw new OpenFailure("key-check-failed");
+  if (version === undefined) throw new OpenFailure("unsupported-key-version");
+}
+
+export function evidenceView(db: DatabaseSync, keys: { rowKey: Buffer; indexKey: Buffer }, guard: () => void): EvidenceDb {
+  return {
+    get: <R = Record<string, unknown>>(sql: string, ...params: SQLInputValue[]) => {
+      const values = plainParameters(params);
+      guard();
+      return db.prepare(checkedSql(sql)).get(...values) as R | undefined;
+    },
+    all: <R = Record<string, unknown>>(sql: string, ...params: SQLInputValue[]) => {
+      const values = plainParameters(params);
+      guard();
+      return db.prepare(checkedSql(sql)).all(...values) as R[];
+    },
+    open: <R>(table: string, rowId: string, sealed: string) => {
+      guard();
+      return openRow<R>(keys.rowKey, table, rowId, sealed);
+    },
+    index: (cls, value) => {
+      guard();
+      return blindIndex(keys.indexKey, cls, value);
+    },
+  };
+}
+
+export function assertEvidenceStoreVersion(database: DatabaseSync): void {
   let stored: MetaRow | undefined;
   try {
     stored = database.prepare("SELECT version AS value FROM schema_modules WHERE name=?").get(STORE_MODULE) as MetaRow | undefined;
@@ -951,7 +859,6 @@ function assertStoreVersion(database: DatabaseSync): void {
 
 function narrowModes(path: string): void {
   chmodSync(path, 0o600);
-  // A read-only connection may have created these with the wider mode of the main file.
   for (const suffix of ["-wal", "-shm"]) {
     try {
       chmodSync(`${path}${suffix}`, 0o600);
@@ -961,7 +868,6 @@ function narrowModes(path: string): void {
   }
 }
 
-/** Only a missing file counts as absent. Any other error stops the open. */
 function fileExists(path: string): boolean {
   try {
     lstatSync(path);
@@ -972,10 +878,6 @@ function fileExists(path: string): boolean {
   }
 }
 
-/**
- * Removes temporary files that an interrupted build left. A file is removed only when the process
- * named in it is no longer running. A failure here never blocks the open.
- */
 function removeStaleTemps(path: string): void {
   const directory = dirname(path);
   const prefix = `${basename(path)}${TEMP_INFIX}`;
@@ -991,12 +893,10 @@ function removeStaleTemps(path: string): void {
     try {
       rmSync(join(directory, name), { force: true });
     } catch {
-      // The next open tries again.
     }
   }
 }
 
-/** Only ESRCH proves that a process is gone. EPERM means it runs under another user. */
 function processRuns(pid: number): boolean {
   if (!Number.isSafeInteger(pid) || pid <= 0) return true;
   try {
@@ -1019,7 +919,6 @@ function removeQuietly(path: string): void {
   try {
     rmSync(path, { force: true });
   } catch {
-    // A leftover temporary name is removed by a later open.
   }
 }
 
@@ -1027,7 +926,6 @@ function closeQuietly(db: DatabaseSync | undefined): void {
   try {
     db?.close();
   } catch {
-    // The connection is already gone.
   }
 }
 
@@ -1035,7 +933,6 @@ function rollback(db: DatabaseSync): void {
   try {
     db.exec("ROLLBACK");
   } catch {
-    // SQLite may have rolled back already. Keep the original failure.
   }
 }
 
@@ -1048,17 +945,12 @@ function sqliteCode(error: unknown): number | undefined {
   return typeof code === "number" ? code & 0xff : undefined;
 }
 
-/** A missing table, a corrupt page, or a file that is not a database fails the key check. */
 function unreadableDatabase(error: unknown): boolean {
   const code = sqliteCode(error);
   return code === undefined || code === 1 || code === 11 || code === 26;
 }
 
-/**
- * Maps a failure to a token from a closed set for a log line: an evidence error code, a SQLite
- * category, an errno name from a fixed list, or "unexpected". No caller text ever reaches a log.
- */
-function failureToken(error: unknown): string {
+export function failureToken(error: unknown): string {
   if (error instanceof EvidenceError) return EVIDENCE_CODES.has(error.code) ? error.code : "unexpected";
   if (error instanceof OpenFailure) return error.detail ?? error.reason;
   const sqlite = sqliteCode(error);

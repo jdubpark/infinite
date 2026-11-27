@@ -9,7 +9,6 @@ const clip = (label: string) => label.length > MAX_LABEL ? `${label.slice(0, MAX
 const SCALES = [1, 1.5, 2, 3];
 const ARROW = 8;
 
-/** A small triangle at the end of the last segment, pointing along it. */
 function arrowhead(points: { x: number; y: number }[]): string {
   const end = points[points.length - 1]!, prev = points[points.length - 2]!;
   const angle = Math.atan2(end.y - prev.y, end.x - prev.x);
@@ -20,7 +19,6 @@ const COLLAPSED_PREFIX = "collapsed:";
 
 type DrawNode = DiagramGraph["nodes"][number];
 
-/** Replaces every collapsed group with one summary node and re-points its edges. */
 function collapse(graph: DiagramGraph, collapsed: ReadonlySet<string>): Pick<DiagramGraph, "direction" | "nodes" | "groups" | "edges"> {
   const owner = new Map<string, string>();
   for (const node of graph.nodes) if (node.group && collapsed.has(node.group)) owner.set(node.id, `${COLLAPSED_PREFIX}${node.group}`);
@@ -41,7 +39,6 @@ function collapse(graph: DiagramGraph, collapsed: ReadonlySet<string>): Pick<Dia
   return { direction: graph.direction, nodes, groups: graph.groups.filter(group => !collapsed.has(group.id)), edges };
 }
 
-/** Draws one generated diagram as data with native SVG. Mermaid text is never interpreted as markup. */
 export function DiagramView({ graph, onOpenComponent, collapsedGroupsAbove = 40 }: {
   graph: DiagramGraph; onOpenComponent?: (componentId: string) => void; collapsedGroupsAbove?: number;
 }) {
@@ -55,7 +52,7 @@ export function DiagramView({ graph, onOpenComponent, collapsedGroupsAbove = 40 
   const drawn = useMemo(() => collapse(graph, collapsedIds), [graph, collapsedIds]);
   const layout = useMemo(
     () => layoutGraph(drawn),
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- the layout depends on graph identity and size only.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     [graph.id, drawn.nodes.length, drawn.edges.length, drawn.groups.length, collapsedIds],
   );
   const nodeById = useMemo(() => new Map(drawn.nodes.map(node => [node.id, node])), [drawn.nodes]);

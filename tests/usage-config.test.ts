@@ -1,7 +1,6 @@
 import test from "node:test"; import assert from "node:assert/strict";
-import { teamLineupSchema, resolveLimitFallback } from "../packages/host/src/team-types.js";
+import { teamLineupSchema, resolveLimitFallback, switchFallback } from "../packages/host/src/team-types.js";
 import { usageConfigSchema } from "../packages/host/src/config.js";
-import { switchFallback } from "../packages/host/src/teams.js";
 const p = (id: string, provider: "claude" | "codex" | "opencode", tier?: "light" | "strong", limitFallback?: string) =>
   provider === "opencode" ? { id, label: id, provider, model: "deepseek/deepseek-flash", variant: "high", tier, limitFallback }
   : { id, label: id, provider, model: provider === "claude" ? "claude-opus-5-5" : "gpt-6-luna", effort: "high", tier, limitFallback };
@@ -10,8 +9,8 @@ const base = { coordinator: p("c", "claude", "strong", "ds-strong"), integrator:
 test("lineup fallbacks must exist, change provider, keep strong tier, and not cycle", () => {
   assert.ok(teamLineupSchema.safeParse(base).success);
   assert.equal(teamLineupSchema.safeParse({ ...base, implementers: [p("haiku", "claude", "light", "missing")] }).success, false);
-  assert.equal(teamLineupSchema.safeParse({ ...base, implementers: [p("haiku", "claude", "light", "c")] }).success, false); // same provider
-  assert.equal(teamLineupSchema.safeParse({ ...base, coordinator: p("c", "claude", "strong", "ds-light"), integrator: p("c", "claude", "strong", "ds-light"), reviewer: p("c", "claude", "strong", "ds-light") }).success, false); // strong -> light
+  assert.equal(teamLineupSchema.safeParse({ ...base, implementers: [p("haiku", "claude", "light", "c")] }).success, false);
+  assert.equal(teamLineupSchema.safeParse({ ...base, coordinator: p("c", "claude", "strong", "ds-light"), integrator: p("c", "claude", "strong", "ds-light"), reviewer: p("c", "claude", "strong", "ds-light") }).success, false);
   const cyclic = { ...base, fallbacks: [p("ds-strong", "opencode", "strong"), p("ds-light", "opencode", "light", "haiku")] };
   assert.equal(teamLineupSchema.safeParse(cyclic).success, false);
 });
@@ -23,10 +22,8 @@ test("resolveLimitFallback follows at most two hops and skips limited providers"
   assert.equal(resolveLimitFallback(lineup, "ds-light", new Set(["opencode"])), undefined);
 });
 test("a limit switch never falls back onto the stopped member's own provider", () => {
-  // haiku (Claude) falls back to OpenCode, whose own fallback is another Claude profile.
   const lineup = teamLineupSchema.parse({ ...base, implementers: [p("haiku", "claude", "light", "ds-chain")], escalations: [p("sonnet", "claude", "light")],
     fallbacks: [p("ds-strong", "opencode", "strong"), p("ds-light", "opencode", "light"), p("ds-chain", "opencode", "light", "sonnet")] });
-  // Host memory holds only OpenCode; Claude's limit was seen by a single-source hook on the stopped member.
   assert.equal(resolveLimitFallback(lineup, "haiku", new Set(["opencode"]))?.id, "sonnet", "The resolver alone would return to Claude");
   assert.equal(switchFallback(lineup, "haiku", "claude", new Set(["opencode"])), undefined);
   assert.equal(switchFallback(lineup, "haiku", "claude", new Set())?.id, "ds-chain");

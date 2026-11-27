@@ -1,9 +1,6 @@
 #!/usr/bin/env node
 import { handleClientCommand } from "./client.js";
 
-// The installed bundle is also the detached service entrypoint. Its private
-// IPC bootstrap is handled by laptop-service or sync-service, not by the
-// interactive parser.
 if (!((process.argv[2] === "--laptop-service" || process.argv[2] === "--sync-service") && process.send) && !await handleClientCommand(process.argv.slice(2))) {
   console.log(`Infinite — cloud sessions in your native terminal
 
@@ -17,6 +14,9 @@ infinite --local-ui codex [supported native flags] "Initial prompt"
 infinite --local-ui opencode [--model PROVIDER/MODEL] [--prompt "Task"]
 infinite list [--json]
 infinite resources [--watch] [--json]
+infinite usage [projects|project ID|goal ID|models [--role ROLE]] [--json]
+infinite usage repairs [--project ID] [--days N] [--json]
+infinite usage interrupted [--project ID] [--days N] [--json]
 infinite close SESSION_ID [--yes] [--takeover] [--json]
 infinite projects [group NAME REPO_ID... | rename ID NAME | hide ID | show ID | primary ID CHECKOUT_ID]
 infinite resume [session ID or unique prefix]
@@ -32,18 +32,39 @@ infinite repo unlink PROJECT_OR_DIRECTORY | repo links
 infinite repo init [--permissions coordinator|off] [--permission-scope TEXT] [--permission-limit N]
                                           First enrollment delegates to coordinator by default
 infinite repo init --permissions off        Disable delegation for future runs
+infinite repo init [--routing off|shadow|auto] [--routing-value cost|balanced|quality|USD] [--routing-contributor allow|deny] [--routing-points start[,escalation][,scout]]
 infinite team revoke-permissions TEAM_ID    Revoke delegation for an active run
+infinite team revoke-routing TEAM_ID    Stop host routing for the run's new tasks
+infinite permissions status [--json]        Show workspace permission delegation
+infinite permissions delegate (--workspace W | --all) [--direction TEXT | --clear-direction] [--request-id UUID]
+infinite permissions revoke --workspace W [--request-id UUID]
+infinite permissions reopen DECISION_ID [--request-id UUID]
+infinite permissions unlock ASSIGNMENT [--request-id UUID]
+infinite permissions log [--rejected] [--raised] [--workspace W] [--since T] [--limit N] [--before CURSOR] [--json]
+infinite permissions mark DECISION_ID --wrong --note TEXT [--request-id UUID]
+infinite permissions replay --set FILE [--json] [--request-id UUID]
+                                          Measure the permission agent on a labelled set
+infinite start [--project ID] "task"
+infinite mission status ID [--json] | mission progress ID [--after CURSOR] [--json] | mission watch ID [--json]
+infinite mission answer ID DECISION_ID TEXT | steer ID TEXT | pause|resume|cancel ID
+infinite board [--project ID]
 infinite team start [OBJECTIVE] [--prd FILE] [--provider PROVIDER]
 infinite routine create --file FILE [--request-id UUID] [--json]
 infinite routine list [--json] | status ID [--json]
 infinite routine pause|resume|cancel ID --revision N [--request-id UUID] [--json]
+infinite routing status PROJECT [--json]
+infinite routing explain RUN_ID TASK_ID [--json]
+infinite routing pause-explore PROJECT
+infinite routing resume-explore PROJECT
+infinite signal add --project ID TEXT [--request-id UUID] [--json]
+infinite signal list --project ID [--after SEQ] [--json]
 infinite understand [--workspace ID] [--json]  Read workspace Understanding
 infinite understand catalog|components|component ID|policy|refresh --workspace ID
 infinite understand create COLLECTION|update COLLECTION ID|archive COLLECTION ID --workspace ID
   Mutations require --revision N --request-id UUID; create/update/policy also require --file JSON
-infinite team status [ID] [--json] [--logs] | team watch ID [--logs] | team pull TEAM_ID [--json]
+infinite team status [ID] [--json] [--logs] | team watch ID [--logs | --board] | team pull TEAM_ID [--json]
   status ID prints open decisions and the Brief. Watch keeps it full screen.
-  l review logs · s summary · ←→ or n/p agent · ↑↓ j/k space scroll · a refresh Brief · q quit
+  b board · l review logs · s summary · ←→ or n/p agent · ↑↓ j/k space scroll · a refresh Brief · q quit
   --logs starts in the review log. --json prints the team record.
 infinite team steer ID TEXT | team answer ID QUESTION_ID TEXT
 infinite team continue ID [TEXT] [--json] [--request-id UUID]

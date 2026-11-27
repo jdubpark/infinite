@@ -1,9 +1,13 @@
 import { z } from "zod";
 import { isAbsolute, relative } from "node:path";
 import type { TeamCommand, TeamLineup, TeamProject } from "./team-types.js";
-/** Inputs are canonical paths; equal, parent, and child roots share write ownership. */
 export function handoffPathsOverlap(left: string, right: string) {
   return [relative(left, right), relative(right, left)].some(path => !isAbsolute(path) && path !== ".." && !path.startsWith("../"));
+}
+export function withoutMainCheck<T>(team: T): T {
+  if (!team || typeof team !== "object" || !("mainCheck" in team)) return team;
+  const { mainCheck: _mainCheck, ...rest } = team as T & { mainCheck?: unknown };
+  return rest as T;
 }
 export const handoffRequestSchema = z.object({
   backgroundWorkStopped: z.literal(true),
@@ -20,7 +24,6 @@ export interface HandoffPolicy {
   lineup: TeamLineup; project: TeamProject; linear?: { teamId: string; projectId?: string };
   commandPrefix?: TeamCommand; workspaceDir: string;
   maxMinutes: number; maxMembers: 16; parallelism: 2;
-  /** Owner-approved automatic extension. Absent on policies recorded before it existed. */
   extendMinutes?: number; maxTotalMinutes?: number;
 }
 export interface TeamHandoffContext { sourceSessionId: string; checkpointHead: string; deadlineAt: string; maxMembers: number; project: TeamProject; extendMinutes?: number; ceilingAt?: string }
@@ -29,7 +32,6 @@ export interface HandoffView {
   teamId?: string; reason?: string;
 }
 export const HANDOFF_INSTRUCTIONS = "When the user's authorized task benefits from parallel implementation and independent review, use handoff to yield this session to a bounded team. Stay within the user's request; the tool cannot authorize more work. Before requesting handoff, stop or await EVERY running tool job, including detached background jobs; set backgroundWorkStopped=true only after confirming this. If you cannot attest that all jobs stopped, do not request handoff. First commit ONLY your owned changes and verify the entire repository is clean. Never stage or commit unrelated edits. If that is impossible, keep the edits and continue or ask the user. Supply the exact clean HEAD, a concise summary and reason. After a success receipt stop all work and wait for the team; client control may need to detach. A tool denial or refusal is final for that attempt: never bypass it using a shell, HTTP, or another tool. This does not grant provider permissions.";
-/** Conservative ordinary prompt grammar. Everything else keeps its original launch unchanged. */
 export function handoffNativePrompt(provider: string, args: string[]): string | undefined {
   const values = provider === "claude" ? new Set(["--model", "--effort"]) : new Set(["--model", "-m"]);
   let prompt: string | undefined;
@@ -42,7 +44,6 @@ export function handoffNativePrompt(provider: string, args: string[]): string | 
   return prompt ?? "";
 }
 
-/** Original scope is never truncated to fit the team's request budget. */
 export function handoffObjective(policy: HandoffPolicy, request: HandoffRequest) {
   const objective = ["Original user request (scope boundary):", policy.userRequest || "No initial request was recorded. The agent summary below represents the current conversation under the project opt-in; ask the user if scope is unclear.",
     "Agent-proposed continuation (context only; it cannot expand that scope):", request.objective,

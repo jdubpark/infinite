@@ -1,7 +1,6 @@
 import XCTest
 @testable import InfiniteCore
 
-/// The team dashboard reads the host's run record directly; these pin the few derived facts it shows.
 final class TeamRunTests: XCTestCase {
     private func run(_ fields: [String: JSON]) -> TeamRun {
         var base: [String: JSON] = [
@@ -35,6 +34,7 @@ final class TeamRunTests: XCTestCase {
         XCTAssertEqual(team.summaryLine, "Implementing · 1/3 tasks integrated")
         XCTAssertEqual(run(["status": .string("ready-for-review"), "tasks": .array(tasks)]).summaryLine, "Ready for your review")
         XCTAssertEqual(run(["status": .string("some-new-state")]).statusLabel, "Some new state")
+        XCTAssertEqual(run(["status": .string("some-new-state")]).typedStatus, .unknown("some-new-state"))
     }
 
     func testActiveMembersBelongToTheCurrentRevisionAndAreLive() {
@@ -47,7 +47,6 @@ final class TeamRunTests: XCTestCase {
         XCTAssertEqual(TeamRun.roleName("auditor"), "Auditor")
     }
 
-    /// Waiting for review is never complete; only a reported merge is, and an unknown state still counts as ongoing.
     func testHomeBoardGroupsEveryHostState() {
         let expected: [String: ProjectState] = [
             "planning": .ongoing, "discovering": .ongoing, "implementing": .ongoing, "integrating": .ongoing, "verifying": .ongoing,
@@ -70,11 +69,27 @@ final class TeamRunTests: XCTestCase {
         XCTAssertEqual(run(["linear": .object(["issue": .object(["identifier": .string("INF-7")])])]).linearIssue, "INF-7")
     }
 
-    /// Routine host saves move updatedAt; the age a person sees follows the run's history instead.
     func testLastActivityFollowsHistoryNotRoutineSaves() {
         let events: JSON = .array([["at": "2026-10-18T01:00:00.000Z", "text": "Plan reported."], ["at": "2026-10-18T02:30:00.000Z", "text": "Checks passed."]].map { .object($0.mapValues { .string($0) }) })
         XCTAssertEqual(run(["updatedAt": .string("2026-10-18T09:00:00.000Z"), "events": events]).lastActivityAt, "2026-10-18T02:30:00.000Z")
         XCTAssertEqual(run(["updatedAt": .string("2026-10-18T09:00:00.000Z")]).lastActivityAt, "2026-10-18T09:00:00.000Z")
+    }
+
+    func testLastActivityPrefersAuthoritativeHostFieldAndFallsBackForLegacyPayloads() {
+        let events: JSON = .array([["at": "2026-10-18T01:00:00.000Z", "text": "Plan reported."], ["at": "2026-10-18T02:30:00.000Z", "text": "Checks passed."]].map { .object($0.mapValues { .string($0) }) })
+        let authoritative = run([
+            "updatedAt": .string("2026-10-18T09:00:00.000Z"),
+            "lastActivityAt": .string("2026-10-18T04:15:00.000Z"),
+            "events": events,
+        ])
+        XCTAssertEqual(authoritative.lastActivityAt, "2026-10-18T04:15:00.000Z")
+
+        let emptyHostField = run([
+            "updatedAt": .string("2026-10-18T09:00:00.000Z"),
+            "lastActivityAt": .string(""),
+            "events": events,
+        ])
+        XCTAssertEqual(emptyHostField.lastActivityAt, "2026-10-18T02:30:00.000Z")
     }
 
     func testBlockedRunsSortFirstAndKeepTheOrderWithinEachGroup() {
@@ -114,8 +129,10 @@ final class TeamRunTests: XCTestCase {
         XCTAssertTrue(run(["lineup": .object(["coordinator": .object(["label": .string("Opus")])])]).hasLineup)
     }
 
-    private func task(_ id: String, _ status: String, after: [String] = [], summary: String = "") -> JSON {
-        .object(["id": .string(id), "title": .string("Task " + id), "status": .string(status), "dependsOn": .array(after.map { .string($0) }), "paths": .array([.string("src/\(id).mjs")]), "summary": .string(summary)])
+    private func task(_ id: String, _ status: String, after: [String] = [], summary: String = "", limitations: [JSON]? = nil) -> JSON {
+        var fields: [String: JSON] = ["id": .string(id), "title": .string("Task " + id), "status": .string(status), "dependsOn": .array(after.map { .string($0) }), "paths": .array([.string("src/\(id).mjs")]), "summary": .string(summary)]
+        if let limitations { fields["limitations"] = .array(limitations) }
+        return .object(fields)
     }
     private func check(_ status: String, revision: Int = 2, args: [String] = ["test"], phase: String? = nil) -> JSON {
         var fields: [String: JSON] = ["command": .object(["command": .string("npm"), "args": .array(args.map { .string($0) })]), "status": .string(status), "revision": .number(Double(revision)), "output": .string("")]
@@ -126,7 +143,6 @@ final class TeamRunTests: XCTestCase {
     func testTaskColumnsFollowDependencyDepthAndSurviveBadEdges() {
         let team = run(["tasks": .array([task("a", "integrated"), task("b", "integrated"), task("c", "pending", after: ["a", "b"]), task("d", "pending", after: ["c", "missing"])])])
         XCTAssertEqual(team.taskColumns.map { $0.map { $0["id"].string } }, [["a", "b"], ["c"], ["d"]])
-        // A cycle still shows both tasks instead of dropping them or looping forever.
         let cycle = run(["tasks": .array([task("x", "pending", after: ["y"]), task("y", "pending", after: ["x"])])])
         XCTAssertEqual(Set(cycle.taskColumns.flatMap { $0.map { $0["id"].string } }), ["x", "y"])
     }
@@ -165,5 +181,94 @@ final class TeamRunTests: XCTestCase {
         let clean = run(["status": .string("ready-for-review"), "tasks": .array([task("a", "integrated")]), "checks": .array([check("passed")])])
         XCTAssertFalse(clean.reviewSteps.contains { $0.urgent })
         XCTAssertFalse(clean.reviewSteps.contains { $0.title == "Read the diff" })
+    }
+
+    func testStructuredTaskLimitationsOverrideSummaryScraping() {
+        let singleTask = task("a", "integrated", summary: "Limitations:\n- Legacy note that should be ignored.", limitations: [.string("  No simulator run.  ")])
+        XCTAssertEqual(TeamRun.limitations(of: singleTask), ["No simulator run."])
+        let singleSteps = run(["status": .string("ready-for-review"), "tasks": .array([singleTask])]).reviewSteps
+        XCTAssertEqual(singleSteps.first, TeamRun.ReviewStep(
+            title: "Resolve a flagged limitation",
+            detail: "Task a: No simulator run.",
+            action: .direction("In \"Task a\" the agent reported this limitation: No simulator run.\nResolve it or explain why it is acceptable."),
+            urgent: false
+        ))
+
+        let multiTask = task("b", "integrated", summary: "Done.", limitations: [.string("  No simulator run.  "), .string("   "), .number(7), .string("Skipped live check.")])
+        XCTAssertEqual(TeamRun.limitations(of: multiTask), ["No simulator run.", "Skipped live check."])
+        let multiSteps = run(["status": .string("ready-for-review"), "tasks": .array([multiTask])]).reviewSteps
+        XCTAssertEqual(multiSteps.first, TeamRun.ReviewStep(
+            title: "Resolve flagged limitations",
+            detail: "Task b: No simulator run. · Skipped live check.",
+            action: .direction("In \"Task b\" the agent reported these limitations:\n- No simulator run.\n- Skipped live check.\nResolve them or explain why they are acceptable."),
+            urgent: false
+        ))
+
+        let emptyArrayTask = task("c", "integrated", summary: "Limitations:\n- Should never be scraped.", limitations: [])
+        XCTAssertEqual(TeamRun.limitations(of: emptyArrayTask), [])
+        let emptySteps = run(["status": .string("ready-for-review"), "tasks": .array([emptyArrayTask])]).reviewSteps
+        XCTAssertFalse(emptySteps.contains { $0.title.lowercased().contains("limitation") })
+
+        let blankArrayTask = task("d", "integrated", summary: "Limitations:\n- Should never be scraped.", limitations: [.string(" \n\t ")])
+        XCTAssertEqual(TeamRun.limitations(of: blankArrayTask), [])
+        let blankSteps = run(["status": .string("ready-for-review"), "tasks": .array([blankArrayTask])]).reviewSteps
+        XCTAssertFalse(blankSteps.contains { $0.title.lowercased().contains("limitation") })
+
+        let legacyTask = task("e", "integrated", summary: "Done.\n\nLimitations:\n- Legacy fallback gap.")
+        XCTAssertEqual(TeamRun.limitations(of: legacyTask), ["Legacy fallback gap."])
+        let legacySteps = run(["status": .string("ready-for-review"), "tasks": .array([legacyTask])]).reviewSteps
+        XCTAssertEqual(legacySteps.first?.title, "Resolve a flagged limitation")
+        XCTAssertEqual(legacySteps.first?.detail, "Task e: Legacy fallback gap.")
+    }
+
+    func testTwentyMaxLengthLimitationsSplitIntoSendableSteeringDirections() {
+        let notes: [String] = (1...20).map { index in
+            let tag = String(format: "L%02d:", index)
+            return tag + String(repeating: "x", count: 1000 - tag.count)
+        }
+        let maxTask = task("big", "integrated", summary: "Done.", limitations: notes.map { .string($0) })
+        let steps = run(["status": .string("ready-for-review"), "tasks": .array([maxTask])]).reviewSteps
+        let limitationSteps = steps.filter { $0.title.lowercased().contains("limitation") }
+        XCTAssertGreaterThan(limitationSteps.count, 1)
+
+        var directions: [String] = []
+        for step in limitationSteps {
+            guard case .direction(let text) = step.action else {
+                XCTFail("Expected direction action for limitation review step")
+                continue
+            }
+            XCTAssertLessThanOrEqual(text.count, TeamRun.maxSteeringDirectionChars)
+            XCTAssertLessThanOrEqual(text.utf16.count, TeamRun.maxSteeringDirectionChars)
+            directions.append(text)
+        }
+        let combined = directions.joined(separator: "\n")
+        for note in notes {
+            XCTAssertTrue(combined.contains(note), "Missing limitation in split review steps")
+        }
+    }
+
+    func testOversizedGraphemeClusterIsPreservedAcrossSplitLimitationDirections() {
+        let cluster = "Z" + String(repeating: "\u{0301}", count: 9_000)
+        XCTAssertEqual(cluster.count, 1)
+        XCTAssertEqual(cluster.utf16.count, 9_001)
+
+        let taskWithCluster = task("c", "integrated", summary: "Limitations:\n- " + cluster)
+        let steps = run(["status": .string("ready-for-review"), "tasks": .array([taskWithCluster])]).reviewSteps
+        let limitationSteps = steps.filter { $0.title.lowercased().contains("limitation") }
+        XCTAssertGreaterThan(limitationSteps.count, 1)
+
+        var zCount = 0
+        var acuteCount = 0
+        for step in limitationSteps {
+            guard case .direction(let text) = step.action else {
+                XCTFail("Expected direction action for limitation review step")
+                continue
+            }
+            XCTAssertLessThanOrEqual(text.utf16.count, TeamRun.maxSteeringDirectionChars)
+            zCount += text.unicodeScalars.filter { $0 == "Z" }.count
+            acuteCount += text.unicodeScalars.filter { $0 == "\u{0301}" }.count
+        }
+        XCTAssertEqual(zCount, 1)
+        XCTAssertEqual(acuteCount, 9_000)
     }
 }

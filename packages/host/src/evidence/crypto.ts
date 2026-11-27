@@ -4,21 +4,19 @@ export const EVIDENCE_KEY_VERSION = 1;
 
 export type EvidenceKeyPurpose = "row-encryption" | "blind-index" | "event-key";
 
-export type EvidenceIndexClass = "project" | "task" | "area";
+export type EvidenceIndexClass = "project" | "task" | "area" | "goal" | "mission" | "legacy" | "model" | "usage-record" | "signal" | "feature-map" | "eval-commit" | "eval-path" | "eval-set";
 
-const INDEX_CLASSES: ReadonlySet<string> = new Set<EvidenceIndexClass>(["project", "task", "area"]);
+const INDEX_CLASSES: ReadonlySet<string> = new Set<EvidenceIndexClass>(["project", "task", "area", "goal", "mission", "legacy", "model", "usage-record", "signal", "feature-map", "eval-commit", "eval-path", "eval-set"]);
 const TABLE_NAME = /^[a-z][a-z0-9_]{0,63}$/;
 const NONCE_BYTES = 12;
 const TAG_BYTES = 16;
 
-/** One 32-byte key per purpose, derived from the host vault key with its own salt and label. */
 export function deriveEvidenceKey(vaultKey: Buffer, purpose: EvidenceKeyPurpose): Buffer {
   const salt = Buffer.from("infinite-evidence-kdf-v1", "utf8");
   const info = Buffer.from(`infinite-evidence:${purpose}:v${EVIDENCE_KEY_VERSION}`, "utf8");
   return Buffer.from(hkdfSync("sha256", vaultKey, salt, info, 32));
 }
 
-/** JSON with sorted object keys. Values that JSON cannot represent exactly are refused. */
 export function canonicalJson(value: unknown): string {
   return canonical(value, new Set());
 }
@@ -59,7 +57,6 @@ function rowAad(table: string, rowId: string): Buffer {
   return Buffer.from(`infinite:evidence:v${EVIDENCE_KEY_VERSION}:${table}:${rowId}`, "utf8");
 }
 
-/** AES-256-GCM over canonical JSON, bound to its table and row ID. */
 export function sealRow(key: Buffer, table: string, rowId: string, value: unknown): string {
   const aad = rowAad(table, rowId);
   const nonce = randomBytes(NONCE_BYTES);
@@ -94,7 +91,6 @@ export function openRow<T>(key: Buffer, table: string, rowId: string, sealed: st
   return JSON.parse(plain) as T;
 }
 
-/** A keyed hash that lets SQL match a value without storing it. Classes never collide. */
 export function blindIndex(key: Buffer, cls: EvidenceIndexClass, value: string): string {
   if (!INDEX_CLASSES.has(cls)) throw new TypeError("Invalid evidence index class");
   if (typeof value !== "string") throw new TypeError("An evidence index value must be a string");

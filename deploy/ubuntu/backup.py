@@ -24,20 +24,15 @@ import tempfile
 import time
 import uuid
 
-
 def run(*args, **kwargs):
     return subprocess.run(args, check=True, text=True, capture_output=True, **kwargs).stdout.strip()
-
 
 def digest(path):
     with path.open("rb") as source:
         return hashlib.file_digest(source, "sha256").hexdigest()
 
-
 def archive_command(staging):
-    # PAX ACL records retain named-user access and inherited directory access.
     return ["tar", "--create", "--gzip", "--format=pax", "--acls", "--numeric-owner", "--file=-", "--directory=" + str(staging), "."]
-
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -82,7 +77,6 @@ def main():
             return
         create_backup(source, output, recipient, config)
 
-
 def assert_no_unconfigured_brain_writer():
     for process in Path("/proc").iterdir():
         if not process.name.isdigit():
@@ -92,7 +86,6 @@ def assert_no_unconfigured_brain_writer():
                 raise RuntimeError("A brain writer is running; configure its service, store, and service files before backup")
         except (FileNotFoundError, PermissionError):
             continue
-
 
 def service_groups(source, brain_service=None, config=None):
     groups = {}
@@ -139,7 +132,6 @@ def service_groups(source, brain_service=None, config=None):
         raise RuntimeError("The cmux service has no application-volume state directory")
     return groups
 
-
 def application_writers(groups, brain_service=None):
     users = {"infinite-host", "infinite-agent"}
     if brain_service:
@@ -158,7 +150,6 @@ def application_writers(groups, brain_service=None):
         except FileNotFoundError:
             continue
     return processes
-
 
 def backup_plan(source, config):
     brain_keys = {"brainService", "brainDirectory", "brainConfig", "brainUnitFiles", "brainRuntimeFiles"}
@@ -240,7 +231,6 @@ def backup_plan(source, config):
         names += ("brain",)
     return list(groups), groups, names, processes, brain
 
-
 def thaw_services(services):
     failed = False
     for service in services:
@@ -250,7 +240,6 @@ def thaw_services(services):
             failed = True
     if failed:
         raise RuntimeError("An application service did not thaw; the independent watchdog remains armed")
-
 
 def create_backup(source, output, recipient, config):
     service = "infinite.service"
@@ -266,8 +255,6 @@ def create_backup(source, output, recipient, config):
     thaw_unit = "infinite-backup-thaw-" + uuid.uuid4().hex
     frozen = False
     try:
-        # Register the independent watchdog before freezing. A slow/failed copy
-        # is never published; the pause is bounded even after SIGKILL.
         run("systemd-run", "--quiet", "--unit=" + thaw_unit, "--on-active=45s", "/usr/bin/systemctl", "thaw", *services)
         started = time.monotonic()
         try:
@@ -280,8 +267,6 @@ def create_backup(source, output, recipient, config):
             processes = application_writers(groups, config.get("brainService"))
             run("sync", "-f", str(source), timeout=5)
             data = staging / "data"; data.mkdir(mode=0o700)
-            # The dedicated temporary directory is omitted. Native homes are
-            # copied in full, including databases and WAL/rollback journals.
             for name in names:
                 budget = 30 - (time.monotonic() - started)
                 if budget <= 0:
@@ -312,7 +297,6 @@ def create_backup(source, output, recipient, config):
             for path in brain["runtimeFiles"]:
                 relative = Path("profiles.json") if path.name == "profiles.json" else Path("scripts") / path.name
                 shutil.copy2(path, runtime / relative)
-        # Age, vault, and LUKS keys are recovered separately from the owner's device.
         manifest = {"format": 1, "createdAt": stamp, "consistency": "process-frozen-crash-consistent", "pauseSeconds": pause_seconds,
                     "service": service, "services": services, "controlGroups": groups, "processStartTicks": processes, "release": os.path.realpath("/opt/infinite"),
                     "brain": ({"service": config["brainService"], "databases": ["knowledge.sqlite3", "routing.sqlite3", "queue.sqlite3"],
@@ -352,10 +336,8 @@ def create_backup(source, output, recipient, config):
         partial.unlink(missing_ok=True)
         shutil.rmtree(staging)
 
-
 if __name__ == "__main__":
     try:
         main()
     except Exception as error:
-        # Do not print filenames from native homes, credentials, or subprocess payloads.
         raise SystemExit("Backup failed: " + (str(error) if isinstance(error, RuntimeError) else type(error).__name__))

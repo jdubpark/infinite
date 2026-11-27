@@ -1,64 +1,150 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import type { Config, Provider } from "./types.js";
+import type { Config, Provider, SessionPurpose } from "./types.js";
 import type { Manager } from "./manager.js";
-import type { TeamAssignment } from "./team-types.js";
 import { writeSealed, unseal } from "./vault.js";
-import { accountOf, periodStart, priceUsage, sumUsage, type UsageRecord, type UsageTotals, type UsageTokens } from "./usage.js";
+import {
+  accountOf, listPriceUsage, periodEnd, periodStart, priceUsage, sumUsage,
+  type Pricing, type ProviderSpendSnapshot, type UsagePeriod, type UsageRecord, type UsageTokens, type UsageTotals,
+} from "./usage.js";
 import { usagePlanSchema, type AccountView, type Balance, type BriefingUsage, type Money, type TaskUsage, type UsageResolvers } from "./usage-api.js";
+import { EvidenceError } from "./evidence/types.js";
+import type { EvidenceStore } from "./evidence/store.js";
+import type { EvidenceTx } from "./evidence/types.js";
+import { OUTCOMES_MODULE } from "./outcome-store.js";
+import { refreshOutcomeCostsForSessions } from "./outcome-cost.js";
+import {
+  SESSION_PURPOSES, closeMissingSession, combineCoverage, importLedger, importState, ledgerRecord, readBriefings, readRecords, readSessions, usageModule, writeBriefing, writeRecordWithOwner, writeSession,
+  type LedgerCoverage, type LedgerCoverageReason, type LedgerHeader, type LedgerState, type SealedLedger, type StoredSession,
+} from "./usage-store.js";
 
-type Period = "day" | "week" | "month";
-export interface SessionUsage extends UsageTotals { measured: true }
+export { combineCoverage };
+
+type Period = UsagePeriod;
+export interface SessionUsage extends UsageTotals { measured: true; coverage: "partial" | "complete"; coverageReason?: LedgerCoverageReason; list?: Money }
+export type UnmeasuredUsage = { measured: false; coverage: "none"; coverageReason?: LedgerCoverageReason; unavailable?: true };
 export type UsageSummary = {
-  /** The default month window; each provider carries the window of its own budget period. */
   period: { start: string; end: string };
-  providers: Record<Provider, { period: { start: string; end: string }; measured: boolean; spent?: UsageTotals; budget?: { usd: number; period: Period }; previous?: UsageTotals; unmeasuredSessions: number }>;
-  month: { start: string; end: string; spent: Money; previous: Money; plansUsd: number; unmeasuredSessions: number };
+  providers: Record<Provider, { period: { start: string; end: string }; measured: boolean; spent?: UsageTotals; budget?: { usd: number; period: Period }; previous?: UsageTotals; unmeasuredSessions: number; partialSessions: number; recorded: { tokens: UsageTokens; messages: number } }>;
+  month: { start: string; end: string; spent: Money; previous: Money; plansUsd: number; unmeasuredSessions: number; partialSessions: number };
   accounts: AccountView[];
 };
-/** `exited` records that the session had exited and its journal was read to its end: nothing in it can change. */
-type LedgerSession = { provider: Provider; projectId: string; createdAt: string; lastActiveAt?: string; measured: boolean; team?: TeamAssignment; profileId?: string; exited?: true };
-/** A session row as `manager.list()` returns it. */
 export type UsageSessionRow = Awaited<ReturnType<Manager["list"]>>[number];
-type Ledger = { cursors: Record<string, number>; sessions: Record<string, LedgerSession>; rows: Record<string, UsageRecord>; briefings: Record<string, { projectId: string; at: string; record?: UsageRecord }> };
+type Snapshot = {
+  sessions: StoredSession[];
+  bySession: Map<string, UsageRecord[]>;
+  briefings: { projectId: string; at: string; record?: UsageRecord }[];
+  taskKey?: string;
+};
+type Ledger = {
+  sessions: readonly StoredSession[];
+  byId: ReadonlyMap<string, StoredSession>;
+  byMember: ReadonlyMap<string, readonly StoredSession[]>;
+  bySession: Map<string, UsageRecord[]>;
+  order: ReadonlyMap<UsageRecord, number>;
+  briefings: Snapshot["briefings"];
+};
+const memberKey = (runId: string, memberId: string) => `${runId}\u0000${memberId}`;
+export const LEDGER_KEEP_MS = 2_000;
+export const USAGE_RECONCILE_STALE_MS = 15_000;
+type Row = Pick<LedgerState, "exited" | "cursor" | "seen" | "refused" | "journaled"> & { lastActiveAt?: string };
+type UsageServiceOptions = { now?: () => number; reconcileStaleMs?: number };
 
 const PROVIDERS: Provider[] = ["claude", "codex", "grok", "opencode", "demo"];
+const COVERED: ReadonlySet<Provider> = new Set<Provider>(["claude", "codex", "demo"]);
 const PAGE = 200;
-const periodEnd = (period: Period, start: Date) => period === "month" ? new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth() + 1, 1))
-  : new Date(start.getTime() + (period === "week" ? 7 : 1) * 86_400_000);
+const MAX_PAGES = 20;
+const EXIT_GRACE_MS = 60_000;
+const REASON = /^[a-z][a-z0-9-]{0,39}$/;
 const SCOPE = "usage";
 const PLAN_SCOPE = "usage-plans";
 const isRecord = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value);
+const measured = (session: StoredSession) => session.coverage !== "none";
+const partial = (session: StoredSession) => session.coverage === "partial" && session.reason !== "running";
+const inWindow = (at: string, from?: Date, to?: Date) => { const time = Date.parse(at); return (!from || time >= from.getTime()) && (!to || time <= to.getTime()); };
+const maxIso = (...values: (string | undefined)[]): string | undefined => {
+  let best: number | undefined;
+  let result: string | undefined;
+  for (const value of values) {
+    if (value === undefined) continue;
+    const ms = Date.parse(value);
+    if (Number.isNaN(ms)) continue;
+    if (best === undefined || ms > best) { best = ms; result = new Date(ms).toISOString(); }
+  }
+  return result;
+};
+const sessionOverlaps = (session: StoredSession, records: readonly UsageRecord[] | undefined, startMs: number, endMs: number): boolean => {
+  const sStart = Date.parse(session.createdAt);
+  let sEnd = Math.max(sStart, session.lastActiveAt ? Date.parse(session.lastActiveAt) : sStart);
+  if (records) {
+    for (const record of records) {
+      const at = Date.parse(record.completedAt);
+      if (at > sEnd) sEnd = at;
+    }
+  }
+  return sStart < endMs && sEnd >= startMs;
+};
+const keyOf = (state: { lastActiveAt?: string; exited: boolean; cursor: number; seen: number; refused: number; coverage: string; reason?: string; journaled?: object }) =>
+  JSON.stringify([state.lastActiveAt ?? null, state.exited, state.cursor, state.seen, state.refused, state.coverage, state.reason ?? null, state.journaled ?? null]);
 
-/**
- * Sealed ledger of per-step OpenCode and reported briefing usage. Every other session is counted
- * as unmeasured and never contributes a zero to a total.
- */
+function journaledCoverage(data: unknown): LedgerState["journaled"] | undefined {
+  if (!isRecord(data)) return undefined;
+  const { coverage, reason, finalDrain } = data;
+  if (coverage !== "none" && coverage !== "partial" && coverage !== "complete") return undefined;
+  if (reason !== undefined && (typeof reason !== "string" || !REASON.test(reason) || coverage === "complete")) return undefined;
+  return {
+    coverage,
+    ...(reason === undefined ? {} : { reason: reason as LedgerCoverageReason }),
+    ...(finalDrain === "complete" || finalDrain === "incomplete" || finalDrain === "skipped" ? { finalDrain } : {}),
+  };
+}
+
+export function ledgerCoverage(input: { provider: Provider; measuredLaunch: boolean; closed: boolean; journaled?: LedgerCoverage; valid: number; refused: number; drained?: boolean; recordingError?: boolean }): LedgerCoverage {
+  const { provider, measuredLaunch, closed, journaled, valid, refused, drained = true, recordingError = false } = input;
+  if (provider === "opencode" && measuredLaunch) {
+    if (recordingError) return { coverage: "partial", reason: "recording-error" };
+    if (!drained) return { coverage: "partial", reason: "drain-incomplete" };
+    return refused > 0 ? { coverage: "partial", reason: "row-dropped" } : { coverage: "complete" };
+  }
+  if (!COVERED.has(provider)) return { coverage: "none", reason: "unsupported" };
+  if (recordingError) return { coverage: "partial", reason: "recording-error" };
+  if (journaled) {
+    if (!drained) return { coverage: "partial", reason: "drain-incomplete" };
+    if (journaled.coverage === "complete" && refused > 0) return { coverage: "partial", reason: "row-dropped" };
+    return { coverage: journaled.coverage, ...(journaled.reason ? { reason: journaled.reason } : {}) };
+  }
+  if (!closed) return valid > 0 ? { coverage: "partial", reason: "running" } : { coverage: "none", reason: "running" };
+  return valid > 0 ? { coverage: "partial", reason: "drain-incomplete" } : { coverage: "none", reason: "unsupported" };
+}
+
 export class UsageService {
-  private ledger: Ledger = { cursors: {}, sessions: {}, rows: {}, briefings: {} };
-  private index?: Map<string, UsageRecord[]>;
   private timer?: NodeJS.Timeout;
   private running = false;
   private closed = false;
   private ticking = false;
+  private imported = false;
+  private tickFailed = false;
+  private lastReconciledAt?: number;
+  private backlogOffset = 0;
+  private readonly clock: () => number;
+  private readonly reconcileStaleMs: number;
   private readonly failed = new Set<string>();
-  private readonly file: string;
+  private readonly ingestionGaps = new Map<string, { provider: Provider; projectId: string; reason: "read-failed" | "ingestion-incomplete" }>();
+  private readonly exitedAt = new Map<string, number>();
+  private kept?: Ledger;
+  private keptAt = 0;
+  private failedAt?: number;
   private readonly planFile: string;
   private planOverrides: Record<string, number> = Object.create(null) as Record<string, number>;
   private balances?: { get(id: string): Balance };
+  private onWritten?: () => void;
   private resolvers: UsageResolvers = { goalOfRun: () => undefined, runTitle: () => undefined, projectName: id => id, sessionTitle: () => undefined };
-  constructor(private readonly config: Config, private readonly key: Buffer, private readonly manager: Manager) {
-    this.file = join(config.stateDir, "usage.sealed");
+  constructor(private readonly config: Config, private readonly key: Buffer, private readonly manager: Manager, private readonly store: EvidenceStore, options: UsageServiceOptions = {}) {
+    this.clock = options.now ?? (() => Date.now());
+    this.reconcileStaleMs = options.reconcileStaleMs ?? USAGE_RECONCILE_STALE_MS;
     this.planFile = join(config.stateDir, "usage-plans.sealed");
-    // The ledger is derived from session journals, so an unreadable one is rebuilt rather than fatal.
-    if (existsSync(this.file)) try {
-      const stored = unseal<Ledger>(key, SCOPE, readFileSync(this.file, "utf8"));
-      if (!isRecord(stored) || !isRecord(stored.rows) || !isRecord(stored.cursors) || !isRecord(stored.sessions)) throw new Error("unexpected ledger shape");
-      this.ledger = stored;
-      this.ledger.briefings ??= {};
-    } catch (error) {
-      console.warn(`[Infinite] The usage ledger cannot be read and is rebuilt from session journals: ${error instanceof Error ? error.message : String(error)}`);
-    }
+    store.register(usageModule);
+    this.imported = this.importOnce();
     if (existsSync(this.planFile)) try {
       const stored = unseal<unknown>(key, PLAN_SCOPE, readFileSync(this.planFile, "utf8"));
       if (!isRecord(stored) || Object.entries(stored).some(([id, value]) => !id || typeof value !== "number" || !usagePlanSchema.safeParse({ planUsd: value }).success))
@@ -68,10 +154,6 @@ export class UsageService {
       console.warn(`[Infinite] Owner usage plans cannot be read and are ignored: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
-  /**
-   * Runs the ledger on its own 2 s timer. The host's TeamService drives `tick(rows)` from the session
-   * listing it already takes, so this is only for a host composed without one.
-   */
   start() {
     if (this.running || this.closed) return;
     this.running = true;
@@ -81,8 +163,19 @@ export class UsageService {
   close() { this.closed = true; this.running = false; if (this.timer) clearInterval(this.timer); }
   useBalances(service: { get(id: string): Balance }) { this.balances = service; }
   useResolvers(resolvers: UsageResolvers) { this.resolvers = resolvers; }
+  onUpdated(listener: () => void) { this.onWritten = listener; }
 
-  /** Updates a subscription plan override, retaining config as the default. */
+  available(): boolean { return this.storeReady() && !this.tickFailed; }
+  markReconciliationFailed(): void { this.tickFailed = true; }
+  readable(): boolean {
+    if (!this.available()) return false;
+    try { this.store.read(db => importState(db)); return true; } catch { return false; }
+  }
+  private write<T>(fn: (tx: EvidenceTx) => T): T {
+    try { return this.store.write(fn); } finally { this.kept = undefined; this.failedAt = undefined; }
+  }
+  private storeReady(): boolean { return this.imported && this.store.status().modules[usageModule.name] === "ready"; }
+
   setPlan(accountId: string, planUsd: number | null): "missing" | "metered" | "updated" {
     const accounts = this.config.usage?.accounts;
     const account = accounts && Object.hasOwn(accounts, accountId) ? accounts[accountId] : undefined;
@@ -96,70 +189,290 @@ export class UsageService {
     return "updated";
   }
 
-  /** Folds new journal usage into the ledger. `rows` is a listing the caller already took; without one, the manager is asked. */
+  private sessionRemoved(sessionId: string): boolean {
+    if (typeof (this.manager as { meta?: unknown }).meta === "function") {
+      try {
+        this.manager.meta(sessionId);
+        return false;
+      } catch (error) {
+        return (error as NodeJS.ErrnoException).code === "ENOENT";
+      }
+    }
+    return true;
+  }
+
   async tick(rows?: UsageSessionRow[]) {
-    if (this.ticking || this.closed) return;
+    if (this.ticking || this.closed || !this.storeReady()) return;
     this.ticking = true;
     try {
-      let changed = false;
-      for (const session of rows ?? await this.manager.list()) {
-        const previous = this.ledger.sessions[session.id];
-        if (previous?.exited) continue;
-        const measured = session.provider === "opencode" && (session.teamModelProfile ? session.teamModelProfile.provider === "opencode" : !session.team && session.runtime?.nativeUi === "opencode");
-        const active = ["starting", "running"].includes(session.status);
-        // Refreshed at most once a minute so a running session does not rewrite the ledger on every tick.
-        const stale = !previous?.lastActiveAt || Date.now() - Date.parse(previous.lastActiveAt) > 60_000;
-        const lastActiveAt = active && stale ? new Date().toISOString() : previous?.lastActiveAt;
-        let readToEnd = !measured;
-        // One unreadable journal must not strand the rows other sessions produced in this tick.
-        if (measured) try {
-          let cursor = this.ledger.cursors[session.id] ?? 0, more = true;
-          while (more && !this.closed) {
-            const page = this.manager.events(session.id, cursor, PAGE, new Set(["usage"]));
-            for (const event of page.events) {
-              if (event.type !== "usage") continue;
-              const record = event.data as unknown as UsageRecord;
-              this.ledger.rows[`${session.id}/${record.messageId}/${record.partId}`] = record; changed = true; this.index = undefined;
-            }
-            if (page.cursor !== cursor) { cursor = page.cursor; this.ledger.cursors[session.id] = cursor; changed = true; }
-            more = page.more;
+      const stored = new Map(this.store.read(db => readSessions(db)).map(row => [row.sessionId, row]));
+      for (const id of [...this.ingestionGaps.keys()]) if (stored.get(id)?.exited) this.ingestionGaps.delete(id);
+      const now = this.clock();
+      const nowIso = new Date(now).toISOString();
+      const list = rows ?? await this.manager.list();
+      const listedIds = new Set(list.map(item => item.id));
+      for (const [sessionId, previous] of stored) {
+        if (previous.exited || listedIds.has(sessionId)) continue;
+        const missingGap = this.ingestionGaps.has(sessionId) || (previous.coverage === "partial" && previous.reason === "drain-incomplete");
+        if (!missingGap || !this.sessionRemoved(sessionId)) continue;
+        const reason: LedgerCoverageReason = previous.reason === "recording-error" ? "recording-error" : "drain-incomplete";
+        const closedAt = maxIso(previous.lastActiveAt, previous.createdAt, nowIso) ?? nowIso;
+        this.write(tx => {
+          if (closeMissingSession(tx, sessionId, closedAt, reason) && this.store.status().modules[OUTCOMES_MODULE] === "ready") {
+            refreshOutcomeCostsForSessions(tx, [{ sessionId, runId: previous.runId, memberId: previous.memberId, exited: true }], this.config.usage?.prices);
           }
-          readToEnd = !more;
-          this.failed.delete(session.id);
-        } catch (error) {
-          if (!this.failed.has(session.id)) {
-            this.failed.add(session.id);
-            console.warn(`[Infinite] Usage for session ${session.id} cannot be read: ${error instanceof Error ? error.message : String(error)}`);
-          }
+        });
+        this.ingestionGaps.delete(sessionId);
+        this.exitedAt.delete(sessionId);
+      }
+      let backlogPages = MAX_PAGES - 1;
+      let nextOffset: number | undefined;
+      let wroteRecords = false;
+      const startOffset = list.length > 0 ? this.backlogOffset % list.length : 0;
+      for (let step = 0; step < list.length; step++) {
+        if (this.closed) break;
+        const listIndex = (startOffset + step) % list.length;
+        const session = list[listIndex]!;
+        const previous = stored.get(session.id);
+        if (previous?.exited) {
+          this.ingestionGaps.delete(session.id);
+          continue;
         }
-        const entry: LedgerSession = { provider: session.provider, projectId: session.projectId, createdAt: session.createdAt, measured,
+        const observed = session.provider === "opencode" && (session.teamModelProfile ? session.teamModelProfile.provider === "opencode" : !session.team && session.runtime?.nativeUi === "opencode");
+        const covered = COVERED.has(session.provider);
+        const read = observed || covered;
+        const active = ["starting", "running"].includes(session.status);
+        const recordingError = session.status === "recording-error" || previous?.reason === "recording-error";
+        const exitedListed = session.status === "exited";
+        const stale = !previous?.lastActiveAt || now - Date.parse(previous.lastActiveAt) > 60_000;
+        const baseLastActiveAt = active && stale ? nowIso : previous?.lastActiveAt;
+        const headerOf = (lastActiveAt: string | undefined): LedgerHeader => ({
+          sessionId: session.id, provider: session.provider, projectId: session.projectId, createdAt: session.createdAt,
           ...(lastActiveAt ? { lastActiveAt } : {}),
           ...(session.team ? { team: session.team } : {}), ...(session.teamModelProfile ? { profileId: session.teamModelProfile.id } : {}),
-          // A session id never runs again once exited, so later ticks can skip it.
-          ...(session.status === "exited" && readToEnd ? { exited: true as const } : {}) };
-        if (JSON.stringify(previous) !== JSON.stringify(entry)) { this.ledger.sessions[session.id] = entry; changed = true; }
+          ...(session.purpose ? { purpose: session.purpose } : {}), ...(session.configId ? { configId: session.configId } : {}),
+        });
+        if (covered && exitedListed && !this.exitedAt.has(session.id)) this.exitedAt.set(session.id, now);
+        const exitedSince = this.exitedAt.get(session.id);
+        const closes = (complete: boolean, journaled: LedgerState["journaled"]) => exitedListed && complete
+          && (!covered || journaled !== undefined || (exitedSince !== undefined && now - exitedSince >= EXIT_GRACE_MS));
+        const stateOf = (row: Row, drained = true): LedgerState => {
+          const coverage = ledgerCoverage({ provider: session.provider, measuredLaunch: observed, closed: row.exited, journaled: row.journaled,
+            valid: row.seen - row.refused, refused: row.refused, drained, recordingError });
+          return { ...coverage, cursor: row.cursor, seen: row.seen, refused: row.refused, exited: row.exited, ...(row.journaled ? { journaled: row.journaled } : {}) };
+        };
+        const keyed = (row: Row, drained = true) => keyOf({ lastActiveAt: row.lastActiveAt, ...stateOf(row, drained) });
+        let current: Row = read
+          ? { exited: false, lastActiveAt: baseLastActiveAt, cursor: previous?.cursor ?? 0, seen: previous?.seen ?? 0, refused: previous?.refused ?? 0, ...(previous?.journaled ? { journaled: previous.journaled } : {}) }
+          : { exited: false, lastActiveAt: baseLastActiveAt, cursor: 0, seen: 0, refused: 0 };
+        let saved = previous ? keyOf(previous) : undefined, complete = !read, readFailed = false, headChecked = false;
+        if (read) {
+          while (!this.closed && (!headChecked || backlogPages > 0)) {
+            if (headChecked) backlogPages--;
+            headChecked = true;
+            let page: ReturnType<Manager["events"]>;
+            try {
+              page = this.manager.events(session.id, current.cursor, PAGE, new Set(["usage", "usage-coverage"]));
+              this.failed.delete(session.id);
+            } catch (error) {
+              readFailed = true;
+              if (!this.failed.has(session.id)) {
+                this.failed.add(session.id);
+                console.warn(`[Infinite] Usage for session ${session.id} cannot be read: ${error instanceof Error ? error.message : String(error)}`);
+              }
+              break;
+            }
+            const records: UsageRecord[] = [];
+            let seen = 0, refused = 0, journaled = current.journaled, maxEventAt: string | undefined;
+            for (const event of page.events) {
+              maxEventAt = maxIso(maxEventAt, typeof event.at === "string" ? event.at : undefined);
+              if (event.type === "usage") {
+                seen++;
+                const record = ledgerRecord(event.data);
+                if (record) {
+                  records.push(record);
+                  maxEventAt = maxIso(maxEventAt, record.completedAt);
+                } else refused++;
+              } else journaled = journaledCoverage(event.data) ?? journaled;
+            }
+            const drained = !page.more;
+            const sawEvents = seen > 0 || refused > 0;
+            const stepLastActiveAt = recordingError || !drained || ((exitedListed || sawEvents) && (previous !== undefined || active))
+              ? maxIso(current.lastActiveAt, nowIso, maxEventAt)
+              : sawEvents
+                ? maxIso(current.lastActiveAt, maxEventAt)
+                : current.lastActiveAt;
+            const next: Row = { exited: closes(drained, journaled), lastActiveAt: stepLastActiveAt, cursor: page.cursor,
+              seen: current.seen + seen, refused: current.refused + refused, ...(journaled ? { journaled } : {}) };
+            const key = keyed(next, drained);
+            if (key !== saved || records.length > 0) {
+              const written = this.write(tx => {
+                const header = headerOf(next.lastActiveAt);
+                if (!writeSession(tx, header, stateOf(next, drained))) return false;
+                const owners = new Set<string>([session.id]);
+                for (const record of records) {
+                  const res = writeRecordWithOwner(tx, session.id, record);
+                  if (res.status !== "kept") {
+                    owners.add(res.ownerSessionId);
+                    wroteRecords = true;
+                  }
+                }
+                if (this.store.status().modules[OUTCOMES_MODULE] === "ready") {
+                  const targets: { sessionId: string; runId?: string; memberId?: string; exited?: boolean }[] = [];
+                  for (const ownerId of owners) {
+                    if (ownerId === session.id) {
+                      targets.push({ sessionId: session.id, runId: header.team?.runId, memberId: header.team?.memberId, exited: next.exited });
+                      continue;
+                    }
+                    const meta = tx.get<{ run_id: string | null; member_id: string | null; exited: number }>(
+                      "SELECT run_id, member_id, exited FROM usage_sessions WHERE session_id=?", ownerId,
+                    );
+                    targets.push({
+                      sessionId: ownerId,
+                      ...(meta?.run_id ? { runId: meta.run_id } : {}),
+                      ...(meta?.member_id ? { memberId: meta.member_id } : {}),
+                      exited: meta?.exited === 1,
+                    });
+                  }
+                  refreshOutcomeCostsForSessions(tx, targets, this.config.usage?.prices);
+                }
+                return true;
+              });
+              if (!written) {
+                console.warn(`[Infinite] Usage for session ${session.id} cannot be stored and is read again next tick.`);
+                break;
+              }
+              saved = key;
+            }
+            current = next;
+            if (drained) { complete = true; break; }
+          }
+          if (complete) this.ingestionGaps.delete(session.id);
+          else {
+            if (!readFailed && nextOffset === undefined && list.length > 0) nextOffset = (listIndex + 1) % list.length;
+            this.ingestionGaps.set(session.id, { provider: session.provider, projectId: session.projectId, reason: readFailed ? "read-failed" : "ingestion-incomplete" });
+          }
+        } else {
+          this.ingestionGaps.delete(session.id);
+        }
+        const finalState = stateOf({ ...current, exited: closes(complete, current.journaled) }, complete);
+        const finalLastActiveAt = recordingError || !complete || (previous !== undefined && exitedListed) || (finalState.coverage === "none" && active)
+          ? maxIso(current.lastActiveAt, nowIso)
+          : current.lastActiveAt;
+        const final: Row = { ...current, lastActiveAt: finalLastActiveAt, exited: closes(complete, current.journaled) };
+        if (final.exited) this.exitedAt.delete(session.id);
+        if (keyed(final, complete) !== saved) {
+          this.write(tx => {
+            const header = headerOf(final.lastActiveAt);
+            if (writeSession(tx, header, stateOf(final, complete)) && this.store.status().modules[OUTCOMES_MODULE] === "ready") {
+              refreshOutcomeCostsForSessions(tx, [{ sessionId: session.id, runId: header.team?.runId, memberId: header.team?.memberId, exited: final.exited }], this.config.usage?.prices);
+            }
+          });
+        }
       }
-      if (changed) { this.index = undefined; writeSealed(this.file, this.key, SCOPE, this.ledger); }
+      if (nextOffset !== undefined) this.backlogOffset = nextOffset;
+      if (!this.closed) {
+        this.lastReconciledAt = this.clock();
+        this.tickFailed = false;
+      }
+      if (wroteRecords) try { this.onWritten?.(); } catch {}
+    } catch (error) {
+      if (!this.tickFailed) console.warn(`[Infinite] The usage ledger could not record this tick: ${error instanceof Error ? error.message : String(error)}`);
+      this.tickFailed = true;
     } finally { this.ticking = false; }
   }
 
-  private rowsBySession() {
-    if (!this.index) {
-      this.index = new Map();
-      for (const [key, record] of Object.entries(this.ledger.rows)) {
-        const id = key.slice(0, key.indexOf("/"));
-        (this.index.get(id) ?? this.index.set(id, []).get(id)!).push(record);
-      }
+  private importOnce(): boolean {
+    if (this.store.status().modules[usageModule.name] !== "ready") return false;
+    try {
+      if (this.store.read(db => importState(db)) === "done") return true;
+      const sealed = this.sealedLedger();
+      this.write(tx => importLedger(tx, sealed.ledger, sealed.outcome));
+      return true;
+    } catch {
+      console.warn("[Infinite] The usage ledger could not be imported and stays unavailable until the next start.");
+      return false;
     }
-    return this.index;
   }
-  private priced(records: UsageRecord[]) {
-    return records.map(record => ({ ...priceUsage(record, this.config.usage?.prices), tokens: record.tokens }));
+  private sealedLedger(): { outcome: "imported" | "absent" | "unreadable"; ledger?: SealedLedger } {
+    const file = join(this.config.stateDir, "usage.sealed");
+    if (!existsSync(file)) return { outcome: "absent" };
+    try {
+      const stored = unseal<SealedLedger>(this.key, SCOPE, readFileSync(file, "utf8"));
+      if (!isRecord(stored) || !isRecord(stored.rows) || !isRecord(stored.cursors) || !isRecord(stored.sessions)) throw new Error("unexpected ledger shape");
+      const objects = <T>(value: Record<string, unknown> | undefined) => Object.fromEntries(Object.entries(value ?? {}).filter(([, item]) => isRecord(item))) as Record<string, T>;
+      return { outcome: "imported", ledger: {
+        cursors: stored.cursors as Record<string, number>,
+        sessions: objects<SealedLedger["sessions"][string]>(stored.sessions),
+        rows: objects<UsageRecord>(stored.rows),
+        briefings: objects<SealedLedger["briefings"][string]>(stored.briefings as Record<string, unknown> | undefined),
+      } };
+    } catch (error) {
+      console.warn(`[Infinite] The usage ledger cannot be read and is rebuilt from session journals: ${error instanceof Error ? error.message : String(error)}`);
+      return { outcome: "unreadable" };
+    }
   }
 
-  private measuredRecords() { return Object.entries(this.ledger.rows).flatMap(([key, record]) => { const id = key.slice(0, key.indexOf("/")), session = this.ledger.sessions[id]; return session?.measured ? [{ id, projectId: session.projectId, record, ...priceUsage(record, this.config.usage?.prices) }] : []; }); }
-  private allMeasuredRecords() {
-    return [...this.measuredRecords(), ...Object.entries(this.ledger.briefings).flatMap(([id, row]) => row.record ? [{ id: `briefing:${id}`, projectId: row.projectId, record: row.record, ...priceUsage(row.record, this.config.usage?.prices) }] : [])];
+  private ledger(): Ledger {
+    if (!this.available()) throw new EvidenceError("unavailable", "The usage ledger is unavailable.");
+    const now = Date.now();
+    if (this.kept && now >= this.keptAt && now - this.keptAt < LEDGER_KEEP_MS) return this.kept;
+    this.kept = undefined;
+    if (this.failedAt !== undefined && now >= this.failedAt && now - this.failedAt < LEDGER_KEEP_MS) throw new EvidenceError("unavailable", "The usage ledger is unavailable.");
+    let data: { sessions: StoredSession[]; records: { sessionId: string; record: UsageRecord }[]; briefings: Snapshot["briefings"] };
+    try {
+      data = this.store.read(db => ({ sessions: readSessions(db), records: readRecords(db), briefings: readBriefings(db) }));
+    } catch {
+      this.failedAt = now;
+      throw new EvidenceError("unavailable", "The usage ledger is unavailable.");
+    }
+    this.failedAt = undefined;
+    const byId = new Map<string, StoredSession>(), members = new Map<string, StoredSession[]>();
+    for (const session of data.sessions) {
+      Object.freeze(session);
+      byId.set(session.sessionId, session);
+      if (session.runId === undefined || session.memberId === undefined) continue;
+      const key = memberKey(session.runId, session.memberId);
+      (members.get(key) ?? members.set(key, []).get(key)!).push(session);
+    }
+    const bySession = new Map<string, UsageRecord[]>(), order = new Map<UsageRecord, number>();
+    data.records.forEach(({ sessionId, record }, index) => {
+      const session = byId.get(sessionId);
+      if (!session || !measured(session)) return;
+      order.set(record, index);
+      (bySession.get(sessionId) ?? bySession.set(sessionId, []).get(sessionId)!).push(record);
+    });
+    for (const list of members.values()) Object.freeze(list);
+    for (const list of bySession.values()) Object.freeze(list);
+    this.kept = { sessions: Object.freeze(data.sessions), byId, byMember: members, bySession, order, briefings: Object.freeze(data.briefings) as Snapshot["briefings"] };
+    this.keptAt = now;
+    return this.kept;
+  }
+  private snapshot(options: { taskId?: string } = {}): Snapshot {
+    const ledger = this.ledger();
+    let taskKey: string | undefined;
+    if (options.taskId !== undefined) {
+      const taskId = options.taskId;
+      try { taskKey = this.store.read(db => db.index("task", taskId)); }
+      catch { throw new EvidenceError("unavailable", "The usage ledger is unavailable."); }
+    }
+    return { sessions: ledger.sessions as StoredSession[], bySession: ledger.bySession, briefings: ledger.briefings, ...(taskKey === undefined ? {} : { taskKey }) };
+  }
+  private price(record: UsageRecord): { cost: number; pricing: Pricing } {
+    return record.provider === "opencode" ? priceUsage(record, this.config.usage?.prices) : { cost: 0, pricing: "unknown" };
+  }
+  private listMoney(records: UsageRecord[]): Money {
+    return this.money(records.map(record => listPriceUsage(record, this.config.usage?.prices)));
+  }
+  private priced(records: UsageRecord[]) {
+    return records.map(record => ({ ...this.price(record), tokens: record.tokens }));
+  }
+  private measuredRecords(data: Snapshot) {
+    const sessions = new Map(data.sessions.map(session => [session.sessionId, session]));
+    return [...data.bySession].flatMap(([id, records]) => { const session = sessions.get(id); return session ? records.map(record => ({ id, projectId: session.projectId, record, ...this.price(record) })) : []; });
+  }
+  private allMeasuredRecords(data: Snapshot) {
+    return [...this.measuredRecords(data), ...data.briefings.flatMap(row => row.record ? [{ id: `briefing:${row.at}`, projectId: row.projectId, record: row.record, ...this.price(row.record) }] : [])];
   }
   private money(rows: { cost: number; pricing: string }[]): Money { return { usd: Math.round(rows.reduce((sum, row) => sum + row.cost, 0) * 1_000_000) / 1_000_000, unpriced: rows.filter(row => row.pricing === "unknown").length }; }
   private dateKey(at: string, tz: string) {
@@ -169,10 +482,13 @@ export class UsageService {
   daily({ days, tz = "UTC", projectId, now = new Date() }: { days: number; tz?: string; projectId?: string; now?: Date }) {
     if (!Number.isInteger(days) || days < 1 || days > 366) throw new RangeError("days must be between 1 and 366");
     this.dateKey(now.toISOString(), tz);
+    return this.dailyFrom(this.snapshot(), { days, tz, projectId, now });
+  }
+  private dailyFrom(data: Snapshot, { days, tz, projectId, now }: { days: number; tz: string; projectId?: string; now: Date }) {
     const last = this.dateKey(now.toISOString(), tz), [year, month, day] = last.split("-").map(Number), date = new Date(Date.UTC(year, month - 1, day));
     const dates = Array.from({ length: days }, (_, index) => { const d = new Date(date.getTime() - (days - index - 1) * 86_400_000); return d.toISOString().slice(0, 10); });
     const accounts = new Set<string>(Object.keys(this.config.usage?.accounts ?? {})), map = new Map(dates.map(key => [key, {} as Record<string, number>]));
-    for (const row of this.allMeasuredRecords()) {
+    for (const row of this.allMeasuredRecords(data)) {
       if (projectId && row.projectId !== projectId) continue;
       const key = this.dateKey(row.record.completedAt, tz), account = accountOf(row.record.providerId, row.record.modelId, this.config.usage?.accounts ?? {});
       accounts.add(account); if (map.has(key)) map.get(key)![account] = (map.get(key)![account] ?? 0) + row.cost;
@@ -181,92 +497,259 @@ export class UsageService {
   }
   projects({ tz = "UTC", now = new Date() }: { tz?: string; now?: Date }) {
     this.dateKey(now.toISOString(), tz);
-    const ids = new Set([...Object.values(this.ledger.sessions).map(s => s.projectId), ...Object.values(this.ledger.briefings).map(b => b.projectId)]);
-    return { projects: [...ids].map(id => { const rows = this.projectRows(id), recent = this.daily({ days: 30, tz, projectId: id, now }), monthStart = periodStart("month", now); return { id, name: this.resolvers.projectName(id) ?? id, total: this.money(rows), month: { ...this.money(rows.filter(row => { const at = Date.parse(row.at); return at >= monthStart.getTime() && at <= now.getTime(); })), unmeasured: this.projectUnmeasured(id, monthStart, now) }, unmeasured: this.projectUnmeasured(id), spark: recent.days.map(day => day.usd) }; }).sort((a, b) => b.total.usd - a.total.usd) };
+    const data = this.snapshot();
+    const ids = new Set([...data.sessions.map(s => s.projectId), ...data.briefings.map(b => b.projectId)]);
+    return { projects: [...ids].map(id => { const rows = this.projectRows(data, id), recent = this.dailyFrom(data, { days: 30, tz, projectId: id, now }), monthStart = periodStart("month", now); return { id, name: this.resolvers.projectName(id) ?? id, total: this.money(rows), month: { ...this.money(rows.filter(row => { const at = Date.parse(row.at); return at >= monthStart.getTime() && at <= now.getTime(); })), unmeasured: this.projectUnmeasured(data, id, monthStart, now), partial: this.projectPartial(data, id, monthStart, now) }, unmeasured: this.projectUnmeasured(data, id), partial: this.projectPartial(data, id), spark: recent.days.map(day => day.usd) }; }).sort((a, b) => b.total.usd - a.total.usd) };
   }
-  private projectUnmeasured(id: string, from?: Date, to?: Date) {
-    const inRange = (at: string) => { const time = Date.parse(at); return (!from || time >= from.getTime()) && (!to || time <= to.getTime()); };
-    return Object.values(this.ledger.sessions).filter(session => session.projectId === id && !session.measured && inRange(session.lastActiveAt ?? session.createdAt)).length
-      + Object.values(this.ledger.briefings).filter(row => row.projectId === id && !row.record && inRange(row.at)).length;
+  private projectUnmeasured(data: Snapshot, id: string, from?: Date, to?: Date) {
+    return data.sessions.filter(session => session.projectId === id && !measured(session) && inWindow(session.lastActiveAt ?? session.createdAt, from, to)).length
+      + data.briefings.filter(row => row.projectId === id && !row.record && inWindow(row.at, from, to)).length;
   }
-  private projectRows(id: string) {
-    const rows = this.allMeasuredRecords().filter(row => row.projectId === id).map(row => ({ ...row, at: row.record.completedAt }));
-    return rows;
+  private projectPartial(data: Snapshot, id: string, from?: Date, to?: Date) {
+    return data.sessions.filter(session => session.projectId === id && partial(session) && inWindow(session.lastActiveAt ?? session.createdAt, from, to)).length;
+  }
+  private projectRows(data: Snapshot, id: string) {
+    return this.allMeasuredRecords(data).filter(row => row.projectId === id).map(row => ({ ...row, at: row.record.completedAt }));
+  }
+  private byPurpose(data: Snapshot, id: string): Record<SessionPurpose, { total: Money; members: number }> {
+    const members = data.sessions.filter(session => session.projectId === id && session.runId !== undefined && session.memberId !== undefined);
+    return Object.fromEntries(SESSION_PURPOSES.map(purpose => {
+      const mine = members.filter(session => session.purpose === purpose);
+      const records = this.priced(mine.filter(measured).flatMap(session => data.bySession.get(session.sessionId) ?? []));
+      const distinct = new Set(mine.map(session => JSON.stringify([session.runId, session.memberId])));
+      return [purpose, { total: this.money(records), members: distinct.size }];
+    })) as Record<SessionPurpose, { total: Money; members: number }>;
   }
   project(id: string, { tz = "UTC", now = new Date() }: { tz?: string; now?: Date } = {}) {
     this.dateKey(now.toISOString(), tz);
-    const sessions = Object.entries(this.ledger.sessions).filter(([, session]) => session.projectId === id), briefings = Object.values(this.ledger.briefings).filter(row => row.projectId === id);
+    const data = this.snapshot();
+    const sessions = data.sessions.filter(session => session.projectId === id), briefings = data.briefings.filter(row => row.projectId === id);
     if (!sessions.length && !briefings.length) return undefined;
-    const total = this.money(this.projectRows(id)), unmeasured = this.projectUnmeasured(id), grouped = { goals: [] as any[], teams: [] as any[], sessions: [] as any[], briefings: [] as any[] };
-    for (const [sessionId, session] of sessions) {
-      const records = this.priced(this.rowsBySession().get(sessionId) ?? []), sum = this.money(records);
-      if (!session.measured) continue;
-      if (session.team) {
-        const goal = this.resolvers.goalOfRun(session.team.runId), prior = grouped.teams.find(row => row.id === session.team!.runId);
+    const total = this.money(this.projectRows(data, id)), unmeasured = this.projectUnmeasured(data, id), partialCount = this.projectPartial(data, id), grouped = { goals: [] as any[], teams: [] as any[], sessions: [] as any[], briefings: [] as any[] };
+    const resolved = new Map<string, ReturnType<UsageResolvers["goalOfRun"]>>();
+    const goalOfRun = (runId: string) => {
+      if (!resolved.has(runId)) resolved.set(runId, this.resolvers.goalOfRun(runId));
+      return resolved.get(runId);
+    };
+    for (const session of sessions) {
+      const records = this.priced(data.bySession.get(session.sessionId) ?? []), sum = this.money(records);
+      if (!measured(session)) continue;
+      if (session.runId !== undefined) {
+        const goal = goalOfRun(session.runId), prior = grouped.teams.find(row => row.id === session.runId);
         if (prior) { prior.total.usd = Math.round((prior.total.usd + sum.usd) * 1_000_000) / 1_000_000; prior.total.unpriced += sum.unpriced; }
-        else grouped.teams.push({ id: session.team.runId, title: this.resolvers.runTitle(session.team.runId) ?? session.team.runId, total: sum, ...(goal ? { goalId: goal.id } : {}) });
+        else grouped.teams.push({ id: session.runId, title: this.resolvers.runTitle(session.runId) ?? session.runId, total: sum, ...(goal ? { goalId: goal.id } : {}) });
       }
-      else grouped.sessions.push({ id: sessionId, title: this.resolvers.sessionTitle(sessionId) ?? sessionId, total: sum });
+      else grouped.sessions.push({ id: session.sessionId, title: this.resolvers.sessionTitle(session.sessionId) ?? session.sessionId, total: sum });
     }
-    for (const row of briefings) { const cost = row.record ? priceUsage(row.record, this.config.usage?.prices) : undefined; grouped.briefings.push({ row, cost }); }
+    for (const row of briefings) { const cost = row.record ? this.price(row.record) : undefined; grouped.briefings.push({ row, cost }); }
     const goals = new Map<string, { id: string; title: string; total: Money; tasks: number }>(), goalTasks = new Map<string, Set<string>>();
     for (const row of grouped.teams.filter(item => item.goalId)) {
-      const goal = this.resolvers.goalOfRun(row.id)!; const current = goals.get(goal.id) ?? { id: goal.id, title: goal.title, total: { usd: 0, unpriced: 0 }, tasks: 0 };
+      const goal = goalOfRun(row.id)!; const current = goals.get(goal.id) ?? { id: goal.id, title: goal.title, total: { usd: 0, unpriced: 0 }, tasks: 0 };
       current.total.usd = Math.round((current.total.usd + row.total.usd) * 1_000_000) / 1_000_000; current.total.unpriced += row.total.unpriced; goals.set(goal.id, current);
-      const ids = goalTasks.get(goal.id) ?? new Set<string>(); for (const session of Object.values(this.ledger.sessions)) { const team = session.team; if (!team || team.runId !== row.id || !team.taskId) continue; ids.add(`${row.id}/${team.taskId}`); } goalTasks.set(goal.id, ids);
+      const ids = goalTasks.get(goal.id) ?? new Set<string>(); for (const session of data.sessions) { if (!session.runId || session.runId !== row.id || !session.taskKey) continue; ids.add(`${row.id}/${session.taskKey}`); } goalTasks.set(goal.id, ids);
     }
     for (const [goalId, row] of goals) row.tasks = goalTasks.get(goalId)?.size ?? 0;
     const briefingMoney = this.money(grouped.briefings.flatMap(({ cost }) => cost ? [cost] : []));
-    return { id, name: this.resolvers.projectName(id) ?? id, total, unmeasured, byKind: { goals: [...goals.values()].reduce((n, g) => n + g.total.usd, 0), teams: grouped.teams.filter(row => !row.goalId).reduce((n, x) => n + x.total.usd, 0), sessions: grouped.sessions.reduce((n, x) => n + x.total.usd, 0), briefings: briefingMoney.usd }, goals: [...goals.values()], teams: grouped.teams, sessions: grouped.sessions, briefings: { total: briefingMoney, runs: briefings.length, unmeasured: briefings.filter(row => !row.record).length } };
+    return { id, name: this.resolvers.projectName(id) ?? id, total, unmeasured, partial: partialCount, byPurpose: this.byPurpose(data, id), byKind:{ goals: [...goals.values()].reduce((n, g) => n + g.total.usd, 0), teams: grouped.teams.filter(row => !row.goalId).reduce((n, x) => n + x.total.usd, 0), sessions: grouped.sessions.reduce((n, x) => n + x.total.usd, 0), briefings: briefingMoney.usd }, goals: [...goals.values()], teams: grouped.teams, sessions: grouped.sessions, briefings: { total: briefingMoney, runs: briefings.length, unmeasured: briefings.filter(row => !row.record).length } };
   }
   taskUsage(runId: string, taskId: string, revision: number): TaskUsage | undefined {
-    const sessions = Object.entries(this.ledger.sessions).filter(([, session]) => session.team?.runId === runId && session.team.taskId === taskId && session.team.revision === revision);
+    let data: Snapshot;
+    try { data = this.snapshot({ taskId }); } catch { return undefined; }
+    const sessions = data.sessions.filter(session => session.runId === runId && session.taskKey === data.taskKey && session.revision === revision);
     if (!sessions.length) return undefined;
-    const rows = sessions.flatMap(([id]) => this.rowsBySession().get(id) ?? []), totals = this.priced(rows), sum = sumUsage(totals);
+    const rows = sessions.flatMap(session => data.bySession.get(session.sessionId) ?? []), totals = this.priced(rows), sum = sumUsage(totals);
     if (!rows.length) return undefined;
-    return { usd: sum.cost, unpriced: totals.filter(row => row.pricing === "unknown").length, tokens: Object.values(sum.tokens).reduce((a, b) => a + b, 0), attempts: new Set(sessions.map(([, session]) => session.team!.memberId)).size, profiles: [...new Set(sessions.map(([, session]) => session.profileId).filter((id): id is string => Boolean(id)))].sort() };
+    const ordered = [...sessions].sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.sessionId.localeCompare(b.sessionId));
+    const coverage = combineCoverage(ordered.map(session => ({ coverage: session.coverage, coverageReason: session.reason })));
+    return { usd: sum.cost, unpriced: totals.filter(row => row.pricing === "unknown").length, tokens: Object.values(sum.tokens).reduce((a, b) => a + b, 0), attempts: new Set(sessions.map(session => session.memberId)).size, profiles: [...new Set(sessions.map(session => session.profileId).filter((id): id is string => Boolean(id)))].sort(),
+      coverage: coverage.coverage as "partial" | "complete", ...(coverage.reason ? { coverageReason: coverage.reason } : {}) };
   }
   recordBriefing(projectId: string, sessionId: string, at: string, usage: BriefingUsage | null) {
     const record = usage ? { provider: "opencode" as const, providerId: usage.providerId, modelId: usage.modelId, messageId: sessionId, partId: at, modelSource: "reported" as const, completedAt: at, tokens: usage.tokens, reportedCost: usage.reportedCost ?? 0 } : undefined;
-    this.ledger.briefings[`${sessionId}/${at}`] = { projectId, at, ...(record ? { record } : {}) };
-    writeSealed(this.file, this.key, SCOPE, this.ledger);
+    const checked = record === undefined ? undefined : ledgerRecord(record);
+    if (record && !checked) console.warn("[Infinite] A usage briefing record is invalid and is stored without its figures.");
+    if (!this.available()) return void console.warn("[Infinite] A usage briefing was lost because the usage ledger is unavailable.");
+    try {
+      this.write(tx => writeBriefing(tx, `${sessionId}/${at}`, projectId, at, checked));
+    } catch {
+      console.warn("[Infinite] A usage briefing was lost because the usage ledger could not store it.");
+    }
   }
 
-  session(sessionId: string): SessionUsage | { measured: false } {
-    if (!this.ledger.sessions[sessionId]?.measured) return { measured: false };
-    return { ...sumUsage(this.priced(this.rowsBySession().get(sessionId) ?? [])), measured: true };
+  session(sessionId: string): SessionUsage | UnmeasuredUsage {
+    let data: Ledger;
+    try { data = this.ledger(); } catch { return { measured: false, coverage: "none", unavailable: true }; }
+    const session = data.byId.get(sessionId);
+    if (!session || !measured(session)) return { measured: false, coverage: "none", ...(session?.reason ? { coverageReason: session.reason } : {}) };
+    const rows = data.bySession.get(sessionId) ?? [];
+    return { ...sumUsage(this.priced(rows)), measured: true, coverage: session.coverage as "partial" | "complete", list: this.listMoney(rows), ...(session.reason ? { coverageReason: session.reason } : {}) };
   }
-  /** Sum over the measured sessions among `ids`; unmeasured ones contribute nothing. */
+  member(runId: string, memberId: string): SessionUsage | UnmeasuredUsage {
+    let data: Ledger;
+    try { data = this.ledger(); } catch { return { measured: false, coverage: "none", unavailable: true }; }
+    const sessions = data.byMember.get(memberKey(runId, memberId)) ?? [];
+    const ordered = [...sessions].sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.sessionId.localeCompare(b.sessionId));
+    const coverage = combineCoverage(ordered.map(session => ({ coverage: session.coverage, coverageReason: session.reason })));
+    if (coverage.coverage === "none") return { measured: false, coverage: "none" };
+    const rows = sessions.flatMap(session => data.bySession.get(session.sessionId) ?? []).sort((a, b) => data.order.get(a)! - data.order.get(b)!);
+    return { ...sumUsage(this.priced(rows)), measured: true, coverage: coverage.coverage as "partial" | "complete", list: this.listMoney(rows), ...(coverage.reason ? { coverageReason: coverage.reason } : {}) };
+  }
+  memberFinal(runId: string, memberId: string): SessionUsage | UnmeasuredUsage {
+    let data: Ledger;
+    try { data = this.ledger(); } catch { return { measured: false, coverage: "none", unavailable: true }; }
+    const sessions = data.byMember.get(memberKey(runId, memberId)) ?? [];
+    if (!sessions.length) return { measured: false, coverage: "none" };
+    const ordered = [...sessions].sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.sessionId.localeCompare(b.sessionId));
+    if (ordered.some(session => !session.exited)) return { measured: false, coverage: "none", coverageReason: "running" };
+    if (ordered.every(session => session.coverage === "none")) {
+      const reason = ordered.find(session => session.reason)?.reason;
+      return { measured: false, coverage: "none", ...(reason ? { coverageReason: reason } : {}) };
+    }
+    const incomplete = ordered.find(session => session.coverage !== "complete" && session.reason)
+      ?? ordered.find(session => session.coverage !== "complete");
+    const rows = ordered.flatMap(session => data.bySession.get(session.sessionId) ?? []).sort((a, b) => data.order.get(a)! - data.order.get(b)!);
+    if (incomplete) {
+      return {
+        ...sumUsage(this.priced(rows)),
+        measured: true,
+        coverage: "partial",
+        ...(incomplete.reason ? { coverageReason: incomplete.reason } : {}),
+      };
+    }
+    return { ...sumUsage(this.priced(rows)), measured: true, coverage: "complete" };
+  }
   sessions(ids: string[]): UsageTotals {
-    return sumUsage(this.priced(ids.filter(id => this.ledger.sessions[id]?.measured).flatMap(id => this.rowsBySession().get(id) ?? [])));
+    let data: Ledger;
+    try { data = this.ledger(); } catch { return sumUsage([]); }
+    return sumUsage(this.priced(ids.flatMap(id => data.bySession.get(id) ?? [])));
+  }
+
+  private ingestionGap(provider: Provider, projectId?: string): "read-failed" | "ingestion-incomplete" | undefined {
+    let incomplete = false;
+    for (const gap of this.ingestionGaps.values()) {
+      if (gap.provider !== provider) continue;
+      if (projectId !== undefined && gap.projectId !== projectId) continue;
+      if (gap.reason === "read-failed") return "read-failed";
+      incomplete = true;
+    }
+    return incomplete ? "ingestion-incomplete" : undefined;
+  }
+
+  private providerWindow(data: Snapshot, provider: Provider, period: Period, now: Date, includePrevious: boolean, projectId?: string) {
+    const start = periodStart(period, now);
+    const end = periodEnd(period, start);
+    const startMs = start.getTime();
+    const endMs = end.getTime();
+    const observed = provider === "opencode";
+    const sessions = data.sessions.filter(s => s.provider === provider && (projectId === undefined || s.projectId === projectId));
+    const briefings = provider === "opencode"
+      ? data.briefings.filter(row => projectId === undefined || row.projectId === projectId)
+      : [];
+    const unmeasuredBriefings = briefings.filter(row => !row.record && Date.parse(row.at) >= startMs && Date.parse(row.at) <= now.getTime()).length;
+    const unmeasuredSessions = sessions.filter(s => !measured(s) && sessionOverlaps(s, data.bySession.get(s.sessionId), startMs, endMs)).length + unmeasuredBriefings;
+    const partialSessions = sessions.filter(s => partial(s) && sessionOverlaps(s, data.bySession.get(s.sessionId), startMs, endMs)).length;
+    const recordingErrorSessions = sessions.filter(s => s.coverage === "partial" && s.reason === "recording-error" && sessionOverlaps(s, data.bySession.get(s.sessionId), startMs, endMs)).length;
+    const within = (from: Date, to: Date) => {
+      const rows = this.priced(sessions.filter(measured).flatMap(s => data.bySession.get(s.sessionId) ?? [])
+        .filter(record => { const at = Date.parse(record.completedAt); return at >= from.getTime() && at < to.getTime(); }));
+      if (provider === "opencode") rows.push(...briefings.flatMap(row => row.record && Date.parse(row.at) >= from.getTime() && Date.parse(row.at) < to.getTime() ? this.priced([row.record]) : []));
+      return rows;
+    };
+    const current = sumUsage(within(start, new Date(now.getTime() + 1)));
+    const previous = includePrevious && observed ? sumUsage(within(periodStart(period, new Date(startMs - 1)), start)) : undefined;
+    return { start, end, observed, unmeasuredSessions, partialSessions, recordingErrorSessions, current, previous };
+  }
+
+  providerSpend(provider: Provider, period: Period, now = new Date(), projectId?: string): ProviderSpendSnapshot {
+    const start = periodStart(period, now);
+    const end = periodEnd(period, start);
+    const window = { kind: period, start: start.toISOString(), end: end.toISOString() };
+    const scoped = projectId === undefined ? {} : { projectId };
+    let data: Snapshot;
+    try {
+      data = this.snapshot();
+    } catch {
+      return { measured: false, provider, ...scoped, period: window, reason: "ledger-unavailable" };
+    }
+    const metrics = this.providerWindow(data, provider, period, now, false, projectId);
+    if (!metrics.observed) {
+      return {
+        measured: false,
+        provider,
+        ...scoped,
+        period: window,
+        reason: "provider-unmeasured",
+        tokens: metrics.current.tokens,
+        messages: metrics.current.messages,
+        unmeasuredSessions: metrics.unmeasuredSessions,
+        partialSessions: metrics.partialSessions,
+      };
+    }
+    const unpriced = metrics.current.pricing.unknown;
+    const reconciliation = this.lastReconciledAt === undefined ? "reconciliation-pending" as const
+      : this.clock() - this.lastReconciledAt > this.reconcileStaleMs ? "reconciliation-stale" as const
+      : undefined;
+    const ingestion = this.ingestionGap(provider, projectId);
+    const undrainedStored = data.sessions.some(session => session.provider === provider
+      && (projectId === undefined || session.projectId === projectId)
+      && !session.exited && session.coverage === "partial" && session.reason === "drain-incomplete");
+    const gap = reconciliation !== undefined ? reconciliation
+      : ingestion !== undefined ? ingestion
+      : undrainedStored ? "ingestion-incomplete" as const
+      : metrics.recordingErrorSessions > 0 ? "recording-error" as const
+      : metrics.unmeasuredSessions > 0 ? "unmeasured-sessions" as const
+      : metrics.partialSessions > 0 ? "partial-sessions" as const
+      : unpriced > 0 ? "unpriced-records" as const
+      : undefined;
+    if (gap !== undefined) {
+      return {
+        measured: false,
+        provider,
+        ...scoped,
+        period: window,
+        reason: gap,
+        usd: metrics.current.cost,
+        tokens: metrics.current.tokens,
+        messages: metrics.current.messages,
+        unpriced,
+        unmeasuredSessions: metrics.unmeasuredSessions,
+        partialSessions: metrics.partialSessions,
+      };
+    }
+    return {
+      measured: true,
+      provider,
+      ...scoped,
+      period: window,
+      usd: metrics.current.cost,
+      tokens: metrics.current.tokens,
+      messages: metrics.current.messages,
+      unpriced: 0,
+      unmeasuredSessions: 0,
+      partialSessions: 0,
+    };
   }
 
   summary(now = new Date()): UsageSummary {
+    const data = this.snapshot();
     const monthStart = periodStart("month", now);
     const providers = {} as UsageSummary["providers"];
     for (const provider of PROVIDERS) {
       const budget = this.config.usage?.budgets[provider];
       const period: Period = budget?.period ?? "month";
-      const start = periodStart(period, now), previousStart = periodStart(period, new Date(start.getTime() - 1));
-      const measured = provider === "opencode";
-      const sessions = Object.entries(this.ledger.sessions).filter(([, s]) => s.provider === provider);
-      const unmeasuredBriefings = provider === "opencode" ? Object.values(this.ledger.briefings).filter(row => !row.record && Date.parse(row.at) >= start.getTime() && Date.parse(row.at) <= now.getTime()).length : 0;
-      const unmeasuredSessions = sessions.filter(([, s]) => !s.measured && Date.parse(s.lastActiveAt ?? s.createdAt) >= start.getTime()).length + unmeasuredBriefings;
-      const within = (from: Date, to: Date) => {
-        const rows = this.priced(sessions.filter(([, s]) => s.measured).flatMap(([id]) => this.rowsBySession().get(id) ?? [])
-          .filter(record => { const at = Date.parse(record.completedAt); return at >= from.getTime() && at < to.getTime(); }));
-        if (provider === "opencode") rows.push(...Object.values(this.ledger.briefings).flatMap(row => row.record && Date.parse(row.at) >= from.getTime() && Date.parse(row.at) < to.getTime() ? this.priced([row.record]) : []));
-        return rows;
-      };
+      const metrics = this.providerWindow(data, provider, period, now, true);
       providers[provider] = {
-        period: { start: start.toISOString(), end: periodEnd(period, start).toISOString() },
-        measured, unmeasuredSessions,
-        ...(measured ? { spent: sumUsage(within(start, new Date(now.getTime() + 1))), previous: sumUsage(within(previousStart, start)) } : {}),
+        period: { start: metrics.start.toISOString(), end: metrics.end.toISOString() },
+        measured: metrics.observed,
+        unmeasuredSessions: metrics.unmeasuredSessions,
+        partialSessions: metrics.partialSessions,
+        recorded: { tokens: metrics.current.tokens, messages: metrics.current.messages },
+        ...(metrics.observed ? { spent: metrics.current, previous: metrics.previous } : {}),
         ...(budget ? { budget: { usd: budget.usd, period } } : {}),
       };
     }
     const end = periodEnd("month", monthStart);
-    const records = this.allMeasuredRecords(), previousStart = periodStart("month", new Date(monthStart.getTime() - 1));
+    const records = this.allMeasuredRecords(data), previousStart = periodStart("month", new Date(monthStart.getTime() - 1));
     const inRange = (from: Date, to: Date) => records.filter(row => Date.parse(row.record.completedAt) >= from.getTime() && Date.parse(row.record.completedAt) < to.getTime());
     const accountConfigs = this.config.usage?.accounts ?? {};
     const accounts: AccountView[] = Object.entries(accountConfigs).map(([id, account]) => {
@@ -279,8 +762,9 @@ export class UsageService {
         ...(planUsd !== undefined ? { planUsd } : {}), ...(planSource ? { planSource } : {}),
         balance: this.balances?.get(id) ?? null };
     });
-    const unmeasuredSessions = Object.values(this.ledger.sessions).filter(session => !session.measured && Date.parse(session.lastActiveAt ?? session.createdAt) >= monthStart.getTime() && Date.parse(session.lastActiveAt ?? session.createdAt) < end.getTime()).length + Object.values(this.ledger.briefings).filter(row => !row.record && Date.parse(row.at) >= monthStart.getTime() && Date.parse(row.at) <= now.getTime()).length;
+    const unmeasuredSessions = data.sessions.filter(session => !measured(session) && Date.parse(session.lastActiveAt ?? session.createdAt) >= monthStart.getTime() && Date.parse(session.lastActiveAt ?? session.createdAt) < end.getTime()).length + data.briefings.filter(row => !row.record && Date.parse(row.at) >= monthStart.getTime() && Date.parse(row.at) <= now.getTime()).length;
     return { period: { start: monthStart.toISOString(), end: end.toISOString() }, providers,
-      month: { start: monthStart.toISOString(), end: end.toISOString(), spent: this.money(inRange(monthStart, new Date(now.getTime() + 1))), previous: this.money(inRange(previousStart, monthStart)), plansUsd: accounts.filter(account => account.kind === "subscription").reduce((sum, account) => sum + (account.planUsd ?? 0), 0), unmeasuredSessions }, accounts };
+      month: { start: monthStart.toISOString(), end: end.toISOString(), spent: this.money(inRange(monthStart, new Date(now.getTime() + 1))), previous: this.money(inRange(previousStart, monthStart)), plansUsd: accounts.filter(account => account.kind === "subscription").reduce((sum, account) => sum + (account.planUsd ?? 0), 0), unmeasuredSessions,
+        partialSessions: data.sessions.filter(session => partial(session) && Date.parse(session.lastActiveAt ?? session.createdAt) >= monthStart.getTime() && Date.parse(session.lastActiveAt ?? session.createdAt) < end.getTime()).length }, accounts };
   }
 }

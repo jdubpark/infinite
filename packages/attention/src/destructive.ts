@@ -1,4 +1,3 @@
-// Pattern list adapted from jevcode (packages/contracts/src/security.ts) with additions.
 export interface DestructivePattern {
   name: string;
   pattern: RegExp;
@@ -6,7 +5,6 @@ export interface DestructivePattern {
 export const destructivePatterns: readonly DestructivePattern[] = [
   { name: "rm-recursive-force", pattern: /\brm\b\s+(-[a-zA-Z]*r[a-zA-Z]*f[a-zA-Z]*|-[a-zA-Z]*f[a-zA-Z]*r[a-zA-Z]*|-r\s+-f|-f\s+-r)\b/i },
   { name: "rm-recursive-force-long", pattern: /\brm\b\s+(?=.*--recursive)(?=.*--force)/i },
-  // Separate flags anywhere in the same command, such as `rm -r build -f`.
   { name: "rm-recursive-force", pattern: /\brm\b(?=[^\n;&|]*\s-[a-zA-Z]*r)(?=[^\n;&|]*\s-[a-zA-Z]*f)/i },
   { name: "git-push-force", pattern: /\bgit\s+push\b[^\n]*(^|\s)(--force(-with-lease)?|-f)(\s|$|=)/ },
   { name: "git-reset-hard", pattern: /\bgit\s+reset\s+--hard\b/ },
@@ -25,7 +23,6 @@ export const destructivePatterns: readonly DestructivePattern[] = [
 ];
 
 export function matchDestructive(command: string): string | null {
-  // A leading `echo …` only prints its words; whatever follows `;`, `&&`, `||` or `|` still runs.
   const runs = command.replace(/^\s*echo\b[^;&|]*/, "");
   for (const entry of destructivePatterns) if (entry.pattern.test(runs)) return entry.name;
   return null;

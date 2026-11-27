@@ -3,7 +3,6 @@ import type { Basis } from "@infinite/remote";
 import { BasisLabel } from "./BasisLabel";
 import { styles } from "./styles";
 
-/** Label and value rows. A row shows its basis only when it differs from the row above. */
 export function Facts({ items }: { items: { label: string; value: string; basis: Basis }[] }) {
   return <View style={styles.stack}>
     {items.map((item, index) => {

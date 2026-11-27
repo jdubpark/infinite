@@ -17,7 +17,6 @@ Environment=TMPDIR=/srv/infinite-data/tmp/control
 ExecStart=/usr/local/bin/node /opt/infinite/packages/host/dist/cli.js serve
 Restart=on-failure
 RestartSec=3
-# Workers intentionally survive an API restart; stop sessions explicitly.
 KillMode=process
 RuntimeDirectory=infinite
 RuntimeDirectoryMode=0700
@@ -30,13 +29,9 @@ MemoryMax=48G
 TasksMax=4096
 CPUQuota=1400%
 PrivateDevices=true
-# Personal host: the agent updates its own tools, so this service uses the
-# real read-write filesystem. Credential files stay mode 0600.
 ProtectSystem=false
 ProtectHome=false
 TemporaryFileSystem=/tmp:rw,nosuid,nodev,mode=1777 /var/tmp:rw,nosuid,nodev,mode=1777
-# sudo launches only the allowlisted native agents as infinite-agent.
-# NoNewPrivileges would prevent that identity transition.
 
 [Install]
 WantedBy=multi-user.target

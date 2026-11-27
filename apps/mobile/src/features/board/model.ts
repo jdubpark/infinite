@@ -1,4 +1,6 @@
 import type { BoardColumn, BoardItem, Mission, Me, MissionDecision, MissionStatus, MissionSubtask } from "../../api/client";
+import type { StatusKind } from "../../status";
+import { shortDate } from "../teams/model";
 
 export type BoardSection = "needs-input" | "working" | "review" | "ended";
 export const BOARD_SECTIONS: { id: BoardSection; title: string; subtitle: string; column: BoardColumn }[] = [
@@ -8,14 +10,16 @@ export const BOARD_SECTIONS: { id: BoardSection; title: string; subtitle: string
   { id: "ended", title: "Ended", subtitle: "Stopped or completed runs.", column: "ended" },
 ];
 
-/** Filter by explicit group when available, while retaining standalone runs under All. */
 export function filterBoard(items: BoardItem[], groupId?: string) {
   return groupId ? items.filter(item => item.groupId === groupId) : items;
 }
 
-/** The board's section order and newest-updated ordering are independent of rendering. */
+export function foldAttempts(items: BoardItem[]) {
+  return items.filter(item => !item.attempt?.superseded);
+}
+
 export function groupBoard(items: BoardItem[], groupId?: string) {
-  const selected = filterBoard(items, groupId);
+  const selected = foldAttempts(filterBoard(items, groupId));
   return BOARD_SECTIONS.map(section => ({
     ...section,
     items: selected.filter(item => item.column === section.column)
@@ -23,16 +27,92 @@ export function groupBoard(items: BoardItem[], groupId?: string) {
   }));
 }
 
+export function attemptsOf(items: BoardItem[], item: BoardItem): BoardItem[] {
+  const work = item.attempt?.workId;
+  if (!work) return [];
+  return items.filter(other => other.attempt?.workId === work)
+    .sort((a, b) => (a.attempt?.number ?? 0) - (b.attempt?.number ?? 0));
+}
+
+export function attemptLabel(item: BoardItem) {
+  return item.attempt ? `Attempt ${item.attempt.number} of ${item.attempt.of}` : undefined;
+}
+
+export function subtaskProgressLabel(item: Pick<BoardItem, "subtasks">): string | undefined {
+  return item.subtasks?.total ? `${item.subtasks.done}/${item.subtasks.total}` : undefined;
+}
+
+export function findBoardItem(items: BoardItem[], kind: BoardItem["kind"], id: string) {
+  return items.find(item => item.kind === kind && item.id === id);
+}
+
+export function boardStatusLabel(item: BoardItem) {
+  if (item.kind === "mission") return missionStatusLabel(item.status as MissionStatus, item.stopReason);
+  const words = item.status.replace(/-/g, " ");
+  return words.charAt(0).toUpperCase() + words.slice(1);
+}
+
+export function boardKind(item: BoardItem): StatusKind {
+  if (item.status === "needs-input") return "attention";
+  if (item.status === "blocked") return "blocked";
+  if (item.status === "paused") return "paused";
+  if (item.column === "review") return "review";
+  if (item.column === "ended") return item.status === "cancelled" ? "cancelled" : "done";
+  return "progress";
+}
+
 export function openMissionDecisions(mission: Mission): MissionDecision[] {
   return mission.decisions.filter(decision => decision.answer == null);
 }
 
-export function missionStatusLabel(status: MissionStatus) {
+export function missionStatusLabel(status: MissionStatus, stopReason?: Mission["stopReason"]) {
+  if (status === "blocked" && stopReason === "deadline") return "Stopped at time limit";
   const labels: Record<MissionStatus, string> = {
     planning: "Planning", working: "Working", "needs-input": "Needs your input", paused: "Paused",
     blocked: "Blocked", "ready-for-review": "Ready for review", cancelled: "Cancelled",
   };
   return labels[status];
+}
+
+export function missionShowsReason(mission: Pick<Mission, "status" | "stopReason" | "reason">): boolean {
+  return Boolean(mission.reason) && !(mission.status === "blocked" && mission.stopReason === "deadline");
+}
+
+export function missionStoppedAtLimit(mission: Pick<Mission, "status" | "stopReason">): boolean {
+  return mission.status === "blocked" && mission.stopReason === "deadline";
+}
+
+export function missionTimeLeftMs(mission: Pick<Mission, "deadlineAt" | "clockStoppedAt">, now: number): number {
+  return mission.clockStoppedAt ? Date.parse(mission.deadlineAt) - Date.parse(mission.clockStoppedAt) : Date.parse(mission.deadlineAt) - now;
+}
+
+export function missionLeftLabel(ms: number): string {
+  const minutes = Math.floor(ms / 60000);
+  if (minutes < 1) return "less than a minute";
+  const hours = Math.floor(minutes / 60), rest = minutes % 60;
+  if (hours === 0) return `${rest} min`;
+  return rest === 0 ? `${hours} h` : `${hours} h ${rest} min`;
+}
+
+export function missionStopLine(mission: Pick<Mission, "status" | "stopReason" | "deadlineAt" | "clockStoppedAt">, now: number): string | undefined {
+  if (missionStoppedAtLimit(mission)) return "Stopped at its time limit. Its work is kept. Extend to continue, or cancel.";
+  if (!["planning", "working", "needs-input", "paused"].includes(mission.status)) return undefined;
+  const left = missionTimeLeftMs(mission, now);
+  if (left <= 0) return "Its time limit has passed. Extend to continue.";
+  if (mission.clockStoppedAt) return `Clock stopped while it waits · ${missionLeftLabel(left)} left`;
+  return `Stops ${shortDate(mission.deadlineAt)}`;
+}
+
+export function missionExtendChoices(maxMinutes: number): { minutes: number; label: string; spoken: string; ownLimit: boolean }[] {
+  const minutes = [60, 360, 1440];
+  if (Number.isInteger(maxMinutes) && maxMinutes >= 5 && maxMinutes <= 1440 && !minutes.includes(maxMinutes)) minutes.push(maxMinutes);
+  const unit = (count: number, word: string) => `${count} ${count === 1 ? word : `${word}s`}`;
+  return minutes.sort((a, b) => a - b).map(value => {
+    const ownLimit = value === maxMinutes;
+    const span = value % 60 === 0 ? `+${value / 60} h` : `+${value} min`;
+    const amount = value % 60 === 0 ? unit(value / 60, "hour") : unit(value, "minute");
+    return { minutes: value, label: ownLimit ? `${span} (its limit)` : span, spoken: `Extend by ${amount}${ownLimit ? ", its limit" : ""}`, ownLimit };
+  });
 }
 
 export function missionSubtaskLabel(status: MissionSubtask["status"]) {
@@ -42,7 +122,6 @@ export function missionSubtaskLabel(status: MissionSubtask["status"]) {
   return labels[status];
 }
 
-/** Mission controls are owner-only and pause when the view is stale. */
 export function missionControls(mission: Mission, role: Me["role"] | undefined, fresh: boolean, now: number) {
   const owner = role === "owner" && fresh;
   const live = !["cancelled", "ready-for-review"].includes(mission.status);
@@ -50,7 +129,8 @@ export function missionControls(mission: Mission, role: Me["role"] | undefined, 
     answer: owner && live,
     steer: owner && live && mission.status !== "paused",
     pause: owner && ["planning", "working", "needs-input"].includes(mission.status),
-    resume: owner && mission.status === "paused" && Date.parse(mission.deadlineAt) > now,
+    resume: owner && mission.status === "paused" && missionTimeLeftMs(mission, now) > 0,
+    extend: owner && (["planning", "working", "needs-input", "paused"].includes(mission.status) || missionStoppedAtLimit(mission)),
     cancel: owner && live,
   };
 }

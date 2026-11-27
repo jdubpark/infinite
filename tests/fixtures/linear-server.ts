@@ -10,12 +10,15 @@ interface FixtureComment { id: string; body: string; issue: { id: string } }
 type WriteOperation = "InfiniteLinearIssueCreate" | "InfiniteLinearIssueUpdate" | "InfiniteLinearCommentCreate";
 type IssueEdit = Partial<Pick<FixtureIssue, "id" | "title" | "description" | "team" | "project" | "parent" | "state" | "archivedAt">>;
 
-/** A GraphQL peer with committed writes that can lose their HTTP acknowledgement. */
 export async function startLinearServer() {
   const apiKey = randomBytes(32).toString("hex"), teamId = randomUUID();
   const issues = new Map<string, FixtureIssue>(), comments = new Map<string, FixtureComment>();
   const labels = new Map<string, { id: string; name: string; team: { id: string } | null }>(), issueLabels = new Map<string, Set<string>>();
   let failLabels = false, rateLimitLabels = false, rateLimitLabelChanges = false;
+  let heldLabelAck: { apply: (value: { operation: string; issueId: string; labelId: string }) => void; result: Promise<boolean>; finish: (failed: boolean) => void } | undefined;
+  let heldLabelRateLimit: { request: (value: { operation: string; issueId: string }) => void; result: Promise<void>; release: () => void } | undefined;
+  let extraHeaders: Record<string, string> = {}, limitedReads: Record<string, string> | undefined, readDelayMs = 0;
+  const readSpans: { start: number; end?: number }[] = [];
   const calls: { operation: string; variables: Record<string, any> }[] = [];
   const lostResponses: { operation: WriteOperation; id: string }[] = [];
   const violations: string[] = [];
@@ -34,7 +37,7 @@ export async function startLinearServer() {
   };
   const server = createServer(async (request, response) => {
     const reply = (status: number, data: unknown) => {
-      response.writeHead(status, { "Content-Type": "application/json" }).end(JSON.stringify(data));
+      response.writeHead(status, { ...extraHeaders, "Content-Type": "application/json" }).end(JSON.stringify(data));
     };
     if (request.method !== "POST" || request.url !== "/graphql") { reply(404, {}); return; }
     if (request.headers.authorization !== apiKey) { violations.push("Invalid API key header"); reply(401, {}); return; }
@@ -45,6 +48,11 @@ export async function startLinearServer() {
       const operation = parsed.operationName ?? /(?:query|mutation)\s+(\w+)/.exec(parsed.query ?? "")?.[1];
       const variables = parsed.variables ?? {};
       calls.push({ operation, variables });
+      let span: { start: number; end?: number } | undefined;
+      if (operation === "InfiniteLinearIssues") {
+        span = { start: performance.now() }; readSpans.push(span);
+        if (readDelayMs) await new Promise(resolve => setTimeout(resolve, readDelayMs));
+      }
       if (unavailable) { reply(503, { errors: [{ message: "Fixture transport unavailable" }] }); return; }
       let data: unknown, writtenId: string | undefined;
       switch (operation) {
@@ -54,6 +62,7 @@ export async function startLinearServer() {
         case "InfiniteLinearIssues": {
           const ids = variables.filter?.id?.in;
           if (!Array.isArray(ids)) throw new Error("Issue reconciliation requires canonical IDs");
+          if (limitedReads) { span!.end = performance.now(); response.writeHead(429, { ...limitedReads, "Content-Type": "application/json" }).end(JSON.stringify({ errors: [{ message: "Rate limited", extensions: { code: "RATELIMITED" } }] })); return; }
           data = { issues: { nodes: ids.flatMap(id => issues.has(id) ? [issues.get(id)] : []),
             pageInfo: { hasNextPage: false, endCursor: null } } };
           break;
@@ -70,7 +79,6 @@ export async function startLinearServer() {
         case "InfiniteLinearIssueUpdate": {
           const issue = issues.get(variables.id), input = variables.input;
           if (!issue || typeof input?.title !== "string") throw new Error("Incomplete issue update");
-          // A held update fails before it commits; the test commits it later to model a delayed write.
           if (holdTitle) { holdTitle = false; heldTitles.push({ id: issue.id, title: input.title }); response.destroy(); return; }
           if (rejectTitle) { rejectTitle = false; data = { issueUpdate: { success: false, issue: null } }; break; }
           Object.assign(issue, { title: input.title, ...titleUpdateEdit, updatedAt: updatedAt() });
@@ -106,12 +114,22 @@ export async function startLinearServer() {
         case "InfiniteLinearIssueAddLabel":
         case "InfiniteLinearIssueRemoveLabel": {
           if (!issues.has(variables.id)) throw new Error("Label change needs a known issue");
-          if (rateLimitLabelChanges) { response.writeHead(200, { "Content-Type": "application/json", "retry-after": "120" }).end(JSON.stringify({ errors: [{ message: "Rate limited", extensions: { code: "RATELIMITED" } }] })); return; }
-          // Linear answers an unknown (for example deleted) label with an error, not a protocol violation.
+          if (rateLimitLabelChanges) {
+            if (heldLabelRateLimit) {
+              const held = heldLabelRateLimit; heldLabelRateLimit = undefined;
+              held.request({ operation, issueId: variables.id }); await held.result;
+            }
+            response.writeHead(200, { "Content-Type": "application/json", "retry-after": "120" }).end(JSON.stringify({ errors: [{ message: "Rate limited", extensions: { code: "RATELIMITED" } }] })); return;
+          }
           if (!labels.has(variables.labelId)) { reply(200, { errors: [{ message: "Entity not found: IssueLabel" }] }); return; }
           const applied = issueLabels.get(variables.id) ?? new Set<string>(), adding = operation === "InfiniteLinearIssueAddLabel";
           if (adding) applied.add(variables.labelId); else applied.delete(variables.labelId);
           issueLabels.set(variables.id, applied);
+          if (heldLabelAck) {
+            const held = heldLabelAck; heldLabelAck = undefined;
+            held.apply({ operation, issueId: variables.id, labelId: variables.labelId });
+            if (await held.result) { reply(200, { errors: [{ message: "Fixture rejected the label acknowledgement" }] }); return; }
+          }
           data = { [adding ? "issueAddLabel" : "issueRemoveLabel"]: { success: true } }; break;
         }
         default: throw new Error(`Unexpected GraphQL operation: ${operation}`);
@@ -121,6 +139,7 @@ export async function startLinearServer() {
         drop = undefined; unavailable = true;
         response.destroy(); return;
       }
+      if (span) span.end = performance.now();
       reply(200, { data });
     } catch (error) {
       violations.push(error instanceof Error ? error.message : "Invalid fixture request");
@@ -134,6 +153,28 @@ export async function startLinearServer() {
     failLabelLookups(value: boolean) { failLabels = value; },
     rateLimitLabelLookups(value: boolean) { rateLimitLabels = value; },
     rateLimitLabelChanges(value: boolean) { rateLimitLabelChanges = value; },
+    holdNextLabelRateLimit() {
+      if (heldLabelRateLimit) throw new Error("A label rate-limit response is already held");
+      let request!: (value: { operation: string; issueId: string }) => void;
+      let release!: () => void;
+      const requested = new Promise<{ operation: string; issueId: string }>(resolve => { request = resolve; });
+      const result = new Promise<void>(resolve => { release = resolve; });
+      heldLabelRateLimit = { request, result, release };
+      return { requested, release: () => release() };
+    },
+    holdNextLabelChangeAcknowledgement() {
+      if (heldLabelAck) throw new Error("A label acknowledgement is already held");
+      let apply!: (value: { operation: string; issueId: string; labelId: string }) => void;
+      let finish!: (failed: boolean) => void;
+      const applied = new Promise<{ operation: string; issueId: string; labelId: string }>(resolve => { apply = resolve; });
+      const result = new Promise<boolean>(resolve => { finish = resolve; });
+      heldLabelAck = { apply, result, finish };
+      return { applied, acknowledge: () => finish(false), fail: () => finish(true) };
+    },
+    responseHeaders(headers: Record<string, string>) { extraHeaders = headers; },
+    rateLimitReads(headers: Record<string, string> | undefined) { limitedReads = headers; },
+    delayReads(ms: number) { readDelayMs = ms; },
+    readSpans,
     dropNextResponse(operation: WriteOperation, bodyIncludes?: string) { drop = { operation, bodyIncludes }; },
     restore() { unavailable = false; },
     editIssue(id: string, changes: IssueEdit) {

@@ -44,7 +44,6 @@ export async function attachNativeOpenCode(config: { origin: string; token: stri
   let killTimer: ReturnType<typeof setTimeout> | undefined;
   const detach = () => {
     if (ended || detaching) return; detaching = true;
-    // Cut off transport before the native UI can send cleanup requests.
     server.closeAllConnections(); server.close(); child?.kill("SIGTERM");
     if (child) killTimer = setTimeout(() => child?.kill("SIGKILL"), 2000);
   };

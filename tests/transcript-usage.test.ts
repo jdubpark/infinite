@@ -6,7 +6,6 @@ import type { UsageRecord, UsageTokens } from "../packages/host/src/usage.js";
 
 const fixture = (name: string) => new URL(`./fixtures/usage/${name}`, import.meta.url);
 
-/** Pushes every row of a fixture. Lines that are not JSON are skipped, as a relay would skip them. */
 function pushFixture(tail: UsageTail, name: string): UsageRecord[] {
   const records: UsageRecord[] = [];
   for (const line of readFileSync(fixture(name), "utf8").split("\n")) {
@@ -60,6 +59,19 @@ test("Claude classes do not overlap", () => {
   assert.equal(record.cacheWrite1h, 500);
   assert.equal(record.tokens.input, 1200);
   assert.equal(record.tokens.cacheRead, 5000);
+});
+
+test("Code Mode transcript usage counts each real model message and skips virtual rows", () => {
+  const tail = new UsageTail({ provider: "claude" });
+  const rows = readFileSync(new URL("./fixtures/claude-code-mode/transcript.jsonl", import.meta.url), "utf8").trim().split("\n");
+  const records = rows.flatMap(line => tail.push(JSON.parse(line)));
+  assert.deepEqual(records.map(record => record.messageId), ["msg_010001", "msg_010002"]);
+  assert.deepEqual(records.reduce((total, record) => {
+    for (const key of TOKEN_CLASSES) total[key] += record.tokens[key];
+    return total;
+  }, { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 }), {
+    input: 4, output: 247, reasoning: 112, cacheRead: 17094, cacheWrite: 17529,
+  });
 });
 
 test("a Claude message that grows is emitted again", () => {
@@ -275,7 +287,6 @@ test("reconciled holds when request totals match the last cumulative total", () 
   assert.equal(new UsageTail({ provider: "claude" }).reconciled(), true);
 });
 
-/** The usage tail of a fixture, with every row pushed. */
 function pushFixtureTail(name: string): UsageTail {
   const tail = new UsageTail({ provider: "codex" });
   pushFixture(tail, name);
@@ -306,7 +317,6 @@ test("a repeated response counts once, and a larger total for it replaces the re
   const larger = { input_tokens: 1500, cached_input_tokens: 300, cache_write_input_tokens: 0, output_tokens: 230, reasoning_output_tokens: 30, total_tokens: 1730 };
   const grown = tail.push(requestRow("resp_dup", "turn_dup", larger));
   assert.equal(grown.length, 1);
-  // The record under the same key holds the whole new snapshot. Only the difference joins the request total.
   assert.deepEqual(grown[0]?.tokens, { input: 1200, output: 200, reasoning: 30, cacheRead: 300, cacheWrite: 0 });
   assert.equal(grown[0]?.messageId, "resp_dup");
   assert.equal(tail.requestTotal(), 1730);

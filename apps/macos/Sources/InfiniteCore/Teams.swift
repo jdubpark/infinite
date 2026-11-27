@@ -1,19 +1,41 @@
 import Foundation
 
-/// One team run as the host reports it: a coordinator's plan, the members working on it, the
-/// decisions waiting on a person, and the host's own check and review evidence. Values are read
-/// on demand from the host's JSON so fields this app does not know pass through untouched.
 public struct TeamRun: Identifiable, Equatable, Sendable {
+    public enum Status: Equatable, Sendable {
+        case planning, discovering, implementing, integrating, verifying, reviewing, delivering
+        case merged, needsInput, paused, blocked, readyForReview, noChange, cancelled
+        case unknown(String)
+
+        public init(_ raw: String) {
+            switch raw {
+            case "planning": self = .planning
+            case "discovering": self = .discovering
+            case "implementing": self = .implementing
+            case "integrating": self = .integrating
+            case "verifying": self = .verifying
+            case "reviewing": self = .reviewing
+            case "delivering": self = .delivering
+            case "merged": self = .merged
+            case "needs-input": self = .needsInput
+            case "paused": self = .paused
+            case "blocked": self = .blocked
+            case "ready-for-review": self = .readyForReview
+            case "no-change": self = .noChange
+            case "cancelled": self = .cancelled
+            default: self = .unknown(raw)
+            }
+        }
+    }
+
     public let value: JSON
     public init(_ value: JSON) { self.value = value }
     public var id: String { value["id"].string }
     public var title: String { value["title"].string }
     public var status: String { value["status"].string }
+    public var typedStatus: Status { Status(status) }
     public var revision: Int { value["revision"].int }
     public var projectID: String { value["projectId"].string }
-    /// The mission whose coordinator runs this team; empty for a team an owner started directly.
     public var missionID: String { value["missionId"].string }
-    /// A mission's subteam is run by its coordinator and is read-only to people: no steering, decisions, owner actions, or ratings.
     public var managedByMission: Bool { !missionID.isEmpty }
     public var provider: String { value["provider"].string }
     public var objective: String { value["objective"].string }
@@ -34,16 +56,22 @@ public struct TeamRun: Identifiable, Equatable, Sendable {
     public var review: JSON { value["review"] }
     public var lineup: JSON { value["lineup"] }
     public var hasLineup: Bool { lineup != .null }
-    /// Questions of the current revision that nobody has answered yet.
     public var openDecisions: [JSON] { decisions.filter { $0["revision"].int == revision && $0["answer"] == .null } }
     public var answeredDecisions: [JSON] { decisions.filter { $0["answer"] != .null } }
-    /// Members of the current revision whose agent sessions are live.
     public var activeMembers: [JSON] { members.filter { $0["revision"].int == revision && ["running", "waiting"].contains($0["status"].string) } }
-    public var needsYou: Bool { status == "needs-input" }
-    /// The agents have stopped: the run waits for a person's review, reported a merge, proposed no change, or was cancelled.
-    public var finished: Bool { ["ready-for-review", "merged", "no-change", "cancelled"].contains(status) }
-    /// Agents are working or the host is integrating, checking, reviewing, or delivering.
-    public var working: Bool { ["planning", "discovering", "implementing", "integrating", "verifying", "reviewing", "delivering"].contains(status) }
+    public var needsYou: Bool { typedStatus == .needsInput }
+    public var finished: Bool {
+        switch typedStatus {
+        case .readyForReview, .merged, .noChange, .cancelled: return true
+        default: return false
+        }
+    }
+    public var working: Bool {
+        switch typedStatus {
+        case .planning, .discovering, .implementing, .integrating, .verifying, .reviewing, .delivering: return true
+        default: return false
+        }
+    }
     public var statusLabel: String { Self.labels[status] ?? status.replacingOccurrences(of: "-", with: " ").capitalizedFirstLetter }
     public static let labels: [String: String] = [
         "planning": "Planning", "discovering": "Investigating", "implementing": "Implementing", "integrating": "Integrating",
@@ -51,41 +79,41 @@ public struct TeamRun: Identifiable, Equatable, Sendable {
         "needs-input": "Needs your input", "paused": "Paused", "blocked": "Blocked",
         "ready-for-review": "Ready for your review", "no-change": "No change proposed", "cancelled": "Cancelled",
     ]
-    /// The home board's group for this run. A run waiting for review is pending, not complete; a reported
-    /// merge is the only complete state, and it remains an agent report rather than host verification.
     public var projectState: ProjectState {
-        switch status {
-        case "cancelled": return .cancelled
-        case "no-change": return .aborted
-        case "merged": return .complete
-        case "paused": return .paused
-        case "blocked": return .stuck
-        case "needs-input", "ready-for-review": return .pending
-        default: return openDecisions.isEmpty ? .ongoing : .pending
+        switch typedStatus {
+        case .cancelled: return .cancelled
+        case .noChange: return .aborted
+        case .merged: return .complete
+        case .paused: return .paused
+        case .blocked: return .stuck
+        case .needsInput, .readyForReview: return .pending
+        case .planning, .discovering, .implementing, .integrating, .verifying, .reviewing, .delivering, .unknown:
+            return openDecisions.isEmpty ? .ongoing : .pending
         }
     }
-    /// How full the status ring draws: the plan's integrated share, never below the current phase's floor.
     public var progressFraction: Double {
-        if ["ready-for-review", "merged"].contains(status) { return 1 }
-        let floor = ["integrating": 0.5, "verifying": 0.75, "reviewing": 0.75, "delivering": 1.0][status] ?? 0.25
+        if typedStatus == .readyForReview || typedStatus == .merged { return 1 }
+        let floor: Double = switch typedStatus {
+        case .delivering: 1.0
+        case .verifying, .reviewing: 0.75
+        case .integrating: 0.5
+        default: 0.25
+        }
         let (done, total) = progress
         return max(floor, total > 0 ? Double(done) / Double(total) : 0)
     }
-    /// When the run last did something a person would notice: its latest history entry. The host
-    /// rewrites `updatedAt` on routine scheduler passes, so that is only the fallback.
-    public var lastActivityAt: String { events.map { $0["at"].string }.max() ?? updatedAt }
-    /// The Linear issue the host syncs this run to, when it tracks one.
+    public var lastActivityAt: String {
+        let recorded = value["lastActivityAt"].string
+        if !recorded.isEmpty { return recorded }
+        return events.map { $0["at"].string }.filter { !$0.isEmpty }.max() ?? updatedAt
+    }
     public var linearIssue: String { value["linear"]["issue"]["identifier"].string }
-    /// A blocked run the owner can resume from a list without the team page: the host marked it resumable,
-    /// it has no goal or delivery receipt that a resume would have to preserve, and no mission coordinator runs it.
     public var offersResume: Bool {
-        status == "blocked" && value["resumable"].bool && Self.absent(value["goal"]) && Self.absent(value["deliveryReceipt"]) && !managedByMission
+        typedStatus == .blocked && value["resumable"].bool && Self.absent(value["goal"]) && Self.absent(value["deliveryReceipt"]) && !managedByMission
     }
-    /// Blocked runs first. A stable partition: the incoming order holds within the blocked and the other runs.
     public static func blockedFirst(_ runs: [TeamRun]) -> [TeamRun] {
-        runs.filter { $0.status == "blocked" } + runs.filter { $0.status != "blocked" }
+        runs.filter { $0.typedStatus == .blocked } + runs.filter { $0.typedStatus != .blocked }
     }
-    /// A field the host leaves out, or sends as null or an empty string, carries nothing.
     private static func absent(_ value: JSON) -> Bool {
         switch value {
         case .null: return true
@@ -96,11 +124,9 @@ public struct TeamRun: Identifiable, Equatable, Sendable {
     public static func roleName(_ role: String) -> String {
         ["project-manager": "Coordinator", "implementer": "Implementer", "integrator": "Integrator", "reviewer": "Reviewer"][role] ?? role.capitalizedFirstLetter
     }
-    /// Integrated tasks out of the planned total; zero total means no plan has been reported yet.
     public var progress: (integrated: Int, total: Int) {
         (tasks.filter { $0["status"].string == "integrated" }.count, tasks.count)
     }
-    /// One line for a list row: the state, then what it is waiting on or how far the plan got.
     public var summaryLine: String {
         let open = openDecisions.count
         if needsYou && open > 0 { return "\(statusLabel) · \(open == 1 ? "1 decision" : "\(open) decisions")" }
@@ -111,8 +137,6 @@ public struct TeamRun: Identifiable, Equatable, Sendable {
     public func member(_ id: String) -> JSON? { members.first { $0["memberId"].string == id } }
     public func task(_ id: String) -> JSON? { tasks.first { $0["id"].string == id } }
 
-    /// Tasks grouped into columns by dependency depth, so parallel work shares a column.
-    /// Unknown or cyclic dependencies do not hide a task; it lands after what is known.
     public var taskColumns: [[JSON]] {
         var depth: [String: Int] = [:]
         func level(_ id: String, _ seen: Set<String>) -> Int {
@@ -131,7 +155,6 @@ public struct TeamRun: Identifiable, Equatable, Sendable {
         }
         return columns
     }
-    /// The latest host check per command in the current revision, setup excluded.
     public var currentChecks: [JSON] {
         var latest: [String: JSON] = [:]
         var order: [String] = []
@@ -143,24 +166,21 @@ public struct TeamRun: Identifiable, Equatable, Sendable {
         return order.compactMap { latest[$0] }
     }
     public static func commandLine(_ command: JSON) -> String { ([command["command"].string] + command["args"].array.map(\.string)).joined(separator: " ") }
-    /// The reviewer's verdict for this revision; an earlier revision's verdict no longer applies.
     public var currentVerdict: String? { review != .null && review["revision"].int == revision ? review["verdict"].string : nil }
 
     public enum StageState: Equatable, Sendable { case pending, active, done, failed }
-    /// Where the run stands at each pipeline stage, from recorded evidence first and status second.
     public var stages: [(name: String, state: StageState)] {
         let checks = currentChecks
         let allIntegrated = !tasks.isEmpty && tasks.allSatisfy { $0["status"].string == "integrated" }
-        let plan: StageState = !tasks.isEmpty ? .done : ["planning", "discovering"].contains(status) ? .active : .pending
-        let build: StageState = allIntegrated ? .done : tasks.contains { $0["status"].string == "blocked" } ? .failed : status == "implementing" || tasks.contains { ["running", "waiting"].contains($0["status"].string) } ? .active : .pending
-        let integrate: StageState = allIntegrated && !headCommit.isEmpty ? .done : status == "integrating" ? .active : .pending
-        let check: StageState = checks.contains { $0["status"].string == "failed" } ? .failed : !checks.isEmpty && checks.allSatisfy { $0["status"].string == "passed" } ? .done : status == "verifying" || checks.contains { $0["status"].string == "running" } ? .active : .pending
-        let reviewed: StageState = currentVerdict == "approved" ? .done : currentVerdict == "changes-requested" ? .failed : status == "reviewing" ? .active : .pending
-        let you: StageState = status == "ready-for-review" || needsYou ? .active : status == "merged" ? .done : .pending
+        let plan: StageState = !tasks.isEmpty ? .done : (typedStatus == .planning || typedStatus == .discovering) ? .active : .pending
+        let build: StageState = allIntegrated ? .done : tasks.contains { $0["status"].string == "blocked" } ? .failed : typedStatus == .implementing || tasks.contains { ["running", "waiting"].contains($0["status"].string) } ? .active : .pending
+        let integrate: StageState = allIntegrated && !headCommit.isEmpty ? .done : typedStatus == .integrating ? .active : .pending
+        let check: StageState = checks.contains { $0["status"].string == "failed" } ? .failed : !checks.isEmpty && checks.allSatisfy { $0["status"].string == "passed" } ? .done : typedStatus == .verifying || checks.contains { $0["status"].string == "running" } ? .active : .pending
+        let reviewed: StageState = currentVerdict == "approved" ? .done : currentVerdict == "changes-requested" ? .failed : typedStatus == .reviewing ? .active : .pending
+        let you: StageState = typedStatus == .readyForReview || needsYou ? .active : typedStatus == .merged ? .done : .pending
         return [("Plan", plan), ("Build", build), ("Integrate", integrate), ("Checks", check), ("Review", reviewed), ("You", you)]
     }
 
-    /// Text an agent put under a "Limitations:" heading in its report, up to the next blank line.
     public static func limitations(_ text: String) -> String? {
         let lines = text.components(separatedBy: .newlines)
         guard let start = lines.firstIndex(where: { $0.trimmingCharacters(in: .whitespaces).lowercased().hasPrefix("limitations:") }) else { return nil }
@@ -171,7 +191,120 @@ public struct TeamRun: Identifiable, Equatable, Sendable {
         return body.isEmpty ? nil : body
     }
 
-    /// One concrete review action: a direction to send the team, or a command to copy.
+    public static func limitations(of task: JSON) -> [String] {
+        if case .array(let items) = task["limitations"] {
+            return items.compactMap { item -> String? in
+                guard case .string(let text) = item else { return nil }
+                let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                return trimmed.isEmpty ? nil : trimmed
+            }
+        }
+        guard let legacy = limitations(task["summary"].string) else { return [] }
+        return [legacy]
+    }
+
+    public static let maxSteeringDirectionChars = 8_000
+
+    private static func utf16Prefix(_ text: String, maxUnits: Int) -> String {
+        guard maxUnits > 0 else { return "" }
+        guard text.utf16.count > maxUnits else { return text }
+        var result = ""
+        var used = 0
+        for character in text {
+            let cost = character.utf16.count
+            if used + cost > maxUnits {
+                if result.isEmpty {
+                    for scalar in character.unicodeScalars {
+                        let scalarCost = scalar.utf16.count
+                        if used + scalarCost > maxUnits { break }
+                        result.unicodeScalars.append(scalar)
+                        used += scalarCost
+                    }
+                }
+                break
+            }
+            result.append(character)
+            used += cost
+        }
+        return result
+    }
+
+    private static func utf16Chunks(_ text: String, maxUnits: Int) -> [String] {
+        guard maxUnits > 0 else { return [] }
+        guard text.utf16.count > maxUnits else { return [text] }
+        var chunks: [String] = []
+        var current = ""
+        var used = 0
+        for character in text {
+            let cost = character.utf16.count
+            if cost <= maxUnits {
+                if used + cost > maxUnits, !current.isEmpty {
+                    chunks.append(current)
+                    current = ""
+                    used = 0
+                }
+                current.append(character)
+                used += cost
+            } else {
+                for scalar in character.unicodeScalars {
+                    let scalarCost = scalar.utf16.count
+                    if used + scalarCost > maxUnits, !current.isEmpty {
+                        chunks.append(current)
+                        current = ""
+                        used = 0
+                    }
+                    if scalarCost <= maxUnits {
+                        current.unicodeScalars.append(scalar)
+                        used += scalarCost
+                    }
+                }
+            }
+        }
+        if !current.isEmpty { chunks.append(current) }
+        return chunks
+    }
+
+    private static func limitationDirection(taskTitle: String, notes: [String]) -> String {
+        if notes.count == 1, let note = notes.first {
+            return "In \"\(taskTitle)\" the agent reported this limitation: \(note)\nResolve it or explain why it is acceptable."
+        }
+        let bullets = notes.map { "- \($0)" }.joined(separator: "\n")
+        return "In \"\(taskTitle)\" the agent reported these limitations:\n\(bullets)\nResolve them or explain why they are acceptable."
+    }
+
+    private static func limitationReviewSteps(taskTitle: String, notes: [String]) -> [ReviewStep] {
+        guard !notes.isEmpty else { return [] }
+        let singleWrapperCost = limitationDirection(taskTitle: "", notes: [""]).utf16.count
+        let multiWrapperCost = limitationDirection(taskTitle: "", notes: ["", ""]).utf16.count
+        let maxTitleUnits = max(0, min(200, maxSteeringDirectionChars - max(singleWrapperCost, multiWrapperCost) - 16))
+        let directionTitle = taskTitle.utf16.count > maxTitleUnits && limitationDirection(taskTitle: taskTitle, notes: notes).utf16.count > maxSteeringDirectionChars
+            ? utf16Prefix(taskTitle, maxUnits: maxTitleUnits)
+            : taskTitle
+        let singleBudget = max(1, maxSteeringDirectionChars - limitationDirection(taskTitle: directionTitle, notes: [""]).utf16.count)
+        let expanded = notes.flatMap { note -> [String] in
+            note.utf16.count <= singleBudget ? [note] : utf16Chunks(note, maxUnits: singleBudget)
+        }
+        var groups: [[String]] = []
+        var current: [String] = []
+        for note in expanded {
+            let candidate = current + [note]
+            if !current.isEmpty && limitationDirection(taskTitle: directionTitle, notes: candidate).utf16.count > maxSteeringDirectionChars {
+                groups.append(current)
+                current = [note]
+            } else {
+                current = candidate
+            }
+        }
+        if !current.isEmpty { groups.append(current) }
+        return groups.map { group in
+            let direction = limitationDirection(taskTitle: directionTitle, notes: group)
+            if group.count == 1, let note = group.first {
+                return ReviewStep(title: "Resolve a flagged limitation", detail: "\(taskTitle): \(note)", action: .direction(direction), urgent: false)
+            }
+            return ReviewStep(title: "Resolve flagged limitations", detail: "\(taskTitle): \(group.joined(separator: " · "))", action: .direction(direction), urgent: false)
+        }
+    }
+
     public struct ReviewStep: Equatable, Sendable {
         public enum Action: Equatable, Sendable { case direction(String), copy(String) }
         public let title: String
@@ -179,8 +312,6 @@ public struct TeamRun: Identifiable, Equatable, Sendable {
         public let action: Action
         public let urgent: Bool
     }
-    /// What the person should do with a run that reports ready: blockers first, then the usual checks.
-    /// These are suggestions; the host never approves or merges on the person's behalf.
     public var reviewSteps: [ReviewStep] {
         var steps: [ReviewStep] = []
         for check in currentChecks where check["status"].string == "failed" {
@@ -191,8 +322,8 @@ public struct TeamRun: Identifiable, Equatable, Sendable {
             steps.append(.init(title: "Address the reviewer's changes", detail: "The reviewer did not approve this revision.", action: .direction("Address every change the reviewer requested, then rerun the checks."), urgent: true))
         }
         for task in tasks {
-            guard let note = Self.limitations(task["summary"].string) else { continue }
-            steps.append(.init(title: "Resolve a flagged limitation", detail: "\(task["title"].string): \(note)", action: .direction("In \"\(task["title"].string)\" the agent reported this limitation: \(note)\nResolve it or explain why it is acceptable."), urgent: false))
+            let notes = Self.limitations(of: task)
+            steps.append(contentsOf: Self.limitationReviewSteps(taskTitle: task["title"].string, notes: notes))
         }
         if !baseCommit.isEmpty {
             let target = headCommit.isEmpty ? branch : headCommit
@@ -204,9 +335,7 @@ public struct TeamRun: Identifiable, Equatable, Sendable {
     }
 }
 
-/// Where a run sits on the home board, in the order the board lists them.
 public enum ProjectState: String, CaseIterable, Sendable {
-    /// Declaration order is the board order: blocked runs first, then the rest in their existing order.
     case stuck, ongoing, pending, paused, complete, cancelled, aborted
     public var title: String {
         switch self {
@@ -219,7 +348,6 @@ public enum ProjectState: String, CaseIterable, Sendable {
         case .aborted: return "Aborted"
         }
     }
-    /// The agents stopped for good; the board folds these groups until opened.
     public var closed: Bool { [.complete, .cancelled, .aborted].contains(self) }
 }
 

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { chooseTeamBrief, failedTeamBriefRow, orderedTeamMembers, teamLogsText, teamMonitorText, teamSummaryText, teamWatchCommand, teamWatchFrame, teamWatchScreen, visibleScreen, wrapText } from "../packages/host/src/team-watch.ts";
+import { chooseTeamBrief, failedTeamBriefRow, openQuestionLines, orderedTeamMembers, teamLogsText, teamMonitorText, teamSummaryText, teamWatchCommand, teamWatchFrame, teamWatchScreen, visibleScreen, wrapText } from "../packages/host/src/team-watch.ts";
 import { chooseBrief, monitorMembers, summarySessionId, type BriefingView } from "../apps/web/src/team-monitor.ts";
 import { chooseBrief as choosePhoneBrief, orderedMembers, plainScreen } from "../apps/mobile/src/features/teams/summary.ts";
 
@@ -19,9 +19,23 @@ const team = {
     { memberId: "impl", sessionId: "s-impl", role: "implementer", revision: 2, title: "Alarm stop", status: "waiting", taskId: "task-1" },
   ],
   tasks: [{ status: "pending" }, { status: "running" }],
-  decisions: [{ id: "q1", question: "Which signal means awake?", answer: undefined }],
+  decisions: [{ id: "q1", question: "Which signal means awake?", answer: undefined, recommendation: { answers: ["Heartbeat"], reason: "It is the signal the host already records" } }],
   events: [{ text: "Coordinator started the fresh plan" }],
 };
+
+test("the web monitor lists an evaluator right after a reviewer", () => {
+  const member = (memberId: string, role: string) => ({ memberId, sessionId: `s-${memberId}`, role, revision: 1, title: memberId, status: "running" });
+  const ordered = monitorMembers([member("delivery", "delivery"), member("evaluator", "evaluator"), member("reviewer", "reviewer")], 1);
+  assert.deepEqual(ordered.map(item => item.memberId), ["reviewer", "evaluator", "delivery"]);
+});
+
+test("a question prints the asking agent's recommendation before its options", () => {
+  const question = { id: "q1", revision: 2, question: "Which store?", options: ["SQLite", "Files"], recommendation: { answers: ["SQLite"], reason: "One writer." } };
+  assert.deepEqual(openQuestionLines(question), ["Question q1: Which store?", "  The asking agent recommends: SQLite. Reason: One writer.", "  1. SQLite", "  2. Files"]);
+  const card = teamSummaryText({ ...team, decisions: [question] }, []).split("\n");
+  const recommended = card.findIndex(line => line.includes("The asking agent recommends: SQLite")), options = card.findIndex(line => line.includes("Options: SQLite / Files"));
+  assert.ok(recommended > 0 && options === recommended + 1, card.join("\n"));
+});
 
 test("the watch card shows current members and stays stable when nothing changed", () => {
   const first = teamMonitorText(team);
@@ -30,6 +44,7 @@ test("the watch card shows current members and stays stable when nothing changed
   assert.doesNotMatch(first, /First plan/);
   assert.match(first, /Tasks {2}1 pending · 1 running/);
   assert.match(first, /Which signal means awake/);
+  assert.match(first, /The asking agent recommends: Heartbeat\. Reason: It is the signal the host already records/);
   assert.equal(teamWatchFrame(first, teamMonitorText(team), false), null);
   assert.equal(teamWatchFrame(first, teamMonitorText({ ...team, status: "implementing" }), false)?.includes("implementing"), true);
   assert.equal(teamWatchFrame(first, first, true)?.startsWith("\x1b[H\x1b[J"), true);
@@ -78,15 +93,13 @@ test("the summary card reads the coordinator brief and the log card returns to i
   assert.match(summary, /not completion or approval/);
   assert.doesNotMatch(summary, /Implementer brief/);
   assert.doesNotMatch(summary, /Keep the first plan/);
-  // The person's open decision comes before the brief, with the command that answers it.
   assert.ok(summary.indexOf("Which signal means awake") < summary.indexOf("Coordinator brief"));
   assert.match(summary, /infinite team answer team-1 q1 "YOUR ANSWER"/);
-  // Sections follow the briefing contract: outcome, system shape, ranked review questions, changes, gaps.
   const order = ["Coordinator brief", "SYSTEM SHAPE", "REVIEW FIRST", "WHAT CHANGED", "GAPS AND UNKNOWNS"].map(text => summary.indexOf(text));
   assert.deepEqual([...order].sort((a, b) => a - b), order);
   assert.ok(!order.includes(-1));
   assert.match(summary, /1\. \[high\] alarm gate\n\s+It decides when the alarm stops\n\s+Ask: Does rolling over count\?/);
-  assert.match(summary.split("\n").at(-1)!, /^l logs · q quit$/);
+  assert.match(summary.split("\n").at(-1)!, /^b board · l logs · q quit$/);
   assert.match(teamSummaryText(detailed, [{ sessionId: "s-pm", status: ready }]).split("\n").at(-1)!, /infinite team status team-1 --logs/);
   const empty = teamSummaryText(detailed, [{ sessionId: "s-pm", status: { state: "empty" } }], "", true);
   assert.match(empty, /Press a to refresh the Brief/);
@@ -101,7 +114,6 @@ test("the summary card reads the coordinator brief and the log card returns to i
   const screen = "\u001b[32mplanning the stop\u001b[0m\nnext step";
   assert.match(visibleScreen(screen), /planning the stop\nnext step/);
   assert.equal(plainScreen(screen), "planning the stop\nnext step");
-  // Blank rows under the composer do not count, so the last lines (dialog and prompt) survive the window.
   assert.equal(plainScreen("Run it?\nyes\n\n   \n", 1), "yes");
   const rows = Array.from({ length: 20 }, (_, index) => `row ${index + 1}`);
   assert.equal(plainScreen([...rows, "", " "].join("\n"), 14), rows.slice(-14).join("\n"));
@@ -115,13 +127,17 @@ test("the summary card reads the coordinator brief and the log card returns to i
   assert.match(logs, /Implementer waiting/);
   assert.match(logs, /Coordinator stopped r1/);
   assert.match(logs, /planning the stop/);
-  assert.match(logs.split("\n").at(-1)!, /^←→ agent · s summary · q quit$/);
+  assert.match(logs.split("\n").at(-1)!, /^←→ agent · b board · s summary · q quit$/);
 });
 
 test("watch keys switch views and agents, scroll, and detach", () => {
   assert.equal(teamWatchCommand("l"), "logs");
-  assert.equal(teamWatchCommand("b"), "summary");
+  assert.equal(teamWatchCommand("b"), "board");
   assert.equal(teamWatchCommand("s"), "summary");
+  assert.equal(teamWatchCommand("\r"), "enter");
+  assert.equal(teamWatchCommand("\n"), "enter");
+  assert.equal(teamWatchCommand("f"), "follow");
+  assert.equal(teamWatchCommand("o"), "openMember");
   assert.equal(teamWatchCommand("n"), "next");
   assert.equal(teamWatchCommand("p"), "prev");
   assert.equal(teamWatchCommand("\u001b[C"), "next");
@@ -137,7 +153,6 @@ test("watch keys switch views and agents, scroll, and detach", () => {
   assert.equal(teamWatchCommand("q"), "detach");
   assert.equal(teamWatchCommand("\u0003ln"), "detach");
   assert.equal(teamWatchCommand("ln"), "next");
-  // The final byte of an escape sequence is not read as a separate key.
   assert.equal(teamWatchCommand("l\u001bOB"), "down");
   assert.equal(teamWatchCommand("x"), null);
 });
@@ -174,7 +189,6 @@ test("a fixed status row keeps body position and frame height stable", () => {
 });
 
 test("recorded screens keep their terminal height without padding, and agent strips stay within width", () => {
-  // A terminal screen keeps its trailing blank rows, so its block height does not change as output fills it.
   const rows = (text: string) => visibleScreen(text, 6).split("\n").length;
   assert.equal(rows("one line\n\n\n\n"), rows("one line\ntwo lines\nthree\n\n"));
   assert.equal(rows("only\n"), 2);
@@ -192,4 +206,80 @@ test("a failed brief refresh retains that session's previous summary", () => {
   assert.equal(failed.status.summary?.text, "Last good brief");
   assert.equal(failed.fetchError, "temporary timeout");
   assert.equal(failedTeamBriefRow("s-impl", "unavailable", [previous]).status.error, "unavailable");
+});
+
+test("the intent checker sorts after the project manager", () => {
+  const ordered = orderedTeamMembers({
+    id: "team-2",
+    revision: 1,
+    members: [
+      { memberId: "scout", sessionId: "s-scout", role: "scout", revision: 1, title: "Scout", status: "running" },
+      { memberId: "checker", sessionId: "s-checker", role: "intent-checker", revision: 1, title: "Check", status: "running" },
+      { memberId: "pm", sessionId: "s-pm", role: "project-manager", revision: 1, title: "Plan", status: "running" },
+    ],
+  });
+  assert.deepEqual(ordered.map(member => member.memberId), ["pm", "checker", "scout"]);
+});
+
+test("the evaluator has a name and a place", () => {
+  const team = {
+    id: "team-3",
+    revision: 1,
+    title: "Run",
+    status: "reviewing",
+    members: [
+      { memberId: "evaluator", sessionId: "s-eval", role: "evaluator", revision: 1, title: "Evaluate", status: "running" },
+      { memberId: "delivery", sessionId: "s-del", role: "delivery", revision: 1, title: "Deliver", status: "running" },
+      { memberId: "reviewer", sessionId: "s-rev", role: "reviewer", revision: 1, title: "Review", status: "running" },
+    ],
+  };
+  const ordered = orderedTeamMembers(team).map(member => member.memberId);
+  assert.equal(ordered.indexOf("evaluator") > ordered.indexOf("reviewer"), true);
+  assert.equal(ordered.indexOf("evaluator") < ordered.indexOf("delivery"), true);
+  assert.match(teamMonitorText({ ...team, workspace: "w", branch: "b", projectId: "p" }), /Evaluator/);
+});
+
+test("teamMonitorText and teamSummaryText render WAIT REASONS and member stall/spinner-only annotations", () => {
+  const waitingTeam = {
+    ...team,
+    members: [
+      { memberId: "pm", sessionId: "s-pm", role: "project-manager", revision: 2, title: "Plan", status: "running", stalledAt: "2026-11-26T00:05:00.000Z" },
+      { memberId: "impl", sessionId: "s-impl", role: "implementer", revision: 2, title: "Alarm stop", status: "running", taskId: "task-1", spinnerOnlySince: "2026-11-26T00:03:00.000Z" },
+    ],
+    waitReasons: [
+      { kind: "stalled", memberId: "pm", summary: "Plan stalled without substantive activity." },
+      { kind: "spinner-only", memberId: "impl", summary: "Alarm stop is showing spinner redraws only." },
+    ],
+  };
+  const monitor = teamMonitorText(waitingTeam);
+  assert.match(monitor, /WAIT REASONS \(2\)/);
+  assert.match(monitor, /\[stalled\] Plan stalled without substantive activity\./);
+  assert.match(monitor, /\[spinner-only\] Alarm stop is showing spinner redraws only\./);
+  assert.match(monitor, /Coordinator {2}running {2}Plan · stalled/);
+  assert.match(monitor, /Implementer {2}running {2}Alarm stop · task-1 · spinner-only/);
+
+  const summary = teamSummaryText(waitingTeam, [{ sessionId: "s-pm", status: { state: "ready", summary: { text: "Brief" } } }]);
+  assert.match(summary, /WAIT REASONS \(2\)/);
+  assert.match(summary, /\[stalled\] Plan stalled without substantive activity\./);
+  assert.match(summary, /\[spinner-only\] Alarm stop is showing spinner redraws only\./);
+
+  const unsortedTeam = {
+    ...team,
+    waitReasons: [
+      { kind: "linear-sync", summary: "Linear\x1b[31m sync\nwaiting" },
+      { kind: "worker-slot", summary: "Slot 1" },
+      { kind: "worker-slot", summary: "Slot 2" },
+      { kind: "worker-slot", summary: "Slot 3" },
+      { kind: "worker-slot", summary: "Slot 4" },
+      { kind: "stalled", summary: "Worker stalled" },
+      { kind: "owner-decision", summary: "Need owner\u0007 choice" },
+    ],
+  };
+  const prioritized = teamMonitorText(unsortedTeam);
+  assert.match(prioritized, /WAIT REASONS \(7\)/);
+  assert.match(prioritized, /\+ 1 more/);
+  assert.ok(prioritized.indexOf("[owner-decision]") < prioritized.indexOf("[stalled]"));
+  assert.ok(prioritized.indexOf("[stalled]") < prioritized.indexOf("[worker-slot]"));
+  assert.doesNotMatch(prioritized, /\[linear-sync\]/);
+  assert.doesNotMatch(prioritized, /\u0007|\x1b\[31m/);
 });

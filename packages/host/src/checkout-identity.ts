@@ -1,47 +1,85 @@
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { basename, dirname } from "node:path";
 import type { ProjectSource } from "./team-types.js";
 
-/** Which repository a checkout is a copy of, captured once from the checkout's own Git metadata. */
 export type CheckoutIdentity = {
   projectId: string;
-  /** `remote:HOST/PATH` (lowercase) or `root:HASH`. Checkouts with equal keys are the same repository. */
   key: string;
-  /** The repository's display name: the remote's last path segment, or the folder name when only a root commit is known. */
   repoName: string;
   capturedAt: string;
   from: "source" | "host-scan";
 };
 
-/** Trimmed stdout of `git -C cwd ...args`, or undefined when Git fails, is missing, or exceeds five seconds. */
+export interface WorkspaceRepositoryBinding { companyId: string; repositoryId: string }
+
 export type GitReader = (cwd: string, args: string[]) => string | undefined;
 
-/**
- * Enrolled checkouts are often owned by the agent user, not the host's service user, and Git refuses to read a
- * repository another user owns ("dubious ownership"). The reads here are metadata lookups that run no hooks, so
- * the ownership check is waived per invocation; the file-system monitor is forced off because it is the one
- * repository-configured command those lookups could otherwise start.
- */
+export type GitCommandResult =
+  | { ok: true; stdout: string }
+  | { ok: false; status: number | null; stderr: string; errorCode?: string; signal?: string };
+
+export type GitResultReader = (cwd: string, args: string[]) => GitCommandResult;
+export type AsyncGitReader = (cwd: string, args: string[]) => Promise<string | undefined>;
+export type AsyncGitResultReader = (cwd: string, args: string[]) => Promise<GitCommandResult>;
+
 const READ_ONLY_GIT = ["-c", "safe.directory=*", "-c", "core.fsmonitor=false"];
 
-export const readGit: GitReader = (cwd, args) => {
+export const readGitResult: GitResultReader = (cwd, args) => {
   try {
-    return execFileSync("git", [...READ_ONLY_GIT, "-C", cwd, ...args], {
-      encoding: "utf8", timeout: 5000, stdio: ["ignore", "pipe", "ignore"], env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+    const stdout = execFileSync("git", [...READ_ONLY_GIT, "-C", cwd, ...args], {
+      encoding: "utf8", timeout: 5000, stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
     }).trim();
-  } catch {
-    return undefined;
+    return { ok: true, stdout };
+  } catch (error) {
+    const err = error as { status?: unknown; stderr?: unknown; code?: unknown; signal?: unknown };
+    const stderr = typeof err.stderr === "string"
+      ? err.stderr.trim()
+      : Buffer.isBuffer(err.stderr) ? err.stderr.toString("utf8").trim() : "";
+    return {
+      ok: false,
+      status: typeof err.status === "number" ? err.status : null,
+      stderr,
+      ...(typeof err.code === "string" ? { errorCode: err.code } : {}),
+      ...(typeof err.signal === "string" ? { signal: err.signal } : {}),
+    };
   }
 };
 
-/** Folder names that say nothing about which repository lives there. */
+export const readGitResultAsync: AsyncGitResultReader = (cwd, args) => new Promise(resolvePromise => {
+  execFile("git", [...READ_ONLY_GIT, "-C", cwd, ...args], {
+    encoding: "utf8", timeout: 5000, maxBuffer: 4 * 1024 * 1024, env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+  }, (error, stdout, stderr) => {
+    if (!error) {
+      resolvePromise({ ok: true, stdout: stdout.trim() });
+      return;
+    }
+    const err = error as { code?: unknown; signal?: unknown; killed?: unknown };
+    const killed = err.killed === true;
+    const status = !killed && typeof err.code === "number" ? err.code : null;
+    const errorCode = typeof err.code === "string" ? err.code : killed ? "ETIMEDOUT" : undefined;
+    const signal = typeof err.signal === "string" ? err.signal : undefined;
+    resolvePromise({
+      ok: false,
+      status,
+      stderr: typeof stderr === "string" ? stderr.trim() : "",
+      ...(errorCode !== undefined ? { errorCode } : {}),
+      ...(signal !== undefined ? { signal } : {}),
+    });
+  });
+});
+
+export const readGit: GitReader = (cwd, args) => {
+  const result = readGitResult(cwd, args);
+  return result.ok ? result.stdout : undefined;
+};
+
+export const readGitAsync: AsyncGitReader = async (cwd, args) => {
+  const result = await readGitResultAsync(cwd, args);
+  return result.ok ? result.stdout : undefined;
+};
+
 const GENERIC_FOLDERS = new Set(["codebase", "code", "src", "repo", "app", "main", "worktree"]);
 
-/**
- * One key for every spelling of a remote: scheme, user info, and a trailing `.git` are dropped and the
- * host is lowercased. A port stays, since it names a different server, and the path keeps its case except
- * on github.com. `repoName` keeps the last path segment's spelling.
- */
 export function normalizeRemote(url: string): { key: string; repoName: string } | undefined {
   const raw = url.trim();
   if (!raw || /\s/.test(raw)) return undefined;
@@ -64,13 +102,11 @@ export function normalizeRemote(url: string): { key: string; repoName: string } 
   const segments = path.split("/").filter(Boolean);
   const repoName = segments.at(-1);
   if (!repoName) return undefined;
-  // GitHub names are case-insensitive; other hosts may distinguish case, and a port names a different server.
   const joined = segments.join("/");
   const hostName = host.replace(/:\d+$/, "");
   return { key: `remote:${host}/${hostName === "github.com" ? joined.toLowerCase() : joined}`, repoName };
 }
 
-/** The checkout folder's name, or its parent's when the folder name is generic (`codebase`, `src`, ...). */
 export function repoNameFromPath(path: string): string {
   const name = basename(path);
   if (!GENERIC_FOLDERS.has(name.toLowerCase())) return name;
@@ -78,27 +114,35 @@ export function repoNameFromPath(path: string): string {
   return parent || name;
 }
 
-/** A GitHub-tracked project names its repository in its source record; the checkout needs no remote and no scan. */
 export function sourceIdentity(project: { id: string; source?: ProjectSource }, at = new Date().toISOString()): CheckoutIdentity | undefined {
   if (project.source?.mode !== "github") return undefined;
   const normalized = normalizeRemote(`https://github.com/${project.source.repository}.git`);
   return normalized ? { projectId: project.id, key: normalized.key, repoName: normalized.repoName, capturedAt: at, from: "source" } : undefined;
 }
 
-/**
- * The identity every host component compares: the source record when the project follows GitHub, otherwise a
- * scan of the checkout. Enrolled GitHub checkouts carry no remote, so a scan alone would name a different key.
- */
 export function expectedIdentity(project: { id: string; path: string; source?: ProjectSource }, git: GitReader, at = new Date().toISOString()): CheckoutIdentity | undefined {
   return sourceIdentity(project, at) ?? captureIdentity(project, git, at);
 }
 
-/** Prefer the origin remote, then the repository's lowest root commit; nothing when Git cannot answer. */
+export async function expectedIdentityAsync(project: { id: string; path: string; source?: ProjectSource }, git: AsyncGitReader, at = new Date().toISOString()): Promise<CheckoutIdentity | undefined> {
+  return sourceIdentity(project, at) ?? captureIdentityAsync(project, git, at);
+}
+
 export function captureIdentity(project: { id: string; path: string }, git: GitReader, at = new Date().toISOString()): CheckoutIdentity | undefined {
   const remote = git(project.path, ["config", "--get", "remote.origin.url"]);
   const normalized = remote ? normalizeRemote(remote) : undefined;
   if (normalized) return { projectId: project.id, key: normalized.key, repoName: normalized.repoName, capturedAt: at, from: "host-scan" };
   const roots = git(project.path, ["rev-list", "--max-parents=0", "HEAD"]);
+  const root = roots?.split(/\s+/).map(line => line.trim()).filter(line => /^[0-9a-f]{4,64}$/i.test(line)).sort()[0];
+  if (!root) return undefined;
+  return { projectId: project.id, key: `root:${root.toLowerCase()}`, repoName: repoNameFromPath(project.path), capturedAt: at, from: "host-scan" };
+}
+
+export async function captureIdentityAsync(project: { id: string; path: string }, git: AsyncGitReader, at = new Date().toISOString()): Promise<CheckoutIdentity | undefined> {
+  const remote = await git(project.path, ["config", "--get", "remote.origin.url"]);
+  const normalized = remote ? normalizeRemote(remote) : undefined;
+  if (normalized) return { projectId: project.id, key: normalized.key, repoName: normalized.repoName, capturedAt: at, from: "host-scan" };
+  const roots = await git(project.path, ["rev-list", "--max-parents=0", "HEAD"]);
   const root = roots?.split(/\s+/).map(line => line.trim()).filter(line => /^[0-9a-f]{4,64}$/i.test(line)).sort()[0];
   if (!root) return undefined;
   return { projectId: project.id, key: `root:${root.toLowerCase()}`, repoName: repoNameFromPath(project.path), capturedAt: at, from: "host-scan" };

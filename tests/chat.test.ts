@@ -8,13 +8,11 @@ import { claimControl, startHost, waitFor } from "./helpers.js";
 
 const attention = { idleAfterMs: 3000, hooks: { claude: true, codex: true } };
 
-/** The journal events of one type. The events route's `types` filter does not list every type, so this filters the page. */
 async function journalEvents(host: Awaited<ReturnType<typeof startHost>>, id: string, type: string): Promise<any[]> {
   const page = await host.fetchApi(`/sessions/${id}/events?limit=200`);
   return page.body.events.filter((event: any) => event.type === type);
 }
 
-/** Waits for the one coverage record a session journals after its exit record and its final drain. */
 async function coverageEvent(host: Awaited<ReturnType<typeof startHost>>, id: string): Promise<any> {
   const events = await waitFor(() => journalEvents(host, id, "usage-coverage"), (found) => found.length === 1, 15000);
   return events[0];
@@ -26,7 +24,6 @@ test("chat is the provider's own conversation record, delivered over the hook re
     const id = randomUUID();
     await host.fetchApi("/sessions", "owner", { requestId: id, provider: "demo", projectId: "rehearsal", title: "Chat", prompt: "hook dialog" });
     const detail = await waitFor(() => host.fetchApi(`/sessions/${id}`), (r) => r.body.attention?.state === "needs-you" && r.body.attention.prompt?.hash, 15000);
-    // Before any reply, the user's prompt and the tool call are already in the chat.
     const early = await waitFor(() => host.fetchApi(`/sessions/${id}/messages`), (r) => r.body.source === "transcript" && r.body.messages.length >= 3, 10000);
     assert.deepEqual(early.body.messages.map((m: any) => [m.role, m.toolName ?? m.text]), [
       ["user", "hook dialog"], ["assistant", "I will remove the stale build directory."], ["tool", "Bash"],
@@ -39,7 +36,6 @@ test("chat is the provider's own conversation record, delivered over the hook re
     const last = finished.body.messages.at(-1);
     assert.equal(last.role, "assistant");
     assert.match(last.id, /^message:demo-/);
-    // Paging from the cursor returns only what arrived later; a follow-up reaches chat the same way.
     const sent = await host.fetchApi(`/sessions/${id}/input`, "owner", { requestId: randomUUID(), text: "Thanks, now stop", submit: true }, control.headers);
     assert.equal(sent.body.state, "delivered");
     const next = await waitFor(() => host.fetchApi(`/sessions/${id}/messages?after=${finished.body.cursor}`), (r) => r.body.messages.length >= 2, 15000);
@@ -85,12 +81,19 @@ test("a rehearsal turn journals its usage, and its exit journals the coverage of
     const coverage = await coverageEvent(host, id);
     const usage = await journalEvents(host, id, "usage");
     assert.ok(usage.some((e: any) => e.data.provider === "claude" && e.data.modelId === "rehearsal-model" && e.data.tokens.input === 120 && e.data.tokens.output === 30));
-    // The last hook is Stop, a turn end, and the final drain reached the end of the file. Nothing
-    // else makes the session partial, so the coverage is complete.
     assert.equal(coverage.data.coverage, "complete");
     assert.equal(coverage.data.reason, undefined);
     assert.equal(coverage.data.provider, "demo");
     assert.equal(coverage.data.finalDrain, "complete");
+    const sum = (field: "input" | "output") => usage.reduce((total: number, event: any) => total + event.data.tokens[field], 0);
+    const listed = await waitFor(() => host.fetchApi("/sessions"), (r) => {
+      const row = r.body.sessions.find((session: any) => session.id === id);
+      return row?.usage?.measured === true && row.usage.coverage === "complete";
+    }, 20000);
+    const ledger = listed.body.sessions.find((session: any) => session.id === id).usage;
+    assert.equal(ledger.tokens.input, sum("input"));
+    assert.equal(ledger.tokens.output, sum("output"));
+    assert.equal((await host.fetchApi("/usage")).body.month.spent.usd, 0);
   } finally {
     await host.stop();
   }
@@ -110,7 +113,6 @@ test("a rehearsal subagent's usage is journaled from its own transcript", { time
     await waitFor(() => host.fetchApi(`/sessions/${id}`), (r) => r.body.status === "exited", 15000);
     const coverage = await coverageEvent(host, id);
     const usage = await journalEvents(host, id, "usage");
-    // The subagent row lives in its own file. Its usage is journaled as secondary, and its text never reaches chat.
     assert.ok(usage.some((e: any) => e.data.secondary === true && e.data.modelId === "rehearsal-sub-model" && e.data.tokens.input === 200 && e.data.tokens.output === 50));
     assert.ok(usage.some((e: any) => e.data.secondary !== true && e.data.modelId === "rehearsal-model"));
     const messages = await host.fetchApi(`/sessions/${id}/messages`);
@@ -157,7 +159,6 @@ test("a rehearsal stopped mid-turn journals the row written after its last hook"
     assert.equal(late.data.tokens.input, 120);
     assert.equal(late.data.tokens.output, 30);
     assert.deepEqual([coverage.data.coverage, coverage.data.reason, coverage.data.finalDrain], ["partial", "stopped-mid-turn", "complete"]);
-    // The exit record, then every usage record, then the coverage record.
     const events = (await host.fetchApi(`/sessions/${id}/events?limit=200`)).body.events;
     const exitedSeq = events.find((e: any) => e.type === "lifecycle" && e.data.status === "exited").seq;
     assert.ok(usage.every((e: any) => e.seq < coverage.seq), "every usage record precedes the coverage record");
@@ -199,7 +200,6 @@ test("a sudo profile drains through the wrapper beside it, and skips without one
       writeFileSync(path, `#!/bin/sh\n${body}\n`, { mode: 0o700 });
       chmodSync(path, 0o700);
     };
-    // A stand-in for sudo: it logs its arguments, drops them through `--`, and runs the rest.
     wrapper("sudo", `echo "$*" >> '${log}'\nwhile [ "$1" != "--" ]; do shift; done\nshift\nexec "$@"`);
     wrapper("demo", `exec '${process.execPath}' --import '${tsx}' '${resolve("packages/host/src/demo.ts")}' "$@"`);
     wrapper("transcript-drain", `exec '${process.execPath}' --import '${tsx}' '${resolve("packages/host/src/hook-relay.ts")}' drain`);
@@ -219,7 +219,6 @@ test("a sudo profile drains through the wrapper beside it, and skips without one
       const drainLines = () => readFileSync(log, "utf8").split("\n").filter(line => line.includes("transcript-drain")).length;
       assert.ok(readFileSync(log, "utf8").split("\n").includes(drainLine));
 
-      // Without the wrapper the drain cannot run: the late row stays unread and the coverage says so.
       rmSync(join(folder, "transcript-drain"), { force: true });
       const before = drainLines();
       const second = randomUUID();
@@ -240,10 +239,6 @@ test("a sudo profile drains through the wrapper beside it, and skips without one
   }
 });
 
-/**
- * Writes the stand-ins a sudo profile needs. The sudo stand-in logs its arguments and runs what follows `--`; with
- * `refuseDrain` it exits 1 for the drain wrapper, as sudo does when its policy does not list the command.
- */
 function sudoStandIns(folder: string, drainBody: string, refuseDrain: boolean) {
   const tsx = import.meta.resolve("tsx");
   const script = (name: string, body: string) => {
@@ -262,7 +257,6 @@ test("a drain that hangs is stopped at its limit and the session still closes", 
   const folder = mkdtempSync(join(tmpdir(), "inf-drain-"));
   try {
     const pidFile = join(folder, "drain.pid");
-    // The stand-ins exec, so the sleeping drain's parent is the worker that started it.
     const profile = sudoStandIns(folder, `echo "$$ $PPID" > '${pidFile}'\nexec sleep 60`, false);
     const host = await startHost({ config: { attention }, agents: { demo: profile } });
     try {
@@ -284,7 +278,6 @@ test("a drain that hangs is stopped at its limit and the session still closes", 
       assert.equal(Number.isSafeInteger(workerPid) && workerPid > 1, true, "the drain recorded the worker that started it");
       const gone = (target: number, limit: number) => waitFor(async () => { try { process.kill(target, 0); return true; } catch { return false; } }, (running) => !running, limit);
       assert.equal(await gone(pid, 2000), false, "the sleeping drain process is gone");
-      // The worker process itself ends within its exit timer once the coverage record is written.
       assert.equal(await gone(workerPid, 5000), false, "the worker process ended after the drain window");
     } finally {
       await host.stop();
@@ -300,7 +293,6 @@ test("a sudo policy that refuses the wrapper skips the drain at once", { timeout
     const profile = sudoStandIns(folder, "exit 0", true);
     const host = await startHost({ config: { attention }, agents: { demo: profile } });
     try {
-      // Stopped mid-turn: the refused drain leaves the late row unread, and the coverage record says so without waiting.
       const midTurn = randomUUID();
       await host.fetchApi("/sessions", "owner", { requestId: midTurn, provider: "demo", projectId: "rehearsal", title: "Refused", prompt: "hook dialog late-row" });
       await waitFor(() => host.fetchApi(`/sessions/${midTurn}`), (r) => r.body.attention?.state === "needs-you" && r.body.attention.prompt?.hash, 15000);
@@ -315,7 +307,6 @@ test("a sudo policy that refuses the wrapper skips the drain at once", { timeout
       const waited = Date.parse(midCoverage.at) - Date.parse(exited.at);
       assert.ok(waited >= 0 && waited < 3000, `a refused drain does not wait for the limit (${waited} ms)`);
 
-      // A clean turn boundary under the same refusal: nothing was owed beyond the last hook, so the session stays complete.
       const clean = randomUUID();
       await host.fetchApi("/sessions", "owner", { requestId: clean, provider: "demo", projectId: "rehearsal", title: "Clean", prompt: "hook dialog" });
       const detail = await waitFor(() => host.fetchApi(`/sessions/${clean}`), (r) => r.body.attention?.state === "needs-you" && r.body.attention.prompt?.hash, 15000);

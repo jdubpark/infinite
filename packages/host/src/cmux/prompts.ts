@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { blockDestructive, detectPrompt, type Prompt } from "@infinite/attention";
-import { array, object, string, CmuxError, type Json } from "./client.js";
+import { array, string, CmuxError, type Json } from "./client.js";
 import type { CmuxProvider } from "./discovery.js";
 
 export interface PendingPrompt {
@@ -21,7 +21,6 @@ export function matchingFeed(rows: Json[], session: { provider: CmuxProvider; na
   return rows.find((row) => {
     if (!string(row.request_id) || (row.status && row.status !== "pending")) return false;
     const key = workstreamKey(row.workstream_id) ?? (row.source && row.session_id ? `${row.source}:${row.session_id}` : undefined);
-    // A known native identity wins; a reused surface cannot inherit an old approval.
     if (key && session.nativeId) return key === `${session.provider}:${session.nativeId}`;
     return Boolean(session.surfaceId && row.surface_id === session.surfaceId && (!row.source || row.source === session.provider));
   });
@@ -80,7 +79,6 @@ export function pendingPrompt(provider: CmuxProvider, screen: string, feed?: Jso
   return { prompt: { ...prompt, hash: fingerprint, source: "screen", destructive: blockDestructive(prompt) }, fingerprint };
 }
 
-/** This only translates an explicit person's answer; no default ever accepts. */
 export function feedReply(feed: Json, option?: number, text?: string): { method: string; params: Json } {
   const kind = String(feed.kind ?? "").toLowerCase();
   const params: Json = { request_id: feed.request_id };

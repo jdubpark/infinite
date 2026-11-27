@@ -1,0 +1,16 @@
+[Unit]
+Description=Infinite eval account output rule (see deploy/ubuntu/eval.md)
+After=nftables.service
+Before=infinite.service
+PartOf=nftables.service
+ReloadPropagatedFrom=nftables.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/infinite/eval.nft
+ExecReload=/usr/sbin/nft -f /etc/infinite/eval.nft
+ExecStop=-/usr/sbin/nft delete table inet infinite_eval
+
+[Install]
+WantedBy=multi-user.target

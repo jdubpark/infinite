@@ -1,0 +1,85 @@
+import { refusalPath } from "./member-entry.js";
+
+export type SecretClass = "private-key" | "access-token" | "hook-token" | "hook-url" | "session-credential";
+
+const PRIVATE_KEY = /-----BEGIN [A-Z ]*PRIVATE KEY/;
+
+const ACCESS_TOKENS: readonly RegExp[] = [
+  /gh[pousr]_[A-Za-z0-9]{36,}/,
+  /github_pat_\w{22,}/,
+  /AKIA[A-Z0-9]{16}/,
+  /xox[abprs]-[A-Za-z0-9-]{10,}/,
+  /sk-[A-Za-z0-9_-]{20,}/,
+  /AIza[0-9A-Za-z_-]{35}/,
+  /eyJ[A-Za-z0-9_-]{7,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/,
+  /v\d+\.eyJ[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{43}(?![A-Za-z0-9_-])/,
+  /v\d+\.\d{9,12}\.[A-Za-z0-9_-]{43}(?![A-Za-z0-9_-])/,
+];
+const MIN_CREDENTIAL_LENGTH = 16;
+const CREDENTIAL_VARIABLES = ["INFINITE_GITHUB_GRANT", "INFINITE_NATIVE_TOKEN", "OPENCODE_SERVER_PASSWORD"] as const;
+
+export function sessionCredentials(env: Readonly<Record<string, string | undefined>>): string[] {
+  const found = new Set<string>();
+  for (const name of CREDENTIAL_VARIABLES) {
+    const value = env[name];
+    if (value) found.add(value);
+  }
+  for (const value of Object.values(env)) {
+    if (!value?.includes("://")) continue;
+    let password = "";
+    try { password = decodeURIComponent(new URL(value).password); } catch {}
+    if (password) found.add(password);
+  }
+  return [...found];
+}
+
+function hookUrlPattern(url: string): RegExp | undefined {
+  let port: string;
+  try {
+    port = new URL(url).port;
+  } catch {
+    return undefined;
+  }
+  return port ? new RegExp(`(?:127\\.0\\.0\\.1|localhost):${port}(?!\\d)`) : undefined;
+}
+
+export function findSecret(value: unknown, own: { token: string; url: string; credentials?: readonly string[] }): { path: string; cls: SecretClass } | undefined {
+  const issued = (own.credentials ?? []).filter(credential => credential.length >= MIN_CREDENTIAL_LENGTH);
+  const hookUrl = hookUrlPattern(own.url);
+  const classify = (text: string): SecretClass | undefined => {
+    if (PRIVATE_KEY.test(text)) return "private-key";
+    if (issued.some(credential => text.includes(credential))) return "session-credential";
+    if (ACCESS_TOKENS.some(pattern => pattern.test(text))) return "access-token";
+    if (own.token.length > 0 && text.includes(own.token)) return "hook-token";
+    if (hookUrl?.test(text)) return "hook-url";
+    return undefined;
+  };
+  return walk(value, [], classify);
+}
+
+function walk(
+  value: unknown,
+  path: PropertyKey[],
+  classify: (text: string) => SecretClass | undefined,
+): { path: string; cls: SecretClass } | undefined {
+  if (typeof value === "string") {
+    const cls = classify(value);
+    return cls ? { path: refusalPath(path), cls } : undefined;
+  }
+  if (Array.isArray(value)) {
+    for (let index = 0; index < value.length; index += 1) {
+      const found = walk(value[index], [...path, index], classify);
+      if (found) return found;
+    }
+    return undefined;
+  }
+  if (value !== null && typeof value === "object") {
+    for (const [key, child] of Object.entries(value)) {
+      const cls = classify(key);
+      if (cls) return { path: refusalPath([...path, key]), cls };
+      const found = walk(child, [...path, key], classify);
+      if (found) return found;
+    }
+  }
+  return undefined;
+}

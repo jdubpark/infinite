@@ -5,8 +5,6 @@ import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
 import { chromium, type Browser, type Page } from "playwright";
 
-// Runs the web client's real dictation hook and controls in Chromium against a stand-in recognizer and cleanup route.
-// PLAYWRIGHT_CHROMIUM_PATH selects a Chromium build other than the one `npx playwright install chromium` provides.
 const executablePath = process.env.PLAYWRIGHT_CHROMIUM_PATH || chromium.executablePath();
 const skip = existsSync(executablePath) ? false : "Chromium for Playwright is not installed; run `npx playwright install chromium`";
 const harness = fileURLToPath(new URL("./fixtures/web-dictation-harness.tsx", import.meta.url));
@@ -33,7 +31,6 @@ describe("web dictation lifecycle", { skip }, () => {
     const page = await browser.newPage();
     const errors: string[] = [];
     page.on("pageerror", error => errors.push(error.message));
-    // A loopback origin is a secure context, which the client's crypto.randomUUID() requires; nothing listens on it.
     await page.route(ORIGIN, route => route.fulfill({ contentType: "text/html", body: '<div id="root"></div>' }));
     await page.goto(ORIGIN);
     await page.addScriptTag({ content: script });
@@ -44,7 +41,6 @@ describe("web dictation lifecycle", { skip }, () => {
   const cleanups = (page: Page) => page.evaluate(() => (window as unknown as Harness).dictation.cleanups.map(cleanup => cleanup.text));
   const reply = (page: Page, text: string) => page.evaluate(text => (window as unknown as Harness).dictation.cleanups.at(-1)!.resolve({ model: "test-cleanup", text }), text);
   const fail = (page: Page, message: string) => page.evaluate(message => (window as unknown as Harness).dictation.cleanups.at(-1)!.reject(new Error(message)), message);
-  // Lets a settled reply and the renders it causes finish before the page is read.
   const settle = (page: Page) => page.evaluate(() => new Promise(resolve => setTimeout(resolve, 50)));
   const field = (page: Page) => page.getByLabel("Field").inputValue();
   const notice = (page: Page) => page.getByRole("status").innerText();
@@ -92,7 +88,6 @@ describe("web dictation lifecycle", { skip }, () => {
     const { page, errors } = await open();
     await page.getByRole("button", { name: "Dictate" }).click();
     await page.getByRole("button", { name: "Stop dictation" }).waitFor();
-    // Typing during capture is kept; dictation appends to the latest text.
     await page.getByLabel("Field").fill("Draft typed");
     await say(page, "um add retries");
     await page.getByRole("button", { name: "Stop dictation" }).click();
@@ -102,7 +97,6 @@ describe("web dictation lifecycle", { skip }, () => {
     assert.equal(await field(page), "Draft typed Add retries.");
     assert.match(await notice(page), /Cleaned up by test-cleanup\./);
 
-    // A send in flight or awaiting retry locks the field; the cleaned text must stay as sent.
     await page.getByRole("button", { name: "Lock field", exact: true }).click();
     await page.getByRole("button", { name: "Unlock field", exact: true }).waitFor();
     assert.equal(await page.getByRole("button", { name: "Use original" }).count(), 0);

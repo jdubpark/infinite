@@ -7,7 +7,6 @@ export type WorkBriefResult =
   | { scope: string; state: "ready"; brief: WorkBrief; canRefresh: boolean }
   | { scope: string; state: "missing" | "upgrade" | "denied"; error: string };
 
-/** `failed` is the outcome of a refresh request that did not reach the host. */
 export type RefreshState = "idle" | "sent" | "denied" | "failed";
 
 const REFRESH_ROLES: Me["role"][] = ["owner", "controller"];
@@ -16,12 +15,7 @@ function needsNarrative(narrative: WorkNarrativeStatus): boolean {
   return narrative.state !== "ready" && narrative.state !== "pending";
 }
 
-/**
- * Reads one work brief every five seconds. When the first ready brief has no current narrative and
- * the role may refresh, it requests one refresh per scope. Viewers never send a refresh.
- */
 export function useWorkBrief(connection: Connection, workspaceId: string, workId: string) {
-  // Credential changes stay inside the poll scope so a late response cannot cross pairings.
   const key = `${connectionKey(connection)}|${connection.url}|${connection.relay?.machineId ?? "direct"}|${connection.token}|${connection.access?.clientId ?? ""}|${connection.access?.clientSecret ?? ""}`;
   const scope = `${key}\u0000${workspaceId}\u0000${workId}`;
   const base = `/project-groups/${encodeURIComponent(workspaceId)}/understanding/work/${encodeURIComponent(workId)}`;
@@ -29,7 +23,6 @@ export function useWorkBrief(connection: Connection, workspaceId: string, workId
   const requestedFor = useRef("");
   const [refresh, setRefresh] = useState<{ scope: string; state: RefreshState; narrative?: WorkNarrativeStatus }>({ scope: "", state: "idle" });
 
-  /** The host answers a refused refresh with 200 and a reason; keep that reason, since the next GET only says no narrative exists. */
   const sendRefresh = async (): Promise<{ state: RefreshState; narrative?: WorkNarrativeStatus }> => {
     try {
       const result = await api<{ narrative: WorkNarrativeStatus }>(connection, `${base}/refresh`, { method: "POST", body: {} });
@@ -81,9 +74,7 @@ export function useWorkBrief(connection: Connection, workspaceId: string, workId
     brief: result?.state === "ready" ? result.brief : null,
     canRefresh: result?.state === "ready" ? result.canRefresh : false,
     refreshState: refresh.scope === scope ? refresh.state : "idle",
-    /** The narrative status the last refresh in this scope returned, when the host answered. */
     refreshNarrative: refresh.scope === scope ? refresh.narrative ?? null : null,
-    /** Asks the host for a narrative now. Owners and controllers only; a `sent` result refreshes the poll. */
     requestRefresh: async () => {
       const result = await sendRefresh();
       setRefresh({ scope, ...result });

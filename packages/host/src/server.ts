@@ -1,4 +1,5 @@
 import express from "express";
+import { browserSessionCookie } from "./browser-session.js";
 import { ProjectContexts, contextLinksRequest } from "./project-context.js";
 import { createServer } from "node:http";
 import { connectTerminals, terminalPages } from "./terminal-stream.js";
@@ -10,7 +11,9 @@ import { z } from "zod";
 import { existsSync, realpathSync } from "node:fs";
 import { join, resolve, sep } from "node:path";
 import { Manager, publicAttention } from "./manager.js";
-import { hashToken, validateLinearConfig } from "./config.js";
+import { MainCheckService, type HostProcesses } from "./main-check.js";
+import { mainCheckRoute } from "./main-check-route.js";
+import { hashToken, validateLinearConfig, validateMcpConfig } from "./config.js";
 import { runtimeSecurity } from "./deployment.js";
 import { workerCall, type WorkerError } from "./ipc.js";
 import { PushStore, isExpoToken } from "./push.js";
@@ -20,36 +23,102 @@ import { CmuxSessions } from "./cmux/index.js";
 import { CmuxError } from "./cmux/client.js";
 import { ContentError, recordedMessages, sessionFile } from "./session-content.js";
 import { connectRemoteAccess } from "./remote-access.js";
-import { ProjectSync, ProjectSyncError, syncFailure } from "./project-sync.js";
+import { parseSyncGeneration, parseSyncPublisherId, ProjectSync, ProjectSyncError, syncFailure } from "./project-sync.js";
 import { ProjectSourceError, ProjectSourceService } from "./project-source.js";
 import { MirroredProjects } from "./mirrored-projects.js";
-import { RepoEnrollmentService, repoEnrollmentRequestSchema } from "./repo-enrollment.js";
+import { RepoEnrollmentService, autonomyChangeSchema, repoEnrollmentRequestSchema } from "./repo-enrollment.js";
+import { onboardingPermissions } from "./permission-onboarding.js";
 import { HandoffService } from "./handoffs.js";
 import { handoffPathsOverlap } from "./handoff-types.js";
 import { WORKSPACE_LIMITS } from "./workspace-checkpoint.js";
+import { inspectHybridSessions } from "./workspace-pool-gc.js";
 import { UsageService } from "./usage-service.js";
 import { EvidenceStore, evidenceDatabasePath } from "./evidence/store.js";
 import { EventOutbox } from "./evidence/outbox.js";
+import { FuseService } from "./fuse/service.js";
+import { MAX_SIGNAL_PAGE, MAX_SIGNAL_TEXT_LENGTH, SignalService } from "./signals/service.js";
+import { HaltService } from "./halt/service.js";
+import type { HaltTarget } from "./halt/rules.js";
+import { EvidenceError } from "./evidence/types.js";
+import { advanceEpoch, configurationModule, configurationProjector, EpochRequestConflict } from "./configuration-store.js";
+import { outcomeBackfill } from "./outcome-backfill.js";
+import { outcomeProjector } from "./outcome-projector.js";
+import { EvalHost } from "./eval-host.js";
+import { EXCLUSION_REASONS, OUTCOMES_MODULE, outcomeModule, runOutcomeView, sweepExpiredOutcomes, type SignalRow } from "./outcome-store.js";
+import { deliveryPort } from "./verdict-delivery.js";
+import { registerVerdicts, sweepExpiredVerdicts } from "./verdict-store.js";
+import { RoutingRecorder } from "./routing-recorder.js";
+import { registerRouting, sweepExpiredDecisions } from "./routing-store.js";
+import { ownerSignal, SignalRequestError, type OwnerSignalInput } from "./outcome-signals.js";
+import { COMMIT_ID, HOLD_DAYS_DEFAULT } from "./outcome-hold.js";
+import { BaseScanner } from "./outcome-scan.js";
+import { profileKeyOf } from "./config-identity.js";
+import { lineupProfiles } from "./team-types.js";
+import { Blackboard } from "./evidence/blackboard.js";
+import { ENTRY_KINDS } from "./evidence/entry-types.js";
 import { usagePlanSchema } from "./usage-api.js";
+import { registerInterruptedTaskMetricsRoute, registerRepairMetricsRoute } from "./repair-metrics-routes.js";
 import { TeamService, TeamError } from "./teams.js";
+import { readDecisionQueue } from "./decision-queue-read.js";
+import { objectiveRoutes } from "./objective-routes.js";
+import { sendSessionList } from "./session-list.js";
+import { withoutCodeMode } from "./session-listing.js";
+import { parseGoalCreateBody } from "./objective-input.js";
+import { routingRoutes } from "./routing-routes.js";
 import { spawnTeamBundle } from "./team-workspace.js";
-import { createTeamSchema, teamContinueSchema, teamMutationSchema, teamDeliveryReconcileSchema, teamVerificationReconcileSchema, teamMemberRetireSchema, teamActionSchema, teamTaskRatingSchema, teamParallelismSchema } from "./team-types.js";
-import { scorecard } from "./scorecard.js";
+import { signalGroup, watchLeader } from "./process-group.js";
+import { createTeamSchema, teamContinueSchema, teamMutationSchema, teamDeliveryReconcileSchema, teamVerificationReconcileSchema, teamProcessesEndedSchema, teamMemberRetireSchema, teamActionSchema, teamTaskRatingSchema, teamParallelismSchema } from "./team-types.js";
+import { scorecardFromRows, type ProfileIdentityOf } from "./scorecard.js";
+import { profileIdentity } from "./run-events.js";
+import { CellQueryRefused, type CellQuery, type CostLookup } from "./outcome-cells.js";
+import { currentEpochs, productionRows, queryCells, queryRollup } from "./outcome-reads.js";
+import { latestAssessment, rollupMissing, type RollupTarget } from "./outcome-rollup.js";
+import { importLegacy, LegacyImportRefused } from "./outcome-import.js";
+import { outcomeCostSync, sessionCostOf } from "./outcome-cost.js";
+import { legacyBatchSchema } from "./outcome-legacy.js";
 import { GoalService } from "./goals.js";
 import { RoutineService } from "./routines.js";
 import { createRoutineSchema, routineActionSchema } from "./routine-types.js";
 import { MissionService, missionBoard } from "./missions.js";
-import { createMissionSchema, missionActionSchema, missionTextSchema } from "./mission-types.js";
+import { registerMissionReadRoutes } from "./mission-read-routes.js";
+import { IntakeStore } from "./intake-store.js";
+import { IntakeLinear } from "./intake-linear.js";
+import { IntakeService } from "./intake.js";
+import { createMcpServer } from "./mcp-server.js";
+import { McpRequestService } from "./mcp-requests.js";
+import { IntakeSlackSurface } from "./intake-slack.js";
+import { SlackClient } from "./slack-client.js";
+import { createIntakeAudienceGuard, createIntakeMissionCreator } from "./intake-audience.js";
+import { createMissionSchema, missionActionSchema, missionExtendSchema, missionTextSchema } from "./mission-types.js";
 import { ProjectGroupService } from "./project-groups.js";
+import { PermissionDelegationService } from "./permission-delegation.js";
+import type { PermissionAgentServices } from "./permission-agent-types.js";
+import { SessionPermissionRequests } from "./permission-session-requests.js";
+import { EvidenceDeliveryLedger, InteractivePermissionDelivery, permissionDeliveryModule } from "./permission-delivery.js";
+import { HeadlessPermissionChannel } from "./permission-headless.js";
+import { INTERRUPT_CLASSES, PERMISSION_POLICY_VERSION } from "./permission-policy.js";
+import { PermissionJournal, permissionJournalModule } from "./evidence/permission-journal.js";
+import { HostPermissionPipeline, PermissionOwnerControls, closeRejectsOnDirectionChange, openPermissionPipelineState } from "./permission-pipeline.js";
+import { registerPermissionControlRoutes } from "./permission-control-routes.js";
+import { permissionRateFlags, registerPermissionReviewRoutes } from "./permission-review-routes.js";
+import { PermissionMeasurements, permissionMeasurementsModule } from "./evidence/permission-measurements.js";
+import { hostProtectedPaths, permissionAgentSettings } from "./permission-agent-config.js";
+import { createPermissionAgentCore } from "./permission-core.js";
+import { realHostPath } from "./permission-shell.js";
+import { createCliTurnLauncher, type PermissionTurnGate } from "./permission-reviewer.js";
+import { PermissionReplayJobs } from "./permission-replay.js";
+import { permissionWriteFence, type PermissionFence } from "./permission-write-fence.js";
+import { PERMISSION_REPLAY_PATH, permissionAgentStatus, registerPermissionAgentRoutes } from "./permission-agent-routes.js";
 import { LinearService } from "./linear.js";
-import { createGoalSchema, goalActionSchema, goalExtendSchema, goalSteerSchema, goalOutcomeSchema, goalParallelismSchema } from "./goal-types.js";
+import { goalActionSchema, goalExtendSchema, goalSteerSchema, goalOutcomeSchema, goalParallelismSchema } from "./goal-types.js";
 import { createProjectGroupSchema, projectGroupIdSchema, updateProjectGroupSchema } from "./project-group-types.js";
 import { DesktopError, DesktopFiles, DesktopResources, DESKTOP_LIMITS } from "./desktop.js";
-import type { Config, Role, Receipt, Session } from "./types.js";
+import { type Config, type Role, type Receipt, type Session, httpControlRequestSchema, isEvalSession, normalizeControlRequest } from "./types.js";
 import { Summarizer, SummaryError } from "./summary.js";
 import { DictationCleaner, DictationError } from "./dictation.js";
 import { RepositoryBriefings } from "./repository-briefings.js";
 import { RepositoryGraphs } from "./repository-graphs.js";
+import { ContextTouches, hostProviderCapabilities, type SessionTouches } from "./context-touches.js";
 import { UnderstandingService } from "./understanding.js";
 import { UnderstandingCatalog, CatalogError } from "./understanding-catalog.js";
 import { UnderstandingRuntime } from "./understanding-runtime.js";
@@ -61,10 +130,26 @@ import { BalanceService } from "./balances.js";
 import { LiveFeed, type LiveTopic } from "./live.js";
 import { MAX_EVENTS_BUFFERED_BYTES, MAX_EVENTS_STREAMS } from "@infinite/remote/protocol";
 import { Readings } from "./readings.js";
+import { EGRESS_PROJECT, egressView } from "./egress.js";
 
 const id = z.uuid();
+const HOUR_MS = 60 * 60 * 1000;
+const DAY_MS = 24 * HOUR_MS;
+const permissionDelegationBodySchema = z.object({
+  requestId: id,
+  workspaceId: projectGroupIdSchema.optional(),
+  all: z.literal(true).optional(),
+  direction: z.string().max(4000).nullable().optional(),
+}).strict().refine(body => (body.workspaceId === undefined) !== (body.all === undefined), { message: "Name exactly one workspace, or all: true." });
+const permissionRevocationBodySchema = z.object({ requestId: id, workspaceId: projectGroupIdSchema }).strict();
+const permissionRatesQuerySchema = z.object({
+  scope: z.enum(["session", "task", "workspace", "host"]),
+  id: z.string().min(1).max(200).optional(),
+  hours: z.coerce.number().int().min(1).max(168).default(1),
+}).strict().refine(query => (query.scope === "host") === (query.id === undefined), {
+  message: "A session, task or workspace scope needs an id, and the host scope takes none.",
+});
 const MAX_LOGIN_ATTEMPT_BUCKETS = 1024;
-/** A recorded pid still names a process. EPERM means it runs under another account, such as the agent user. */
 function alive(pid: unknown) {
   if (!Number.isInteger(pid) || (pid as number) <= 1) return false;
   try { process.kill(pid as number, 0); return true; } catch (error) { return (error as NodeJS.ErrnoException).code === "EPERM"; }
@@ -123,7 +208,7 @@ const inputSchema = z
     force: z.boolean().optional(),
   })
   .strict();
-export function createApp(config: Config, key: Buffer) {
+export function createApp(config: Config, key: Buffer, options: { configFile?: string; processCensus?: HostProcesses } = {}) {
   config.machine = machineIdentity(config, key);
   if ((config.cmux?.enabled || config.remote?.enabled) && runtimeSecurity(config.deployment).tenancy !== "single-tenant")
     throw new Error("Machine access and cmux require a single-tenant host");
@@ -132,18 +217,20 @@ export function createApp(config: Config, key: Buffer) {
   const mirroredProjects = runtimeSecurity(config.deployment).tenancy === "single-tenant" ? new MirroredProjects(config, key) : undefined;
   const enrollment = new RepoEnrollmentService(config, key, { isBusy: async projectId =>
     projectSync.applying(projectId) || projectSource.refreshing(projectId) || await projectRunning(projectId, true) });
-  validateLinearConfig(config);
-  const manager = new Manager(config, key);
-  const projectSync = new ProjectSync(config, key);
+  validateMcpConfig(config);
+  let intakeAudience: ReturnType<typeof createIntakeAudienceGuard> | undefined;
+  const manager = new Manager(config, key, undefined, { projectContexts: new ProjectContexts(config, key, () => intakeAudience?.workspaceBindings()) });
+  const projectSync = new ProjectSync(config, key, { inspectHybridSessions: () => inspectHybridSessions(config.stateDir, listSessions) });
   const desktopFiles = new DesktopFiles(config);
-  // Session starts admitted past the sync check that the session list may not show yet.
   const startsInFlight = new Map<string, number>();
   const routineStarts = new Set<string>();
   const projectFileChanges = new Set<string>();
   const projectConfigChanges = new Set<string>();
   let sourceChanged: (projectId: string) => void = () => {};
   let sourceAppliedGraph: (projectId: string, head: string) => void = () => {};
-  const projectSource = new ProjectSourceService(config, { running: id => sessionRunningInProject(id), prefix: config.teams?.commandPrefix, onApplied: (id, head) => { sourceChanged(id); sourceAppliedGraph(id, head); } });
+  let baseScanner: BaseScanner | undefined;
+  let mainCheck: MainCheckService | undefined;
+  const projectSource = new ProjectSourceService(config, { running: id => sessionRunningInProject(id), prefix: config.teams?.commandPrefix, onApplied: (id, head) => { sourceChanged(id); sourceAppliedGraph(id, head); }, onMirror: fetch => { baseScanner?.notify(fetch); mainCheck?.observe(fetch); } });
   const repositoryGraphs = config.repositoryGraphs
     ? new RepositoryGraphs(config.repositoryGraphs, config.projects, config.teams?.workspaceDir, config.teams?.commandPrefix)
     : undefined;
@@ -151,11 +238,6 @@ export function createApp(config: Config, key: Buffer) {
     const project = config.projects.find(item => item.id === projectId);
     if (repositoryGraphs && project) void repositoryGraphs.refreshCurrent(projectId, project.path, "shared").catch(() => undefined);
   };
-  /**
-   * Whether a session may be using the project directory: one starting or running there, including cmux sessions,
-   * or one whose worker did not answer while its recorded worker or provider process still lives. Laptop-mode
-   * tools run elsewhere, and an exited session never counts. A session list that cannot be read counts as running.
-   */
   const startInProject = async <T>(projectId: string, start: () => Promise<T>, routineStart = false): Promise<T> => {
     if (routineStarts.has(projectId) && !routineStart) throw new TeamError(409, "routine-starting", "A scheduled goal is being admitted for this project. Retry after it appears.");
     if (projectConfigChanges.has(projectId)) throw new TeamError(409, "project-config-changing", "Repository setup is being updated. Retry after it finishes.");
@@ -174,45 +256,150 @@ export function createApp(config: Config, key: Buffer) {
   const summarizer = config.summaries ? new Summarizer(config.summaries) : undefined;
   const readings = new Readings(config, key, manager, summarizer);
   const ownerServices: { goals?: GoalService; missions?: MissionService; handoffs?: HandoffService } = {};
-  // A store that cannot open stays unavailable with a fixed reason. It never blocks the host, a run, or a removal.
   const evidence = new EvidenceStore({ databasePath: evidenceDatabasePath(config.stateDir), vaultKey: key });
   const outbox = new EventOutbox(evidence);
+  evidence.register(configurationModule());
+  outbox.registerProjector(configurationProjector());
+  evidence.register(outcomeModule());
+  registerRouting(evidence, outbox);
+  registerVerdicts(evidence, outbox);
+  const signals = new SignalService({ store: evidence });
+  let lateReceipts: () => void = () => {};
+  baseScanner = new BaseScanner({
+    store: evidence, mirrorPath: id => projectSource.mirrorPath(id), prefix: config.teams?.commandPrefix, holdDays: () => config.teams?.outcomes?.holdDays ?? HOLD_DAYS_DEFAULT,
+    onApplied: scan => {
+      signals.recordScan(scan);
+      lateReceipts();
+    },
+  });
+  outbox.registerProjector(outcomeProjector(evidence, { prices: config.usage?.prices }));
+  const evalHost: EvalHost = new EvalHost({ config, store: evidence, source: projectSource, hostLoad: manager.hostLoad, halt: () => halt, runs: () => teams.understandingRecords(), teams: () => teams, sessions: manager, cost: sessionId => sessionCostOf(usage.session(sessionId)), usage: () => usage, fuse: () => gate });
+  const fuse = new FuseService({ config, key, store: evidence, sessionExists: id => {
+    try { manager.meta(id); return true; } catch (error) { return (error as NodeJS.ErrnoException).code !== "ENOENT"; }
+  } });
+  const blackboard = new Blackboard(evidence);
   const teams = new TeamService(config, key, manager, startInProject, linear, readings, {
     source: projectSource,
     graphs: repositoryGraphs,
     events: outbox,
-    onMerged: id => void projectSource.refresh(id).then(status => {
-      sourceChanged(id);
-      if (status.appliedHead && !status.pending) scheduleGraphForSession(id);
-    }, () => sourceChanged(id)),
+    capture: evalHost.capture, replayLaunchGate: input => evalHost.replayLaunchWait(input),
+    entries: blackboard, ...(options.processCensus ? { processes: options.processCensus } : {}),
+    delivery: deliveryPort(evidence),
+    onMerged: id => {
+      lateReceipts();
+      void projectSource.refresh(id).then(status => {
+        sourceChanged(id);
+        if (status.appliedHead && !status.pending) scheduleGraphForSession(id);
+      }, () => sourceChanged(id));
+    },
     ownerActive: run => {
       if (ownerServices.goals?.retainsTeamRun(run.id) || ownerServices.missions?.retainsSubteamRun(run.id)) return true;
       return Boolean(run.handoff && ownerServices.handoffs?.ownsActiveTeam(run.id));
     },
   });
   teams.useEvidence(evidence);
-  const usage = new UsageService(config, key, manager);
+  lateReceipts = () => { void teams.settleReceipts().catch(() => {}); };
+  const router = new RoutingRecorder({ store: evidence }); teams.useRouter(router);
+  const backfillOutcomes = outcomeBackfill(evidence, () => teams.understandingRecords(), {
+    mapOf: projectId => config.projects.find(project => project.id === projectId)?.team?.features,
+    now: () => new Date().toISOString(), prices: config.usage?.prices,
+  });
+  backfillOutcomes();
+  const usage = new UsageService(config, key, manager, evidence); const syncCosts = outcomeCostSync(evidence, config.usage?.prices); syncCosts();
   const balances = new BalanceService(config.usage?.accounts ?? {});
   usage.useBalances(balances);
-  // TeamService ticks on every host and drives the ledger from its own session listing.
-  teams.useUsage(usage);
+  teams.useUsage(usage); const refreshHeadrooms = () => router.refreshHeadrooms(config.teams?.lineup, teams.providerLimitHistory(), config.usage?.prices); refreshHeadrooms(); usage.onUpdated(refreshHeadrooms); teams.onLimitsChanged(refreshHeadrooms);
   const goals = new GoalService(config, key, teams, linear);
+  lateReceipts = () => { void teams.settleReceipts().then(() => goals.syncReceipts()).catch(() => {}); };
   ownerServices.goals = goals;
   const projectGroups = new ProjectGroupService(config, key, undefined, { appliedAt: id => projectSync.status(id).appliedAt });
+  let permissionJournal: PermissionJournal | undefined;
+  try {
+    evidence.register(permissionJournalModule);
+    permissionJournal = new PermissionJournal(evidence);
+  } catch { permissionJournal = undefined; }
+  let permissionDelegation: PermissionDelegationService | undefined;
+  try { permissionDelegation = new PermissionDelegationService(config, key, projectGroups); }
+  catch { console.warn("[Infinite] Permission delegation is unavailable on this host."); }
+  const permissionAgent: PermissionAgentServices = {};
+  let permissionMeasurements: PermissionMeasurements | undefined;
+  try {
+    evidence.register(permissionMeasurementsModule);
+    permissionMeasurements = new PermissionMeasurements(evidence);
+  } catch { permissionMeasurements = undefined; }
+  const permissionTurnGate: { hold?: PermissionTurnGate } = {};
+  const permissionCoreOptions = {
+    settings: () => permissionAgentSettings(config),
+    launcher: createCliTurnLauncher({ agents: config.agents, gate: turn => permissionTurnGate.hold?.(turn) ?? true, onUsage: usage => permissionMeasurements?.recordUsage(usage) }),
+    results: permissionMeasurements,
+    facts: {
+      protectedPaths: hostProtectedPaths(config, fileURLToPath(new URL("../../../", import.meta.url)), options.configFile ? [options.configFile] : []),
+      releaseCommands: config.permissionAgent?.releaseCommands ?? [],
+    },
+  };
+  const permissionCore = createPermissionAgentCore({ ...permissionCoreOptions, resolvePath: realHostPath });
+  permissionAgent.core = permissionCore;
+  const permissionReplays = permissionMeasurements
+    ? new PermissionReplayJobs({ core: () => createPermissionAgentCore({ ...permissionCoreOptions, purpose: "replay" }), measurements: permissionMeasurements,
+      onSettled: () => { void teams.permissionAuthorityChanged().catch(() => {}); } })
+    : undefined;
+  const permissionState = permissionJournal ? openPermissionPipelineState(evidence) : undefined;
+  const permissionControls = permissionJournal && permissionState ? new PermissionOwnerControls(permissionJournal, permissionState) : undefined;
+  if (permissionAgent.core && permissionJournal && permissionDelegation && permissionState)
+    permissionAgent.pipeline = new HostPermissionPipeline({
+      core: permissionAgent.core, journal: permissionJournal, delegation: permissionDelegation, state: permissionState,
+      halted: projectId => halt.check({ projectId }).state === "halted",
+      haltEpoch: projectId => halt.epoch(projectId),
+    });
+  const sessionPermissions = new SessionPermissionRequests(config, manager, {
+    delivery: () => permissionAgent.delivery,
+    serves: projectId => permissionAgent.pipeline ? permissionAgent.pipeline.serves(projectId).served : true,
+    authority: projectId => { const found = permissionDelegation?.coverage(projectId); return found?.covered ? found.authorityHash : undefined; },
+    taskEnded: taskId => permissionAgent.pipeline?.taskEnded(taskId),
+  });
+  manager.observeListings(rows => sessionPermissions.observe(rows));
+  let permissionDeliveryLedger: EvidenceDeliveryLedger | undefined;
+  try {
+    evidence.register(permissionDeliveryModule);
+    permissionDeliveryLedger = new EvidenceDeliveryLedger(evidence);
+  } catch { permissionDeliveryLedger = undefined; }
+  const permissionDelivery = new InteractivePermissionDelivery({ pipeline: () => permissionAgent.pipeline, ledger: permissionDeliveryLedger });
+  permissionAgent.delivery = permissionDelivery;
+  teams.usePermissionAgent(permissionAgent);
+  const settlePermissionAuthority = async (): Promise<PermissionFence> => {
+    let confirmed = true;
+    try { await teams.permissionAuthorityChanged(); } catch { confirmed = false; }
+    try { if (!await permissionDelivery.fenceRetired()) confirmed = false; } catch { confirmed = false; }
+    return confirmed ? {} : { deliveryFence: "uncertain" };
+  };
+  const permissionAgentState = () => {
+    try { return permissionAgent.pipeline && permissionDelivery.active() && permissionCore.readiness().ready ? "active" as const : "inactive" as const; }
+    catch { return "inactive" as const; }
+  };
+  const headlessChannel = new HeadlessPermissionChannel({ key, target: manager.socketTarget, legacySockets: () => manager.activePermissionSockets(), sessions: manager, services: permissionAgent,
+    teamLive: session => teams.permissionAgentLive(session), teamTask: session => teams.permissionAgentTask(session) });
+  permissionAgent.headless = headlessChannel;
+  manager.useHeadlessChannel(headlessChannel);
   const missions = new MissionService(config, key, manager, teams, projectGroups);
   ownerServices.missions = missions;
-  // A run is live while its sealed record file exists, so a record that failed to load keeps its evidence.
-  const sweepEvidence = () => evidence.sweep(id => teams.hasRecordFile(id) || missions.hasRecordFile(id));
+  const sweepEvidence = () => {
+    lateReceipts();
+    evidence.sweep(id => teams.hasRecordFile(id) || missions.hasRecordFile(id));
+    sweepExpiredOutcomes(evidence, new Date().toISOString(), undefined, config.teams?.outcomes?.retentionDays);
+    sweepExpiredVerdicts(evidence, new Date().toISOString());
+    sweepExpiredDecisions(evidence, new Date().toISOString());
+    signals.sweep(); projectSync.scheduleGarbageCollection(true);
+  };
   let evidenceSweep: NodeJS.Timeout | undefined;
-  // A projector that fell behind catches up without waiting for the next event. Each pass is bounded.
   const advanceOutbox = () => {
     for (let pass = 0; pass < 20; pass++) {
       const result = outbox.advance();
       if (!result.pending || result.blocked.length > 0) break;
     }
+    backfillOutcomes(); syncCosts();
   };
   let outboxTimer: NodeJS.Timeout | undefined;
-  const closeEvidence = () => { clearInterval(evidenceSweep); clearInterval(outboxTimer); evidence.close(); };
+  const closeEvidence = () => { baseScanner?.close(); clearInterval(evidenceSweep); clearInterval(outboxTimer); fuse.stop(); evalHost.close(); evidence.close(); };
   missions.useUsage(usage);
   usage.useResolvers({
     goalOfRun: runId => { const goal = goals.list().find(value => value.cycles.some(cycle => cycle.teamId === runId)); return goal ? { id: goal.id, title: goal.title } : undefined; },
@@ -221,11 +408,9 @@ export function createApp(config: Config, key: Buffer) {
     sessionTitle: sessionId => { try { return manager.meta(sessionId).session.title; } catch { return undefined; } },
   });
   const projectSchema = z.string().regex(/^[a-z0-9-]{1,80}$/);
-  const cmux = config.cmux?.enabled ? new CmuxSessions(config, key) : undefined;
+  const cmux = config.cmux?.enabled ? new CmuxSessions(config, key, manager.projectContexts) : undefined;
   const handoffs: HandoffService = new HandoffService(config, key, manager, teams, startInProject, async (sessionId, projectId) => {
     const sourcePath = realpathSync(manager.meta(sessionId).session.cwd);
-    // This callback owns one start reservation. Earlier admitted creates may not
-    // have a session row yet, especially while cmux returns a cached listing.
     for (const project of config.projects) {
       if (!handoffPathsOverlap(sourcePath, realpathSync(project.path))) continue;
       if ((startsInFlight.get(project.id) ?? 0) > (project.id === projectId ? 1 : 0) ||
@@ -242,45 +427,49 @@ export function createApp(config: Config, key: Buffer) {
   const assertNoHandoff = (projectId: string) => {
     if (handoffs.activeForProject(projectId)) throw new TeamError(409, "handoff-in-progress", "This project is transferring a task to a team. Wait for its checkpoint to finish.");
   };
+  intakeAudience = createIntakeAudienceGuard({ config, groups: projectGroups, sourceAppliedHead: projectId => projectSource.status(projectId).appliedHead });
+  const createMission = createIntakeMissionCreator({ config, missions, groups: projectGroups, audience: intakeAudience, assertNoHandoff });
+  const intakeStore = config.intake ? new IntakeStore(config, key) : undefined;
+  const intakeSlackClient = config.intake?.slack ? new SlackClient({ botTokenFile: config.intake.slack.botTokenFile, appTokenFile: config.intake.slack.appTokenFile, endpoint: config.intake.slack.endpoint, teamId: config.intake.slack.teamId, organizationScope: config.intake.slack.organizationScope, workspaceAllowed: intakeAudience.workspacesAllowed }) : undefined;
+  const intake = config.intake && intakeStore ? new IntakeService(config, intakeStore, missions, new IntakeLinear(linear), { create: createMission, threads: intakeSlackClient, audience: intakeAudience, ...(config.intake.slack?.classify ? { router: text => readings.requestRoute(text) } : {}) }) : undefined;
+  const mcp = config.mcp && intakeStore && intake ? createMcpServer(config, new McpRequestService(config, intakeStore, intake, missions, projectGroups)) : undefined;
+  const intakeSlack = intakeStore && intakeSlackClient && intake ? new IntakeSlackSurface(config, intakeStore, missions, teams, intakeSlackClient, { audience: intakeAudience, direct: input => intake.requestFromSlack(input) }) : undefined;
   const resumable = (session: { status: string; provider: string; workspace?: unknown; team?: unknown; nativeSession?: unknown; resumeNativeSession?: unknown }) =>
     session.status === "exited" && !session.workspace && !session.team && Boolean(session.nativeSession ?? session.resumeNativeSession) && ["claude", "codex", "opencode"].includes(session.provider);
-  // Native records written before executionLocation existed carry only the hybrid workspace.
   const executionLocation = (session: { executionLocation?: "cloud" | "laptop"; workspace?: unknown }): "cloud" | "laptop" =>
     session.executionLocation ?? (session.workspace ? "laptop" : "cloud");
   const usageRow = (id: string) => { const row = usage.session(id); return row.measured ? { usage: row } : {}; };
-  const listSessions = async () => {
-    const native = (await manager.list({ includeFullMessage: Boolean(config.jev) })).map(session => {
-      const handoff = handoffs.view(session.id);
+  const listSessions = async (options: { includeFullMessage?: boolean } = {}) => {
+    const native = (await manager.list({ includeFullMessage: options.includeFullMessage === true || Boolean(config.jev && config.jev.sessionReadings !== false) })).filter(session => !isEvalSession(session)).map(session => {
+      const handoff = handoffs.listedView(session.id);
       const managed = managedBy(session);
       return { ...session, ...(managed ? { managedBy: managed } : {}), handoff, ...usageRow(session.id), executionLocation: executionLocation(session), backend: "infinite" as const, machineId: config.machine!.id,
         resumable: resumable(session) && ["unavailable", "available"].includes(handoff.status) };
     });
-    // Provider conversation IDs survive restarts and can exist in several
-    // recordings. Only a currently verified worker PID identifies this runtime.
     const known = new Set(native.filter(s => s.status === "running" && s.nativeSession && s.pid)
       .map(s => `${s.provider}:${s.nativeSession!.id}:${s.pid}`));
     const external = cmux ? (await cmux.list()).filter(s => s.status !== "running" || !s.nativeSession || !s.pid || !known.has(`${s.provider}:${s.nativeSession.id}:${s.pid}`)) : [];
     const merged = readings.merge([...native, ...external.map(s => ({ ...s, backend: "cmux" as const, machineId: config.machine!.id, resumable: resumable(s) }))]);
-    return merged.map(session => ({ ...session, attention: publicAttention(session.attention) }));
+    return options.includeFullMessage === true ? merged : merged.map(session => ({ ...session, attention: publicAttention(session.attention) }));
   };
   const sessionDetail = async (sessionId: string) => {
     if (cmux && !existsSync(join(config.stateDir, "sessions", sessionId, "meta.sealed"))) {
       const session = await cmux.get(sessionId);
       return { ...session, machineId: config.machine!.id, resumable: resumable(session) };
     }
-    const session = { ...manager.meta(sessionId).session, ...(await manager.state(sessionId, true)) };
+    const session = withoutCodeMode({ ...manager.meta(sessionId).session, ...(await manager.state(sessionId, true)) });
     const handoff = handoffs.view(sessionId);
     const managed = managedBy(session);
-    const { generatedTitle: _generatedTitle, ...publicSession } = readings.merge([session])[0];
+    const { generatedTitle: _generatedTitle, ...publicSession } = readings.merge([session], false)[0];
     return { ...publicSession, ...(managed ? { managedBy: managed } : {}), handoff, executionLocation: executionLocation(session), backend: "infinite", machineId: config.machine!.id,
       resumable: resumable(session) && ["unavailable", "available"].includes(handoff.status) };
   };
-  const sessionEvents = async (sessionId: string, after: number, limit = 200) => {
+  const sessionEvents = async (sessionId: string, after: number, limit = 200, types?: Set<string>) => {
     if (cmux && !existsSync(join(config.stateDir, "sessions", sessionId, "meta.sealed"))) {
       await cmux.get(sessionId);
-      return cmux.events(sessionId, after, limit);
+      return cmux.events(sessionId, after, limit, types);
     }
-    return manager.events(sessionId, after, limit);
+    return manager.events(sessionId, after, limit, types);
   };
   const live = new LiveFeed({
     sessions: async () => ({ sessions: await listSessions() }),
@@ -288,11 +477,6 @@ export function createApp(config: Config, key: Buffer) {
     session: sessionDetail,
     events: (sessionId, after) => sessionEvents(sessionId, after),
   });
-  /**
-   * A source refresh waits only for work that uses the project tree itself: a cloud session whose working directory
-   * lies inside it (team members run in their own clones and do not count), an admitted session start, and a file or
-   * repository-setup change in flight. A failed session listing, or a session without a recorded directory, fails closed.
-   */
   async function sessionRunningInProject(projectId: string) {
     if (startsInFlight.has(projectId) || projectFileChanges.has(projectId) || projectConfigChanges.has(projectId)) return true;
     const project = config.projects.find(p => p.id === projectId);
@@ -310,10 +494,6 @@ export function createApp(config: Config, key: Buffer) {
       (["running", "starting"].includes(s.status) ||
         (["unavailable", "recording-error"].includes(s.status) && (alive(s.pid) || alive((s as { workerPid?: unknown }).workerPid)))));
   }
-  /**
-   * A sync commit or apply evaluates projectRunning only after `applying()` turns true.
-   * A start either sees that flag and is refused, or is counted before the check runs.
-   */
   const projectRunning = async (projectId: string, ignoreConfigChange = false) => {
     if (!ignoreConfigChange && projectConfigChanges.has(projectId)) return true;
     if (startsInFlight.has(projectId) || handoffs.activeForProject(projectId) || teams.activeForProject(projectId) || goals.activeForProject(projectId)) return true;
@@ -331,12 +511,9 @@ export function createApp(config: Config, key: Buffer) {
   const routines = new RoutineService(config, key, goals, {
     isProjectBusy: routineProjectBusy,
     startGoal: async (request, admit) => {
-      // Recover an acknowledged goal through its original idempotency key before
-      // applying busy checks: the existing goal itself reserves this project.
       try { goals.get(request.requestId); return await goals.create(request, admit); }
       catch (error) { if (!(error instanceof TeamError) || error.code !== "goal-not-found") throw error; }
       if (await routineProjectBusy(request.projectId)) throw new TeamError(409, "routine-project-busy", "This project already has active work. The routine has not launched another goal.");
-      // Close the admission gap after the asynchronous session inventory.
       if (startsInFlight.has(request.projectId) || goals.activeForProject(request.projectId) || teams.activeForProject(request.projectId))
         throw new TeamError(409, "routine-project-busy", "Work started in this project while the routine checked it.");
       routineStarts.add(request.projectId);
@@ -346,7 +523,24 @@ export function createApp(config: Config, key: Buffer) {
       } finally { routineStarts.delete(request.projectId); }
     },
   });
-  const desktopResources = new DesktopResources(config, listSessions);
+  const halt = new HaltService({ config, key });
+  permissionTurnGate.hold = () => { const view = halt.view(); return view.readable && !view.host; };
+  halt.useServices({ routines, goals, missions, teams }, teamId => goals.ownsActiveTeam(teamId) || missions.ownsActiveSubteam(teamId));
+  const gate = halt.gate(fuse);
+  mainCheck = new MainCheckService({ config, key, mirrorPath: id => projectSource.mirrorPath(id), halt, hostLoad: manager.hostLoad, ...(options.processCensus ? { ports: { processes: options.processCensus } } : {}) });
+  manager.useFuse(gate);
+  teams.useFuse(gate);
+  goals.useFuse(gate);
+  missions.useFuse(gate);
+  routines.useFuse(gate);
+  routines.useSignals(signals.reader(), goalIds => {
+    const wanted = new Set(goalIds);
+    return goals.understandingRecords().filter(goal => wanted.has(goal.id))
+      .flatMap(goal => [...goal.cycles.map(cycle => cycle.teamId), ...(goal.activeTeamId ? [goal.activeTeamId] : [])]);
+  });
+  goals.useSignals(signals.reader());
+  fuse.start();
+  const desktopResources = new DesktopResources(config, () => listSessions());
   const changeProjectFiles = async <T>(projectId: string, action: () => Promise<T>) => {
     if (projectFileChanges.has(projectId)) throw new DesktopError("files-changing", "Project files are being changed. Retry after the transfer finishes.");
     projectFileChanges.add(projectId);
@@ -355,7 +549,6 @@ export function createApp(config: Config, key: Buffer) {
       if (await projectRunning(projectId)) throw new DesktopError("session-running", "Stop this project's running sessions before replacing files");
       if (projectSync.applying(projectId)) throw new DesktopError("sync-applying", "A workspace sync is being applied. Retry after it finishes.");
       if (projectSource.refreshing(projectId)) throw new DesktopError("source-refreshing", "A refresh from GitHub is updating this project. Retry after it finishes.");
-      // Fence sync after checking existing sessions, while new session admission is already closed.
       startsInFlight.set(projectId, (startsInFlight.get(projectId) ?? 0) + 1); held = true;
       return await action();
     } finally {
@@ -384,8 +577,6 @@ export function createApp(config: Config, key: Buffer) {
     knowledge: { read: workspaceId => ({ schemaVersion: 1, catalog: understandingCatalog.read(workspaceId), ...understandingRuntime.read(workspaceId) }) },
   });
   async function inputAuthority(sessionId: string, res: express.Response) {
-    // Retained workers from earlier releases hash the entire request. Adding
-    // optional fields would make a pre-upgrade receipt impossible to retry.
     return (await manager.state(sessionId)).capabilities?.inputControl
       ? { actor: res.locals.actor, leaseId: res.locals.leaseId } : {};
   }
@@ -415,8 +606,12 @@ export function createApp(config: Config, key: Buffer) {
       return res.status(403).json({ error: "Host is not allowed" });
     next();
   });
-  // The sync commit manifest is parsed by its own route, after authentication.
-  app.use((req, res, next) => /^\/api\/projects\/[^/]+\/sync\/commit$/.test(req.path) ? next()
+  app.post("/api/login", (_req, res, next) => {
+    if (config.browserSessions === false)
+      return res.status(403).json({ code: "browser-sessions-disabled", error: "Browser sign-in is disabled on this instance" });
+    next();
+  });
+  app.use((req, res, next) => /^\/api\/projects\/[^/]+\/sync\/commit$/.test(req.path) || PERMISSION_REPLAY_PATH.test(req.path) ? next()
     : express.json({ limit: /^\/api\/sessions\/[^/]+\/opencode(?:\/|$)/.test(req.path) ? "8mb" : "96kb" })(req, res, next));
   function authenticate(token: string) {
     const digest = Buffer.from(hashToken(token), "hex");
@@ -430,11 +625,8 @@ export function createApp(config: Config, key: Buffer) {
       const device = authenticate(bearer);
       return device ? { device, credentialHash: device.hash, instance: "legacy", bearer: true } : undefined;
     }
-    const value = req.headers.cookie
-      ?.split(";")
-      .map((v) => v.trim())
-      .find((v) => v.startsWith("infinite="))
-      ?.slice(9);
+    if (config.browserSessions === false) return undefined;
+    const value = browserSessionCookie(req);
     const session = value ? cookies.get(hashToken(value)) : undefined;
     if (!session || session.expires <= Date.now()) return undefined;
     const device = config.tokens.find(token => token.hash === session.device.hash);
@@ -498,6 +690,7 @@ export function createApp(config: Config, key: Buffer) {
     res.locals.leaseId = id.optional().parse(req.get("X-Infinite-Control"));
     next();
   });
+  app.use("/api", permissionWriteFence(settlePermissionAuthority));
   const requireRole =
     (roles: Role[]): express.RequestHandler =>
     (_req, res, next) =>
@@ -526,9 +719,6 @@ export function createApp(config: Config, key: Buffer) {
     error: "This session is run by its mission coordinator. Talk to the coordinator from the mission.",
     code: "mission-managed",
   };
-  // Attach this after route matching and before role checks, using Express's
-  // decoded route params so case, escapes, and optional trailing slashes cannot
-  // skip the mission boundary.
   const refuseMissionManaged: express.RequestHandler = (req, res, next) => {
     const param = req.params.id ?? req.params[0];
     const sessionId = Array.isArray(param) ? param[0] : param;
@@ -567,7 +757,6 @@ export function createApp(config: Config, key: Buffer) {
       else next(error);
     });
   };
-  // A fallback lease on a managed session lapses within its TTL once the prompt closes; release stays open.
   const refuseManagedClaim: express.RequestHandler = (req, res, next) =>
     req.body?.action === "claim" || req.body?.action === "renew" ? refuseManagedOutsideProviderPrompt(req, res, next) : next();
   app.get("/api/me", (_req, res) =>
@@ -584,7 +773,9 @@ export function createApp(config: Config, key: Buffer) {
       providers: Object.keys(config.agents).filter(
         (p) => p !== "demo" || config.enableDemo,
       ),
-      teams: { enabled: Boolean(config.teams), repoEnrollment: 1, permissionDelegation: 1, establishChecks: 1, sessionHandoff: 1, projectSource: 1, maxParallelism: 4, ...(config.teams?.lineup ? { lineup: config.teams.lineup } : {}) },
+      providerCapabilities: hostProviderCapabilities(config.enableDemo),
+      teams: { enabled: Boolean(config.teams), repoEnrollment: 1, permissionDelegation: 1, establishChecks: 1, sessionHandoff: 1, projectSource: 1, autonomyMode: 1, routing: 1, routingAuto: 1, routingPoints: 1, maxParallelism: 4, ...(config.teams?.lineup ? { lineup: config.teams.lineup } : {}) },
+      permissions: { workspaceDelegation: 1, decisionLog: 1, onboardingCoverage: 1 },
       goals: { enabled: goals.enabled() },
       missions: { enabled: missions.enabled() },
       usage: { enabled: Boolean(config.usage), budgets: config.usage?.budgets ?? {} },
@@ -600,23 +791,97 @@ export function createApp(config: Config, key: Buffer) {
         ...(repositoryBriefings ? { repositoryBriefings: { model: repositoryBriefings.model, automatic: config.repositoryBriefings!.automatic } } : {}),
         ...(config.remote?.enabled ? { remoteTerminal: 1 } : {}),
         desktop: { resources: 1, files: 1, fileTransfer: 1, chunkBytes: DESKTOP_LIMITS.chunkBytes, maxFileBytes: DESKTOP_LIMITS.maxFileBytes },
+        swarmContext: 1,
       },
     }),
   );
+  const usageUnavailable = { error: "The usage ledger is unavailable" };
+  const ledgerUnavailable = (error: unknown) => error instanceof EvidenceError && error.code === "unavailable";
+  const requireLedger = () => { if (!usage.readable()) throw new EvidenceError("unavailable", "The usage ledger is unavailable."); };
+  registerInterruptedTaskMetricsRoute(app, { runs: filter => teams.interruptedTaskRuns(filter), evidence });
+  app.use("/api/usage", (_req, res, next) => usage.available() ? next() : void res.status(503).json(usageUnavailable));
   app.get("/api/usage", (_req, res) => res.json(usage.summary()));
   app.get("/api/evidence/status", (_req, res) => res.json(evidence.describe()));
+  app.get("/api/linear/status", (_req, res) => res.json(linear.status()));
+  app.get("/api/fuse", (_req, res) => res.json(fuse.view()));
+  app.get("/api/egress", requireRole(["owner"]), (req, res) => {
+    const project = req.query.project;
+    if (project !== undefined && (typeof project !== "string" || !EGRESS_PROJECT.test(project))) return void res.status(400).json({ error: "Invalid project" });
+    res.json(egressView(config, project));
+  });
+  const fuseCloseSchema = z.discriminatedUnion("scope", [
+    z.object({ scope: z.literal("host") }).strict(),
+    z.object({ scope: z.literal("project"), projectId: z.string().min(1) }).strict(),
+  ]);
+  app.post("/api/fuse/close", requireRole(["owner"]), (req, res) => {
+    const body = fuseCloseSchema.safeParse(req.body);
+    if (!body.success) return void res.status(400).json({ error: "Invalid fuse close request" });
+    const scope = body.data, projectId = scope.scope === "project" ? scope.projectId : undefined;
+    if (projectId !== undefined && !config.projects.some(project => project.id === projectId))
+      return void res.status(404).json({ error: "Project not found" });
+    const result = fuse.close(scope);
+    if (result === "unmeasurable") return void res.status(409).json({ error: "The fuse cannot close until its launch record can be read", code: "unmeasurable" });
+    if (result === "write-failed") return void res.status(503).json({ error: "The fuse could not record the close", code: "write-failed" });
+    return void res.json({ result, view: fuse.view() });
+  });
+  app.get("/api/halt", (_req, res) => res.json(halt.view()));
+  const haltNote = z.string().trim().min(1).max(500);
+  const haltEngageSchema = z.discriminatedUnion("scope", [
+    z.object({ requestId: z.uuid(), scope: z.literal("host"), reason: haltNote.optional() }).strict(),
+    z.object({ requestId: z.uuid(), scope: z.literal("project"), projectId: z.string().min(1), reason: haltNote.optional() }).strict(),
+  ]);
+  const haltReleaseSchema = z.discriminatedUnion("scope", [
+    z.object({ requestId: z.uuid(), scope: z.literal("host"), keepPaused: z.boolean().optional() }).strict(),
+    z.object({ requestId: z.uuid(), scope: z.literal("project"), projectId: z.string().min(1), keepPaused: z.boolean().optional() }).strict(),
+  ]);
+  const haltTarget = (body: { scope: "host" } | { scope: "project"; projectId: string }): HaltTarget =>
+    body.scope === "host" ? { scope: "host" } : { scope: "project", projectId: body.projectId };
+  const haltActor = (res: express.Response) => ({ deviceId: String(res.locals.deviceId), label: String(res.locals.actor?.label ?? "Paired device") });
+  const projectMissing = () => new TeamError(404, "project-not-found", "Project not found");
+  app.post("/api/halt", requireRole(["owner"]), async (req, res) => {
+    const body = haltEngageSchema.parse(req.body), target = haltTarget(body);
+    if (target.scope === "project" && !config.projects.some(project => project.id === target.projectId)) throw projectMissing();
+    res.json(await halt.engage(target, { requestId: body.requestId, ...(body.reason === undefined ? {} : { reason: body.reason }) }, haltActor(res)));
+  });
+  app.post("/api/halt/release", requireRole(["owner"]), async (req, res) => {
+    const body = haltReleaseSchema.parse(req.body), target = haltTarget(body);
+    if (target.scope === "project" && !config.projects.some(project => project.id === target.projectId) &&
+        !halt.view().projects.some(project => project.projectId === target.projectId)) throw projectMissing();
+    res.json(await halt.release(target, { requestId: body.requestId, ...(body.keepPaused === undefined ? {} : { keepPaused: body.keepPaused }) }, haltActor(res)));
+  });
+  const sessionCost: CostLookup = sessionId => sessionCostOf(usage.session(sessionId));
+  const profileLabels = (): ((profileId: string) => string | undefined) => {
+    const labels = new Map<string, string>();
+    for (const run of teams.list()) for (const member of run.members) {
+      const profile = member.modelProfile;
+      if (profile && !labels.has(profile.id)) labels.set(profile.id, profile.label);
+    }
+    for (const profile of config.teams?.lineup ? lineupProfiles(config.teams.lineup) : []) labels.set(profile.id, profile.label);
+    return profileId => labels.get(profileId);
+  };
+  const configuredIdentity: ProfileIdentityOf = profileId => {
+    const profile = config.teams?.lineup ? lineupProfiles(config.teams.lineup).find(candidate => candidate.id === profileId) : undefined;
+    if (!profile) return undefined;
+    const identity = profileIdentity(profile, profile.provider);
+    return { provider: identity.provider, model: identity.model ?? "default", effort: identity.effort ?? null };
+  };
   app.get("/api/usage/models", (req, res) => {
     const query = z.object({ role: z.string().trim().min(1).max(40).optional() }).strict().parse(req.query);
-    return res.json(scorecard(teams.list(), sessionId => {
-      const found = usage.session(sessionId);
-      return found.measured ? { cost: found.cost, tokens: found.tokens.input + found.tokens.output + found.tokens.reasoning + found.tokens.cacheRead + found.tokens.cacheWrite, unpriced: found.pricing.unknown } : undefined;
-    }, { role: query.role }));
+    const role = query.role ?? "implementer";
+    try {
+      if (role !== "implementer" && role !== "scout") return void res.json(scorecardFromRows([], { role, label: () => undefined, cost: sessionCost }));
+      const { rows } = productionRows(evidence, role);
+      const epoch = currentEpochs(evidence, new Date().toISOString());
+      return void res.json(scorecardFromRows(rows, { role, label: profileLabels(), identity: configuredIdentity, epoch, cost: sessionCost }));
+    } catch (error) {
+      if (error instanceof EvidenceError && error.code === "unavailable") return void res.status(503).json({ code: "evidence-unavailable", error: "The evidence store is unavailable." });
+      throw error;
+    }
   });
-  app.get("/api/usage/daily", (req, res, next) => {
-    try { const query = z.object({ days: z.coerce.number().int().min(1).max(366).default(30), tz: z.string().default("UTC"), project: z.string().optional() }).strict().parse(req.query); return void res.json(usage.daily({ days: query.days, tz: query.tz, projectId: query.project })); } catch (error) { if (error instanceof RangeError) return void res.status(400).json({ error: "Invalid timezone or day range" }); return next(error); }
-  });
+  app.get("/api/usage/daily", (req, res, next) => { try { const query = z.object({ days: z.coerce.number().int().min(1).max(366).default(30), tz: z.string().default("UTC"), project: z.string().optional() }).strict().parse(req.query); return void res.json(usage.daily({ days: query.days, tz: query.tz, projectId: query.project })); } catch (error) { if (error instanceof RangeError) return void res.status(400).json({ error: "Invalid timezone or day range" }); return next(error); } });
   app.get("/api/usage/projects", (req, res, next) => { try { const query = z.object({ tz: z.string().default("UTC") }).strict().parse(req.query); return void res.json(usage.projects({ tz: query.tz })); } catch (error) { if (error instanceof RangeError) return void res.status(400).json({ error: "Invalid timezone" }); return next(error); } });
   app.get("/api/usage/projects/:id", (req, res, next) => { try { const query = z.object({ tz: z.string().default("UTC") }).strict().parse(req.query), result = usage.project(String(req.params.id), { tz: query.tz }); if (!result) return void res.status(404).json({ error: "Project usage not found" }); return void res.json(result); } catch (error) { if (error instanceof RangeError) return void res.status(400).json({ error: "Invalid timezone" }); return next(error); } });
+  registerRepairMetricsRoute(app, { runs: filter => teams.repairMetricsRuns(filter), memberUsage: (runId, memberId) => usage.memberFinal(runId, memberId), evidence, readable: () => usage.readable() });
   app.put("/api/usage/accounts/:id/plan", requireRole(["owner"]), (req, res) => {
     const accounts = config.usage?.accounts, accountId = String(req.params.id);
     const account = accounts && Object.hasOwn(accounts, accountId) ? accounts[accountId] : undefined;
@@ -624,10 +889,115 @@ export function createApp(config: Config, key: Buffer) {
     if (account.kind !== "subscription") return void res.status(400).json({ error: "Only subscription plans can be updated" });
     const body = usagePlanSchema.safeParse(req.body);
     if (!body.success) return void res.status(400).json({ error: "Invalid usage plan" });
+    requireLedger();
     usage.setPlan(accountId, body.data.planUsd);
     return void res.json({ accounts: usage.summary().accounts });
   });
-  app.post("/api/usage/balances/refresh", requireRole(["owner"]), async (_req, res) => { await balances.refresh(true); return res.json({ accounts: usage.summary().accounts }); });
+  app.post("/api/usage/balances/refresh", requireRole(["owner"]), async (_req, res) => { requireLedger(); await balances.refresh(true); return res.json({ accounts: usage.summary().accounts }); });
+  app.use("/api/usage", (error: unknown, _req: express.Request, res: express.Response, next: express.NextFunction) => ledgerUnavailable(error) ? void res.status(503).json(usageUnavailable) : next(error));
+  const outcomeCellsQuery = z.object({
+    project: z.string().regex(/^[a-z0-9-]{1,80}$/).optional(),
+    role: z.enum(["implementer", "scout"]).default("implementer"),
+    by: z.string().max(200).optional()
+      .transform(value => value === undefined ? ["profile"] : value === "" ? [] : value.split(","))
+      .pipe(z.array(z.enum(["project", "profile", "area", "kind", "risk"])).refine(list => new Set(list).size === list.length, { message: "A dimension may appear once." })),
+    sources: z.string().max(200).optional()
+      .transform(value => (value ?? "production").split(","))
+      .pipe(z.array(z.enum(["production", "duel", "replay", "legacy"])).min(1)),
+    days: z.coerce.number().int().min(1).max(3650).optional(),
+  }).strict();
+  app.get("/api/outcomes", (req, res) => {
+    const query = outcomeCellsQuery.parse(req.query);
+    const scope = { role: query.role, by: query.by, sources: query.sources, ...(query.project === undefined ? {} : { projectId: query.project }), ...(query.days === undefined ? {} : { days: query.days }) };
+    try {
+      const result = queryCells(evidence, { use: "display", ...scope } satisfies CellQuery, { now: new Date().toISOString(), cost: sessionCost });
+      return void res.json({ use: "display", query: scope, cells: result.cells, unreadable: result.unreadable });
+    } catch (error) {
+      if (error instanceof CellQueryRefused) return void res.status(400).json({ code: error.code, error: "The host refused the outcome query." });
+      if (error instanceof EvidenceError && error.code === "unavailable") return void res.status(503).json({ code: "evidence-unavailable", error: "The evidence store is unavailable." });
+      throw error;
+    }
+  });
+  const lowerUuid = z.uuid().transform(value => value.toLowerCase());
+  const rollupQuery = z.union([z.strictObject({ goal: lowerUuid }), z.strictObject({ mission: lowerUuid })]);
+  app.get("/api/outcomes/rollup", (req, res) => {
+    const query = rollupQuery.parse(req.query);
+    const target: RollupTarget = "goal" in query ? { kind: "goal", id: query.goal } : { kind: "mission", id: query.mission };
+    try {
+      const goal = target.kind === "goal" ? goals.understandingRecords().find(record => record.id === target.id) : undefined;
+      const known = target.kind === "goal" ? goal !== undefined : missions.hasRecordFile(target.id);
+      const rollup = queryRollup(evidence, target, { known, assessment: goal ? latestAssessment(goal.outcomes) : null, cost: sessionCost });
+      if (rollupMissing(rollup)) return void res.status(404).json({ code: "rollup-not-found", error: "No roll-up exists for this goal or mission." });
+      return void res.json(rollup);
+    } catch (error) {
+      if (error instanceof EvidenceError && error.code === "unavailable") return void res.status(503).json({ code: "evidence-unavailable", error: "The evidence store is unavailable." });
+      throw error;
+    }
+  });
+  app.post("/api/outcomes/legacy", requireRole(["owner"]), (req, res) => {
+    const now = Date.now();
+    const parsed = legacyBatchSchema(now).safeParse(req.body);
+    if (!parsed.success) return void res.status(400).json({ code: "legacy-invalid", error: "The legacy batch is invalid." });
+    const body = parsed.data;
+    try {
+      return void res.json(importLegacy(evidence, body, { now: new Date(now).toISOString(), retentionDays: config.teams?.outcomes?.retentionDays }));
+    } catch (error) {
+      if (error instanceof LegacyImportRefused) return void res.status(409).json({ code: "legacy-limit", error: "The host holds too many legacy lines." });
+      if (error instanceof EvidenceError && error.code === "unavailable") return void res.status(503).json({ code: "evidence-unavailable", error: "The evidence store is unavailable." });
+      throw error;
+    }
+  });
+  const servedSignal = (signal: SignalRow) => ({ ...signal, payload: Object.fromEntries(Object.entries(signal.payload).filter(([name]) => name !== "request")) });
+  app.get("/api/outcomes/runs/:runId", (req, res) => {
+    const runId = id.parse(req.params.runId);
+    try {
+      if (evidence.status().modules[OUTCOMES_MODULE] !== "ready") throw new EvidenceError("unavailable", "The evidence store is unavailable.");
+      const view = runOutcomeView(evidence, runId);
+      if (view === undefined) return void res.status(404).json({ code: "outcomes-not-found", error: "No outcome rows exist for this run." });
+      const served = (row: object) => Object.fromEntries(Object.entries(row).filter(([name]) => !["projectRef", "taskRef", "areaRef"].includes(name)));
+      return void res.json({ ...(view.summary ? { summary: served(view.summary) } : {}), rows: view.rows.map(served), members: view.members.map(served), signals: view.signals.map(servedSignal), unreadable: view.unreadable });
+    } catch (error) {
+      if (error instanceof EvidenceError && error.code === "unavailable") return void res.status(503).json({ code: "evidence-unavailable", error: "The evidence store is unavailable." });
+      throw error;
+    }
+  });
+  app.post("/api/outcomes/epochs", requireRole(["owner"]), (req, res) => {
+    const body = z.object({ profileId: z.string().regex(/^[a-z][a-z0-9-]{0,39}$/), requestId: z.uuid() }).strict().parse(req.body);
+    const profile = config.teams?.lineup ? profileKeyOf(lineupProfiles(config.teams.lineup), body.profileId) : undefined;
+    if (profile === undefined) return void res.status(404).json({ code: "profile-not-found", error: "No configured profile has this ID." });
+    if (profile === "ambiguous") return void res.status(409).json({ code: "profile-ambiguous", error: "This profile ID names more than one configuration. Give each its own ID." });
+    try {
+      const advanced = advanceEpoch(evidence, { profile, requestId: body.requestId, now: new Date().toISOString() });
+      return void res.json({ profileId: body.profileId, provider: profile.provider, model: profile.model, effort: profile.effort,
+        epoch: advanced.epoch, since: advanced.since, repeated: advanced.repeated });
+    } catch (error) {
+      if (error instanceof EpochRequestConflict) return void res.status(409).json({ code: "request-conflict", error: error.message });
+      if (error instanceof EvidenceError && error.code === "unavailable") return void res.status(503).json({ code: "evidence-unavailable", error: "The evidence store is unavailable." });
+      throw error;
+    }
+  });
+  const signalIssue = z.string().regex(/^[A-Za-z][A-Za-z0-9]{0,9}-[0-9]{1,9}$/);
+  const signalCommit = z.string().regex(COMMIT_ID);
+  const signalTime = z.iso.datetime({ offset: true }).refine(value => Date.parse(value) <= Date.now(), "A signal time cannot be later than the request.").transform(value => new Date(value).toISOString());
+  const ownerSignalSchema = z.union([
+    z.object({ action: z.literal("record"), kind: z.literal("linked-fix"), requestId: z.uuid(), runId: z.uuid(), memberId: z.uuid().optional(),
+      issue: signalIssue.optional(), commit: signalCommit.optional(), at: signalTime.optional() }).strict()
+      .refine(body => body.issue !== undefined || body.commit !== undefined, "A linked fix names an issue, a commit, or both."),
+    z.object({ action: z.literal("record"), kind: z.literal("exclusion"), requestId: z.uuid(), runId: z.uuid(), memberId: z.uuid(), reason: z.enum(EXCLUSION_REASONS) }).strict(),
+    z.object({ action: z.literal("withdraw"), kind: z.enum(["linked-fix", "exclusion"]), signalId: z.string().regex(/^[0-9a-f]{64}$/) }).strict(),
+  ]);
+  const signalStatus = { "request-conflict": 409, "signal-not-withdrawable": 409, "outcome-not-found": 404, "signal-not-found": 404 } as const;
+  app.post("/api/outcomes/signals", requireRole(["owner"]), (req, res) => {
+    const body = ownerSignalSchema.parse(req.body);
+    try {
+      const result = ownerSignal(evidence, body as OwnerSignalInput, new Date().toISOString());
+      return void res.json({ signal: servedSignal(result.signal), repeated: result.repeated });
+    } catch (error) {
+      if (error instanceof SignalRequestError) return void res.status(signalStatus[error.code]).json({ code: error.code, error: error.message });
+      if (error instanceof EvidenceError && error.code === "unavailable") return void res.status(503).json({ code: "evidence-unavailable", error: "The evidence store is unavailable." });
+      throw error;
+    }
+  });
   app.post("/api/dictation/cleanup", requireRole(["owner", "controller"]), async (req, res) => {
     const body = z.object({ text: z.string().trim().min(1).max(32000) }).strict().parse(req.body);
     if (!dictationCleaner) return void res.status(503).json({ code: "dictation-unavailable", error: "This host has no dictation model configured." });
@@ -638,9 +1008,12 @@ export function createApp(config: Config, key: Buffer) {
       throw error;
     }
   });
-  app.get("/api/teams", (_req, res) => res.json({ teams: teams.list() }));
+  app.get("/api/teams", (req, res) => res.json({ teams: z.enum(["full", "list"]).default("full").parse(req.query.view) === "list" ? teams.listItems() : teams.list() }));
   app.get("/api/goals", (_req, res) => res.json({ goals: goals.list() }));
   app.get("/api/goals/:id", (req, res) => res.json(goals.get(id.parse(req.params.id))));
+  objectiveRoutes(app, { goals, teams }, requireRole(["owner", "controller", "viewer"]), requireRole(["owner"]));
+  routingRoutes(app, { evidence, config: () => config, teams, headroomCache: router.headroomCache }, requireRole(["owner", "controller", "viewer"]), requireRole(["owner"]));
+  evalHost.routes(app, requireRole(["owner", "controller", "viewer"]), requireRole(["owner"]));
   app.get("/api/routines", (_req, res) => res.json({ routines: routines.list() }));
   app.get("/api/routines/:id", (req, res) => res.json(routines.get(id.parse(req.params.id))));
   app.post("/api/routines", requireRole(["owner"]), async (req, res) => res.json(await routines.create(createRoutineSchema.parse(req.body))));
@@ -752,10 +1125,68 @@ export function createApp(config: Config, key: Buffer) {
   app.post("/api/project-groups", requireRole(["owner"]), (req, res) => res.json(projectGroups.create(createProjectGroupSchema.parse(req.body))));
   app.put("/api/project-groups/:id", requireRole(["owner"]), (req, res) => res.json(projectGroups.update(projectGroupIdSchema.parse(req.params.id), updateProjectGroupSchema.parse(req.body))));
   app.delete("/api/project-groups/:id", requireRole(["owner"]), (req, res) => res.json(projectGroups.remove(projectGroupIdSchema.parse(req.params.id), z.object({ requestId: z.uuid(), revision: z.number().int().min(1) }).strict().parse(req.body))));
+  const permissionsUnavailable = (res: express.Response) => res.status(503).json({ error: "Permission delegation is unavailable on this host." });
+  app.get("/api/permissions/status", requireRole(["owner", "controller"]), async (_req, res) => {
+    if (!permissionDelegation) return permissionsUnavailable(res);
+    const journal = permissionJournal;
+    const now = Date.now();
+    const rateWindow = (windowMs: number) => journal!.rates({ scope: "host", since: new Date(now - windowMs).toISOString(), until: new Date(now).toISOString() });
+    let rates: { lastHour: ReturnType<PermissionJournal["rates"]>; lastDay: ReturnType<PermissionJournal["rates"]> } | null = null;
+    if (journal) { try { rates = { lastHour: rateWindow(HOUR_MS), lastDay: rateWindow(DAY_MS) }; } catch { rates = null; } }
+    res.json({
+      agent: permissionAgentState(),
+      policyVersion: PERMISSION_POLICY_VERSION,
+      interruptClasses: [...INTERRUPT_CLASSES],
+      workspaces: permissionDelegation.status(),
+      rates,
+      rateFlags: permissionRateFlags(journal, now),
+      ...permissionAgentStatus(permissionCore, permissionMeasurements, permissionReplays),
+      headless: await headlessChannel.status().catch(() => null),
+    });
+  });
+  registerPermissionAgentRoutes(app, { requireRole, requireOwnerCli, jobs: permissionReplays });
+  app.get("/api/permissions/rates", requireRole(["owner", "controller"]), (req, res) => {
+    if (!permissionJournal) return res.status(503).json({ error: "The permission journal is unavailable on this host." });
+    const query = permissionRatesQuerySchema.parse(req.query);
+    const until = Date.now();
+    return res.json({
+      scope: query.scope,
+      ...(query.id === undefined ? {} : { id: query.id }),
+      hours: query.hours,
+      rates: permissionJournal.rates({
+        scope: query.scope,
+        ...(query.id === undefined ? {} : { id: query.id }),
+        since: new Date(until - query.hours * HOUR_MS).toISOString(),
+        until: new Date(until).toISOString(),
+      }),
+    });
+  });
+  app.post("/api/permissions/delegations", requireRole(["owner"]), requireOwnerCli, async (req, res) => {
+    if (!permissionDelegation) return permissionsUnavailable(res);
+    const body = permissionDelegationBodySchema.parse(req.body);
+    const actor = { deviceId: String(res.locals.deviceId) };
+    const request = { requestId: body.requestId, direction: body.direction };
+    const delegation = permissionDelegation;
+    const recorded = <T>(act: () => T) => closeRejectsOnDirectionChange(delegation, permissionJournal, config.projects.map(project => project.id), act);
+    if (body.all) {
+      const result = recorded(() => delegation.delegateAll(request, actor));
+      return res.json({ agent: permissionAgentState(), views: result.views, replacedOptOuts: result.replacedOptOuts });
+    }
+    const result = recorded(() => delegation.delegate(body.workspaceId!, request, actor));
+    return res.json({ agent: permissionAgentState(), views: [result.view], replacedOptOuts: result.replacedOptOuts });
+  });
+  app.post("/api/permissions/revocations", requireRole(["owner"]), requireOwnerCli, async (req, res) => {
+    if (!permissionDelegation) return permissionsUnavailable(res);
+    const body = permissionRevocationBodySchema.parse(req.body);
+    const view = permissionDelegation.revoke(body.workspaceId, { requestId: body.requestId }, { deviceId: String(res.locals.deviceId) });
+    return res.json({ agent: permissionAgentState(), view });
+  });
+  registerPermissionControlRoutes(app, { guards: [requireRole(["owner"]), requireOwnerCli], controls: permissionControls });
+  registerPermissionReviewRoutes(app, { journal: permissionJournal, requireRole, requireOwnerCli, workspaces: projectGroups, projects: () => config.projects });
   app.post("/api/goals", requireRole(["owner"]), async (req, res) => {
-    const body = createGoalSchema.parse(req.body);
+    const { goal: body, criteria } = parseGoalCreateBody(req.body);
     assertNoHandoff(body.projectId);
-    return res.json(await startInProject(body.projectId, () => goals.create(body)));
+    return res.json(await startInProject(body.projectId, () => goals.create(body, undefined, criteria)));
   });
   app.post("/api/goals/:id/steer", requireRole(["owner", "controller"]), async (req, res) => res.json(await goals.steer(id.parse(req.params.id), goalSteerSchema.parse(req.body))));
   app.post("/api/goals/:id/parallelism", requireRole(["owner"]), async (req, res) => res.json(await goals.setParallelism(id.parse(req.params.id), goalParallelismSchema.parse(req.body))));
@@ -763,30 +1194,84 @@ export function createApp(config: Config, key: Buffer) {
   for (const action of ["pause", "resume", "cancel"] as const)
     app.post(`/api/goals/:id/${action}`, requireRole(["owner"]), async (req, res) => res.json(await goals[action](id.parse(req.params.id), goalActionSchema.parse(req.body))));
   app.post("/api/goals/:id/extend", requireRole(["owner"]), async (req, res) => res.json(await goals.extend(id.parse(req.params.id), goalExtendSchema.parse(req.body))));
-  app.get("/api/missions", (_req, res) => res.json({ missions: missions.list() }));
-  app.get("/api/missions/:id", (req, res) => res.json(missions.get(id.parse(req.params.id))));
-  app.post("/api/missions", requireRole(["owner"]), async (req, res) => {
-    const body = createMissionSchema.parse(req.body);
-    // A retry returns the recorded mission even if the group or a handoff changed since it was admitted.
-    const recorded = missions.replayCreate(body);
-    if (recorded) return res.json(recorded);
-    const group = projectGroups.get(body.groupId);
-    const resolvedBody = { ...body, groupId: group.id };
-    for (const repo of group.repos)
-      for (const checkout of repo.checkouts) assertNoHandoff(checkout.projectId);
-    return res.json(await missions.create(resolvedBody, body));
-  });
-  // Mission controls and answers are owner-only, so every recorded mission answer is the owner's.
+  registerMissionReadRoutes(app, { missions, teams, manager });
+  app.get("/api/intake", (_req, res) => res.json({ records: intake?.list() ?? [], ...intake?.status(), ...(intakeSlack ? { slack: intakeSlack.status() } : {}) }));
+  app.get("/api/intake/workspace-scope", requireRole(["owner"]), (_req, res) => res.json({ state: !config.intake?.slack ? "unconfigured" : intakeAudience.workspacesAllowed() ? "verified" : "blocked" }));
+  app.post("/api/missions", requireRole(["owner"]), async (req, res) => res.json(await createMission(createMissionSchema.parse(req.body))));
   app.post("/api/missions/:id/steer", requireRole(["owner"]), async (req, res) => res.json(await missions.steer(id.parse(req.params.id), missionTextSchema.parse(req.body))));
   app.post("/api/missions/:id/answer/:decisionId", requireRole(["owner"]), async (req, res) =>
     res.json(await missions.answer(id.parse(req.params.id), id.parse(req.params.decisionId), missionTextSchema.parse(req.body))));
   for (const action of ["pause", "resume", "cancel"] as const)
     app.post(`/api/missions/:id/${action}`, requireRole(["owner"]), async (req, res) => res.json(await missions[action](id.parse(req.params.id), missionActionSchema.parse(req.body))));
+  app.post("/api/missions/:id/extend", requireRole(["owner"]), async (req, res) => res.json(await missions.extend(id.parse(req.params.id), missionExtendSchema.parse(req.body))));
   app.get("/api/board", (_req, res) => {
     const memberships = projectGroups.membershipSnapshot();
     return res.json(missionBoard(missions.list(), teams.list(), goals.list(), config.projects, id => memberships.get(id)));
   });
+  app.get("/api/decision-queue", async (_req, res) => res.json(await readDecisionQueue({ manager, cmux, permissions: sessionPermissions, teams, goals, missions })));
   app.get("/api/teams/:id", (req, res) => res.json(teams.get(id.parse(req.params.id))));
+  const contextTouches = new ContextTouches({
+    read: (sessionId, after) => manager.events(sessionId, after, 200, new Set(["signal"])),
+    areas: projectId => repositoryGraphs?.areas(projectId),
+  });
+  const unobservedTouches = (sessionId: string): SessionTouches => ({ sessionId, observable: false, complete: true, graphQueries: 0, files: [], truncated: false });
+  const sessionTouches = async (source: { sessionId: string; cwd: string; provider: string; projectId: string }) => {
+    if (!existsSync(join(config.stateDir, "sessions", source.sessionId, "meta.sealed"))) return unobservedTouches(source.sessionId);
+    try { return await contextTouches.session(source); }
+    catch { return unobservedTouches(source.sessionId); }
+  };
+  app.get("/api/teams/:id/context", async (req, res) => {
+    const team = teams.get(id.parse(req.params.id));
+    const shown = team.members.filter(member => member.revision === team.revision || member.status === "running" || member.status === "waiting");
+    const members = await Promise.all(shown.map(async member => ({ memberId: member.memberId,
+      ...await sessionTouches({ sessionId: member.sessionId, cwd: member.cwd, provider: member.provider ?? team.provider, projectId: team.projectId }) })));
+    res.json({ teamId: team.id, revision: team.revision, members });
+  });
+  const entryQuery = z.object({
+    kind: z.union([z.enum(ENTRY_KINDS), z.array(z.enum(ENTRY_KINDS)).min(1).max(8)]).optional(),
+    task: z.string().regex(/^[a-z][a-z0-9-]{0,39}$/).optional(),
+    since: z.string().regex(/^\d{1,15}$/).transform(Number).optional(),
+    limit: z.string().regex(/^\d{1,3}$/).transform(Number).pipe(z.number().int().min(1).max(100)).optional(),
+  }).strict();
+  const entryRead = (req: express.Request, res: express.Response, read: (runId: string) => unknown) => {
+    const runId = id.parse(req.params.id);
+    if (!teams.hasRecordFile(runId)) throw new TeamError(404, "team-not-found", "Team not found.");
+    try { return res.json(read(runId)); }
+    catch (error) {
+      if (error instanceof EvidenceError && error.code === "unavailable")
+        return res.status(503).json({ code: "evidence-unavailable", error: "The evidence store is unavailable." });
+      throw error;
+    }
+  };
+  app.get("/api/teams/:id/entries", (req, res) => {
+    const query = entryQuery.parse(req.query);
+    const kinds = query.kind === undefined ? undefined : Array.isArray(query.kind) ? query.kind : [query.kind];
+    return entryRead(req, res, runId => blackboard.list(runId, {
+      ...(kinds ? { kinds } : {}),
+      ...(query.task ? { taskId: query.task } : {}),
+      ...(query.since !== undefined ? { since: query.since } : {}),
+      ...(query.limit !== undefined ? { limit: query.limit } : {}),
+    }));
+  });
+  app.get("/api/teams/:id/entries/:entryId", (req, res) => {
+    const entryId = id.parse(req.params.entryId);
+    return entryRead(req, res, runId => {
+      const found = blackboard.get(runId, entryId);
+      if (!found) throw new TeamError(404, "entry-not-found", "Entry not found.");
+      return found;
+    });
+  });
+  const entryWithdrawBody = z.object({ requestId: z.uuid() }).strict();
+  app.post("/api/teams/:id/entries/:entryId/withdraw", requireRole(["owner"]), (req, res) => {
+    const entryId = id.parse(req.params.entryId);
+    return entryRead(req, res, runId => {
+      if (!entryWithdrawBody.safeParse(req.body).success) throw new TeamError(400, "entry-withdraw-invalid", "The withdrawal request is invalid.");
+      const changed = blackboard.withdraw(runId, entryId);
+      if (changed === undefined) throw new TeamError(404, "entry-not-found", "Entry not found.");
+      return { entryId, state: "withdrawn", changed: changed === "withdrawn" };
+    });
+  });
+  app.get("/api/teams/:id/context-usage", (req, res) => entryRead(req, res, runId => ({ members: blackboard.contextUsage(runId) })));
   app.delete("/api/teams/:id", requireRole(["owner"]), async (req, res) => {
     const teamId = id.parse(req.params.id);
     if (goals.ownsActiveTeam(teamId)) throw new TeamError(409, "goal-owned-team", "Control this feature from its goal.");
@@ -800,7 +1285,8 @@ export function createApp(config: Config, key: Buffer) {
     let finished = false, child: ReturnType<typeof spawnTeamBundle> | undefined;
     const stop = () => {
       if (!child || finished) return;
-      try { if (child.pid && process.platform !== "win32") process.kill(-child.pid, "SIGKILL"); else child.kill("SIGKILL"); } catch { /* Already exited. */ }
+      signalGroup(child, "SIGKILL");
+      child.stdout.destroy();
     };
     const disconnect = () => { if (!res.writableEnded) { stop(); finished = true; clearTimeout(timer); } };
     req.once("aborted", disconnect);
@@ -812,6 +1298,7 @@ export function createApp(config: Config, key: Buffer) {
     if (req.aborted || res.destroyed || res.writableEnded) return;
     const limit = 512 * 1024 * 1024;
     child = spawnTeamBundle(bundle.workspace, bundle.branch, config.teams?.commandPrefix);
+    const leader = watchLeader(child);
     res.status(200).set({ "Content-Type": "application/octet-stream", "X-Infinite-Branch": bundle.branch, "X-Infinite-Head": bundle.head });
     let size = 0;
     child.stdout.on("data", (chunk: Buffer) => {
@@ -826,7 +1313,7 @@ export function createApp(config: Config, key: Buffer) {
       if (finished) return;
       finished = true;
       clearTimeout(timer);
-      if (code !== 0) res.destroy(); else res.end();
+      if (code !== 0 || leader.leftover) res.destroy(); else res.end();
     });
   });
   app.post("/api/teams", requireRole(["owner"]), async (req, res) => {
@@ -834,10 +1321,14 @@ export function createApp(config: Config, key: Buffer) {
     assertNoHandoff(body.projectId);
     return res.json(await startInProject(body.projectId, () => teams.create(body)));
   });
-  const standaloneTeam = (value: unknown) => {
-    const teamId = id.parse(value);
-    if (teams.get(teamId).goal) throw new TeamError(409, "goal-owned-team", "Control this feature from its goal. Team decisions can still be answered here.");
-    if (teams.get(teamId).missionId) throw new TeamError(409, "mission-owned-team", "Control this subteam from its mission.");
+  const standaloneTeam = (value: unknown, allowOrphanedBlockedCancel = false) => {
+    const teamId = id.parse(value), team = teams.get(teamId);
+    if (allowOrphanedBlockedCancel && !team.goal && team.status === "blocked") {
+      if (missions.ownsActiveSubteam(teamId)) throw new TeamError(409, "mission-owned-team", "Control this subteam from its mission.");
+      return teamId;
+    }
+    if (team.goal) throw new TeamError(409, "goal-owned-team", "Control this feature from its goal. Team decisions can still be answered here.");
+    if (team.missionId) throw new TeamError(409, "mission-owned-team", "Control this subteam from its mission.");
     return teamId;
   };
   app.post("/api/teams/:id/steer", requireRole(["owner", "controller"]), async (req, res) =>
@@ -848,6 +1339,7 @@ export function createApp(config: Config, key: Buffer) {
     res.json(await teams.reconcileDelivery(standaloneTeam(req.params.id), teamDeliveryReconcileSchema.parse(req.body))));
   app.post("/api/teams/:id/reconcile-verification", requireRole(["owner"]), async (req, res) =>
     res.json(await teams.reconcileVerification(standaloneTeam(req.params.id), teamVerificationReconcileSchema.parse(req.body))));
+  app.post("/api/teams/:id/processes-ended", requireRole(["owner"]), async (req, res) => res.json(await teams.processesEnded(id.parse(req.params.id), teamProcessesEndedSchema.parse(req.body))));
   app.get("/api/teams/:id/members/:memberId/runtime", requireRole(["owner"]), async (req, res) =>
     res.json(await teams.inspectMemberRuntime(standaloneTeam(req.params.id), id.parse(req.params.memberId))));
   app.post("/api/teams/:id/members/:memberId/retire", requireRole(["owner"]), async (req, res) =>
@@ -860,8 +1352,10 @@ export function createApp(config: Config, key: Buffer) {
     res.json(await (teams.get(teamId).goal ? goals.answer(teamId, decisionId, body) : teams.answer(teamId, decisionId, body)));
   });
   for (const action of ["pause", "resume", "cancel"] as const) {
-    app.post(`/api/teams/:id/${action}`, requireRole(["owner"]), async (req, res) =>
-      res.json(await teams[action](standaloneTeam(req.params.id), teamActionSchema.parse(req.body))));
+    app.post(`/api/teams/:id/${action}`, requireRole(["owner"]), async (req, res) => {
+      const teamId = id.parse(req.params.id);
+      res.json(await (action === "cancel" && teams.get(teamId).goal && !missions.ownsActiveSubteam(teamId) ? goals.cancelReleasedRun(teamId, teamActionSchema.parse(req.body)) : teams[action](standaloneTeam(teamId, action === "cancel"), teamActionSchema.parse(req.body))));
+    });
   }
   app.get("/api/machine/resources", async (_req, res) => res.json(await desktopResources.sample()));
   app.post("/api/projects/resolve", requireRole(["owner"]), requireOwnerCli, (req, res) => {
@@ -877,7 +1371,6 @@ export function createApp(config: Config, key: Buffer) {
     const projectId = projectSchema.parse(req.params.id);
     if (!mirroredProjects.isMirrored(projectId)) throw new TeamError(409, "project-not-mirrored", "Only mirrored projects can be forgotten.");
     if (projectConfigChanges.has(projectId)) throw new TeamError(409, "project-config-changing", "Repository setup is being updated. Retry after it finishes.");
-    // Holding the configuration lock refuses new sessions, teams and goals while the checks run.
     projectConfigChanges.add(projectId);
     try {
       if (projectSync.applying(projectId)) throw new TeamError(409, "sync-applying", "A workspace sync is being applied to this project. Retry after it finishes.");
@@ -901,9 +1394,21 @@ export function createApp(config: Config, key: Buffer) {
       throw new TeamError(403, "single-tenant-required", "Repository enrollment requires a single-tenant host.");
     if (projectConfigChanges.has(projectId) || projectFileChanges.has(projectId))
       throw new TeamError(409, "project-busy", "Repository setup or files are being updated. Retry after the operation finishes.");
+    if (body.permissionOptOut && !permissionDelegation) return permissionsUnavailable(res);
+    const onboarding = onboardingPermissions(permissionDelegation, projectId, body, { deviceId: String(res.locals.deviceId) });
     projectConfigChanges.add(projectId);
-    try { res.json(await enrollment.put(projectId, body)); }
-    finally { projectConfigChanges.delete(projectId); }
+    try {
+      const { view, first } = await enrollment.enroll(projectId, body, { beforeWrite: onboarding.beforeWrite });
+      const coverage = onboarding.after(first);
+      res.json({ ...view, permissionAgent: coverage });
+    } finally { projectConfigChanges.delete(projectId); }
+  });
+  app.put("/api/projects/:id/autonomy", requireRole(["owner"]), requireOwnerCli, async (req, res) => {
+    const projectId = projectSchema.parse(req.params.id);
+    const body = autonomyChangeSchema.parse(req.body);
+    if (runtimeSecurity(config.deployment).tenancy !== "single-tenant")
+      throw new TeamError(403, "single-tenant-required", "Repository enrollment requires a single-tenant host.");
+    res.json(await enrollment.setAutonomy(projectId, body));
   });
   app.get("/api/projects/:id/files", async (req, res) => {
     res.json(await desktopFiles.list(projectSchema.parse(req.params.id), z.string().max(4096).default("").parse(req.query.path),
@@ -960,18 +1465,14 @@ export function createApp(config: Config, key: Buffer) {
     res.json({ ok: true });
   });
   app.post("/api/logout", (req, res) => {
-    const value = req.headers.cookie
-      ?.split(";")
-      .map((v) => v.trim())
-      .find((v) => v.startsWith("infinite="))
-      ?.slice(9);
-    if (value) cookies.delete(hashToken(value));
-    res.clearCookie("infinite", { path: "/api" });
+    if (config.browserSessions !== false) {
+      const value = browserSessionCookie(req);
+      if (value) cookies.delete(hashToken(value));
+      res.clearCookie("infinite", { path: "/api" });
+    }
     res.json({ ok: true });
   });
-  app.get("/api/sessions", async (_req, res) =>
-    res.json({ sessions: await listSessions() }),
-  );
+  app.get("/api/sessions", (req, res) => sendSessionList(req, res, () => listSessions()));
   app.get("/api/events", (req, res) => {
     const topicValues = z.array(z.union([z.literal("sessions"), z.literal("teams"), z.string().regex(/^session\/[0-9a-f-]{36}$/i)])).min(1).max(16)
       .parse(z.string().min(1).max(4096).parse(req.query.topics).split(","));
@@ -1045,10 +1546,8 @@ export function createApp(config: Config, key: Buffer) {
     }
     const { backend: _backend, ...nativeRequest } = request;
     scheduleGraphForSession(request.projectId);
-    res.status(201).json(await startInProject(request.projectId, () => manager.create(nativeRequest)));
+    res.status(201).json(withoutCodeMode(await startInProject(request.projectId, () => manager.create(nativeRequest, "owner"))));
   });
-  // Imported sessions keep their own transport and journal. Authorization is the same
-  // as the managed-worker routes; raw native gateways remain worker-only.
   app.use("/api/sessions/:id", async (req, res, next) => {
     if (!cmux) return next();
     const sessionId = id.parse(req.params.id);
@@ -1072,8 +1571,8 @@ export function createApp(config: Config, key: Buffer) {
         await cmux.get(sessionId);
         const after = z.coerce.number().int().min(0).max(Number.MAX_SAFE_INTEGER).default(0).parse(req.query.after);
         const limit = z.coerce.number().int().min(1).max(200).default(200).parse(req.query.limit);
-        const page = cmux.events(sessionId, after, limit);
         const types = typeof req.query.types === "string" ? new Set(req.query.types.split(",")) : undefined;
+        const page = cmux.events(sessionId, after, limit, types?.size === 1 && types.has("signal") ? types : undefined);
         return void res.json({ ...page, events: types ? page.events.filter(e => types.has(e.type)) : page.events });
       }
       if (action === "/messages") return void res.json(await cmux.messages(sessionId,
@@ -1088,8 +1587,8 @@ export function createApp(config: Config, key: Buffer) {
     const authority = { actor: res.locals.actor, leaseId: res.locals.leaseId };
     try {
       if (action === "/control") {
-        const body = z.object({ action: z.enum(["claim", "renew", "release"]), leaseId: id.optional(), takeover: z.boolean().optional() }).strict().parse(req.body);
-        return void res.json({ control: await cmux.call(sessionId, { op: "control", ...body, actor: res.locals.actor }) });
+        const normalized = normalizeControlRequest(httpControlRequestSchema.parse(req.body), res.locals.actor);
+        return void (normalized.ok ? res.json({ control: await cmux.call(sessionId, normalized.request) }) : (cmux.requireStored(sessionId), res.status(409).json({ code: normalized.code, error: "Control changed or expired. This input was not sent. Refresh and take control again." })));
       }
       if (action === "/input") return void res.json(await cmux.call(sessionId, { op: "input", ...inputSchema.parse(req.body), ...authority }));
       if (action === "/answer") return void res.json(await cmux.call(sessionId, { op: "answer", ...answerSchema.parse(req.body), ...authority }));
@@ -1116,6 +1615,12 @@ export function createApp(config: Config, key: Buffer) {
     res.json(await sessionDetail(id.parse(req.params.id)));
   });
   app.get("/api/sessions/:id/handoff", (req, res) => res.json(handoffs.view(id.parse(req.params.id))));
+  app.get("/api/sessions/:id/context", async (req, res) => {
+    const sessionId = id.parse(req.params.id);
+    if (cmux && !existsSync(join(config.stateDir, "sessions", sessionId, "meta.sealed"))) { await cmux.get(sessionId); return void res.json(unobservedTouches(sessionId)); }
+    const session = manager.meta(sessionId).session;
+    res.json(await sessionTouches({ sessionId, cwd: session.cwd, provider: session.provider, projectId: session.projectId }));
+  });
   app.get("/api/sessions/:id/messages", async (req, res) => {
     const sessionId = id.parse(req.params.id);
     const session = manager.meta(sessionId).session;
@@ -1123,7 +1628,6 @@ export function createApp(config: Config, key: Buffer) {
     res.json(recordedMessages(manager, session, z.string().max(100).optional().parse(req.query.after),
       z.coerce.number().int().min(1).max(200).default(200).parse(req.query.limit), transcript));
   });
-  // A digest of the chat after a cursor. The text is the model's reading, labeled as such.
   app.get("/api/sessions/:id/summary", async (req, res) => {
     const sessionId = id.parse(req.params.id);
     const session = manager.meta(sessionId).session;
@@ -1176,7 +1680,7 @@ export function createApp(config: Config, key: Buffer) {
     try {
       if (manager.meta(sessionId).session.team)
         return void res.status(409).json({ code: "team-session", error: "Team sessions cannot be deleted individually" });
-      await manager.remove(sessionId);
+      await manager.remove(sessionId); projectSync.scheduleGarbageCollection(true);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT")
         return void res.status(404).json({ code: "not-found", error: "Session not found" });
@@ -1189,13 +1693,13 @@ export function createApp(config: Config, key: Buffer) {
     const { requestId } = z.object({ requestId: id }).strict().parse(req.body);
     const projectId = manager.meta(sessionId).session.projectId;
     scheduleGraphForSession(projectId);
-    res.json(await startInProject(projectId, () => manager.resume(sessionId, requestId)));
+    res.json(withoutCodeMode(await startInProject(projectId, () => manager.resume(sessionId, requestId, "owner"))));
   });
   app.get("/api/sessions/:id/native", refuseMissionManaged, requireRole(["owner"]), async (req, res) => {
     if (!res.locals.bearer) return res.status(403).json({ error: "Pair an owner CLI to use the native frontend" });
     const sessionId = id.parse(req.params.id);
     if (!manager.meta(sessionId).session.runtime?.nativeUi) return res.status(409).json({ error: "This session uses its original terminal transport" });
-    res.json(await workerCall(config.runDir, sessionId, { op: "native-info" }));
+    res.json(await workerCall(manager.socketTarget, sessionId, { op: "native-info" }));
   });
   app.post("/api/sessions/:id/workspace-export", requireRole(["owner"]), async (req, res) => {
     if (!res.locals.bearer || req.headers.origin) return void res.status(403).json({ error: "Workspace recovery requires a paired owner CLI" });
@@ -1203,13 +1707,14 @@ export function createApp(config: Config, key: Buffer) {
     if (!manager.meta(sessionId).session.workspace) return void res.status(409).json({ error: "This session has no hybrid workspace" });
     const request = z.object({ method: z.enum(["sync/export", "sync/blob"]), hash: z.string().regex(/^[a-f0-9]{64}$/).optional() }).strict().parse(req.body);
     if (request.method === "sync/blob" && !request.hash) return void res.status(400).json({ error: "A content hash is required" });
-    res.json(await workerCall(config.runDir, sessionId, { op: "workspace-export", ...request }, 300000));
+    if (request.method === "sync/export" && request.hash) return void res.status(400).json({ error: "sync/export does not accept a content hash" });
+    res.json(await workerCall(manager.socketTarget, sessionId, request.method === "sync/blob" ? { op: "workspace-export", method: "sync/blob", hash: request.hash! } : { op: "workspace-export", method: "sync/export" }, 300000));
   });
   app.all(/^\/api\/sessions\/([a-f\d-]{36})\/opencode(\/.*)?$/, refuseMissionManaged, requireRole(["owner"]), async (req, res) => {
     if (!res.locals.bearer || req.headers.origin || !res.locals.leaseId) return void res.status(403).json({ error: "Native access requires an owner CLI and current control" });
     const sessionId = id.parse(req.params[0]);
     if (manager.meta(sessionId).session.runtime?.nativeUi !== "opencode") return void res.status(409).json({ error: "This session does not use an OpenCode server" });
-    const backend = await workerCall<{ url: string; token: string }>(config.runDir, sessionId, { op: "native-connect", actor: res.locals.actor, leaseId: res.locals.leaseId });
+    const backend = await workerCall<{ url: string; token: string }>(manager.socketTarget, sessionId, { op: "native-connect", actor: res.locals.actor, leaseId: res.locals.leaseId });
     if (!/^http:\/\/127\.0\.0\.1:\d+$/.test(backend.url)) throw new Error("Invalid native endpoint");
     const path = new URL(req.originalUrl, origin).pathname.slice(`/api/sessions/${sessionId}/opencode`.length) || "/";
     const query = new URL(req.originalUrl, origin).search;
@@ -1251,29 +1756,23 @@ export function createApp(config: Config, key: Buffer) {
           )
         : undefined;
     const sessionId = id.parse(req.params.id);
-    const page = await sessionEvents(sessionId, after, limit);
+    const page = await sessionEvents(sessionId, after, limit, types?.size === 1 && types.has("signal") ? types : undefined);
     res.json({ ...page, events: types ? page.events.filter(event => types.has(event.type)) : page.events });
   });
   app.post("/api/sessions/:id/control", refuseManagedClaim, requireRole(["owner", "controller"]), async (req, res) => {
     const sessionId = id.parse(req.params.id);
     manager.meta(sessionId);
-    const body = z.object({
-      action: z.enum(["claim", "renew", "release"]),
-      leaseId: id.optional(),
-      takeover: z.boolean().optional(),
-    }).strict().parse(req.body);
+    const normalized = normalizeControlRequest(httpControlRequestSchema.parse(req.body), res.locals.actor);
     if (!(await manager.state(sessionId)).capabilities?.inputControl)
       return void res.status(409).json({ error: "This session uses an older worker without input control", code: "unsupported" });
-    res.json({ control: await manager.controlSession(sessionId, { op: "control", ...body, actor: res.locals.actor }) });
+    res.status(normalized.ok ? 200 : 409).json(normalized.ok ? { control: await manager.controlSession(sessionId, normalized.request) } : { code: normalized.code, error: "Control changed or expired. This input was not sent. Refresh and take control again." });
   });
-  // Only a directly paired owner CLI can send terminal control bytes. Browser
-  // cookies and controller/viewer keys retain their existing narrower inputs.
   app.post("/api/sessions/:id/raw", refuseManagedOutsideProviderPrompt, requireRole(["owner"]), async (req, res) => {
     if (!res.locals.bearer) return res.status(403).json({ error: "Pair an owner CLI to use native input" });
     const sessionId = id.parse(req.params.id);
     manager.meta(sessionId);
     const body = z.object({ requestId: id, text: z.string().min(1).max(8192) }).strict().parse(req.body);
-    res.json(await workerCall<Receipt>(config.runDir, sessionId, { op: "raw", ...body, ...await inputAuthority(sessionId, res) }));
+    res.json(await workerCall<Receipt>(manager.socketTarget, sessionId, { op: "raw", ...body, ...await inputAuthority(sessionId, res) }));
   });
   app.get("/api/sessions/:id/stream", async (req, res) => {
     const sessionId = id.parse(req.params.id);
@@ -1308,14 +1807,13 @@ export function createApp(config: Config, key: Buffer) {
       const body = inputSchema.parse(req.body);
       try {
         res.json(
-          await workerCall<Receipt>(config.runDir, sessionId, {
+          await workerCall<Receipt>(manager.socketTarget, sessionId, {
             op: "input",
             ...body,
             ...await inputAuthority(sessionId, res),
           }),
         );
       } catch (error) {
-        // A dialog is open: the text would land in it, so nothing was typed.
         if ((error as WorkerError).code === "prompt-open")
           return void res.status(409).json({
             error: "prompt-open",
@@ -1334,10 +1832,9 @@ export function createApp(config: Config, key: Buffer) {
       const body = answerSchema.parse(req.body);
       const authority = missionManagedSession(sessionId) ? { missionManaged: true as const } : await inputAuthority(sessionId, res);
       try {
-        // An answer waits for the dialog to redraw and close, so it gets more than the default 4 s.
         res.json(
           await workerCall(
-            config.runDir,
+            manager.socketTarget,
             sessionId,
             { op: "answer", ...body, ...authority },
             12000,
@@ -1369,7 +1866,7 @@ export function createApp(config: Config, key: Buffer) {
         .strict()
         .parse(req.body);
       res.json(
-        await workerCall(config.runDir, sessionId, { op: "key", ...body, ...await inputAuthority(sessionId, res) }),
+        await workerCall(manager.socketTarget, sessionId, { op: "key", ...body, ...await inputAuthority(sessionId, res) }),
       );
     },
   );
@@ -1382,7 +1879,7 @@ export function createApp(config: Config, key: Buffer) {
       manager.meta(sessionId);
       const body = z.object({ requestId: id }).strict().parse(req.body);
       res.json(
-        await workerCall(config.runDir, sessionId, { op: "stop", ...body, ...await inputAuthority(sessionId, res) }),
+        await workerCall(manager.socketTarget, sessionId, { op: "stop", ...body, ...await inputAuthority(sessionId, res) }),
       );
     },
   );
@@ -1400,7 +1897,7 @@ export function createApp(config: Config, key: Buffer) {
         .strict()
         .parse(req.body);
       res.json(
-        await workerCall(config.runDir, sessionId, { op: "resize", ...body, ...await inputAuthority(sessionId, res) }),
+        await workerCall(manager.socketTarget, sessionId, { op: "resize", ...body, ...await inputAuthority(sessionId, res) }),
       );
     },
   );
@@ -1410,18 +1907,51 @@ export function createApp(config: Config, key: Buffer) {
     if (!project) return void res.status(404).json({ error: "Unknown project" });
     res.json({ id: project.id, name: project.name, path: project.path, source: projectSource.status(projectId), sync: await projectSync.liveStatus(projectId, () => projectRunning(projectId)) });
   });
+  app.get("/api/projects/:id/graph/map", (req, res) => {
+    const projectId = projectSchema.parse(req.params.id);
+    if (!config.projects.some(project => project.id === projectId)) return void res.status(404).json({ error: "Unknown project" });
+    const lane = z.string().regex(/^(?:shared|run-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})$/).default("shared").parse(req.query.lane);
+    res.json(repositoryGraphs ? repositoryGraphs.codeMap(projectId, lane) : { state: "disabled" });
+  });
   app.get("/api/projects/:id/graph", requireRole(["owner"]), (req, res) => {
     const projectId = projectSchema.parse(req.params.id);
     if (!config.projects.some(project => project.id === projectId)) return void res.status(404).json({ error: "Unknown project" });
     const enabled = Boolean(repositoryGraphs && (!config.repositoryGraphs?.projectIds || config.repositoryGraphs.projectIds.includes(projectId)));
     res.json({ enabled, state: enabled ? "enabled" : "disabled", receipts: enabled ? repositoryGraphs!.status(projectId) : [] });
   });
+  const signalsUnavailable = { code: "evidence-unavailable", error: "The evidence store is unavailable." };
+  const ownerSignalBody = z.object({ requestId: z.uuid(), text: z.string().trim().min(1).max(MAX_SIGNAL_TEXT_LENGTH) }).strict();
+  const signalPageQuery = z.object({
+    after: z.coerce.number().int().min(0).default(0),
+    limit: z.coerce.number().int().min(1).max(MAX_SIGNAL_PAGE).default(50),
+  });
+  app.post("/api/projects/:id/signals", requireRole(["owner"]), (req, res) => {
+    const projectId = projectSchema.parse(req.params.id);
+    if (!config.projects.some(project => project.id === projectId)) return void res.status(404).json({ error: "Unknown project" });
+    const body = ownerSignalBody.parse(req.body);
+    const result = signals.record({ projectId, kind: "owner", key: body.requestId, text: body.text });
+    if ("failure" in result) {
+      if (result.failure === "invalid") return void res.status(400).json({ error: "Invalid signal" });
+      if (result.failure === "gone") return void res.status(410).json({ code: "signal-gone", error: "This request was recorded before. Its signal is no longer kept." });
+      if (result.failure === "full") return void res.status(503).json({ code: "signal-inbox-full", error: "The signal inbox is full. Try again after old signals expire." });
+      return void res.status(503).json(signalsUnavailable);
+    }
+    res.json({ recorded: result.recorded, signal: result.signal });
+  });
+  app.get("/api/projects/:id/signals", requireRole(["owner", "controller", "viewer"]), (req, res) => {
+    const projectId = projectSchema.parse(req.params.id);
+    if (!config.projects.some(project => project.id === projectId)) return void res.status(404).json({ error: "Unknown project" });
+    const query = signalPageQuery.parse(req.query);
+    const page = signals.page(projectId, query.after, { limit: query.limit });
+    if (!page) return void res.status(503).json(signalsUnavailable);
+    res.json(page);
+  });
+  app.get("/api/projects/:id/main-check", requireRole(["owner"]), mainCheckRoute(config, projectId => mainCheck?.view(projectId)));
   app.post("/api/projects/:id/source/refresh", requireRole(["owner"]), async (req, res) => {
     const projectId = projectSchema.parse(req.params.id);
     if (!projectSource.isGithub(projectId)) throw new ProjectSourceError("This project follows the laptop, not GitHub.", "not-github");
     res.json(await projectSource.refresh(projectId));
   });
-  // Sync moves whole checkouts, ignored files and credentials included, so it shares laptop execution's single-tenant gate.
   app.use("/api/projects/:id/sync", (_req, res, next) => runtimeSecurity(config.deployment).tenancy === "single-tenant" ? next()
     : void res.status(403).json({ error: "Workspace sync requires a single-tenant host" }));
   const refuseGithubSync = (projectId: string, res: express.Response) => {
@@ -1429,39 +1959,36 @@ export function createApp(config: Config, key: Buffer) {
     res.status(409).json({ error: "This project follows GitHub; laptop sync is off. Re-enroll with --source laptop to upload from this computer.", code: "source-github" });
     return true;
   };
-  const syncWriter = (req: express.Request, res: express.Response) => ({
-    deviceId: String(res.locals.deviceId),
-    publisherId: z.uuid().optional().parse(req.get("X-Infinite-Sync-Publisher")),
-  });
-  const syncGeneration = (req: express.Request) => z.uuid().optional().parse(req.get("X-Infinite-Sync-Generation"));
+  const syncWriter = (req: express.Request, res: express.Response) => ({ deviceId: String(res.locals.deviceId), publisherId: parseSyncPublisherId(req.get("X-Infinite-Sync-Publisher")) });
+  const syncLease = (req: express.Request, res: express.Response) => ({ writer: syncWriter(req, res), generation: parseSyncGeneration(req.get("X-Infinite-Sync-Generation")) });
   app.post("/api/projects/:id/sync/begin", requireRole(["owner"]), requireOwnerCli, async (req, res) => {
     const projectId = projectSchema.parse(req.params.id);
     if (refuseGithubSync(projectId, res)) return;
-    res.json(await projectSync.begin(projectId, syncWriter(req, res)));
+    res.json(await projectSync.begin(projectId, syncWriter(req, res), z.object({ expectEmpty: z.boolean().optional() }).strict().parse(req.body ?? {})));
   });
   app.post("/api/projects/:id/sync/has", requireRole(["owner"]), requireOwnerCli, async (req, res) => {
+    const { writer, generation } = syncLease(req, res);
     const body = z.object({ hashes: z.array(z.string().regex(/^[a-f0-9]{64}$/)).max(512) }).strict().parse(req.body);
-    res.json({ missing: await projectSync.missing(projectSchema.parse(req.params.id), body.hashes, syncWriter(req, res), syncGeneration(req)) });
+    res.json({ missing: await projectSync.missing(projectSchema.parse(req.params.id), body.hashes, writer, generation) });
   });
-  // A body over one chunk can never be stored; it answers 413 before it is read.
   app.put("/api/projects/:id/sync/blob/:hash", requireRole(["owner"]), requireOwnerCli, express.raw({ type: "application/octet-stream", limit: WORKSPACE_LIMITS.chunkBytes }), async (req, res) => {
+    const { writer, generation } = syncLease(req, res);
     if (!Buffer.isBuffer(req.body) || !req.body.length) return void res.status(400).json({ error: "Send the chunk as application/octet-stream" });
-    await projectSync.putBlob(projectSchema.parse(req.params.id), String(req.params.hash), req.body, syncWriter(req, res), syncGeneration(req));
+    await projectSync.putBlob(projectSchema.parse(req.params.id), String(req.params.hash), req.body, writer, generation);
     res.json({ stored: true });
   });
-  // A batch frames many chunks in one request, so an upload pays one round trip per batch instead of per chunk.
   app.put("/api/projects/:id/sync/blobs", requireRole(["owner"]), requireOwnerCli, express.raw({ type: "application/octet-stream", limit: WORKSPACE_LIMITS.batchBytes }), async (req, res) => {
+    const { writer, generation } = syncLease(req, res);
     if (!Buffer.isBuffer(req.body) || !req.body.length) return void res.status(400).json({ error: "Send the chunk batch as application/octet-stream" });
-    res.json({ stored: await projectSync.putBlobs(projectSchema.parse(req.params.id), req.body, syncWriter(req, res), syncGeneration(req)) });
+    res.json({ stored: await projectSync.putBlobs(projectSchema.parse(req.params.id), req.body, writer, generation) });
   });
-  // The body wraps a manifest of up to the manifest bound with its generation; the store checks the manifest itself.
   app.post("/api/projects/:id/sync/commit", requireRole(["owner"]), requireOwnerCli, express.json({ limit: WORKSPACE_LIMITS.manifestBytes + 64 * 1024 }), async (req, res) => {
     const projectId = projectSchema.parse(req.params.id);
     if (refuseGithubSync(projectId, res)) return;
+    const { writer, generation } = syncLease(req, res);
     const body = z.object({ generation: z.uuid(), manifest: z.unknown() }).strict().parse(req.body);
-    const headerGeneration = syncGeneration(req);
-    if (headerGeneration && headerGeneration !== body.generation) throw new ProjectSyncError("The sync generation does not match this request", "stale-generation");
-    res.json(await projectSync.commit(projectId, body.generation, body.manifest, () => projectRunning(projectId), syncWriter(req, res)));
+    if (generation !== body.generation) throw new ProjectSyncError("The sync generation does not match this request", "stale-generation");
+    res.json(await projectSync.commit(projectId, body.generation, body.manifest, () => projectRunning(projectId), writer));
   });
   app.post("/api/projects/:id/sync/apply", requireRole(["owner"]), async (req, res) => {
     const projectId = projectSchema.parse(req.params.id);
@@ -1475,17 +2002,15 @@ export function createApp(config: Config, key: Buffer) {
   app.get("/api/projects/:id/sync/blob/:hash", requireRole(["owner"]), requireOwnerCli, async (req, res) => {
     res.json({ base64: await projectSync.readBlob(projectSchema.parse(req.params.id), String(req.params.hash)) });
   });
-  const projectContexts = new ProjectContexts(config, key);
   app.get("/api/projects/:id/context-links", (req, res) => {
-    return res.json(projectContexts.listLinks(String(req.params.id)));
+    return res.json(manager.projectContexts.listLinks(String(req.params.id)));
   });
   app.put("/api/projects/:id/context-links", requireRole(["owner"]), (req, res) => {
-    return res.json(projectContexts.setLinks(String(req.params.id), contextLinksRequest.parse(req.body)));
+    return res.json(manager.projectContexts.setLinks(String(req.params.id), contextLinksRequest.parse(req.body)));
   });
   app.get("/api/projects/:id/context", (req, res) => {
-    if (!config.projects.some((p) => p.id === req.params.id))
-      return res.status(404).json({ error: "Unknown project" });
-    return res.json(manager.context(req.params.id));
+    if (!config.projects.some((p) => p.id === req.params.id)) return res.status(404).json({ error: "Unknown project" });
+    return res.json(manager.projectContexts.context(req.params.id));
   });
   app.put("/api/projects/:id/context", requireRole(["owner"]), (req, res) => {
     if (!config.projects.some((p) => p.id === req.params.id))
@@ -1498,7 +2023,7 @@ export function createApp(config: Config, key: Buffer) {
       .strict()
       .parse(req.body);
     return res.json(
-      manager.setContext(
+      manager.projectContexts.setContext(
         String(req.params.id),
         body.text,
         body.expectedVersion,
@@ -1506,13 +2031,15 @@ export function createApp(config: Config, key: Buffer) {
     );
   });
   app.use("/api", (_req, res) =>
-    res.status(404).json({ error: "Endpoint not found" }),
+    res.status(404).json({ code: "route-not-found", error: "Endpoint not found" }),
   );
-  app.use(
-    express.static(
-      fileURLToPath(new URL("../../../apps/web/dist/", import.meta.url)),
-    ),
-  );
+  const serveWeb = express.static(fileURLToPath(new URL("../../../apps/web/dist/", import.meta.url)));
+  app.use((req, res, next) => {
+    if (config.browserSessions === false) return res.status(503).type("html").send(
+      "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Browser sign-in disabled</title><main><h1>Browser sign-in is disabled</h1><p>Do not enter a device key here. Connect with a paired CLI or native app.</p></main></html>",
+    );
+    serveWeb(req, res, next);
+  });
   app.use(
     (
       error: unknown,
@@ -1520,7 +2047,6 @@ export function createApp(config: Config, key: Buffer) {
       res: express.Response,
       _next: express.NextFunction,
     ) => {
-      // `error` carries the message every client displays; a failed sync operation also names its category.
       if (error instanceof TeamError) return res.status(error.status).json({ code: error.code, error: error.message });
       if (error instanceof CatalogError) return res.status(error.statusCode).json({ code: "understanding-catalog", error: error.message });
       if (error instanceof BehaviorError) return res.status(error.statusCode).json({ code: "understanding-behavior", error: error.message });
@@ -1548,13 +2074,14 @@ export function createApp(config: Config, key: Buffer) {
         return res.status(code === "ENOENT" ? 404 : code === "EACCES" || code === "EPERM" ? 403 : 409)
           .json({ code: "file-unavailable", error: "The file operation could not be completed. Refresh the project before retrying." });
       }
-      // Workspace sync failures are about the project tree, not a session; their category never names a path.
       if (/^\/api\/projects\/[^/]+\/sync\//.test(req.path)) {
         const failure = syncFailure(error);
         return res.status(409).json({ code: "sync-failed", category: failure.category, error: failure.message, message: failure.message });
       }
       if ((error as NodeJS.ErrnoException).code === "ENOENT")
         return res.status(404).json({ error: "Session not found" });
+      if ((error as WorkerError).code === "resize-refused")
+        return res.status(503).json({ code: "resize-refused", error: (error as Error).message });
       if (["control-busy", "control-lost"].includes((error as WorkerError).code ?? ""))
         return res.status(409).json({
           code: (error as WorkerError).code,
@@ -1567,7 +2094,6 @@ export function createApp(config: Config, key: Buffer) {
           : ["invalid-cursor", "invalid-control"].includes(error.code) ? 400 : 409;
         return res.status(status).json({ code: error.code, error: error.message });
       }
-      // Never echo filesystem paths, prompts, tokens, or child process details.
       return res.status(409).json({
         error:
           "Operation could not be completed. Refresh the session before retrying. Input delivery may be uncertain.",
@@ -1575,50 +2101,61 @@ export function createApp(config: Config, key: Buffer) {
     },
   );
   const server = createServer(app);
-  // One listener per event: Node warns about a leak once more than ten listeners share one emitter,
-  // and the subsystems below plus the socket routes attached next crossed that limit.
   server.once("listening", () => {
     linear.start();
     teams.start();
     goals.start();
     routines.start();
     missions.start();
+    intake?.start();
+    void intakeSlack?.start().catch(() => undefined);
     handoffs.start();
     readings.start();
-    // The timer checks each tick which projects follow GitHub, so one enrolled while the server runs is picked up too.
     projectSource.start();
     repositoryGraphs?.start();
     void repositoryBriefings?.start().catch(() => {});
     understandingRuntime.start();
     balances.start();
+    void headlessChannel.listen().catch(() => console.warn("[Infinite] The headless permission channel could not start."));
     sweepEvidence();
     evidenceSweep = setInterval(sweepEvidence, 60 * 60 * 1000);
     evidenceSweep.unref();
     advanceOutbox();
     outboxTimer = setInterval(advanceOutbox, 60 * 1000);
     outboxTimer.unref();
+    evalHost.start();
+    void halt.start().catch(() => {});
+    void mainCheck?.start().catch(() => {});
   });
   server.once("close", () => {
+    headlessChannel.close();
+    void mcp?.close();
     teams.close();
     usage.close();
     balances.close();
     goals.close();
     routines.close();
     missions.close();
+    intake?.close();
+    intakeSlack?.close();
     repositoryBriefings?.close();
     repositoryGraphs?.close();
     void understandingRuntime.close();
     void understandingBehaviors.close();
-    void workNarratives.close();
+    void workNarratives.close().catch(() => {});
     linear.close();
     handoffs.close();
     readings.stop();
-    projectSource.stop();
+    projectSource.stop(); void projectSync.close();
+    halt.stop();
     closeEvidence();
+    void mainCheck?.close();
   });
   const closeTerminals = connectTerminals(server, manager, authenticate, missionManagedSession);
   const closeNative = connectNativeFrontends(server, manager, authenticate, missionManagedSession);
   const closeRemote = connectRemoteAccess(server, config);
-  const closeConnections = () => { routines.close(); live.close(); handoffs.close(); missions.close(); readings.stop(); goals.close(); teams.close(); closeEvidence(); usage.close(); balances.close(); linear.close(); repositoryGraphs?.close(); const briefingClosed = Promise.all([repositoryBriefings?.close(), understandingRuntime.close(), understandingBehaviors.close(), workNarratives.close()]).then(() => {}); closeTerminals(); closeNative(); closeRemote(); desktopFiles.close(); cmux?.close(); server.closeAllConnections(); return briefingClosed; };
-  return { app, manager, projectSync, teams, goals, routines, missions, readings, sessions: { list: listSessions }, pushStore, server, closeConnections };
+  const closeConnections = () => { const mainCheckClosed = mainCheck?.close() ?? Promise.resolve(); routines.close(); live.close(); handoffs.close(); missions.close(); intake?.close(); intakeSlack?.close(); readings.stop(); goals.close(); const teamsClosed = teams.close(); halt.stop(); closeEvidence(); usage.close(); balances.close(); linear.close(); repositoryGraphs?.close(); const briefingClosed = Promise.allSettled([teamsClosed, mainCheckClosed, projectSync.close(), mcp?.close(), repositoryBriefings?.close(), understandingRuntime.close(), understandingBehaviors.close(), workNarratives.close()]).then(results => { const failed = results.find(result => result.status === "rejected"); if (failed) throw failed.reason; }); closeTerminals(); closeNative(); closeRemote(); desktopFiles.close(); cmux?.close(); server.closeAllConnections(); return briefingClosed; };
+  return { app, manager, projectSync, teams, goals, routines, missions, readings, sessions: { list: listSessions }, pushStore, server, mcpServer: mcp?.server, closeConnections, fuse, halt, mainCheck,
+    permissions: { holder: (sessionId: string, promptId: number) => sessionPermissions.holder(sessionId, promptId),
+      ownerClass: (sessionId: string, promptId: number) => permissionDelivery.ownerClass(sessionId, promptId) }, permissionAgent };
 }

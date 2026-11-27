@@ -10,9 +10,9 @@ import { unseal, writeSealed } from "./vault.js";
 
 type Stored = HandoffView & { sessionId: string; projectId: string; teamId: string; stopId: string; acceptedAt: string; deadlineAt: string; request: HandoffRequest; policy: HandoffPolicy };
 type StartInProject = <T>(projectId: string, action: () => Promise<T>) => Promise<T>;
-/** One durable transfer per source. Creation retries reuse the persisted team identity. */
 export class HandoffService {
   private readonly records = new Map<string, Stored>();
+  private readonly settled = new Map<string, { view: HandoffView; revision: string }>();
   private readonly directory: string;
   private timer?: NodeJS.Timeout;
   private running = false;
@@ -31,13 +31,16 @@ export class HandoffService {
     }
   }
   private save(record: Stored) { writeSealed(join(this.directory, `${record.sessionId}.sealed`), this.key, `handoff:${record.sessionId}`, record); }
-  private discover(sessionId: string): Stored | undefined {
+  private discover(sessionId: string, exited = false): Stored | undefined {
     const previous = this.records.get(sessionId);
     if (previous) return previous;
+    const kept = this.settled.get(sessionId);
+    if (kept) { if (kept.revision === this.manager.metaRevision(sessionId)) return; this.settled.delete(sessionId); }
     const source = this.manager.meta(sessionId).session;
-    if (!source.handoff?.policy) return;
+    const revision = this.manager.metaRevision(sessionId);
+    if (!source.handoff?.policy) { if (revision) this.settled.set(sessionId, { view: { status: "unavailable", reason: source.handoff?.reason ?? "This session was created without a handoff capability." }, revision }); return; }
     const event = this.manager.handoffRequest(sessionId);
-    if (!event) return;
+    if (!event) { if (exited && revision) this.settled.set(sessionId, { view: { status: "available" }, revision }); return; }
     const envelope = handoffEnvelopeSchema.parse(event.data);
     if (envelope.sessionId !== sessionId) throw new Error("Invalid handoff source");
     const policy = source.handoff.policy;
@@ -55,6 +58,12 @@ export class HandoffService {
     if (record) return { status: record.status, teamId: record.teamId, ...(record.reason ? { reason: record.reason } : {}) };
     const source = this.manager.meta(sessionId).session;
     return source.handoff?.policy ? { status: "available" } : { status: "unavailable", reason: source.handoff?.reason ?? "This session was created without a handoff capability." };
+  }
+  listedView(sessionId: string): HandoffView {
+    if (this.records.has(sessionId)) return this.view(sessionId);
+    const kept = this.settled.get(sessionId);
+    if (kept && kept.revision === this.manager.metaRevision(sessionId)) return { ...kept.view };
+    return this.view(sessionId);
   }
   activeForProject(projectId: string) {
     const project = this.config.projects.find(project => project.id === projectId);
@@ -74,7 +83,7 @@ export class HandoffService {
     if (this.busy || !this.running) return;
     this.busy = true;
     try {
-      for (const source of await this.manager.list()) this.discover(source.id);
+      const listed = await this.manager.list(); const ids = new Set(listed.map(source => source.id)); for (const id of this.settled.keys()) if (!ids.has(id)) this.settled.delete(id); for (const source of listed) this.discover(source.id, source.status === "exited");
       for (const record of this.records.values()) {
         if (["started", "blocked"].includes(record.status)) continue;
         try { await this.step(record); }
@@ -89,7 +98,6 @@ export class HandoffService {
     } finally { this.busy = false; }
   }
   private async step(record: Stored) {
-    // A crash after creation must find the same team before inspecting a changed source.
     try {
       const team = this.teams.get(record.teamId);
       if (team.handoff?.sourceSessionId !== record.sessionId || team.projectId !== record.projectId) throw new Error("Conflicting handoff team identity");
@@ -124,7 +132,6 @@ export class HandoffService {
         title: this.manager.meta(record.sessionId).session.title.slice(0, 100), objective, parallelism: record.request.parallelism },
         { sourceSessionId: record.sessionId, checkpointHead: record.request.checkpointHead, deadlineAt: record.deadlineAt, maxMembers: record.policy.maxMembers, project: record.policy.project,
           extendMinutes: record.policy.extendMinutes ?? 0, ceilingAt: new Date(Date.parse(record.acceptedAt) + (record.policy.maxTotalMinutes ?? record.policy.maxMinutes) * 60000).toISOString() }, record.policy);
-      // Keep admission fenced until the pinned copy is fully prepared.
       this.save(record);
     });
   }

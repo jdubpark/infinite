@@ -1,0 +1,641 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
+import { existsSync, readdirSync } from "node:fs";
+import { join } from "node:path";
+import { EvalHost } from "../packages/host/src/eval-host.js";
+import { type EvalIdentity } from "../packages/host/src/eval-identity.js";
+import { isEvalSession } from "../packages/host/src/types.js";
+import { insertTrial } from "../packages/host/src/eval-trial-store.js";
+import { TRIAL_HARNESS_VERSION } from "../packages/host/src/eval-trial-rules.js";
+import type { EvalJobView } from "../packages/host/src/eval-types.js";
+import type { RuntimeProcess } from "../packages/host/src/team-retirement.js";
+import type { TrialTeams } from "../packages/host/src/eval-trial-pump.js";
+import { fixture } from "./team-fixture.js";
+import { PROJECT, profile, NOW, setup, STAND_IN_EVAL_UID, alive, fixtureInventory, readFileOr, gatesOnly, host, mine, validated, baseline, jobRow, trialRows, drive, launcherOps, graderRecord, reopen, wrapTeams, sessionOf, memberStarted, teamFixture, serveTeam, type TrialSql } from "./eval-run-fixture.js";
+
+test("a fixture task is resolved by a member that applies the reference", { timeout: 900_000 }, async () => {
+  const s = setup();
+  const fx = await teamFixture(s);
+  const served = await serveTeam(s, fx);
+  const h = host(s, { teams: () => served.service, sessions: served.manager });
+  try {
+    await validated(h);
+    const jobId = baseline(h, 1, 1);
+    let checkedWhileRunning = false;
+    await drive(s, h, () => {
+      for (const row of trialRows(s, jobId)) {
+        if (row.state !== "running") continue;
+        checkedWhileRunning = true;
+        assert.equal(served.service.list().some(view => view.id === row.trial_id), false, "the running run is not listed");
+      }
+      return jobRow(s, jobId)?.status === "completed";
+    }, [], 600_000);
+    assert.ok(checkedWhileRunning, "the run was seen while the member ran");
+    const rows = trialRows(s, jobId);
+    assert.equal(rows.length, 1, "one trial");
+    assert.equal(rows[0].ending, "graded");
+    assert.equal(rows[0].resolved, 1, "the reference resolves the task");
+    assert.equal(rows[0].isolation, "isolated");
+    const outcome = s.r.store.read(db => db.get<{ source: string; experiment_ref: string | null }>(
+      "SELECT source, experiment_ref FROM outcomes WHERE run_id = ?", rows[0].trial_id));
+    assert.equal(outcome?.source, "replay", "the outcome row is a replay row");
+    assert.equal(outcome?.experiment_ref, rows[0].trial_id, "the outcome row names the trial");
+    assert.deepEqual(readdirSync(join(s.evalRoot, "trials")), [], "the trials root is empty after the job");
+    assert.equal(served.service.list().some(view => view.id === rows[0].trial_id), false, "the run is not listed");
+    const sessions = await served.manager.list();
+    const evalSessions = sessions.filter(row => isEvalSession(row));
+    assert.ok(evalSessions.length > 0, "the replay session exists");
+    assert.ok(evalSessions.every(row => row.executionIdentity === "eval"), "the replay session records eval execution identity");
+    assert.equal(sessions.filter(row => !isEvalSession(row)).length, sessions.length - evalSessions.length);
+    assert.equal(served.service.replayIds().length, 0, "the graded trial leaves no run record");
+  } finally {
+    h.close();
+    await h.idle();
+    await fx.close();
+    s.r.store.close();
+  }
+});
+
+test("an empty result, an edit outside the paths, and an undecided permission end their trials", { timeout: 900_000 }, async () => {
+  const s = setup();
+  const fx = await teamFixture(s);
+  const served = await serveTeam(s, fx);
+  const h = host(s, { teams: () => served.service, sessions: served.manager });
+  try {
+    await validated(h);
+    const endings: string[] = [];
+    for (const mode of ["empty", "outside", "permission"]) {
+      const jobId = baseline(h, 1, 1);
+      await drive(s, h, () => jobRow(s, jobId)?.status === "completed", [mode], 600_000);
+      endings.push(trialRows(s, jobId)[0]?.ending ?? "none");
+    }
+    assert.deepEqual(endings, ["no-result", "scope-violation", "permission"]);
+    const asked = served.events.filter(event => /decision|question/.test(event.kind));
+    assert.deepEqual(asked.map(event => event.kind), [], "no owner question was asked");
+  } finally {
+    h.close();
+    await h.idle();
+    await fx.close();
+    s.r.store.close();
+  }
+});
+
+test("a provider limit voids the trial, and it runs again", { timeout: 900_000 }, async () => {
+  const s = setup();
+  const fx = await teamFixture(s);
+  const served = await serveTeam(s, fx);
+  let offset = 0;
+  const clock = () => new Date(Date.now() + offset).toISOString();
+  let stated: string | undefined;
+  const teams = wrapTeams(served.service, {
+    replayState: async trialId => {
+      const state = await served.service.replayState(trialId);
+      if (state?.resetsAt !== undefined) stated = state.resetsAt;
+      return state;
+    },
+  });
+  const h = host(s, { teams, sessions: served.manager, now: clock });
+  try {
+    await validated(h);
+    const jobId = baseline(h, 1, 2, { maxWallMinutes: 43_200 });
+    const modes = ["limit", "reference"];
+    await drive(s, h, () => trialRows(s, jobId).some(row => row.ending === "void-limit"), modes, 240_000);
+    const first = trialRows(s, jobId);
+    assert.equal(first.length, 1, "one trial so far");
+    assert.equal(first[0]?.ending, "void-limit");
+    assert.deepEqual(served.service.providerLimits(), [], "the limit memory stays empty");
+    await drive(s, h, () => false, modes, 5_000);
+    assert.equal(trialRows(s, jobId).length, 1, "no second trial while the provider is limited");
+    assert.equal(jobRow(s, jobId)?.waiting, "provider-limit", "the job waits for the provider");
+    const resetMs = stated === undefined ? NaN : Date.parse(stated);
+    offset = Number.isFinite(resetMs) && resetMs - Date.now() > 120_000 ? resetMs - Date.now() - 60_000 : 10 * 60_000;
+    await drive(s, h, () => false, modes, 3_000);
+    assert.equal(jobRow(s, jobId)?.waiting, "provider-limit", "the job still waits for the provider just before the reset");
+    assert.equal(trialRows(s, jobId).length, 1, "no second trial just before the reset");
+    offset += 25 * 3_600_000;
+    await drive(s, h, () => jobRow(s, jobId)?.status === "completed", modes, 240_000);
+    const rows = trialRows(s, jobId);
+    assert.equal(rows[1]?.ending, "graded", "the second trial is graded");
+    assert.equal(rows[1]?.attempt, 1, "the second run is attempt 1");
+    assert.deepEqual(served.service.providerLimits(), [], "the limit memory stays empty");
+  } finally {
+    h.close();
+    await h.idle();
+    await fx.close();
+    s.r.store.close();
+  }
+});
+
+test("no trial while the eval identity is busy", { timeout: 300_000 }, async () => {
+  const s = setup();
+  const busy: EvalIdentity = { ...s.identity, probe: async () => ({ state: "busy" }) };
+  const h = host(s, { identity: busy, ...gatesOnly });
+  try {
+    await validated(h);
+    const jobId = baseline(h, 1, 1);
+    await drive(s, h, () => false, [], 20_000);
+    assert.equal(trialRows(s, jobId).length, 0, "no trial row");
+    assert.equal(jobRow(s, jobId)?.waiting, "eval-identity");
+  } finally {
+    h.close();
+    await h.idle();
+    s.r.store.close();
+  }
+  const alive = setup();
+  let planted = false;
+  const aliveRow: RuntimeProcess = { pid: 2, parent: 1, group: 2, ruid: STAND_IN_EVAL_UID, euid: STAND_IN_EVAL_UID, born: "", state: "S" };
+  const hAlive = host(alive, { ...gatesOnly, inventory: async () => (planted ? [aliveRow] : []) });
+  try {
+    await validated(hAlive);
+    planted = true;
+    const jobId = baseline(hAlive, 1, 1);
+    await drive(alive, hAlive, () => jobRow(alive, jobId)?.status === "blocked", [], 120_000);
+    assert.equal(trialRows(alive, jobId).length, 0, "no trial row");
+    assert.equal(jobRow(alive, jobId)?.status, "blocked");
+    assert.equal(jobRow(alive, jobId)?.reason, "eval-processes-alive");
+  } finally {
+    hAlive.close();
+    await hAlive.idle();
+    alive.r.store.close();
+  }
+});
+
+test("without both identities, no trial starts and the summary says why", { timeout: 300_000 }, async () => {
+  const none = setup({ member: false });
+  const hNone = host(none, gatesOnly);
+  try {
+    await validated(hNone);
+    const jobId = baseline(hNone, 1, 1);
+    await drive(none, hNone, () => false, [], 10_000);
+    assert.equal(trialRows(none, jobId).length, 0);
+    assert.equal(jobRow(none, jobId)?.waiting, "eval-identity");
+    const summary = await hNone.summary(PROJECT);
+    assert.ok(!("code" in summary));
+    assert.equal(summary.evalIdentity.state, "not-configured");
+    assert.equal(summary.trials.dailyCap, 10, "the daily cap is the project's trialsPerDay");
+  } finally {
+    hNone.close();
+    await hNone.idle();
+    none.r.store.close();
+  }
+  const v1 = setup({ version1: true });
+  const hV1 = host(v1, gatesOnly);
+  try {
+    await validated(hV1);
+    const jobId = baseline(hV1, 1, 1);
+    await drive(v1, hV1, () => false, [], 10_000);
+    assert.equal(trialRows(v1, jobId).length, 0);
+    assert.equal(jobRow(v1, jobId)?.waiting, "grader");
+    const summary = await hV1.summary(PROJECT);
+    assert.ok(!("code" in summary));
+    assert.equal(summary.grader.version, 1, "the summary shows the version 1 grader");
+  } finally {
+    hV1.close();
+    await hV1.idle();
+    v1.r.store.close();
+  }
+});
+
+test("a restart in the middle of a trial voids it", { timeout: 900_000 }, async () => {
+  const s = setup();
+  const fx = await teamFixture(s);
+  const served = await serveTeam(s, fx);
+  const first = host(s, { teams: () => served.service, sessions: served.manager });
+  let second: EvalHost | undefined;
+  try {
+    await validated(first);
+    const jobId = baseline(first, 2, 3);
+    await drive(s, first, () => memberStarted(s), ["stall"], 240_000);
+    assert.ok(memberStarted(s), "the member started");
+    await drive(s, first, () => false, [], 1_500);
+    const preparing = randomUUID();
+    s.r.store.write(tx => {
+      const running = tx.get<{ task_id: string; config_ref: string; payload: string }>("SELECT task_id, config_ref, payload FROM eval_trials WHERE job_id = ?", jobId);
+      assert.ok(running, "the stalled trial row exists");
+      const configuration = { profile, guidance: "as-of-base" as const, knowledge: "none" as const };
+      insertTrial(tx, { trialId: preparing, jobId, taskId: running.task_id, configRef: running.config_ref, harness: TRIAL_HARNESS_VERSION, slot: 1,
+        attempt: 0, projectId: PROJECT, configuration, keepDays: 365 }, NOW);
+    });
+    const before = launcherOps(s).length;
+    first.close();
+    await first.idle();
+    reopen(s);
+    second = host(s, { teams: () => served.service, sessions: served.manager });
+    await drive(s, second, () => jobRow(s, jobId)?.status === "completed", ["reference"], 840_000);
+    const rows = s.r.store.read(db => db.all<TrialSql & { slot: number; session_id: string | null }>(
+      "SELECT trial_id, state, ending, attempt, resolved, isolation, slot, session_id FROM eval_trials WHERE job_id = ? ORDER BY slot, attempt", jobId));
+    assert.equal(rows.length, 3, "three trial rows: the voided trial, its rerun, and the second slot");
+    assert.equal(rows.some(row => row.trial_id === preparing), false, "the preparing row is gone");
+    assert.deepEqual(rows.map(row => [row.slot, row.attempt, row.ending]), [[0, 0, "void-host"], [0, 1, "graded"], [1, 0, "graded"]],
+      "the voided slot runs again as attempt 1, and the preparing slot runs as attempt 0");
+    assert.ok(rows[0].session_id, "the voided trial names its session, so the sweep can remove it");
+    const view = second.job(jobId);
+    assert.ok(!("code" in view) && view.kind === "baseline" && view.trials.void === 1, "the job counts one void trial");
+    const run = await served.service.replayState(rows[0].trial_id);
+    assert.ok(run === undefined || run.ending === "void-host", "the run ends void-host");
+    assert.deepEqual(launcherOps(s).slice(before, before + 3), ["stop", "clean", "scrub"], "the account is reset before any trial command");
+  } finally {
+    first.close();
+    await first.idle();
+    second?.close();
+    await second?.idle();
+    await fx.close();
+    s.r.store.close();
+  }
+});
+
+test("a lost replay run voids its trial", { timeout: 900_000 }, async () => {
+  const s = setup();
+  const fx = await teamFixture(s);
+  const served = await serveTeam(s, fx);
+  const service = served.service;
+  let lost: string | undefined;
+  const teams = (): TrialTeams => ({
+    createForReplay: input => service.createForReplay(input),
+    replayState: async trialId => (trialId === lost ? undefined : service.replayState(trialId)),
+    endReplay: (trialId, ending) => service.endReplay(trialId, ending),
+    forgetReplay: trialId => service.forgetReplay(trialId),
+    replayIds: () => service.replayIds(),
+    providerLimits: () => service.providerLimits(),
+  });
+  const h = host(s, { teams, sessions: served.manager });
+  try {
+    await validated(h);
+    const jobId = baseline(h, 1, 1);
+    await drive(s, h, () => memberStarted(s), ["stall"], 240_000);
+    await drive(s, h, () => false, [], 2_000);
+    lost = trialRows(s, jobId)[0]?.trial_id;
+    assert.ok(lost, "the trial row exists");
+    await drive(s, h, () => trialRows(s, jobId)[0]?.state === "final", [], 60_000);
+    assert.equal(trialRows(s, jobId)[0]?.ending, "void-host", "the lost run voids its trial");
+    assert.ok(sessionOf(s, lost), "the voided trial names the session it last saw, so the sweep can remove it");
+  } finally {
+    h.close();
+    await h.idle();
+    await fx.close();
+    s.r.store.close();
+  }
+
+  const t = setup();
+  const tfx = await teamFixture(t);
+  const tserved = await serveTeam(t, tfx);
+  const th = host(t, { teams: () => tserved.service, sessions: tserved.manager });
+  try {
+    await validated(th);
+    const jobId = baseline(th, 1, 2);
+    await drive(t, th, () => memberStarted(t), ["stall"], 240_000);
+    const taskId = t.r.store.read(db => db.get<{ task_id: string }>("SELECT task_id FROM eval_trials WHERE job_id = ?", jobId))?.task_id;
+    assert.ok(taskId, "the trial names its task");
+    t.r.store.write(tx => { tx.run("DELETE FROM eval_tasks WHERE task_id = ?", taskId); });
+    await drive(t, th, () => trialRows(t, jobId)[0]?.state === "final", [], 60_000);
+    assert.equal(trialRows(t, jobId)[0]?.ending, "void-host", "the deleted task voids its trial");
+    await drive(t, th, () => jobRow(t, jobId)?.status === "completed", ["reference"], 120_000);
+    assert.equal(jobRow(t, jobId)?.status, "completed", "the job moves past the task");
+    assert.equal(trialRows(t, jobId).length, 1, "no second trial for the deleted task");
+  } finally {
+    th.close();
+    await th.idle();
+    await tfx.close();
+    t.r.store.close();
+  }
+});
+
+test("validation and trials share the grader one step at a time", { timeout: 900_000 }, async () => {
+  const JOB_OPS = new Set(["receive", "run", "read", "digest", "export", "clean", "remove"]);
+  const s = setup();
+  const fx = await teamFixture(s);
+  const served = await serveTeam(s, fx);
+  const h = host(s, { teams: () => served.service, sessions: served.manager });
+  try {
+    await mine(h);
+    const created = h.create(PROJECT, { kind: "validate", limits: { maxWallMinutes: 60 } }, randomUUID());
+    assert.ok("job" in created, "the validation job is created");
+    const validation = created.job.jobId;
+    await drive(s, h, () => (h.job(validation) as EvalJobView).counts.valid >= 1 || (h.job(validation) as EvalJobView).status === "completed",
+      [], 240_000);
+    const jobId = baseline(h, 1, 1);
+    await drive(s, h, () => jobRow(s, jobId)?.status === "completed" && (h.job(validation) as EvalJobView).status === "completed",
+      ["reference"], 840_000);
+    assert.equal(jobRow(s, jobId)?.status, "completed", "the baseline job completes");
+    const record = graderRecord(s);
+    const open = new Set<string>();
+    const seen = new Set<string>();
+    for (const [op, job] of record) {
+      if (!JOB_OPS.has(op) || job === undefined) continue;
+      seen.add(job);
+      for (const other of open) assert.equal(other, job, "no other job's command runs between a receive and its clean");
+      if (op === "receive") open.add(job);
+      if (op === "clean") open.delete(job);
+    }
+    assert.ok(seen.has(validation) && seen.has(jobId), "both jobs used the grader");
+  } finally {
+    h.close();
+    await h.idle();
+    await fx.close();
+    s.r.store.close();
+  }
+});
+
+test("an unavailable store starts no trial", { timeout: 300_000 }, async () => {
+  const s = setup();
+  const fx = await teamFixture(s);
+  const served = await serveTeam(s, fx);
+  const h = host(s, { teams: () => served.service, sessions: served.manager });
+  try {
+    baseline(h, 1, 1);
+    assert.deepEqual(launcherOps(s), [], "creating the job runs no launcher command");
+    s.r.store.close();
+    assert.doesNotThrow(() => h.tick());
+    await h.idle();
+    h.sweep();
+    assert.deepEqual(launcherOps(s), [], "no launcher command runs");
+    assert.equal(readFileOr(s.r.record), "", "no grader command runs");
+    assert.deepEqual(await h.summary(PROJECT), { status: 503, code: "evidence-unavailable" }, "the summary answers 503");
+    assert.deepEqual(h.jobs(), { status: 503, code: "evidence-unavailable" }, "the jobs list answers 503");
+  } finally {
+    h.close();
+    await h.idle();
+    await fx.close();
+  }
+});
+
+test("a graded trial leaves no run record and, later, no session", { timeout: 900_000 }, async () => {
+  const s = setup();
+  const fx = await teamFixture(s);
+  const served = await serveTeam(s, fx);
+  let offset = 0;
+  const clock = () => new Date(Date.now() + offset).toISOString();
+  const h = host(s, { teams: () => served.service, sessions: served.manager, now: clock });
+  try {
+    await validated(h);
+    const jobId = baseline(h, 1, 1);
+    await drive(s, h, () => jobRow(s, jobId)?.status === "completed", [], 600_000);
+    const trial = trialRows(s, jobId)[0];
+    assert.ok(trial, "the trial row exists");
+    assert.equal(trial.ending, "graded");
+    assert.deepEqual(served.service.replayIds(), [], "the graded trial leaves no run record");
+    const sessionOf = () => s.r.store.read(db => db.get<{ session_id: string | null }>(
+      "SELECT session_id FROM eval_trials WHERE trial_id = ?", trial.trial_id))?.session_id ?? null;
+    const sessionId = sessionOf();
+    assert.ok(sessionId, "the trial keeps its session until the sweep");
+    const directory = join(fx.host.config.stateDir, "sessions", sessionId);
+    assert.ok(existsSync(directory), "the session directory exists after grading");
+    offset += 2 * 3_600_000;
+    h.sweep();
+    for (let attempt = 0; attempt < 150 && (existsSync(directory) || sessionOf() !== null); attempt++) {
+      await new Promise(resolve => setTimeout(resolve, 200));
+    }
+    assert.equal(existsSync(directory), false, "the session directory is gone after the sweep");
+    assert.equal(sessionOf(), null, "the trial no longer names its session");
+  } finally {
+    h.close();
+    await h.idle();
+    await fx.close();
+    s.r.store.close();
+  }
+});
+
+test("a baseline job is created, viewed, and resumed through the host", { timeout: 300_000 }, async () => {
+  const s = setup();
+  let planted = false;
+  const aliveRow: RuntimeProcess = { pid: 2, parent: 1, group: 2, ruid: STAND_IN_EVAL_UID, euid: STAND_IN_EVAL_UID, born: "", state: "S" };
+  const h = host(s, { ...gatesOnly, inventory: async () => (planted ? [aliveRow] : []) });
+  try {
+    await validated(h);
+    planted = true;
+    const jobId = baseline(h, 1, 1);
+    const view = h.job(jobId);
+    assert.ok(!("code" in view), "the job is viewable");
+    assert.equal(view.kind, "baseline");
+    assert.ok("trials" in view && "tasks" in view, "the view is a baseline view");
+    const listed = h.jobs();
+    assert.ok(Array.isArray(listed));
+    const row = listed.find(item => item.jobId === jobId);
+    assert.ok(row !== undefined && row.kind === "baseline" && "trials" in row, "the list shows a baseline view");
+    await drive(s, h, () => jobRow(s, jobId)?.status === "blocked", [], 120_000);
+    assert.equal(jobRow(s, jobId)?.reason, "eval-processes-alive");
+    planted = false;
+    const resumed = h.control(jobId, "resume");
+    assert.ok(!("code" in resumed), "the resume answers a job view, not a refusal");
+    assert.equal(resumed.kind, "baseline");
+    assert.notEqual(resumed.status, "blocked");
+  } finally {
+    h.close();
+    await h.idle();
+    s.r.store.close();
+  }
+});
+
+test("an error in the validation step does not stop the trial step", { timeout: 900_000 }, async () => {
+  const s = setup();
+  const fx = await teamFixture(s);
+  const served = await serveTeam(s, fx);
+  const inner = s.grader;
+  const ref: { h?: EvalHost } = {};
+  s.grader = { ...inner, remove: async job => {
+    const view = ref.h?.job(job);
+    if (view !== undefined && !("code" in view) && view.kind === "validate" && view.status === "completed") throw new Error("remove failed");
+    return inner.remove(job);
+  } };
+  const h = host(s, { teams: () => served.service, sessions: served.manager });
+  ref.h = h;
+  try {
+    await validated(h);
+    const jobId = baseline(h, 1, 1);
+    await drive(s, h, () => jobRow(s, jobId)?.status === "completed", [], 400_000);
+    const rows = trialRows(s, jobId);
+    assert.equal(rows[0]?.ending, "graded", "the trial ran although the validation step threw on every tick");
+  } finally {
+    h.close();
+    await h.idle();
+    await fx.close();
+    s.r.store.close();
+  }
+});
+
+test("a running member is watched while a validation step holds the chain", { timeout: 900_000 }, async () => {
+  const s = setup();
+  const fx = await teamFixture(s);
+  const served = await serveTeam(s, fx);
+  const inner = s.grader;
+  const ref: { h?: EvalHost } = {};
+  let mode: "refuse" | "hold" | "open" = "refuse";
+  let entered = false;
+  let release: () => void = () => undefined;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  s.grader = { ...inner, remove: async job => {
+    const view = ref.h?.job(job);
+    if (view === undefined || "code" in view || view.kind !== "validate" || view.status !== "completed" || mode === "open") return inner.remove(job);
+    if (mode === "refuse") return false;
+    entered = true;
+    await held;
+    return inner.remove(job);
+  } };
+  let skew = false;
+  const ended: string[] = [];
+  const teams = wrapTeams(served.service, {
+    replayState: async trialId => {
+      const state = await served.service.replayState(trialId);
+      return skew && state?.memberStartedAt !== undefined ? { ...state, memberStartedAt: new Date(Date.now() - 11 * 60_000).toISOString() } : state;
+    },
+    endReplay: async (trialId, ending) => {
+      ended.push(ending);
+      return served.service.endReplay(trialId, ending);
+    },
+  });
+  const h = host(s, { teams, sessions: served.manager });
+  ref.h = h;
+  try {
+    await validated(h);
+    const jobId = baseline(h, 1, 1);
+    await drive(s, h, () => memberStarted(s), ["stall"], 240_000);
+    assert.ok(memberStarted(s), "the member started");
+    mode = "hold";
+    skew = true;
+    for (let attempt = 0; attempt < 80 && !ended.includes("timeout"); attempt++) {
+      h.tick();
+      await new Promise(resolve => setTimeout(resolve, 250));
+    }
+    assert.ok(entered, "the chain is held in the validation step");
+    assert.ok(ended.includes("timeout"), `the run ended by timeout while the chain was held; ended: ${ended.join(",")}`);
+    assert.notEqual(trialRows(s, jobId)[0]?.state, "final", "the chain, not the watch, finishes the trial");
+  } finally {
+    mode = "open";
+    release();
+    h.close();
+    await h.idle();
+    await fx.close();
+    s.r.store.close();
+  }
+});
+
+test("a failure while grading closes the trial void-host and the next trial runs", { timeout: 900_000 }, async () => {
+  const s = setup();
+  const fx = await teamFixture(s);
+  const served = await serveTeam(s, fx);
+  const inner = s.grader;
+  let thrown = false;
+  s.grader = { ...inner, stop: async () => {
+    const grading = s.r.store.read(db => db.get("SELECT 1 AS n FROM eval_trials WHERE state = 'grading'"));
+    if (grading !== undefined && !thrown) {
+      thrown = true;
+      throw new Error("grader stop failed");
+    }
+    return inner.stop();
+  } };
+  const h = host(s, { teams: () => served.service, sessions: served.manager });
+  try {
+    await validated(h);
+    const jobId = baseline(h, 1, 2);
+    await drive(s, h, () => jobRow(s, jobId)?.status === "completed", [], 400_000);
+    assert.ok(thrown, "the grading threw once");
+    const rows = trialRows(s, jobId);
+    assert.deepEqual(rows.map(row => [row.attempt, row.state, row.ending]), [[0, "final", "void-host"], [1, "final", "graded"]]);
+    const view = h.job(jobId);
+    assert.ok(!("code" in view) && view.kind === "baseline" && view.trials.void === 1, "the job records the void trial");
+    assert.deepEqual(served.service.replayIds(), [], "no run remains");
+  } finally {
+    h.close();
+    await h.idle();
+    await fx.close();
+    s.r.store.close();
+  }
+});
+
+test("a failed stop is tried again before a settled trial is void", { timeout: 900_000 }, async () => {
+  const s = setup();
+  const fx = await teamFixture(s);
+  const served = await serveTeam(s, fx);
+  let armed = false, thrown = false;
+  const h = host(s, { teams: () => served.service, sessions: served.manager, inventory: async () => {
+    if (armed && !thrown) {
+      thrown = true;
+      throw new Error("inventory failed");
+    }
+    return fixtureInventory(s.r.groups);
+  } });
+  try {
+    await validated(h);
+    const jobId = baseline(h, 1, 1);
+    await drive(s, h, () => trialRows(s, jobId).some(row => row.state === "running"), [], 240_000);
+    armed = true;
+    await drive(s, h, () => jobRow(s, jobId)?.status === "completed", [], 400_000);
+    assert.ok(thrown, "one stop failed");
+    assert.equal(trialRows(s, jobId)[0]?.ending, "graded", "the settled trial is graded, not void");
+  } finally {
+    h.close();
+    await h.idle();
+    await fx.close();
+    s.r.store.close();
+  }
+});
+
+test("a clean that fails at a trial's end is run again before the next trial starts", { timeout: 900_000 }, async () => {
+  const s = setup();
+  const fx = await teamFixture(s);
+  const served = await serveTeam(s, fx);
+  const inner = s.identity;
+  let failedAt = -1;
+  s.identity = { ...inner, clean: async () => {
+    const done = await inner.clean();
+    const ended = s.r.store.read(db => db.get<{ n: number }>("SELECT COUNT(*) AS n FROM eval_trials WHERE state = 'final'"))?.n ?? 0;
+    if (ended >= 1 && failedAt < 0) {
+      failedAt = launcherOps(s).length;
+      return false;
+    }
+    return done;
+  } };
+  const h = host(s, { teams: () => served.service, sessions: served.manager });
+  try {
+    await validated(h);
+    const jobId = baseline(h, 2, 2);
+    await drive(s, h, () => jobRow(s, jobId)?.status === "completed", [], 600_000);
+    assert.ok(failedAt >= 0, "the clean at the first trial's end failed once");
+    assert.equal(jobRow(s, jobId)?.status, "completed", "the second trial ran");
+    const after = launcherOps(s).slice(failedAt);
+    const receive = after.indexOf("receive");
+    assert.ok(receive > 0, "the second trial received its source after the failure");
+    assert.deepEqual(after.slice(0, receive), ["stop", "clean", "scrub", "stop", "clean", "scrub"],
+      `the failure forces a start-up reset before the trial's own reset and before any trial command; ops: ${after.join(",")}`);
+    assert.equal(trialRows(s, jobId).length, 2, "both trials ran");
+  } finally {
+    h.close();
+    await h.idle();
+    await fx.close();
+    s.r.store.close();
+  }
+});
+
+test("a failed launch ends the run it may have left", { timeout: 900_000 }, async () => {
+  const s = setup();
+  const fx = await teamFixture(s);
+  const served = await serveTeam(s, fx);
+  let launches = 0;
+  const ended: Array<[string, string]> = [];
+  const teams = wrapTeams(served.service, {
+    createForReplay: async input => {
+      launches += 1;
+      if (launches === 1) throw new Error("launch failed");
+      return served.service.createForReplay(input);
+    },
+    endReplay: async (trialId, ending) => {
+      ended.push([trialId, ending]);
+      return served.service.endReplay(trialId, ending);
+    },
+  });
+  const h = host(s, { teams, sessions: served.manager });
+  try {
+    await validated(h);
+    const jobId = baseline(h, 1, 2);
+    await drive(s, h, () => trialRows(s, jobId)[0]?.state === "final", [], 240_000);
+    const first = trialRows(s, jobId)[0];
+    assert.equal(first?.ending, "void-host", "the failed launch voids its trial");
+    assert.ok(ended.some(([trialId, ending]) => trialId === first.trial_id && ending === "void-host"), "the run is ended void-host");
+  } finally {
+    h.close();
+    await h.idle();
+    await fx.close();
+    s.r.store.close();
+  }
+});

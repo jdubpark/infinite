@@ -23,7 +23,6 @@ public enum CmuxTransportError: Error, LocalizedError, Sendable {
 }
 
 public enum CmuxTerminalOutput: Sendable {
-    /// Reset the local emulator to this size before applying the snapshot bytes.
     case snapshot(Data, columns: Int, rows: Int)
     case bytes(Data)
     case resized(columns: Int, rows: Int)
@@ -31,7 +30,6 @@ public enum CmuxTerminalOutput: Sendable {
     case invalidFrame
 }
 
-/// Queue acceptance is not a delivery receipt or evidence of provider execution.
 public enum CmuxInputAcceptance: Sendable {
     case queued
 }
@@ -41,10 +39,6 @@ public struct CmuxCreatedTerminal: Sendable {
     public let workspaceID: String
 }
 
-/// A serialized owner of the optional native SDK connection.
-///
-/// The output handler runs on an SDK thread. It must not synchronously call back
-/// into this connection and must bound any downstream rendering queue.
 public actor CmuxConnection {
     public nonisolated static var sdkAvailable: Bool {
         #if canImport(CmuxTerminalClientFFI)
@@ -55,18 +49,16 @@ public actor CmuxConnection {
     }
 
     #if canImport(CmuxTerminalClientFFI)
-    private var clientOwner: CmuxClientOwner?
-    private var client: OpaquePointer? { clientOwner?.pointer }
-    private var outputRelay: CmuxOutputRelay? {
-        get { clientOwner?.outputRelay }
-        set { clientOwner?.outputRelay = newValue }
+    private enum ConnectionState {
+        case disconnected
+        case connected(CmuxClientOwner)
     }
+
+    private var state: ConnectionState = .disconnected
     #endif
 
     public init() {}
 
-    /// The SDK stores its identity in this owner-only directory. Callers must
-    /// account for that storage separately from their platform Keychain keys.
     public func connect(
         route: String,
         stateDirectory: URL,
@@ -74,7 +66,7 @@ public actor CmuxConnection {
         invitation: String? = nil
     ) throws {
         #if canImport(CmuxTerminalClientFFI)
-        guard client == nil else { throw CmuxTransportError.alreadyConnected }
+        guard case .disconnected = state else { throw CmuxTransportError.alreadyConnected }
         try validateRoute(route)
         guard stateDirectory.isFileURL, !deviceName.isEmpty,
               deviceName.utf8.count <= 128, !deviceName.contains("\0"),
@@ -106,7 +98,7 @@ public actor CmuxConnection {
             }
         }
         guard let connected else { throw sdkError(error, fallback: "The cmux server connection failed.") }
-        clientOwner = CmuxClientOwner(pointer: connected)
+        state = .connected(CmuxClientOwner(pointer: connected))
         #else
         throw CmuxTransportError.sdkUnavailable
         #endif
@@ -152,23 +144,23 @@ public actor CmuxConnection {
         onOutput: @escaping @Sendable (CmuxTerminalOutput) -> Void
     ) throws {
         #if canImport(CmuxTerminalClientFFI)
-        let client = try connectedClient()
+        let owner = try connectedOwner()
         guard terminalID.hasPrefix("term_"), terminalID.utf8.count <= 128,
               !terminalID.contains("\0") else {
             throw CmuxTransportError.invalidConfiguration("Choose a valid server terminal.")
         }
-        cmux_terminal_client_set_output_callback(client, nil, nil)
-        cmux_terminal_client_detach(client)
+        cmux_terminal_client_set_output_callback(owner.pointer, nil, nil)
+        cmux_terminal_client_detach(owner.pointer)
         let relay = CmuxOutputRelay(receive: onOutput)
-        outputRelay = relay
-        cmux_terminal_client_set_output_callback(client, cmuxOutputCallback, Unmanaged.passUnretained(relay).toOpaque())
+        owner.attachment = .attached(relay)
+        cmux_terminal_client_set_output_callback(owner.pointer, cmuxOutputCallback, Unmanaged.passUnretained(relay).toOpaque())
         var error = [CChar](repeating: 0, count: 2048)
         let attached = terminalID.withCString {
-            cmux_terminal_client_attach_with_timeout(client, $0, &error, error.count, 15_000)
+            cmux_terminal_client_attach_with_timeout(owner.pointer, $0, &error, error.count, 15_000)
         }
         if !attached {
-            cmux_terminal_client_set_output_callback(client, nil, nil)
-            outputRelay = nil
+            cmux_terminal_client_set_output_callback(owner.pointer, nil, nil)
+            owner.attachment = .detached
             throw sdkError(error, fallback: "The terminal could not be attached.")
         }
         #else
@@ -178,7 +170,7 @@ public actor CmuxConnection {
 
     public func send(_ bytes: Data) throws -> CmuxInputAcceptance {
         #if canImport(CmuxTerminalClientFFI)
-        let client = try connectedClient()
+        let client = try connectedOwner().pointer
         try validateInput(bytes)
         let queued = bytes.withUnsafeBytes {
             cmux_terminal_client_send(client, $0.bindMemory(to: UInt8.self).baseAddress, $0.count)
@@ -192,7 +184,7 @@ public actor CmuxConnection {
 
     public func paste(_ text: String) throws -> CmuxInputAcceptance {
         #if canImport(CmuxTerminalClientFFI)
-        let client = try connectedClient()
+        let client = try connectedOwner().pointer
         let bytes = Data(text.utf8)
         try validateInput(bytes)
         let queued = bytes.withUnsafeBytes {
@@ -207,7 +199,7 @@ public actor CmuxConnection {
 
     public func resize(columns: Int, rows: Int) throws {
         #if canImport(CmuxTerminalClientFFI)
-        let client = try connectedClient()
+        let client = try connectedOwner().pointer
         guard let columns = UInt16(exactly: columns), let rows = UInt16(exactly: rows), columns > 0, rows > 0 else {
             throw CmuxTransportError.invalidConfiguration("The terminal size is invalid.")
         }
@@ -221,30 +213,29 @@ public actor CmuxConnection {
 
     public func detach() {
         #if canImport(CmuxTerminalClientFFI)
-        guard let client else { return }
-        cmux_terminal_client_set_output_callback(client, nil, nil)
-        cmux_terminal_client_detach(client)
-        outputRelay = nil
+        guard case .connected(let owner) = state else { return }
+        cmux_terminal_client_set_output_callback(owner.pointer, nil, nil)
+        cmux_terminal_client_detach(owner.pointer)
+        owner.attachment = .detached
         #endif
     }
 
-    /// Disconnecting releases this attachment and never requests terminal termination.
     public func disconnect() {
         #if canImport(CmuxTerminalClientFFI)
-        clientOwner = nil
+        state = .disconnected
         #endif
     }
 
     #if canImport(CmuxTerminalClientFFI)
-    private func connectedClient() throws -> OpaquePointer {
-        guard let client else { throw CmuxTransportError.notConnected }
-        return client
+    private func connectedOwner() throws -> CmuxClientOwner {
+        guard case .connected(let owner) = state else { throw CmuxTransportError.notConnected }
+        return owner
     }
 
     private func readJSON(
         _ operation: (OpaquePointer, UnsafeMutablePointer<CChar>, Int) -> UnsafeMutablePointer<CChar>?
     ) throws -> Data {
-        let client = try connectedClient()
+        let client = try connectedOwner().pointer
         var error = [CChar](repeating: 0, count: 2048)
         guard let result = operation(client, &error, error.count) else {
             throw sdkError(error, fallback: "The cmux request failed; refresh before retrying a mutation.")
@@ -281,16 +272,17 @@ public actor CmuxConnection {
 }
 
 #if canImport(CmuxTerminalClientFFI)
-/// Only the enclosing actor accesses this owner. Its destructor keeps the
-/// callback context alive until the SDK has waited for all in-flight calls.
-/// A Sendable owner also permits cleanup on macOS versions without isolated
-/// actor destructors.
 private final class CmuxClientOwner: @unchecked Sendable {
+    enum Attachment {
+        case detached
+        case attached(CmuxOutputRelay)
+    }
+
     let pointer: OpaquePointer
-    var outputRelay: CmuxOutputRelay?
+    var attachment: Attachment = .detached
     init(pointer: OpaquePointer) { self.pointer = pointer }
     deinit {
-        withExtendedLifetime(outputRelay) {
+        withExtendedLifetime(attachment) {
             cmux_terminal_client_set_output_callback(pointer, nil, nil)
             cmux_terminal_client_disconnect(pointer)
         }

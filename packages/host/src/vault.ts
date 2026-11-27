@@ -5,7 +5,9 @@ import {
   closeSync,
   writeSync,
   fsyncSync,
+  fstatSync,
   renameSync,
+  rmSync,
   readFileSync,
   readdirSync,
   existsSync,
@@ -57,12 +59,17 @@ export function writeSealed(
   const temporary = `${file}.${randomBytes(8).toString("hex")}.tmp`;
   const fd = openSync(temporary, "wx", 0o600);
   try {
-    writeSync(fd, seal(key, scope, value));
-    fsyncSync(fd);
-  } finally {
-    closeSync(fd);
+    try {
+      writeSync(fd, seal(key, scope, value));
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    renameSync(temporary, file);
+  } catch (error) {
+    try { rmSync(temporary, { force: true }); } catch {}
+    throw error;
   }
-  renameSync(temporary, file);
   const dir = openSync(dirname(file), "r");
   try {
     fsyncSync(dir);
@@ -71,15 +78,21 @@ export function writeSealed(
   }
 }
 
-// One worker writes each journal. Records are authenticated against both session
-// and sequence. Segments bound reconnect reads without truncating old history.
-const SEGMENT_SIZE = 256;
+export const SEGMENT_SIZE = 256;
+export const MAX_EVENT_PAGE_BYTES = 512 * 1024;
+export interface JournalAppendMeta {
+  segment: string;
+  bytes: number;
+}
 export class Journal {
   seq = 0;
+  private failure: unknown;
+  private failed = false;
   constructor(
     readonly directory: string,
     readonly key: Buffer,
     readonly sessionId: string,
+    private readonly options?: { onAppend?: (event: Event, meta: JournalAppendMeta) => void },
   ) {
     mkdirSync(directory, { recursive: true, mode: 0o700 });
     const segments = readdirSync(directory)
@@ -98,25 +111,55 @@ export class Journal {
     }
   }
   append(type: Event["type"], data: Event["data"]): Event {
-    const seq = this.seq + 1;
-    const event: Event = { seq, at: new Date().toISOString(), type, data };
-    const file = join(
-      this.directory,
-      `${String(Math.floor((seq - 1) / SEGMENT_SIZE)).padStart(10, "0")}.journal`,
+    return this.appendAll(type, [data])[0];
+  }
+  appendAll(type: Event["type"], items: readonly Event["data"][]): Event[] {
+    if (this.failed) throw new Error("Journal closed after a failed write", { cause: this.failure });
+    return this.write(type, items);
+  }
+  private write(type: Event["type"], items: readonly Event["data"][]): Event[] {
+    const at = new Date().toISOString();
+    const first = this.seq;
+    const events = items.map(
+      (data, index): Event => ({ seq: first + index + 1, at, type, data }),
     );
-    const bytes = Buffer.from(
-      seal(this.key, `${this.sessionId}:${seq}`, event) + "\n",
-    );
-    const fd = openSync(file, "a", 0o600);
-    try {
-      let offset = 0;
-      while (offset < bytes.length) offset += writeSync(fd, bytes, offset);
-      fsyncSync(fd);
-    } finally {
-      closeSync(fd);
+    for (let start = 0; start < events.length; ) {
+      const segment = Math.floor((events[start].seq - 1) / SEGMENT_SIZE);
+      const end = Math.min(events.length, (segment + 1) * SEGMENT_SIZE - first);
+      const lines = events
+        .slice(start, end)
+        .map((event) => seal(this.key, `${this.sessionId}:${event.seq}`, event) + "\n");
+      const bytes = Buffer.from(lines.join(""));
+      const name = `${String(segment).padStart(10, "0")}.journal`;
+      let segmentBytes = 0;
+      try {
+        const fd = openSync(join(this.directory, name), "a", 0o600);
+        try {
+          let offset = 0;
+          while (offset < bytes.length) offset += writeSync(fd, bytes, offset);
+          fsyncSync(fd);
+          segmentBytes = fstatSync(fd).size;
+        } finally {
+          closeSync(fd);
+        }
+      } catch (error) {
+        this.failed = true;
+        this.failure = error;
+        throw error;
+      }
+      let size = segmentBytes - bytes.length;
+      try {
+        for (let at = start; at < end; at++) {
+          size += Buffer.byteLength(lines[at - start]);
+          this.seq = events[at].seq;
+          this.options?.onAppend?.(events[at], { segment: name, bytes: size });
+        }
+      } finally {
+        this.seq = events[end - 1].seq;
+      }
+      start = end;
     }
-    this.seq = seq;
-    return event;
+    return events;
   }
 }
 
@@ -139,11 +182,11 @@ export function readEvents(
     );
     if (!existsSync(file)) break;
     const lines = readFileSync(file, "utf8").split("\n");
-    lines.pop(); // An in-progress final write is replayed on the next read.
+    lines.pop();
     for (let i = 0; i < lines.length; i++) {
       const seq = segment * SEGMENT_SIZE + i + 1;
       if (seq <= after) continue;
-      if (events.length >= limit || totalBytes >= 512 * 1024)
+      if (events.length >= limit || totalBytes >= MAX_EVENT_PAGE_BYTES)
         return { events, cursor: scanned, more: true };
       const event = unseal<Event>(key, `${sessionId}:${seq}`, lines[i]);
       if (event.seq !== seq) throw new Error("Journal sequence mismatch");

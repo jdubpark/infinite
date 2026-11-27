@@ -36,7 +36,6 @@ test("native and fallback watches become quiet, including skipped special files"
   for (const nativeAvailable of [true, false]) {
     const { root, cacheDir } = fixture(t);
     execFileSync("mkfifo", [join(root, "pipe")]);
-    // An unusable cache exercises real native startup failure, without a test hook.
     if (!nativeAvailable) writeFileSync(cacheDir, "occupied");
     const changes = await watchWorkspaceChanges([root], cacheDir);
     assert.ok(changes);

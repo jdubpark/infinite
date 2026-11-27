@@ -10,29 +10,24 @@ import { age } from "../../status";
 import { theme } from "../../theme";
 import {
   blockedTeamsFirst, canContinueBlockedTeam, canResumeBlockedTeam, GOAL_LABELS, goalGroup, goalKind, groupRuns, newer, openDecisions, pendingApprovals, shortDate, TEAM_LABELS, teamGroup, teamKind, teamProgress, teamReady,
-  type ProductGoal, type RunGroup, type TeamView,
+  type ProductGoal, type RunGroup, type TeamListItem, type TeamView,
 } from "./model";
+import { summarizeMobileListWaitReason } from "./inspector-model";
 import { providerName, RequestStatus } from "./parts";
 import { orderedMembers } from "./summary";
 import { useRunRequest } from "./useRunRequest";
 
-/** Closed runs start folded so live work stays on the first screen. */
 function useFolds() {
   const [open, setOpen] = useState<Partial<Record<RunGroup, boolean>>>({});
   return { folded: (group: RunGroup) => group === "closed" ? !open.closed : open[group] === false, toggle: (group: RunGroup, folded: boolean) => setOpen(value => ({ ...value, [group]: folded })) };
 }
 
-/**
- * The Teams tab as a Linear-style project list: each run's state, plan progress, and the agents
- * assigned to it, grouped by what it needs from a person.
- */
-export function TeamList({ connection, me, teams, sessions, now }: { connection: Connection; me: Me; teams: TeamView[]; sessions: SessionRow[]; now: number }) {
+export function TeamList({ connection, me, teams, sessions, now }: { connection: Connection; me: Me; teams: TeamListItem[]; sessions: SessionRow[]; now: number }) {
   const router = useRouter();
   const machine = connectionKey(connection);
   const folds = useFolds();
   const project = (id: string) => me.projects?.find(value => value.id === id)?.name ?? id;
   const attention = new Set(sessions.filter(session => session.attention.state === "needs-you").map(session => session.id));
-  // Agent prompts the coordinator escalated or was not delegated; prompts it is deciding stay off the list.
   const approvals = new Map(teams.map(team => [team.id, pendingApprovals(team, sessions).length]));
   return <View>
     {!me.teams?.enabled ? <Text style={s.notice}>Teams need host setup.</Text>
@@ -47,7 +42,6 @@ export function TeamList({ connection, me, teams, sessions, now }: { connection:
           const open = openDecisions(team).length;
           const asks = approvals.get(team.id) ?? 0;
           const finished = ["ready-for-review", "cancelled", "no-change", "merged"].includes(team.status);
-          // Approvals are answered from the team, so they replace the host's pointer at the member session.
           const note = !asks && !finished && team.reason ? team.reason : "";
           const agents = orderedMembers(team.members.filter(member => member.revision === team.revision), team.revision);
           return <TeamRunRow key={team.id} connection={connection} team={team} role={me.role} machine={machine} now={now} kind={kind} done={done} total={total} open={open} asks={asks} note={note} agents={agents} attention={attention} project={project} onOpen={() => router.push({ pathname: "/team/[id]", params: { id: team.id, machine } })} />;
@@ -62,21 +56,21 @@ export function TeamList({ connection, me, teams, sessions, now }: { connection:
 }
 
 function TeamRunRow({ connection, team: received, role, machine, now, kind, done, total, open, asks, note, agents, attention, project, onOpen }: {
-  connection: Connection; team: TeamView; role: Me["role"]; machine: string; now: number; kind: ReturnType<typeof teamKind>["kind"];
-  done: number; total: number; open: number; asks: number; note: string; agents: TeamView["members"]; attention: Set<string>;
+  connection: Connection; team: TeamListItem; role: Me["role"]; machine: string; now: number; kind: ReturnType<typeof teamKind>["kind"];
+  done: number; total: number; open: number; asks: number; note: string; agents: TeamListItem["members"]; attention: Set<string>;
   project: (id: string) => string; onOpen: () => void;
 }) {
-  const [recorded, setRecorded] = useState<TeamView | null>(null);
+  const [recorded, setRecorded] = useState<TeamListItem | null>(null);
   const team = newer(recorded, received);
   const request = useRunRequest<TeamView>(connection, `${machine}/team/${team.id}`, {
     accepted: result => {
-      setRecorded(previous => newer(previous, result));
-      void api<{ teams: TeamView[] }>(connection, "/teams").then(value => {
+      setRecorded(previous => newer<TeamListItem>(previous, result));
+      void api<{ teams: TeamListItem[] }>(connection, "/teams?view=list").then(value => {
         const refreshed = value.teams.find(item => item.id === result.id);
         if (refreshed) setRecorded(previous => newer(previous, refreshed));
       }).catch(() => {});
     },
-    refused: () => { void api<{ teams: TeamView[] }>(connection, "/teams").then(value => {
+    refused: () => { void api<{ teams: TeamListItem[] }>(connection, "/teams?view=list").then(value => {
       const refreshed = value.teams.find(item => item.id === team.id);
       if (refreshed) setRecorded(previous => newer(previous, refreshed));
     }).catch(() => {}); },
@@ -85,9 +79,27 @@ function TeamRunRow({ connection, team: received, role, machine, now, kind, done
   const canContinue = canContinueBlockedTeam(team, role);
   const resume = () => request.send(`/teams/${team.id}/resume`, "Resume", team.revision);
   const { kind: rowKind } = canResume ? { kind: "blocked" as const } : { kind };
+  const waitSummary = summarizeMobileListWaitReason(team);
+  const normalizedNote = note.replace(/\s+/g, " ").trim();
+  const duplicateActionCount = Boolean(
+    waitSummary
+    && waitSummary.extraCount === 0
+    && ((waitSummary.kind === "owner-decision" && open > 0) || (waitSummary.kind === "provider-prompt" && asks > 0)),
+  );
+  const duplicateNote = Boolean(waitSummary && normalizedNote && normalizedNote === waitSummary.summary && waitSummary.extraCount === 0);
+  const shownWait = waitSummary && !duplicateActionCount && !duplicateNote ? waitSummary : undefined;
+  const waitAccessibility = shownWait
+    ? [shownWait.label, shownWait.summary, shownWait.extraCount > 0 ? `plus ${shownWait.extraCount} more` : ""].filter(Boolean).join(", ")
+    : "";
+  const rowAccessibilityLabel = [
+    `Open team ${team.title}`,
+    TEAM_LABELS[team.status],
+    total ? `${done} of ${total} tasks integrated` : "",
+    waitAccessibility,
+  ].filter(Boolean).join(", ");
   return <View style={s.runRowWrap}>
     <View style={s.listRow}>
-      <Pressable accessibilityRole="button" accessibilityLabel={`Open team ${team.title}, ${TEAM_LABELS[team.status]}${total ? `, ${done} of ${total} tasks integrated` : ""}`}
+      <Pressable accessibilityRole="button" accessibilityLabel={rowAccessibilityLabel}
         onPress={onOpen} style={({ pressed }) => [s.rowContent, pressed && s.pressed]}>
         <View style={s.icon}><StatusIcon kind={rowKind} fraction={team.status === "blocked" ? 0 : teamKind(team).fraction} size={18} /></View>
         <View style={s.main}>
@@ -107,6 +119,13 @@ function TeamRunRow({ connection, team: received, role, machine, now, kind, done
           {team.status === "blocked" ? <Text style={s.blockedReason} numberOfLines={2}>{team.reason ?? " "}</Text>
             : note ? <Text style={s.alert} numberOfLines={1}>{note}</Text>
               : <Text style={s.meta} numberOfLines={1}>{[project(team.projectId), team.linear?.issue?.identifier, team.goal ? `Goal cycle ${team.goal.cycle}` : ""].filter(Boolean).join(" · ")}</Text>}
+          {shownWait ? <View style={s.waitRow}>
+            <Text style={[s.waitLine, shownWait.tone === "attention" && s.attentionText, shownWait.tone === "error" && s.errorText]} numberOfLines={1}>
+              <Text style={s.waitLabel}>{shownWait.label}</Text>
+              {shownWait.summary ? ` · ${shownWait.summary}` : ""}
+            </Text>
+            {shownWait.extraCount > 0 ? <Text style={[s.waitExtra, shownWait.tone === "attention" && s.attentionText, shownWait.tone === "error" && s.errorText]}>(+{shownWait.extraCount})</Text> : null}
+          </View> : null}
         </View>
       </Pressable>
       {canResume ? <Button compact busy={request.busy} secondary title="Resume" disabled={request.busy || Boolean(request.pending)} onPress={resume} /> : null}
@@ -116,7 +135,6 @@ function TeamRunRow({ connection, team: received, role, machine, now, kind, done
   </View>;
 }
 
-/** The Goals tab: each goal's state, cycles used against its limit, and deadline. */
 export function GoalList({ connection, me, goals, now }: { connection: Connection; me: Me; goals: ProductGoal[]; now: number }) {
   const router = useRouter();
   const machine = connectionKey(connection);
@@ -175,6 +193,10 @@ export const listStyles = StyleSheet.create({
   errorText: { color: theme.colors.error },
   meta: { fontSize: 12, lineHeight: 17, color: theme.colors.mutedInk, flexShrink: 1 },
   alert: { fontSize: 13, lineHeight: 18, color: theme.colors.warningInk },
+  waitRow: { flexDirection: "row", alignItems: "center", gap: 4 },
+  waitLine: { fontSize: 12, lineHeight: 17, color: theme.colors.mutedInk, flexShrink: 1 },
+  waitLabel: { fontWeight: "600" },
+  waitExtra: { fontSize: 12, lineHeight: 17, color: theme.colors.mutedInk, flexShrink: 0 },
   blockedReason: { minHeight: 34, fontSize: 12, lineHeight: 17, color: theme.colors.error, flexShrink: 1 },
   notice: { backgroundColor: theme.colors.warningSurface, color: theme.colors.warningInk, fontSize: 12, lineHeight: 18, padding: 12, borderRadius: theme.radius.card, marginTop: 12 },
   empty: { paddingVertical: 40, paddingHorizontal: 12, gap: 8, alignItems: "center" },

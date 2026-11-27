@@ -1,18 +1,21 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { isAbsolute, relative, resolve } from "node:path";
 import { z } from "zod";
 import { failureReason } from "./failure-reason.js";
+import { signalGroup, spawnGroup, watchLeader } from "./process-group.js";
+import { agentModelClientEnvironment } from "./egress.js";
 import type { Manager } from "./manager.js";
 import type { ChatMessage } from "./session-content.js";
 import type { Project, Session } from "./types.js";
 import type { BriefingUsage } from "./usage-api.js";
 
+const STOP_GRACE_MS = 3_000;
+
 export interface RepositoryBriefingConfig {
   command: string;
   args: string[];
-  /** Jevcode writer; Jevcode's default (Muse Spark through OpenCode) when absent. */
   runner?: "muse" | "deepseek" | "codex";
   model?: string;
   automatic: boolean;
@@ -37,7 +40,6 @@ const briefSchema = z.object({
   unknowns: z.array(z.string().min(1).max(900)).max(8),
   diagrams: z.array(z.object({ title: z.string().min(1).max(120), kind: z.enum(["system", "change"]), mermaid: z.string().min(1).max(3000), citations: z.array(citation).max(6) }).strict()).max(2).default([]),
 }).strict();
-// Jevcode's automatic run decides whether this turn warranted a refresh; the brief may predate it.
 const decisionSchema = z.object({
   action: z.enum(["skip", "run", "coalesced", "disabled", "failed"]), reason: z.string().max(1000),
   judge: z.enum(["jev", "heuristic"]).nullable(), worthwhile: z.number().min(0).max(1).nullable(), scope: z.enum(["skip", "update", "full"]).nullable(),
@@ -123,7 +125,17 @@ type Tracked = { cursor: number; createdAt: number; checkpointDue?: number };
 type BriefingRetention = {
   capture(session: Session, location: Location): Promise<unknown>;
   persist(session: Session, location: Location, summary: RepositorySummary, captured: unknown): Promise<void>;
+  cacheKey?(session: Session, location: Location): Promise<string | undefined>;
+  captureKey?(captured: unknown): string | undefined;
+  available?(session: Session, location: Location): Promise<boolean>;
 };
+type LatestStatus = { status: BriefingStatus; sourceKey?: string; updatedAt: number };
+
+type Lifecycle =
+  | { kind: "idle"; timer?: NodeJS.Timeout; polling: boolean }
+  | { kind: "draining"; timer?: NodeJS.Timeout; polling: boolean }
+  | { kind: "closing"; done: Promise<void>; resolve: () => void }
+  | { kind: "closed" };
 
 function inside(root: string, candidate: string): boolean {
   const child = relative(root, candidate);
@@ -167,11 +179,12 @@ function renderBrief(brief: z.infer<typeof briefSchema>) {
   return out.join("\n");
 }
 
-async function collectProcess(command: string, args: string[], options: { cwd: string; input?: string; timeoutMs: number; maxBytes: number; signal?: AbortSignal }): Promise<string> {
+async function collectProcess(command: string, args: string[], options: { cwd: string; input?: string; timeoutMs: number; maxBytes: number; signal?: AbortSignal; env?: NodeJS.ProcessEnv }): Promise<string> {
   return new Promise((resolvePromise, rejectPromise) => {
     let child: ChildProcess;
-    try { child = spawn(command, args, { cwd: options.cwd, stdio: ["pipe", "pipe", "pipe"], detached: process.platform !== "win32" }); }
+    try { child = spawnGroup(command, args, { cwd: options.cwd, env: options.env, stdio: ["pipe", "pipe", "pipe"] }, STOP_GRACE_MS); }
     catch { rejectPromise(new Error("spawn")); return; }
+    const leader = watchLeader(child);
     let stdout = Buffer.alloc(0), stderrTail = Buffer.alloc(0), stopped: string | undefined;
     let closeCode: number | null | undefined, closeHandled = false, escalationDone = false;
     const finish = () => {
@@ -185,12 +198,12 @@ async function collectProcess(command: string, args: string[], options: { cwd: s
     const stop = (reason: string) => {
       if (stopped) return;
       stopped = reason;
-      try { if (child.pid && process.platform !== "win32") process.kill(-child.pid, "SIGTERM"); else child.kill("SIGTERM"); } catch { /* already exited */ }
+      signalGroup(child, "SIGTERM");
       setTimeout(() => {
-        try { if (child.pid && process.platform !== "win32") process.kill(-child.pid, "SIGKILL"); else child.kill("SIGKILL"); } catch { /* already exited */ }
+        signalGroup(child, "SIGKILL");
         escalationDone = true;
         finish();
-      }, 3000);
+      }, STOP_GRACE_MS);
     };
     const timer = setTimeout(() => stop("timeout"), options.timeoutMs);
     timer.unref();
@@ -204,6 +217,10 @@ async function collectProcess(command: string, args: string[], options: { cwd: s
     child.on("error", () => { stopped ??= "spawn"; escalationDone = true; });
     child.on("close", code => {
       closeCode = code;
+      if (leader.leftover && !stopped) {
+        stopped = "output-held";
+        escalationDone = true;
+      }
       if (!stopped) clearTimeout(timer);
       finish();
     });
@@ -215,24 +232,19 @@ async function collectProcess(command: string, args: string[], options: { cwd: s
 
 export class RepositoryBriefings {
   private usageRecorder?: { recordBriefing(projectId: string, sessionId: string, at: string, usage: BriefingUsage | null): void };
-  private timer?: NodeJS.Timeout;
-  private closed = false;
-  private polling = false;
-  private running = false;
+  private lifecycle: Lifecycle = { kind: "idle", polling: false };
   private discoveredBefore = 0;
   private readonly tracked = new Map<string, Tracked>();
   private readonly locations = new Map<string, Location>();
   private readonly pending = new Map<string, Job>();
   private readonly inFlight = new Map<string, Job>();
   private readonly reports = new Map<string, RepositorySummary>();
-  private readonly latest = new Map<string, BriefingStatus>();
-  private readonly statusUpdatedAt = new Map<string, number>();
+  private readonly latest = new Map<string, LatestStatus>();
   private readonly controllers = new Set<AbortController>();
   private readonly lastAttempt = new Map<string, number>();
   private retention?: BriefingRetention;
   useUsage(service: { recordBriefing(projectId: string, sessionId: string, at: string, usage: BriefingUsage | null): void }) { this.usageRecorder = service; }
   useRetention(retention: BriefingRetention) { this.retention = retention; }
-  private readonly closeWaiters: (() => void)[] = [];
 
   constructor(
     readonly config: RepositoryBriefingConfig,
@@ -243,37 +255,99 @@ export class RepositoryBriefings {
 
   get model() { return this.config.model ?? WRITER_LABEL[this.config.runner ?? "muse"]; }
 
+  private currentLifecycle(): Lifecycle {
+    return this.lifecycle;
+  }
+
+  private isClosed(): boolean {
+    return this.lifecycle.kind === "closing" || this.lifecycle.kind === "closed";
+  }
+
   async start(): Promise<void> {
-    if (this.closed || this.timer) return;
+    if (this.lifecycle.kind !== "idle" || this.lifecycle.timer) return;
     const sessions = await this.manager.list().catch(() => []);
-    if (this.closed) return;
+    if (this.isClosed()) return;
     this.discoveredBefore = Date.now();
     for (const listed of sessions) {
       const session = this.manager.meta(listed.id).session;
       if (session.status === "running" || session.status === "starting" || session.status === "unavailable" || session.status === "recording-error") {
         this.tracked.set(session.id, { cursor: listed.seq, createdAt: Date.parse(session.createdAt) || 0 });
-        try { this.rememberLocation(session.id, await this.location(session)); } catch { /* source is explicitly unavailable when an event arrives */ }
+        try { this.rememberLocation(session.id, await this.location(session)); } catch {}
       }
     }
-    if (this.closed) return;
+    const lc = this.currentLifecycle();
+    if ((lc.kind !== "idle" && lc.kind !== "draining") || lc.timer) return;
     this.trimTracked();
-    this.timer = setInterval(() => { void this.poll(); }, this.config.intervalMs);
-    this.timer.unref();
+    const timer = setInterval(() => { void this.poll(); }, this.config.intervalMs);
+    timer.unref();
+    lc.timer = timer;
   }
 
   close(): Promise<void> {
-    this.closed = true;
-    if (this.timer) clearInterval(this.timer);
-    this.timer = undefined;
+    if (this.lifecycle.kind === "closed") return Promise.resolve();
+    if (this.lifecycle.kind === "closing") return this.lifecycle.done;
+    if (this.lifecycle.timer) clearInterval(this.lifecycle.timer);
     for (const controller of this.controllers) controller.abort();
     for (const job of this.pending.values()) for (const waiter of job.waiters) waiter.reject(new Error("Repository brief service closed"));
     this.pending.clear();
-    return this.running ? new Promise(resolve => this.closeWaiters.push(resolve)) : Promise.resolve();
+    if (this.lifecycle.kind === "draining") {
+      let resolveDone!: () => void;
+      const done = new Promise<void>(resolve => { resolveDone = resolve; });
+      this.lifecycle = { kind: "closing", done, resolve: resolveDone };
+      return done;
+    }
+    this.lifecycle = { kind: "closed" };
+    return Promise.resolve();
   }
 
   async status(session: Session): Promise<BriefingStatus> {
-    const current = this.latest.get(session.id);
-    if (current) return current;
+    const initial = this.latest.get(session.id);
+    if (session.team?.role === "mission-coordinator" && this.retention?.cacheKey) {
+      if (initial && !initial.status.summary && (initial.status.state === "failed" || initial.status.state === "pending" || initial.status.state === "running")) {
+        return initial.status;
+      }
+      if (!initial?.status.summary) {
+        try {
+          const location = await this.location(session);
+          this.rememberLocation(session.id, location);
+          const available = this.retention.available ? await this.retention.available(session, location) : true;
+          const current = this.latest.get(session.id);
+          if (current && !current.status.summary && (current.status.state === "failed" || current.status.state === "pending" || current.status.state === "running")) {
+            return current.status;
+          }
+          if (!available) return { state: "unavailable", error: "This session source is unavailable for repository briefing." };
+          if (!current?.status.summary) return { state: "empty" };
+        } catch {
+          const current = this.latest.get(session.id);
+          if (current && (current.status.state === "failed" || current.status.state === "pending" || current.status.state === "running")) {
+            const { summary: _stale, ...rest } = current.status;
+            return rest;
+          }
+          return { state: "unavailable", error: "This session source is unavailable for repository briefing." };
+        }
+      }
+      let liveKey: string | undefined;
+      try {
+        const location = await this.location(session);
+        this.rememberLocation(session.id, location);
+        liveKey = await this.retention.cacheKey(session, location);
+      } catch {
+        const current = this.latest.get(session.id);
+        if (current && (current.status.state === "failed" || current.status.state === "pending" || current.status.state === "running")) {
+          const { summary: _stale, ...rest } = current.status;
+          return rest;
+        }
+        return { state: "unavailable", error: "This session source is unavailable for repository briefing." };
+      }
+      const current = this.latest.get(session.id);
+      if (!current) return { state: "empty" };
+      if (!current.status.summary) return current.status;
+      if (liveKey && current.sourceKey === liveKey) return current.status;
+      if (current.status.state === "ready") return { state: "empty" };
+      const { summary: _stale, ...rest } = current.status;
+      return rest;
+    }
+    if (initial) return initial.status;
     try {
       const location = await this.location(session);
       this.rememberLocation(session.id, location);
@@ -287,23 +361,41 @@ export class RepositoryBriefings {
     }
   }
 
-  /** Snapshot current briefing lifecycle labels without probing a session or scheduling work. */
   understandingStatuses() {
-    return [...this.latest.entries()].map(([sessionId, status]) => ({ sessionId, state: status.state,
-      attemptedAt: this.lastAttempt.get(sessionId), updatedAt: this.statusUpdatedAt.get(sessionId)!, ...(status.error ? { error: status.error } : {}) }));
+    return [...this.latest.entries()].map(([sessionId, entry]) => ({ sessionId, state: entry.status.state,
+      attemptedAt: this.lastAttempt.get(sessionId), updatedAt: entry.updatedAt, ...(entry.status.error ? { error: entry.status.error } : {}) }));
   }
 
   async summarize(session: Session, from: string): Promise<RepositorySummary | Omit<RepositorySummary, "repository">> {
-    if (this.closed) throw new Error("Repository brief service closed");
+    if (this.isClosed()) throw new Error("Repository brief service closed");
     const state = await this.manager.state(session.id);
     const activity = await this.readMessages(session, state.capabilities?.transcript === 1, from, state.seq);
     const { messages, cursor: to } = activity;
-    const key = rangeKey(session.id, from, messages);
-    const cached = this.reports.get(key);
-    if (cached) return cached;
+    const baseKey = rangeKey(session.id, from, messages);
+    const pinnedLookup = Boolean(this.retention?.cacheKey && session.team?.role === "mission-coordinator");
+    if (!pinnedLookup) {
+      const cached = this.reports.get(baseKey);
+      if (cached) return cached;
+    }
     const location = await this.location(session);
-    if (this.closed) throw new Error("Repository brief service closed");
+    if (this.isClosed()) throw new Error("Repository brief service closed");
     if (messages.length === 0) return { engine: "jevcode", model: this.model, text: "", from, to, messages: 0, at: new Date().toISOString() };
+    let key = baseKey;
+    let sourceKey: string | undefined;
+    if (pinnedLookup) {
+      try {
+        sourceKey = await this.retention!.cacheKey!(session, location);
+        if (this.isClosed()) throw new Error("Repository brief service closed");
+        if (sourceKey) key = `${baseKey}:${sourceKey}`;
+      } catch {
+        key = `${baseKey}:uncached:${Date.now()}`;
+      }
+      const cached = this.reports.get(key);
+      if (cached) {
+        if (!this.hasActiveJob(session.id)) this.setStatus(session.id, { state: "ready", summary: cached }, sourceKey);
+        return cached;
+      }
+    }
     const baseline = location.baseline ?? await this.captureHead(location.root);
     const nextLocation = { ...location, baseline };
     this.rememberLocation(session.id, nextLocation);
@@ -312,21 +404,22 @@ export class RepositoryBriefings {
   }
 
   private async poll(): Promise<void> {
-    if (this.closed || this.polling || !this.config.automatic) return;
-    this.polling = true;
+    if ((this.lifecycle.kind !== "idle" && this.lifecycle.kind !== "draining") || this.lifecycle.polling || !this.config.automatic) return;
+    this.lifecycle.polling = true;
     try {
       const observedAt = Date.now();
       const sessions = await this.manager.list();
       for (const listed of sessions) await this.observe(listed);
-      // Evicted or completed sessions first seen before this watermark are baselined,
-      // never replayed from zero. No unbounded historical session-id set is needed.
       this.discoveredBefore = Math.max(this.discoveredBefore, observedAt);
-    } catch { /* Poll failures do not change prior status or schedule a retry storm. */ }
-    finally { this.polling = false; void this.drain(); }
+    } catch {}
+    finally {
+      if (this.lifecycle.kind === "idle" || this.lifecycle.kind === "draining") this.lifecycle.polling = false;
+      void this.drain();
+    }
   }
 
   private async observe(listed: ListedSession): Promise<void> {
-    if (this.closed) return;
+    if (this.isClosed()) return;
     let tracked = this.tracked.get(listed.id);
     if (!tracked) {
       const createdAt = Date.parse(listed.createdAt) || 0;
@@ -334,7 +427,7 @@ export class RepositoryBriefings {
       tracked = { cursor: createdAt >= this.discoveredBefore ? 0 : listed.seq, createdAt };
       this.tracked.set(listed.id, tracked);
       if (createdAt >= this.discoveredBefore) {
-        try { this.rememberLocation(listed.id, await this.location(this.manager.meta(listed.id).session)); } catch { /* status will be explicit if requested */ }
+        try { this.rememberLocation(listed.id, await this.location(this.manager.meta(listed.id).session)); } catch {}
       }
       this.trimTracked();
     }
@@ -368,8 +461,26 @@ export class RepositoryBriefings {
     const activity = await this.readMessages(session, transcript, "0", listed.seq);
     if (!activity.messages.length) { this.setStatus(listed.id, { state: "empty", error: EMPTY_MESSAGE }); return; }
     const to = activity.cursor;
-    const key = rangeKey(session.id, "0", activity.messages);
-    if (this.reports.has(key) || this.inFlight.has(key)) return;
+    const baseKey = rangeKey(session.id, "0", activity.messages);
+    let key = baseKey;
+    let sourceKey: string | undefined;
+    if (this.retention?.cacheKey && session.team?.role === "mission-coordinator") {
+      try {
+        sourceKey = await this.retention.cacheKey(session, location);
+        if (sourceKey) key = `${baseKey}:${sourceKey}`;
+      } catch {
+        key = `${baseKey}:uncached:${Date.now()}`;
+      }
+    }
+    const cached = this.reports.get(key);
+    if (cached) {
+      for (const [pendingKey, pendingJob] of this.pending) {
+        if (pendingJob.session.id === session.id && pendingJob.automatic && pendingJob.waiters.length === 0) this.pending.delete(pendingKey);
+      }
+      if (!this.hasActiveJob(session.id)) this.setStatus(session.id, { state: "ready", summary: cached }, sourceKey);
+      return;
+    }
+    if (this.inFlight.has(key)) return;
     const priorAttempt = this.lastAttempt.get(session.id) ?? 0;
     const dueAt = Math.max(Date.now() + DEBOUNCE_MS, priorAttempt + this.config.cooldownMs);
     const job: Job = { key, session, location, messages: activity.messages, observedMessages: activity.observedMessages, truncated: activity.truncated,
@@ -378,20 +489,19 @@ export class RepositoryBriefings {
       if (pendingJob.session.id === session.id && pendingJob.automatic && pendingJob.waiters.length === 0 && pendingKey !== key) this.pending.delete(pendingKey);
     }
     const sameRange = this.pending.get(key);
-    if (this.closed) return;
+    if (this.isClosed()) return;
     if (sameRange) {
       sameRange.dueAt = Math.min(sameRange.dueAt, job.dueAt);
       sameRange.automatic = true;
     } else this.pending.set(key, job);
-    this.setStatus(session.id, { state: "pending", ...(this.latest.get(session.id)?.summary ? { summary: this.latest.get(session.id)!.summary } : {}) });
+    const previousSummary = this.latest.get(session.id)?.status.summary;
+    this.setStatus(session.id, { state: "pending", ...(previousSummary ? { summary: previousSummary } : {}) });
     this.trimPending();
     void this.drain();
   }
 
   private async readMessages(session: Session, transcript: boolean, after: string, through: number) {
     const messages: ChatMessage[] = [];
-    // Bound a recent journal window, rather than repeatedly reading the first page
-    // of a long conversation. This advances with the actual checkpoint sequence.
     const start = Math.max(Number(after), through - MAX_PAGES * PAGE_SIZE);
     if (start === 0 && session.initialPrompt && !transcript) messages.push({ id: "initial", role: "user", text: session.initialPrompt, ts: session.createdAt });
     const types = transcript ? new Set(["message"]) : new Set(["message", "signal", "input-result"]);
@@ -430,7 +540,7 @@ export class RepositoryBriefings {
   }
 
   private enqueue(job: Job): Promise<RepositorySummary> {
-    if (this.closed) return Promise.reject(new Error("Repository brief service closed"));
+    if (this.isClosed()) return Promise.reject(new Error("Repository brief service closed"));
     const cached = this.reports.get(job.key);
     if (cached) return Promise.resolve(cached);
     return new Promise((resolvePromise, rejectPromise) => {
@@ -441,72 +551,95 @@ export class RepositoryBriefings {
         if (this.pending.size >= MAX_PENDING) { rejectPromise(new Error("Repository briefing queue is full")); return; }
         this.pending.set(job.key, { ...job, waiters: [...job.waiters, { resolve: resolvePromise, reject: rejectPromise }] });
       }
-      this.setStatus(job.session.id, { state: "pending", ...(this.latest.get(job.session.id)?.summary ? { summary: this.latest.get(job.session.id)!.summary } : {}) });
+      const previousSummary = this.latest.get(job.session.id)?.status.summary;
+      this.setStatus(job.session.id, { state: "pending", ...(previousSummary ? { summary: previousSummary } : {}) });
       void this.drain();
     });
   }
 
   private async drain(): Promise<void> {
-    if (this.running || this.closed) return;
-    this.running = true;
+    if (this.lifecycle.kind !== "idle") return;
+    this.lifecycle = { kind: "draining", timer: this.lifecycle.timer, polling: this.lifecycle.polling };
     try {
-      while (!this.closed && this.pending.size) {
+      while (this.lifecycle.kind === "draining" && this.pending.size) {
         const ready = [...this.pending.values()].filter(job => job.dueAt <= Date.now()).sort((a, b) => a.dueAt - b.dueAt)[0];
         if (!ready) break;
         this.pending.delete(ready.key);
         try {
-        if (ready.automatic && ready.waiters.length === 0) {
-          // Recollect at execution time after debounce/cooldown and queue wait.
-          // Manual callers keep the exact range they requested.
-          const state = await this.manager.state(ready.session.id);
-          const activity = await this.readMessages(ready.session, state.capabilities?.transcript === 1, ready.from, state.seq);
-          ready.messages = activity.messages; ready.to = activity.cursor;
-          ready.observedMessages = activity.observedMessages; ready.truncated = activity.truncated;
-          ready.key = rangeKey(ready.session.id, ready.from, ready.messages);
-          if (this.reports.has(ready.key)) continue;
-          const matching = this.pending.get(ready.key);
-          if (matching) { ready.waiters.push(...matching.waiters); this.pending.delete(ready.key); }
-        }
-        if (this.closed) { for (const waiter of ready.waiters) waiter.reject(new Error("Repository brief service closed")); break; }
-        this.setStatus(ready.session.id, { state: "running", ...(this.latest.get(ready.session.id)?.summary ? { summary: this.latest.get(ready.session.id)!.summary } : {}) });
-        this.inFlight.set(ready.key, ready);
-        this.lastAttempt.delete(ready.session.id);
-        this.lastAttempt.set(ready.session.id, Date.now());
-        while (this.lastAttempt.size > MAX_TRACKED) this.lastAttempt.delete(this.lastAttempt.keys().next().value!);
-          // Capture the enrolled source before the model call; persistence revalidates it after await.
+          if (ready.automatic && ready.waiters.length === 0) {
+            const state = await this.manager.state(ready.session.id);
+            const activity = await this.readMessages(ready.session, state.capabilities?.transcript === 1, ready.from, state.seq);
+            ready.messages = activity.messages; ready.to = activity.cursor;
+            ready.observedMessages = activity.observedMessages; ready.truncated = activity.truncated;
+            const baseKey = rangeKey(ready.session.id, ready.from, ready.messages);
+            const sourceKey = this.retention?.cacheKey && ready.session.team?.role === "mission-coordinator"
+              ? await this.retention.cacheKey(ready.session, ready.location) : undefined;
+            ready.key = sourceKey ? `${baseKey}:${sourceKey}` : baseKey;
+            const cached = this.reports.get(ready.key);
+            if (cached) {
+              if (!this.hasActiveJob(ready.session.id)) this.setStatus(ready.session.id, { state: "ready", summary: cached }, sourceKey);
+              continue;
+            }
+            const matching = this.pending.get(ready.key);
+            if (matching) { ready.waiters.push(...matching.waiters); this.pending.delete(ready.key); }
+          }
+          if (this.isClosed()) { for (const waiter of ready.waiters) waiter.reject(new Error("Repository brief service closed")); break; }
+          const runningSummary = this.latest.get(ready.session.id)?.status.summary;
+          this.setStatus(ready.session.id, { state: "running", ...(runningSummary ? { summary: runningSummary } : {}) });
+          const queueKey = ready.key;
+          this.inFlight.set(queueKey, ready);
+          this.lastAttempt.delete(ready.session.id);
+          this.lastAttempt.set(ready.session.id, Date.now());
+          while (this.lastAttempt.size > MAX_TRACKED) this.lastAttempt.delete(this.lastAttempt.keys().next().value!);
           const retentionCapture = this.retention ? await this.retention.capture(ready.session, ready.location) : undefined;
+          const baseKey = rangeKey(ready.session.id, ready.from, ready.messages);
+          const capturedSourceKey = ready.session.team?.role === "mission-coordinator"
+            ? this.retention?.captureKey?.(retentionCapture)
+            : undefined;
+          const reportKey = ready.session.team?.role === "mission-coordinator"
+            ? (capturedSourceKey ? `${baseKey}:${capturedSourceKey}` : undefined)
+            : ready.key;
           const summary = await this.run(ready);
           if (this.retention && retentionCapture !== undefined)
             await this.retention.persist(ready.session, ready.location, summary, retentionCapture);
-          this.inFlight.delete(ready.key);
-          this.reports.set(ready.key, summary);
-          if (this.reports.size > MAX_CACHE) this.reports.delete(this.reports.keys().next().value!);
-          this.setStatus(ready.session.id, { state: "ready", summary });
+          this.inFlight.delete(queueKey);
+          if (reportKey) {
+            this.reports.set(reportKey, summary);
+            if (this.reports.size > MAX_CACHE) this.reports.delete(this.reports.keys().next().value!);
+          }
+          this.setStatus(ready.session.id, { state: "ready", summary }, capturedSourceKey);
           for (const waiter of ready.waiters) waiter.resolve(summary);
         } catch (error) {
           this.inFlight.delete(ready.key);
           const notReady = error instanceof NotReady;
           const notOptedIn = error instanceof NotOptedIn;
           const message = notOptedIn ? NOT_OPTED_IN_MESSAGE : notReady ? NOT_READY_MESSAGE : `${FAILED_MESSAGE} Reason: ${failureReason(error)}`;
-          this.setStatus(ready.session.id, { state: notOptedIn ? "unavailable" : notReady ? "empty" : "failed", ...(this.latest.get(ready.session.id)?.summary ? { summary: this.latest.get(ready.session.id)!.summary } : {}), error: message });
+          const failedSummary = this.latest.get(ready.session.id)?.status.summary;
+          this.setStatus(ready.session.id, { state: notOptedIn ? "unavailable" : notReady ? "empty" : "failed", ...(failedSummary ? { summary: failedSummary } : {}), error: message });
           for (const waiter of ready.waiters) waiter.reject(new Error(message));
         }
       }
     } finally {
-      this.running = false;
-      for (const resolve of this.closeWaiters.splice(0)) resolve();
-      if (!this.closed && [...this.pending.values()].some(job => job.dueAt <= Date.now())) void this.drain();
+      const lc = this.currentLifecycle();
+      if (lc.kind === "closing") {
+        const { resolve } = lc;
+        this.lifecycle = { kind: "closed" };
+        resolve();
+      } else if (lc.kind === "draining") {
+        this.lifecycle = { kind: "idle", timer: lc.timer, polling: lc.polling };
+        if ([...this.pending.values()].some(job => job.dueAt <= Date.now())) void this.drain();
+      }
     }
   }
 
   private async run(job: Job): Promise<RepositorySummary> {
-    if (this.closed) throw new Error("Repository brief service closed");
+    if (this.isClosed()) throw new Error("Repository brief service closed");
     const current = await this.location(job.session);
-    if (this.closed || current.cwd !== job.location.cwd || current.root !== job.location.root) throw new Error("Repository source changed");
-    // auto keeps per-checkout state: it skips unchanged turns, revises only stale sections, checks
-    // claims with Jev when the agent account has a key, and learns its timing from outcomes.
+    if (this.isClosed() || current.cwd !== job.location.cwd || current.root !== job.location.root) throw new Error("Repository source changed");
+    const repoTarget = inside(job.location.root, job.location.cwd) ? job.location.cwd : job.location.root;
     const args = [...this.config.args, "auto", "--trigger", "host", "--format", "json", "--activity-stdin", "--session", job.session.id,
-      "--repo", job.location.cwd, "--timeout", String(Math.ceil(this.config.timeoutMs / 1000))];
+      "--repo", repoTarget, "--timeout", String(Math.ceil(this.config.timeoutMs / 1000))];
+    if (job.session.team?.role === "mission-coordinator") args.push("--no-state");
     if (job.location.baseline) args.push("--base", job.location.baseline);
     if (this.config.runner) args.push("--runner", this.config.runner);
     if (this.config.model) args.push("--model", this.config.model);
@@ -515,12 +648,11 @@ export class RepositoryBriefings {
     try {
       const activity = activityInput(job.messages);
       const raw = await collectProcess(this.config.command, args, {
-        cwd: job.location.cwd, input: activity.input, timeoutMs: this.config.timeoutMs,
+        cwd: repoTarget, env: agentModelClientEnvironment(), input: activity.input, timeoutMs: this.config.timeoutMs,
         maxBytes: MAX_STDOUT_BYTES, signal: controller.signal,
       });
       const value: unknown = JSON.parse(raw);
       const empty = emptySchema.safeParse(value);
-      // Jevcode reports `disabled` only when automatic briefs are off globally: unavailable, not failed.
       if (empty.success) throw empty.data.decision.action === "disabled" ? new NotOptedIn() : new NotReady();
       const parsed = envelopeSchema.parse(value);
       if (resolve(parsed.repo) !== job.location.root || (job.location.baseline !== null && parsed.base !== job.location.baseline))
@@ -548,9 +680,12 @@ export class RepositoryBriefings {
     const projectRoot = realpathSync(project.path);
     const allowedRoot = session.team && teamRoot ? teamRoot : projectRoot;
     if (!inside(allowedRoot, cwd)) throw new Error("outside");
-    const output = await collectProcess("git", ["-c", `safe.directory=${cwd}`, "-C", cwd, "rev-parse", "--show-toplevel"], { cwd, timeoutMs: MAX_GIT_MS, maxBytes: 4096 });
+    const isMissionCoordinator = session.team?.role === "mission-coordinator";
+    const repoTarget = isMissionCoordinator && !inside(projectRoot, cwd) ? projectRoot : cwd;
+    const expectedRoot = isMissionCoordinator ? projectRoot : allowedRoot;
+    const output = await collectProcess("git", ["-c", `safe.directory=${repoTarget}`, "-C", repoTarget, "rev-parse", "--show-toplevel"], { cwd: repoTarget, timeoutMs: MAX_GIT_MS, maxBytes: 4096 });
     const root = realpathSync(output.trim());
-    if (!inside(allowedRoot, root)) throw new Error("git-root");
+    if (!inside(expectedRoot, root)) throw new Error("git-root");
     const previous = this.locations.get(session.id);
     const baseline = previous?.root === root ? previous.baseline : await this.captureHead(root);
     return { cwd, root, baseline };
@@ -569,14 +704,21 @@ export class RepositoryBriefings {
     while (this.locations.size > MAX_STATUS) this.locations.delete(this.locations.keys().next().value!);
   }
 
-  private setStatus(id: string, status: BriefingStatus): void {
+  private hasActiveJob(sessionId: string): boolean {
+    for (const job of this.inFlight.values()) if (job.session.id === sessionId) return true;
+    for (const job of this.pending.values()) if (job.session.id === sessionId) return true;
+    return false;
+  }
+
+  private setStatus(id: string, status: BriefingStatus, sourceKey?: string): void {
+    const previous = this.latest.get(id);
+    const resolvedKey = status.summary
+      ? (sourceKey !== undefined ? sourceKey : previous?.sourceKey)
+      : undefined;
     this.latest.delete(id);
-    this.latest.set(id, status);
-    this.statusUpdatedAt.set(id, Date.now());
+    this.latest.set(id, { status, ...(resolvedKey !== undefined ? { sourceKey: resolvedKey } : {}), updatedAt: Date.now() });
     while (this.latest.size > MAX_STATUS) {
-      const oldest = this.latest.keys().next().value!;
-      this.latest.delete(oldest);
-      this.statusUpdatedAt.delete(oldest);
+      this.latest.delete(this.latest.keys().next().value!);
     }
   }
 

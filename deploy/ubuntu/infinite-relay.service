@@ -13,7 +13,6 @@ Environment=PATH=/usr/local/bin:/usr/bin:/bin
 ExecStart=/usr/local/bin/node /opt/infinite-relay/packages/host/dist/cli.js relay-serve --config /etc/infinite-relay/relay.json
 Restart=on-failure
 RestartSec=3
-# Holds proxy.sock (mode 0600). Only root's cloudflared can connect; agent accounts cannot.
 RuntimeDirectory=infinite-relay
 RuntimeDirectoryMode=0700
 UMask=0077
@@ -33,8 +32,6 @@ ProtectControlGroups=true
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 RestrictNamespaces=true
 LockPersonality=true
-# The relay only reads its config, listens on loopback for the runner, and on its socket for
-# cloudflared. It holds no device keys.
 
 [Install]
 WantedBy=multi-user.target

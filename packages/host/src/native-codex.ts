@@ -3,14 +3,23 @@ import { MAX_RECORDED_MESSAGE, type TranscriptMessage } from "./transcript.js";
 import { createServer } from "node:http";
 import { existsSync } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
+import { normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 import { WebSocket, WebSocketServer } from "ws";
 import type { Signal } from "@infinite/attention";
 import type { AgentProfile, InputControl } from "./types.js";
 import { NATIVE_MAX_BUFFERED, NATIVE_MAX_MESSAGE } from "./native-transport.js";
-import { connectCodexEnvironments, type CodexEnvironmentClient, type CodexExecutor } from "./codex-environment.js";
+import {
+  CODEX_ENVIRONMENT_STATE_FILE,
+  connectCodexEnvironments,
+  openCodexEnvironmentStore,
+  type CodexEnvironmentClient,
+  type CodexEnvironmentPersistenceOptions,
+  type CodexEnvironmentStore,
+  type CodexExecutor,
+} from "./codex-environment.js";
+export { CODEX_ENVIRONMENT_STATE_FILE };
 
-/** Default hybrid launches use the native frontend; ordinary cloud PTYs retain argv passthrough. */
 export function validateNativeCodexArgs(args: string[], initialPrompt = "", allowEmpty = false) {
   const values = new Set(["-m", "--model", "-c", "--config", "-a", "--ask-for-approval", "-s", "--sandbox"]);
   const flags = new Set(["--no-alt-screen", "--search"]);
@@ -26,22 +35,79 @@ export function validateNativeCodexArgs(args: string[], initialPrompt = "", allo
     else if (!value.startsWith("-") && prompt === undefined) prompt = value;
     else throw new Error("Local Codex UI supports a prompt, --model, --config, --ask-for-approval, --sandbox, --search and --no-alt-screen. Use terminal mode for other native arguments.");
   }
-  // Codex does not materialize an empty thread for a second native frontend.
-  // Hybrid launches can retain the original terminal until the first real prompt.
   if (!(prompt ?? initialPrompt).trim()) {
     if (allowEmpty) return launch;
     throw new Error("Cloud Codex's local interface requires an initial prompt. Use infinite --laptop codex to start in your laptop project, or omit --local-ui for a cloud terminal.");
   }
-  // A prompt such as "login" is text, never a provider administration command.
   return [...launch, "--", prompt ?? initialPrompt];
+}
+
+export function nativeCodexObserverArgs(args: string[], initialPrompt = "", allowEmpty = false, restoredThreadId?: string) {
+  if (!restoredThreadId) return validateNativeCodexArgs(args, initialPrompt, allowEmpty);
+  const values = new Set(["-m", "--model", "-c", "--config", "-a", "--ask-for-approval", "-s", "--sandbox"]);
+  const flags = new Set(["--no-alt-screen", "--search"]);
+  const launch: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const value = args[i];
+    if (values.has(value)) {
+      if (++i < args.length) launch.push(value, args[i]);
+    } else if (flags.has(value) || (value.includes("=") && values.has(value.split("=", 1)[0]))) {
+      launch.push(value);
+    } else if (value === "--") {
+      break;
+    }
+  }
+  return [...launch, "resume", restoredThreadId];
+}
+
+export function prepareCodexWorkerExecution(options: {
+  file: string;
+  key: Buffer;
+  scope: string;
+  workspace: { cwd: string; roots: string[] };
+  resumeThreadId?: string;
+}): {
+  environmentState: CodexEnvironmentPersistenceOptions;
+  environmentId?: string;
+  resumeThreadId?: string;
+} {
+  const environmentState: CodexEnvironmentPersistenceOptions = {
+    file: options.file,
+    key: options.key,
+    scope: options.scope,
+  };
+  const loaded = openCodexEnvironmentStore(environmentState).read();
+  if (loaded.state === "unreadable") return { environmentState };
+  if (loaded.state === "missing") {
+    return {
+      environmentState,
+      ...(options.resumeThreadId ? { resumeThreadId: options.resumeThreadId } : {}),
+    };
+  }
+  const threadIds = Object.keys(loaded.record.threads);
+  const savedThreadId = options.resumeThreadId ?? (threadIds.length === 1 ? threadIds[0] : undefined);
+  if (!savedThreadId) return { environmentState };
+  const entry = loaded.record.threads[savedThreadId];
+  const normalizedCwd = normalize(options.workspace.cwd);
+  const normalizedRoots = [...new Set(options.workspace.roots.map(root => normalize(root)))];
+  const rootsMatch = entry?.status === "verified" &&
+    entry.placement.runtimeWorkspaceRoots.length === normalizedRoots.length &&
+    normalizedRoots.every(root => entry.placement.runtimeWorkspaceRoots.includes(root));
+  if (entry?.status === "verified" && entry.placement.cwd === normalizedCwd && rootsMatch) {
+    return {
+      environmentState,
+      environmentId: entry.placement.environmentId,
+      resumeThreadId: savedThreadId,
+    };
+  }
+  return { environmentState, resumeThreadId: savedThreadId };
 }
 
 type Message = { id?: number | string; method?: string; params?: Record<string, any>; result?: any; error?: unknown };
 type Attachment = { authority: InputControl; used: boolean };
 type Executor = CodexExecutor;
+type PendingRequest = { method: string; generation?: number; trackedResume?: boolean };
 
-/** A prepared host uses the qualified backend automatically; wrapped profiles
- * select their backend explicitly so a different Unix identity is never bypassed. */
 function appServerLaunch(profile: AgentProfile) {
   if (profile.appServerCommand) return { command: profile.appServerCommand, args: profile.appServerArgs ?? [] };
   const prepared = fileURLToPath(new URL("../../../.local/codex-handoff/bin/codex-app-server", import.meta.url));
@@ -49,11 +115,6 @@ function appServerLaunch(profile: AgentProfile) {
   return { command: profile.command, args: [...profile.args, "app-server"] };
 }
 
-/**
- * One cloud backend and one cloud observer TUI per Infinite session. Provider credentials
- * never leave this process. Every local frontend frame is fenced by the worker's lease.
- */
-/** A completed app-server item as one chat message; items without user-facing text yield none. */
 export function nativeItemMessage(item: unknown): TranscriptMessage | undefined {
   if (!item || typeof item !== "object") return undefined;
   const row = item as Record<string, unknown>;
@@ -77,49 +138,90 @@ export function nativeItemMessage(item: unknown): TranscriptMessage | undefined 
 export async function startNativeCodex(options: {
   profile: AgentProfile; cwd: string; env: Record<string, string>;
   execution?: Executor;
+  resumeThreadId?: string;
+  environmentState?: CodexEnvironmentPersistenceOptions;
+  environmentStore?: CodexEnvironmentStore;
   onExecutionUnavailable?: () => void;
+  onProviderRestart?: (phase: "restarting" | "restored" | "fenced", threadId?: string) => void;
   checkControl: (authority: InputControl) => void;
   onThread: (id: string) => void;
   onExit: () => void;
   onSignal: (signal: Signal) => void;
-  /** Completed conversation items, as the provider reports them. */
   onMessage?: (message: TranscriptMessage) => void;
   noAltScreen: boolean;
   record: (method: string) => void;
 }) {
-  const token = randomBytes(32).toString("hex");
+  let token = randomBytes(32).toString("hex");
   const observerToken = randomBytes(32).toString("hex");
   const attachments = new Map<string, Attachment>();
-  let threadId: string | undefined, ready = false, stopped = false;
+  let endpoint = "";
+  let threadId: string | undefined = options.resumeThreadId, ready = false, stopped = false;
+  let restarting = false, providerRestarts = 0;
   let lastMessage: string | undefined;
   let execution = options.execution, selecting = false;
   let environments: CodexEnvironmentClient | undefined;
   let child: ChildProcess | undefined;
+  let restoredClean = true;
+  let verifyingResumes = 0;
   const http = createServer((_req, res) => { res.writeHead(404); res.end(); });
   const sockets = new WebSocketServer({ noServer: true, maxPayload: NATIVE_MAX_MESSAGE, perMessageDeflate: false });
   const upstreams = new Set<WebSocket>();
   const shutdown = () => {
     if (stopped) return;
     stopped = true;
+    restarting = false;
     for (const socket of [...sockets.clients, ...upstreams]) socket.terminate();
     sockets.close(); http.close();
     child?.kill("SIGTERM");
     attachments.clear();
     environments?.close();
   };
-  try {
-    const backend = appServerLaunch(options.profile);
-    child = spawn(backend.command, [...backend.args, "--listen", "ws://127.0.0.1:0",
-      "--ws-auth", "capability-token", "--ws-token-sha256", createHash("sha256").update(token).digest("hex")], {
+  const backend = appServerLaunch(options.profile);
+  const handleBackendExit = () => {
+    if (stopped || restarting) return;
+    const recoverable = Boolean(execution && threadId && (options.environmentState || options.environmentStore) && providerRestarts < 5 && !selecting);
+    if (!recoverable) {
+      shutdown();
+      options.onExit();
+      return;
+    }
+    providerRestarts += 1;
+    restarting = true;
+    ready = false;
+    options.onProviderRestart?.("restarting");
+    environments?.close();
+    environments = undefined;
+    for (const socket of [...sockets.clients, ...upstreams]) socket.terminate();
+    upstreams.clear();
+    attachments.clear();
+    void (async () => {
+      try {
+        const outcome = await bootProvider(threadId);
+        restarting = false;
+        if (stopped) return;
+        options.onProviderRestart?.(outcome === "restored" ? "restored" : "fenced", outcome === "restored" ? threadId : undefined);
+      } catch {
+        restarting = false;
+        if (!stopped) {
+          shutdown();
+          options.onExit();
+        }
+      }
+    })();
+  };
+  const bootProvider = async (targetThreadId?: string): Promise<"started" | "restored" | "fenced"> => {
+    const nextToken = randomBytes(32).toString("hex");
+    const spawned = spawn(backend.command, [...backend.args, "--listen", "ws://127.0.0.1:0",
+      "--ws-auth", "capability-token", "--ws-token-sha256", createHash("sha256").update(nextToken).digest("hex")], {
       cwd: options.cwd, env: options.env, stdio: ["ignore", "pipe", "pipe"],
     });
-    child.on("exit", () => { if (!stopped) { shutdown(); options.onExit(); } });
-    const endpoint = await new Promise<string>((resolve, reject) => {
+    child = spawned;
+    const nextEndpoint = await new Promise<string>((resolve, reject) => {
       let output = "";
       const timer = setTimeout(() => finish(new Error("Codex backend did not become ready")), 15000);
       const finish = (error?: Error, url?: string) => {
-        clearTimeout(timer); child!.stdout!.off("data", read); child!.stderr!.off("data", read);
-        child!.off("error", failed); child!.off("exit", exited);
+        clearTimeout(timer); spawned.stdout!.off("data", read); spawned.stderr!.off("data", read);
+        spawned.off("error", failed); spawned.off("exit", exited);
         if (error) reject(error); else resolve(url!);
       };
       const read = (chunk: Buffer) => {
@@ -129,22 +231,53 @@ export async function startNativeCodex(options: {
       };
       const failed = () => finish(new Error("Could not launch Codex backend"));
       const exited = () => finish(new Error("Codex backend exited during startup"));
-      child!.stdout!.on("data", read); child!.stderr!.on("data", read);
-      child!.once("error", failed); child!.once("exit", exited);
+      spawned.stdout!.on("data", read); spawned.stderr!.on("data", read);
+      spawned.once("error", failed); spawned.once("exit", exited);
     });
-    // Continue draining diagnostics; they can contain local paths and are not public records.
-    child.stdout!.resume(); child.stderr!.resume();
-    if (execution) {
-      environments = await connectCodexEnvironments({ endpoint, token, onDisconnect: options.onExecutionUnavailable });
-      await environments.register(execution);
+    if (stopped) {
+      spawned.kill("SIGTERM");
+      throw new Error("Codex native backend stopped during startup");
     }
+    spawned.stdout!.resume(); spawned.stderr!.resume();
+    token = nextToken;
+    endpoint = nextEndpoint;
+    spawned.on("exit", () => { if (!stopped && child === spawned) handleBackendExit(); });
+    if (execution) {
+      const nextEnvironments = await connectCodexEnvironments({
+        endpoint: nextEndpoint,
+        token: nextToken,
+        onDisconnect: () => { if (!restarting) options.onExecutionUnavailable?.(); },
+        ...(options.environmentState ? { persistence: options.environmentState } : {}),
+        ...(options.environmentStore ? { store: options.environmentStore } : {}),
+      });
+      environments = nextEnvironments;
+      await nextEnvironments.register(execution);
+      if (targetThreadId) {
+        try {
+          await nextEnvironments.restoreThread(targetThreadId);
+          ready = true;
+          restoredClean = true;
+          options.onThread(targetThreadId);
+          return "restored";
+        } catch {
+          ready = false;
+          restoredClean = false;
+          options.onExecutionUnavailable?.();
+          return "fenced";
+        }
+      }
+    }
+    return "started";
+  };
+  try {
+    await bootProvider(options.resumeThreadId);
     http.on("upgrade", (req, socket, head) => {
       socket.on("error", () => {});
       const credential = req.headers.authorization?.match(/^Bearer ([a-f\d]{64})$/)?.[1];
       const observer = credential === observerToken;
       const attachment = credential ? attachments.get(credential) : undefined;
       try {
-        if (req.headers.origin || req.url !== "/" || sockets.clients.size >= 8 || (!observer && (!attachment || attachment.used || !ready))) throw new Error("Denied");
+        if (stopped || restarting || !endpoint || req.headers.origin || req.url !== "/" || sockets.clients.size >= 8 || (!observer && (!attachment || attachment.used || !ready))) throw new Error("Denied");
         if (attachment) { options.checkControl(attachment.authority); attachment.used = true; }
       } catch { socket.end("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n"); return; }
       sockets.handleUpgrade(req, socket, head, frontend => {
@@ -152,18 +285,81 @@ export async function startNativeCodex(options: {
         upstreams.add(upstream);
         const queue: string[] = [];
         let bytes = 0, startRequest: number | string | undefined;
+        let endStartupDiscovery: (() => void) | undefined;
+        let holdingFrontend = 0;
+        const heldUpstream: string[] = [];
+        let heldUpstreamBytes = 0;
+        let socketPendingResumes = 0;
         const checkpointRequest = `infinite-checkpoint-${randomBytes(16).toString("hex")}`;
         let checking = false;
-        const pending = new Map<number | string, string>();
-        const close = () => { frontend.terminate(); upstream.terminate(); };
+        let checkpointGeneration: number | undefined;
+        const pending = new Map<number | string, PendingRequest>();
+        const releaseDiscovery = () => {
+          const end = endStartupDiscovery;
+          endStartupDiscovery = undefined;
+          end?.();
+        };
+        const releaseAllSocketResumes = () => {
+          if (socketPendingResumes > 0) {
+            verifyingResumes = Math.max(0, verifyingResumes - socketPendingResumes);
+            socketPendingResumes = 0;
+          }
+        };
+        const finishSocketResume = () => {
+          if (socketPendingResumes > 0) {
+            socketPendingResumes -= 1;
+            verifyingResumes = Math.max(0, verifyingResumes - 1);
+          }
+        };
+        const close = () => {
+          releaseDiscovery();
+          releaseAllSocketResumes();
+          holdingFrontend = 0;
+          heldUpstream.length = 0;
+          heldUpstreamBytes = 0;
+          frontend.terminate();
+          upstream.terminate();
+        };
         const authority = () => { if (!observer) options.checkControl(attachment!.authority); };
         const timer = setInterval(() => { try { authority(); } catch { close(); } }, 1000);
         const send = (target: WebSocket, data: string) => {
           if (target.bufferedAmount + Buffer.byteLength(data) > NATIVE_MAX_BUFFERED) throw new Error("Native connection is too slow");
           target.send(data);
         };
-        frontend.on("close", () => { clearInterval(timer); upstream.close(); if (credential && !observer) attachments.delete(credential); });
-        upstream.on("close", () => { clearInterval(timer); upstreams.delete(upstream); frontend.close(); });
+        const deliverFrontend = (payload: string) => {
+          if (holdingFrontend > 0) {
+            const nextBytes = heldUpstreamBytes + Buffer.byteLength(payload);
+            if (nextBytes > NATIVE_MAX_BUFFERED) {
+              close();
+              return;
+            }
+            heldUpstreamBytes = nextBytes;
+            heldUpstream.push(payload);
+            return;
+          }
+          if (frontend.readyState === WebSocket.OPEN) send(frontend, payload);
+        };
+        const drainHeld = (firstPayload?: string) => {
+          try {
+            if (stopped || frontend.readyState !== WebSocket.OPEN) {
+              heldUpstream.length = 0;
+              heldUpstreamBytes = 0;
+              return;
+            }
+            if (firstPayload !== undefined) send(frontend, firstPayload);
+            if (holdingFrontend > 0) return;
+            const buffered = heldUpstream.splice(0, heldUpstream.length);
+            heldUpstreamBytes = 0;
+            for (const frame of buffered) {
+              if (frontend.readyState !== WebSocket.OPEN) break;
+              send(frontend, frame);
+            }
+          } catch {
+            close();
+          }
+        };
+        frontend.on("close", () => { clearInterval(timer); releaseDiscovery(); releaseAllSocketResumes(); upstream.close(); if (credential && !observer) attachments.delete(credential); });
+        upstream.on("close", () => { clearInterval(timer); releaseDiscovery(); releaseAllSocketResumes(); upstreams.delete(upstream); frontend.close(); });
         frontend.on("error", close); upstream.on("error", close);
         frontend.on("message", (data, binary) => {
           try {
@@ -176,8 +372,14 @@ export async function startNativeCodex(options: {
             };
             if (method === "thread/start") {
               if (!observer || threadId || startRequest !== undefined || message.id === undefined) { refuse(); return; }
-              // The installed app-server cannot hydrate the TUI's paginated default.
-              // Legacy history supports same-thread rejoin once a user message exists.
+              if (execution && environments) {
+                try {
+                  endStartupDiscovery = environments.beginStartupDiscovery(execution.environmentId);
+                } catch (error) {
+                  refuse(error instanceof Error ? error.message : "Execution environment startup is unavailable");
+                  return;
+                }
+              }
               message.params = { ...params, historyMode: "legacy" };
               startRequest = message.id;
             } else if (method === "thread/fork" || method === "thread/delete" || method === "thread/archive" || method === "thread/unarchive") { refuse(); return; }
@@ -186,13 +388,24 @@ export async function startNativeCodex(options: {
             if (execution && method) {
               if (selecting && ["thread/start", "thread/resume", "thread/settings/update", "turn/start", "turn/settings/update"].includes(method)) { refuse("Execution is moving to the cloud. Retry after handoff completes."); return; }
               const executor = execution;
+              if (method === "turn/start" && threadId && environments) {
+                if (verifyingResumes > 0) {
+                  refuse("Execution placement verification is in progress; retry after thread resume completes.");
+                  return;
+                }
+                const decision = environments.checkDispatch({
+                  threadId,
+                  environmentId: executor.environmentId,
+                  cwd: executor.cwd,
+                  roots: executor.roots,
+                });
+                if (!decision.allowed) { refuse(decision.reason); return; }
+              }
               if (method === "initialize") message.params = { ...params, capabilities: { ...params?.capabilities, experimentalApi: true } };
               if (method === "thread/start" || method === "turn/start") {
                 message.params = { ...message.params, cwd: executor.cwd, runtimeWorkspaceRoots: executor.roots,
                   environments: [{ environmentId: executor.environmentId, cwd: executor.cwd, runtimeWorkspaceRoots: executor.roots }] };
               }
-              // Resume/settings cwd overrides can reset Codex's sticky environment to
-              // the app-server host. The session's selected workspace stays authoritative.
               if (method === "thread/resume" || method === "thread/settings/update") {
                 message.params = { ...params };
                 delete message.params.cwd;
@@ -210,7 +423,18 @@ export async function startNativeCodex(options: {
             }
             if (method && message.id !== undefined) {
               if (pending.size >= 1024) throw new Error("Too many pending native requests");
-              pending.set(message.id, method);
+              const currentView = environments && threadId ? environments.placement(threadId) : undefined;
+              const observedGeneration = currentView?.status === "verified" ? currentView.placement.generation : undefined;
+              const trackedResume = method === "thread/resume" && Boolean(execution && environments && threadId);
+              if (trackedResume) {
+                verifyingResumes += 1;
+                socketPendingResumes += 1;
+              }
+              pending.set(message.id, {
+                method,
+                ...(observedGeneration !== undefined ? { generation: observedGeneration } : {}),
+                ...(trackedResume ? { trackedResume: true } : {}),
+              });
             }
             if (!observer && method && !/^(initialize|.*\/read|.*\/list|thread\/resume)$/.test(method)) options.record(method);
             const text = JSON.stringify(message);
@@ -226,22 +450,87 @@ export async function startNativeCodex(options: {
             const message = JSON.parse(data.toString()) as Message;
             if (message.id === checkpointRequest) {
               checking = false;
-              ready = !message.error && message.result?.thread?.id === threadId;
+              const observedCheckpointGen = checkpointGeneration;
+              checkpointGeneration = undefined;
+              const thread = message.result?.thread;
+              ready = !message.error && thread?.id === threadId;
+              if (ready && environments && execution && threadId) {
+                const view = environments.placement(threadId);
+                if (!restoredClean || view.status !== "verified") {
+                  ready = false;
+                } else if (observedCheckpointGen !== undefined && observedCheckpointGen !== view.placement.generation) {
+                  ready = false;
+                  if (upstream.readyState === WebSocket.OPEN) {
+                    checking = true;
+                    checkpointGeneration = view.placement.generation;
+                    send(upstream, JSON.stringify({ id: checkpointRequest, method: "thread/read", params: { threadId, includeTurns: true } }));
+                  }
+                } else if (!Array.isArray(thread?.environments)) {
+                  ready = false;
+                } else {
+                  try { environments.assertObservedEnvironments(threadId, thread.environments); } catch { ready = false; }
+                }
+              }
               return;
             }
-            if (observer && startRequest !== undefined && message.id === startRequest && message.result?.thread?.id) {
-              if (threadId && threadId !== message.result.thread.id) throw new Error("Native conversation changed");
-              threadId = message.result.thread.id;
-              environments?.observe({ method: "thread/started", params: { thread: { id: threadId } } });
-              options.onThread(threadId!);
+            if (observer && startRequest !== undefined && message.id === startRequest) {
+              startRequest = undefined;
+              pending.delete(message.id);
+              releaseDiscovery();
+              if (message.error || typeof message.result?.thread?.id !== "string" || !message.result.thread.id) {
+                deliverFrontend(JSON.stringify(message));
+                return;
+              }
+              const startedThreadId: string = message.result.thread.id;
+              if (threadId && threadId !== startedThreadId) throw new Error("Native conversation changed");
+              threadId = startedThreadId;
+              environments?.observe({ method: "thread/started", params: { thread: { id: startedThreadId } } });
+              if (environments && execution) {
+                const startPayload = JSON.stringify(message);
+                const startId = message.id;
+                holdingFrontend += 1;
+                void environments.confirmInitialPlacement({
+                  threadId: startedThreadId,
+                  executor: execution,
+                  reportedEnvironments: message.result.thread.environments,
+                }).then(
+                  () => {
+                    holdingFrontend = Math.max(0, holdingFrontend - 1);
+                    if (stopped || frontend.readyState !== WebSocket.OPEN) {
+                      heldUpstream.length = 0;
+                      heldUpstreamBytes = 0;
+                      return;
+                    }
+                    options.onThread(startedThreadId);
+                    drainHeld(startPayload);
+                  },
+                  error => {
+                    holdingFrontend = Math.max(0, holdingFrontend - 1);
+                    heldUpstream.length = 0;
+                    heldUpstreamBytes = 0;
+                    ready = false;
+                    if (!stopped && frontend.readyState === WebSocket.OPEN) {
+                      try {
+                        send(frontend, JSON.stringify({
+                          id: startId,
+                          error: { code: -32000, message: error instanceof Error ? error.message : "Initial execution placement verification failed" },
+                        }));
+                      } catch {}
+                    }
+                    close();
+                  },
+                );
+                return;
+              }
+              options.onThread(startedThreadId);
             }
             if (observer && threadId && !ready && !checking && ["turn/started", "turn/completed"].includes(message.method ?? "")) {
               checking = true;
+              const view = environments ? environments.placement(threadId) : undefined;
+              checkpointGeneration = view?.status === "verified" ? view.placement.generation : undefined;
               send(upstream, JSON.stringify({ id: checkpointRequest, method: "thread/read", params: { threadId, includeTurns: true } }));
             }
             if (observer) environments?.observe(message);
-            // Only the persistent observer records provider events, so extra UIs do
-            // not duplicate timeline entries. A provider turn ending is not task completion.
             if (observer && message.params?.threadId === threadId) {
               if (message.method === "turn/started") { lastMessage = undefined; options.onSignal({ kind: "turn-start" }); }
               if (message.method === "item/completed" && message.params?.item?.type === "agentMessage" && typeof message.params.item.text === "string")
@@ -251,14 +540,60 @@ export async function startNativeCodex(options: {
                 options.onSignal({ kind: "provider-limit", limit: "usage", confidence: "corroborated", message: "Codex reported usageLimitExceeded" });
               if (message.method === "turn/completed") options.onSignal({ kind: "turn-end", message: message.params?.turn?.status === "interrupted" ? "Turn interrupted" : lastMessage, failed: message.params?.turn?.status === "failed" });
             }
-            const method = message.id === undefined ? undefined : pending.get(message.id);
+            const req = message.id === undefined ? undefined : pending.get(message.id);
             if (message.id !== undefined && !message.method) pending.delete(message.id);
+            const method = req?.method;
+            if (method === "thread/resume" && req?.trackedResume) {
+              if (message.error || !execution || !environments || !threadId) {
+                finishSocketResume();
+              } else if (Array.isArray(message.result?.thread?.environments)) {
+                const view = environments.placement(threadId);
+                if (!selecting && view.status === "verified" && (req.generation === undefined || req.generation === view.placement.generation)) {
+                  try { environments.assertObservedEnvironments(threadId, message.result.thread.environments); } catch { ready = false; }
+                }
+                finishSocketResume();
+              } else {
+                const resumePayload = JSON.stringify(message);
+                const resumeId = message.id;
+                holdingFrontend += 1;
+                void environments.verify(threadId).then(
+                  () => {
+                    holdingFrontend = Math.max(0, holdingFrontend - 1);
+                    finishSocketResume();
+                    drainHeld(resumePayload);
+                  },
+                  error => {
+                    holdingFrontend = Math.max(0, holdingFrontend - 1);
+                    finishSocketResume();
+                    heldUpstream.length = 0;
+                    heldUpstreamBytes = 0;
+                    ready = false;
+                    if (!stopped && frontend.readyState === WebSocket.OPEN && resumeId !== undefined) {
+                      try {
+                        send(frontend, JSON.stringify({
+                          id: resumeId,
+                          error: { code: -32000, message: error instanceof Error ? error.message : "Thread resume placement verification failed" },
+                        }));
+                      } catch {}
+                    }
+                    close();
+                  },
+                );
+                return;
+              }
+            } else if (method === "thread/read" && !message.error && !selecting && environments && threadId &&
+                Array.isArray(message.result?.thread?.environments)) {
+              const view = environments.placement(threadId);
+              if (view.status === "verified" && req?.generation === view.placement.generation) {
+                try { environments.assertObservedEnvironments(threadId, message.result.thread.environments); } catch { ready = false; }
+              }
+            }
             if (method === "thread/list" && Array.isArray(message.result?.data)) {
               message.result.data = message.result.data.filter((thread: { id: string }) => thread.id === threadId);
               message.result.nextCursor = null;
             }
             if (method === "thread/loaded/list" && Array.isArray(message.result?.data)) message.result.data = message.result.data.filter((id: string) => id === threadId);
-            if (frontend.readyState === WebSocket.OPEN) send(frontend, JSON.stringify(message));
+            deliverFrontend(JSON.stringify(message));
           } catch { close(); }
         });
       });
@@ -271,14 +606,15 @@ export async function startNativeCodex(options: {
       connect(authority: InputControl) {
         options.checkControl(authority);
         if (!ready || !threadId || stopped) throw new Error("Native frontend is not ready");
-        // Unused credentials are bounded and valid only while their control lease survives.
         for (const [key, value] of attachments) { try { options.checkControl(value.authority); } catch { attachments.delete(key); } }
         if (attachments.size >= 32) throw new Error("Too many native attachments");
         const credential = randomBytes(32).toString("hex");
         attachments.set(credential, { authority, used: false });
         return { url, token: credential, sessionId: threadId };
       },
-      supportsExecutionSelection: environments?.supportsSelection ?? false,
+      get supportsExecutionSelection() {
+        return (environments?.supportsSelection ?? false) && restoredClean;
+      },
       async selectExecution(next: Executor, release: () => void) {
         if (!environments || !threadId || selecting || stopped) throw new Error("Execution selection is unavailable");
         selecting = true;
@@ -287,6 +623,21 @@ export async function startNativeCodex(options: {
           if (!current.observed) throw new Error("The provider conversation has not been observed");
           const receipt = await environments.select({ threadId, turnId: current.turnId, executor: next,
             releaseHeldOperation: () => { execution = next; release(); } });
+          return receipt;
+        } finally { selecting = false; }
+      },
+      async reconcileExecution(next: Executor, release?: () => void) {
+        if (!environments || !threadId || selecting || stopped) throw new Error("Execution reconciliation is unavailable");
+        selecting = true;
+        try {
+          const receipt = await environments.reconcileThread({
+            threadId,
+            executor: next,
+            releaseHeldOperation: () => { execution = next; release?.(); },
+          });
+          restoredClean = true;
+          ready = true;
+          options.onThread(threadId);
           return receipt;
         } finally { selecting = false; }
       },

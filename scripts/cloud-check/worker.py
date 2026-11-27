@@ -519,6 +519,7 @@ def main() -> int:
         }
         snapshot_id = sha256_bytes(json.dumps(snapshot_state, sort_keys=True, separators=(",", ":")).encode("utf-8"))
         receipt = {"base": base, "snapshot": snapshot_id, "envelope": sha256_file(PAYLOAD / "snapshot.json"),
+                   "commandSha256": sha256_bytes(json.dumps(argv, ensure_ascii=True, separators=(",", ":")).encode("ascii")),
                    "mode": "npm" if legacy else mode, "profile": profile, "kernel": platform.release()}
         engine = version("docker", ["info", "--format", "{{.ID}}"])
         machine_id = pathlib.Path("/etc/machine-id").read_text().strip()

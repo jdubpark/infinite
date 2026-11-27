@@ -1,8 +1,39 @@
 import type { Attention, AttentionState } from "@infinite/attention";
-import { memberLimit, type TeamMember, type TeamPermissionDecision, type TeamRun, type TeamStatus } from "./team-types.js";
+import { ACTIVE_MEMBER_STATUSES, memberLimit, type TeamMember, type TeamPermissionDecision, type TeamRun, type TeamStatus } from "./team-types.js";
 
 export const MEMBER_STALL_REASON = "An agent showed no activity twice on the same assignment. Its workspace was preserved.";
 export const STOP_REFUSED_REASON = "An agent could not be stopped. Release its input control or inspect its terminal before integration.";
+export const STOP_REFUSAL_BACKOFF_MS = 30_000;
+
+export function hasActiveControl(state: { control?: { expiresAt: number } | null }, nowMs: number): boolean {
+  return Boolean(state.control && state.control.expiresAt > nowMs);
+}
+
+export function clearStopRefusedReason(run: Pick<TeamRun, "reason" | "revision" | "members">, member: TeamMember): void {
+  if (run.reason === STOP_REFUSED_REASON && !run.members.some(other => other !== member && other.revision === run.revision && ACTIVE_MEMBER_STATUSES.includes(other.status) && other.status === "unavailable")) {
+    run.reason = undefined;
+  }
+}
+
+export class StopRefusalBackoff {
+  private readonly retryAt = new Map<string, number>();
+
+  isActive(memberId: string, nowMs: number): boolean {
+    const until = this.retryAt.get(memberId);
+    if (until === undefined) return false;
+    if (nowMs < until) return true;
+    this.retryAt.delete(memberId);
+    return false;
+  }
+
+  record(memberId: string, nowMs: number): void {
+    this.retryAt.set(memberId, nowMs + STOP_REFUSAL_BACKOFF_MS);
+  }
+
+  clear(memberId: string): void {
+    this.retryAt.delete(memberId);
+  }
+}
 
 const ACTIVE_STALL_RUN_STATUSES = new Set<TeamRun["status"]>([
   "planning",
@@ -133,12 +164,13 @@ export interface StallRecoveryInput {
   journalDrained: boolean;
   hasDeliveryAttempt: boolean;
   controlHeld?: boolean;
+  stopBackoffActive?: boolean;
   nowMs: number;
   phase: "detect" | "replace";
 }
 
 export function evaluateStallRecovery(input: StallRecoveryInput): StallRecoveryDecision {
-  const { run, member, attentionState, activePrompt, quietForMs, stallWindowMs, journalDrained, hasDeliveryAttempt, controlHeld, nowMs, phase } = input;
+  const { run, member, attentionState, activePrompt, quietForMs, stallWindowMs, journalDrained, hasDeliveryAttempt, controlHeld, stopBackoffActive, nowMs, phase } = input;
 
   if (run.members.some(item => item !== member && item.stalledSourceMemberId === member.memberId)) {
     return { action: "suppress-duplicate", guard: "duplicate-suppression", reason: "replacement-already-exists" };
@@ -250,6 +282,9 @@ export function evaluateStallRecovery(input: StallRecoveryInput): StallRecoveryD
     }
     if (controlHeld) {
       return { action: "none", guard: "eligible-cause", reason: "waiting-on-control" };
+    }
+    if (stopBackoffActive) {
+      return { action: "none", guard: "eligible-cause", reason: "stop-refusal-backoff" };
     }
     return { action: "initiate-stop" };
   }

@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { initialAttention } from "@infinite/attention";
 import { createRemoteClient, RemoteError } from "@infinite/remote";
 import { hashToken } from "../packages/host/src/config.js";
-import type { Manager } from "../packages/host/src/manager.js";
+import { TeamStopRefused, type Manager } from "../packages/host/src/manager.js";
 import { MissionService, type ProjectGroupLookup } from "../packages/host/src/missions.js";
 import { connectRemoteAccess } from "../packages/host/src/remote-access.js";
 import { STOP_REFUSED_REASON } from "../packages/host/src/stall-recovery.js";
@@ -319,5 +319,153 @@ test("MissionService.reportHeld() and willWake() use projectHolders without call
     missions.close();
     teams.close();
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("reported member under active control lease does not flap run.reason or hammer stopTeamSession and clears STOP_REFUSED_REASON on recovery", async () => {
+  const f = schedulerFixture();
+  try {
+    const member = f.run.members[0]!;
+    const freshAt = new Date().toISOString();
+    member.role = "implementer";
+    member.taskId = "task-1";
+    member.lastActivityAt = freshAt;
+    member.report = { kind: "result", summary: "Completed task 1" };
+    f.state.attention.lastActivityAt = freshAt;
+    f.state.control = { id: randomUUID(), label: "Owner", expiresAt: Date.now() + 30_000 };
+    f.run.status = "implementing";
+    f.run.tasks = [{ id: "task-1", title: "Task 1", instructions: "Implement task 1", paths: ["a.txt"], dependsOn: [], revision: 1, status: "running", memberId: member.memberId }];
+
+    let stops = 0;
+    f.manager.stopTeamSession = async () => {
+      stops++;
+      if (f.state.control && f.state.control.expiresAt > Date.now()) {
+        throw Object.assign(new Error("Input control is held"), { code: "control-busy" });
+      }
+      f.state.status = "exited";
+      return f.manager.state();
+    };
+    f.writeTeam();
+    const teams = f.openTeam();
+    const internals = teams as unknown as {
+      records: Map<string, { run: TeamRun }>;
+      step(stored: unknown): Promise<void>;
+      save(stored: unknown): void;
+    };
+    const stored = internals.records.get(f.run.id)!;
+    let saves = 0;
+    const origSave = internals.save.bind(teams);
+    internals.save = (value: unknown) => { saves++; return origSave(value); };
+
+    const reasons: (string | undefined)[] = [];
+    for (let i = 0; i < 3; i++) {
+      await internals.step(stored);
+      reasons.push(teams.get(f.run.id).reason);
+    }
+    assert.equal(stops, 0);
+    assert.deepEqual(reasons, [STOP_REFUSED_REASON, STOP_REFUSED_REASON, STOP_REFUSED_REASON]);
+    assert.equal(teams.get(f.run.id).members[0]!.status, "unavailable");
+    assert.equal(saves, 1);
+
+    f.state.control = null;
+    await internals.step(stored);
+    const recovered = await waitFor(() => Promise.resolve(teams.get(f.run.id)), run => !run.pendingOperation);
+    assert.equal(stops, 1);
+    assert.equal(recovered.reason, undefined);
+  } finally {
+    f.close();
+  }
+});
+
+test("non-control TeamStopRefused respects retry backoff across ticks while preserving earlierStop next-tick retry", async () => {
+  const f = schedulerFixture();
+  let teams: TeamService | undefined;
+  try {
+    let nowMs = Date.now();
+    const member = f.run.members[0]!;
+    member.role = "implementer";
+    member.taskId = "task-1";
+    f.state.control = null;
+    f.run.status = "implementing";
+    f.run.tasks = [{ id: "task-1", title: "Task 1", instructions: "Implement task 1", paths: ["a.txt"], dependsOn: [], revision: 1, status: "running", memberId: member.memberId }];
+
+    let stops = 0;
+    let refuseStop = true;
+    f.manager.stopTeamSession = async () => {
+      stops++;
+      if (refuseStop) throw new TeamStopRefused("This session does not belong to the team assignment", 403);
+      f.state.status = "exited";
+      return f.manager.state();
+    };
+    f.writeTeam();
+    teams = new TeamService(f.config, f.key, f.manager as unknown as Manager, (_project, start) => start(), undefined, undefined, { now: () => nowMs });
+    const internals = teams as unknown as {
+      records: Map<string, { run: TeamRun }>;
+      step(stored: unknown): Promise<void>;
+      save(stored: unknown): void;
+    };
+    const stored = internals.records.get(f.run.id)!;
+    let saves = 0;
+    const origSave = internals.save.bind(teams);
+    internals.save = (value: unknown) => { saves++; return origSave(value); };
+
+    await internals.step(stored);
+    const savesAfterFirstTick = saves;
+    assert.equal(stops, 1);
+    assert.equal(teams.get(f.run.id).reason, STOP_REFUSED_REASON);
+    assert.equal(teams.get(f.run.id).members[0]!.status, "unavailable");
+
+    nowMs += 500;
+    await internals.step(stored);
+    nowMs += 500;
+    await internals.step(stored);
+    assert.equal(stops, 1);
+    assert.equal(saves, savesAfterFirstTick);
+    assert.equal(teams.get(f.run.id).reason, STOP_REFUSED_REASON);
+
+    nowMs += 31_000;
+    refuseStop = false;
+    await internals.step(stored);
+    const recovered = await waitFor(
+      () => Promise.resolve(teams!.get(f.run.id)),
+      run => run.members.length === 2 && !run.pendingOperation,
+    );
+    assert.equal(stops, 2);
+    assert.equal(recovered.reason, undefined);
+    assert.equal(recovered.members[1]!.stalledSourceMemberId, member.memberId);
+
+    const fEarlier = schedulerFixture();
+    let teamsEarlier: TeamService | undefined;
+    try {
+      const mEarlier = fEarlier.run.members[0]!;
+      mEarlier.role = "implementer";
+      mEarlier.taskId = "task-1";
+      mEarlier.stalledAt = new Date(nowMs - 1000).toISOString();
+      fEarlier.state.control = null;
+      fEarlier.run.status = "implementing";
+      fEarlier.run.tasks = [{ id: "task-1", title: "Task 1", instructions: "Implement task 1", paths: ["a.txt"], dependsOn: [], revision: 1, status: "running", memberId: mEarlier.memberId }];
+      let earlierStops = 0;
+      fEarlier.manager.stopTeamSession = async () => {
+        earlierStops++;
+        throw new TeamStopRefused("This session does not belong to the team assignment", 403);
+      };
+      fEarlier.writeTeam();
+      teamsEarlier = new TeamService(fEarlier.config, fEarlier.key, fEarlier.manager as unknown as Manager, (_project, start) => start(), undefined, undefined, { now: () => nowMs });
+      const earlierInternals = teamsEarlier as unknown as {
+        records: Map<string, { run: TeamRun }>;
+        step(stored: unknown): Promise<void>;
+      };
+      const earlierStored = earlierInternals.records.get(fEarlier.run.id)!;
+      await earlierInternals.step(earlierStored);
+      nowMs += 500;
+      await earlierInternals.step(earlierStored);
+      assert.equal(earlierStops, 2);
+    } finally {
+      await teamsEarlier?.close();
+      fEarlier.close();
+    }
+  } finally {
+    await teams?.close();
+    f.close();
   }
 });

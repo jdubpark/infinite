@@ -13,7 +13,7 @@ import { commandStillRunningEvent, leftoverView, notedLeftover, settledLeftover,
 import type { WorkerError } from "./ipc.js";
 import { writeSealed, unseal } from "./vault.js";
 import { accountSettingPrompt, PROVIDER_NAMES, recoveryTurnEnd, type AttentionState, type Prompt, type SignalData } from "@infinite/attention";
-import { activeStageForRole, evaluateStallRecovery, MEMBER_STALL_REASON, STOP_REFUSED_REASON, syncObservedMemberState, type LivePromptRef } from "./stall-recovery.js";
+import { activeStageForRole, clearStopRefusedReason, evaluateStallRecovery, hasActiveControl, MEMBER_STALL_REASON, STOP_REFUSED_REASON, StopRefusalBackoff, syncObservedMemberState, type LivePromptRef } from "./stall-recovery.js";
 import { describeTeamWaitReasons, PERMISSION_AGENT_REASON, PERMISSION_REVIEW_REASON, PROVIDER_INPUT_REASON, SESSION_SLOT_REASON } from "./team-wait-reasons.js";
 import { autonomyOf, type AutonomyMode } from "./autonomy.js";
 import { buildTeamPendingOperation, createTeamSchema, lineupProfiles, resolveLimitFallback, teamActionSchema, teamGoalContextSchema, teamLineupSchema, teamMutationSchema, teamMemberRetireSchema, teamParallelismSchema, teamProcessesEndedSchema, recordedTeamReportEnvelopeSchema, type CreateTeam, type TeamContinue, type TeamGoalContext, type TeamLineup, type TeamMember, type TeamMemberRetire, type TeamModelProfile, type TeamParallelism, type TeamPermissionDecision, type TeamProcessesEnded, type TeamPermissionRecoveryView, type TeamRun, type TeamScout, type TeamTask, type TeamView, type TeamVerificationReconcile, type TeamDeliveryReconcile, currentPermissions, DEFAULT_STORAGE_FLOOR, hostClosedBlockedReason, autoPinned, coversPoint, hostProfilesFor, memberLimit, switchFallback, decisionAnswerLabel, inputSourceLabel, type SteeringSource } from "./team-types.js";
@@ -162,7 +162,7 @@ export const providerInputReason = PROVIDER_INPUT_REASON;
 const permissionReviewReason = PERMISSION_REVIEW_REASON;
 const permissionAgentReason = PERMISSION_AGENT_REASON;
 const runtimeUnavailableReason = "An agent runtime is unavailable; the team is waiting for confirmed state.";
-const memberStateReasons: ReadonlySet<string> = new Set([runtimeUnavailableReason, permissionReviewReason, permissionAgentReason, providerInputReason, STOP_REFUSED_REASON]);
+const memberStateReasons: ReadonlySet<string> = new Set([runtimeUnavailableReason, permissionReviewReason, permissionAgentReason, providerInputReason]);
 const clock = (iso: string) => `${iso.slice(11, 16)} UTC`;
 export const memberTimeLimitReason = "An agent exceeded its one-hour runtime limit. Its workspace was preserved.";
 export const memberStallReason = MEMBER_STALL_REASON;
@@ -283,7 +283,7 @@ export class TeamService {
   private readonly intentChecks = new TeamIntent({ prepare: (s, r, f, o, p) => this.prepareMember(s as Stored, r, undefined, f, o, p), consume: (s, m) => this.consume(s as Stored, m), operation: (s, p, c, m) => this.operation(s as Stored, "result", p, c, m), save: s => this.save(s as Stored), event: (s, t) => this.event(s as Stored, t), block: (s, e, m) => this.block(s as Stored, e, m), project: run => this.config.projects.find(project => project.id === run.projectId), limited: () => this.limits.limited(this.currentDate()), prefix: () => this.config.teams?.commandPrefix });
   private readonly objectiveTests = new TeamRegister({ holder: id => this.records.get(id), configured: run => this.config.projects.find(project => project.id === run.projectId)?.team?.checks ?? [], workspace: s => { try { this.assertRunPath(s as Stored, s.run.workspace); return s.run.workspace; } catch { return undefined; } }, enqueue: (runId, work) => this.enqueue(runId, work), save: s => this.save(s as Stored), event: (s, text) => this.event(s as Stored, text), prefix: () => this.config.teams?.commandPrefix, now: timestamp });
   readonly verdicts = new TeamVerdicts({ holder: id => this.records.get(id), prepare: (s, o, p, f) => this.prepareMember(s as Stored, "evaluator", undefined, undefined, o, p, f), consume: (s, m) => this.consume(s as Stored, m), operation: (s, p, c, m) => this.operation(s as Stored, "result", p, c, m), save: s => this.save(s as Stored), delivery: (runId, head, since) => this.options?.delivery?.(runId, head, since), event: (s, t) => this.event(s as Stored, t), emit: (s, d) => this.emitWith(s as Stored, "verdict.recorded", [d.verdictId], { revision: s.verdict?.revision ?? s.run.revision }, () => d), configured: run => this.config.projects.find(project => project.id === run.projectId)?.team?.checks ?? [], limited: () => this.limits.limited(this.currentDate()), prefix: () => this.config.teams?.commandPrefix, register: this.objectiveTests, now: timestamp, uuid: randomUUID });
-  private reconciledAt = 0;
+  private readonly stopBackoff = new StopRefusalBackoff(); private reconciledAt = 0;
   constructor(private readonly config: Config, private readonly key: Buffer, private readonly manager: Manager, private readonly startInProject: StartInProject, private readonly linear?: LinearService, private readonly titler?: Pick<Readings, "requestTitle">, private readonly options?: TeamServiceOptions) {
     this.directory = join(config.stateDir, "teams");
     this.limits = new ProviderLimits(join(config.stateDir, "provider-limits.sealed"), key);
@@ -707,7 +707,7 @@ export class TeamService {
     if (!this.options?.events) return;
     (stored.ledgerReplaces ??= {})[next.memberId] = { memberId: previous.memberId, cause };
   }
-  private memberStopped(stored: Stored, member: TeamMember, reason: MemberStopReason, detail?: MemberStopDetail): void {
+  private memberStopped(stored: Stored, member: TeamMember, reason: MemberStopReason, detail?: MemberStopDetail): void { this.stopBackoff.clear(member.memberId); clearStopRefusedReason(stored.run, member);
     if (member.role === "permission-coordinator") return;
     this.emitWith(stored, "member.stopped", [member.memberId],
       { memberId: member.memberId, taskId: member.taskId, revision: member.revision },
@@ -1707,13 +1707,13 @@ export class TeamService {
   private stallWindowFor(member: TeamMember) {
     return member.role === "reviewer" ? Math.min(this.stallWindow(), REVIEW_QUIET_WINDOW_MS) : this.stallWindow();
   }
-  private evalStall(stored: Stored, member: TeamMember, attentionState: AttentionState, journalDrained: boolean, phase: "detect" | "replace", activePrompt?: LivePromptRef | null, controlHeld = false) {
+  private evalStall(stored: Stored, member: TeamMember, attentionState: AttentionState, journalDrained: boolean, phase: "detect" | "replace", activePrompt?: LivePromptRef | null, controlHeld = false, stopBackoffActive = false) {
     const nowMs = this.currentDate().getTime();
-    return evaluateStallRecovery({ run: stored.run, member, attentionState, ...(activePrompt !== undefined ? { activePrompt } : {}), ...(controlHeld ? { controlHeld } : {}), quietForMs: nowMs - Date.parse(member.lastActivityAt ?? member.startedAt ?? timestamp()), stallWindowMs: this.stallWindowFor(member), journalDrained, hasDeliveryAttempt: Boolean(stored.deliveryAttempt), nowMs, phase });
+    return evaluateStallRecovery({ run: stored.run, member, attentionState, ...(activePrompt !== undefined ? { activePrompt } : {}), ...(controlHeld ? { controlHeld } : {}), ...(stopBackoffActive ? { stopBackoffActive } : {}), quietForMs: nowMs - Date.parse(member.lastActivityAt ?? member.startedAt ?? timestamp()), stallWindowMs: this.stallWindowFor(member), journalDrained, hasDeliveryAttempt: Boolean(stored.deliveryAttempt), nowMs, phase });
   }
-  private async detectStall(stored: Stored, member: TeamMember, attentionState: AttentionState, journalDrained: boolean, exited = false, activePrompt?: LivePromptRef | null, controlHeld = false) {
-    const stall = this.evalStall(stored, member, attentionState, journalDrained, "detect", activePrompt, controlHeld);
-    if (stall.action === "suppress-duplicate" || (exited && stall.action === "none" && stall.guard === "current-assignment" && stall.reason !== "inactive-run-status")) { member.status = "stopped"; this.save(stored); return false; }
+  private async detectStall(stored: Stored, member: TeamMember, attentionState: AttentionState, journalDrained: boolean, exited = false, activePrompt?: LivePromptRef | null, controlHeld = false, stopBackoffActive = false) {
+    const stall = this.evalStall(stored, member, attentionState, journalDrained, "detect", activePrompt, controlHeld, stopBackoffActive);
+    if (stall.action === "suppress-duplicate" || (exited && stall.action === "none" && stall.guard === "current-assignment" && stall.reason !== "inactive-run-status")) { member.status = "stopped"; this.stopBackoff.clear(member.memberId); clearStopRefusedReason(stored.run, member); this.save(stored); return false; }
     if (stall.action !== "initiate-stop" && stall.action !== "end-replay") return false;
     await this.replaceStalledMember(stored, member, attentionState, activePrompt);
     return Boolean(stored.pending || stored.run.status === "blocked");
@@ -2142,7 +2142,7 @@ export class TeamService {
         const held = states.flatMap((state, index) => state.status !== "exited" && state.attention.state === "needs-you"
           ? [this.promptHolder(run, observedMembers[index].sessionId, state.attention.prompt?.id)] : []);
         const reason = states.some(state => ["unavailable", "recording-error"].includes(state.status)) ? runtimeUnavailableReason
-          : held.includes("user") ? providerInputReason : held.includes("agent") ? permissionAgentReason : held.length ? permissionReviewReason : run.reason === STOP_REFUSED_REASON && states.some(state => Boolean(state.control && state.control.expiresAt > this.currentDate().getTime())) ? STOP_REFUSED_REASON : undefined;
+          : held.includes("user") ? providerInputReason : held.includes("agent") ? permissionAgentReason : held.length ? permissionReviewReason : undefined;
         if (run.reason !== reason) { run.reason = reason; this.save(stored); }
       }
       if (stored.pending) return;
@@ -2215,12 +2215,11 @@ export class TeamService {
               this.save(stored);
               continue;
             }
-            if (state.status === "exited") {
+            if (state.status === "exited") { this.stopBackoff.clear(member.memberId);
               if (member.stalledAt && journalDrained) { if (await this.detectStall(stored, member, state.attention.state, journalDrained, true, null)) return; continue; }
               if (member.role === "permission-coordinator") {
                 const decision = permissionCoordinatorDecision(run, member);
-                member.status = "waiting";
-                member.report = undefined;
+                member.status = "waiting"; clearStopRefusedReason(run, member); member.report = undefined;
                 if (decision && ["pending", "reviewing"].includes(decision.status)) {
                   decision.status = "escalated"; decision.reason = "The permission coordinator exited without its assigned decision report.";
                   const recovery = decision.recoveryRequestId ? run.permissionRecovery?.requests.find(item => item.id === decision.recoveryRequestId) : undefined;
@@ -2236,7 +2235,8 @@ export class TeamService {
               if (this.intentChecks.failed(stored, member) || this.verdicts.failed(stored, member)) return;
               this.block(stored, new TeamError(409, "missing-agent-report", "An agent exited without a valid structured report. Its task is unresolved."), member); return;
             }
-            if (state.status === "running" && member.status === "unavailable" && member.role !== "permission-coordinator") member.status = "running";
+            const nowMs = this.currentDate().getTime(), controlHeld = hasActiveControl(state, nowMs), stopBackoffActive = this.stopBackoff.isActive(member.memberId, nowMs);
+            if (state.status === "running" && member.status === "unavailable" && member.role !== "permission-coordinator" && !stopBackoffActive) member.status = "running";
             if (this.agentEligible(stored)) {
               await this.retireCoordinatorReviews(stored);
               if (this.agentServes(stored)) this.handOffPermission(stored, member, state);
@@ -2250,15 +2250,16 @@ export class TeamService {
               if (run.replay && holder === "user") return void this.replays.end(stored, "permission");
               run.reason = run.reason === providerInputReason || holder === "user" ? providerInputReason : holder === "agent" ? permissionAgentReason : permissionReviewReason;
             }
-            else if (member.status !== "unavailable" || member.role !== "permission-coordinator" ||
-              permissionCoordinatorDecision(run, member)?.status === "reviewing") member.status = "running";
+            else if (member.role === "permission-coordinator" ? (member.status !== "unavailable" || permissionCoordinatorDecision(run, member)?.status === "reviewing") : !stopBackoffActive) member.status = "running";
             this.save(stored);
-            if (state.status === "running" && member.role !== "permission-coordinator" && await this.detectStall(stored, member, state.attention.state, journalDrained, false, state.attention.state === "needs-you" && state.attention.prompt ? { id: state.attention.prompt.id, ...(state.attention.prompt.hash ? { hash: state.attention.prompt.hash } : {}) } : null, Boolean(state.control && state.control.expiresAt > this.currentDate().getTime()))) return;
+            if (state.status === "running" && member.role !== "permission-coordinator" && await this.detectStall(stored, member, state.attention.state, journalDrained, false, state.attention.state === "needs-you" && state.attention.prompt ? { id: state.attention.prompt.id, ...(state.attention.prompt.hash ? { hash: state.attention.prompt.hash } : {}) } : null, controlHeld, stopBackoffActive)) return;
             continue;
           }
           this.save(stored);
         }
-        try { if (!await this.stopped(member)) continue; if (run.reason === STOP_REFUSED_REASON) run.reason = undefined; }
+        const reportedState = await this.manager.state(member.sessionId).catch(() => undefined);
+        if (reportedState && reportedState.status !== "exited" && hasActiveControl(reportedState, this.currentDate().getTime())) { if (member.status !== "unavailable" || run.reason !== STOP_REFUSED_REASON) { member.status = "unavailable"; run.reason = STOP_REFUSED_REASON; this.save(stored); } continue; }
+        try { if (!await this.stopped(member)) continue; this.stopBackoff.clear(member.memberId); clearStopRefusedReason(run, member); }
         catch { member.status = "unavailable"; run.reason = STOP_REFUSED_REASON; this.save(stored); continue; }
         if (!trackingReady) { member.status = "reported"; member.exitConfirmedAt ??= timestamp(); this.save(stored); continue; }
         if (member.role === "implementer" && member.report?.kind === "result") {
@@ -2494,13 +2495,10 @@ export class TeamService {
     member.stoppedReason ??= `No activity for ${minutes} minutes`;
     this.save(stored);
     let exited;
-    try { exited = await this.stopped(member); if (!exited) { this.save(stored); return; } if (run.reason === STOP_REFUSED_REASON) run.reason = undefined; }
+    try { exited = await this.stopped(member); if (!exited) { this.save(stored); return; } this.stopBackoff.clear(member.memberId); clearStopRefusedReason(run, member); }
     catch (error) {
       const refused = error instanceof TeamStopRefused || error instanceof Error && ["control-busy", "control-lost"].includes((error as WorkerError).code ?? "");
-      if (refused && !earlierStop) {
-        member.stalledAt = undefined;
-        if (member.stoppedReason?.startsWith("No activity for ")) member.stoppedReason = undefined;
-      }
+      if (refused && !earlierStop) { member.stalledAt = undefined; if (member.stoppedReason?.startsWith("No activity for ")) member.stoppedReason = undefined; this.stopBackoff.record(member.memberId, this.currentDate().getTime()); }
       member.status = "unavailable"; run.reason = STOP_REFUSED_REASON; this.save(stored); return;
     }
     const { page, limit } = this.readMemberJournal(stored, member, true);
@@ -2530,7 +2528,7 @@ export class TeamService {
     const run = stored.run, provider = member.provider ?? run.provider, name = PROVIDER_NAMES[provider];
     const kind = limit.limit === "credits" ? "credit limit" : "usage limit", resets = limit.resetsAt ? clock(limit.resetsAt) : undefined;
     if (limit.confidence === "corroborated") this.limits.observe({ provider, limit: limit.limit, detectedAt: limit.at, ...(limit.resetsAt ? { resetsAt: limit.resetsAt } : {}), sessionId: member.sessionId, runId: run.id, confidence: "corroborated" });
-    try { if (!await this.stopped(member)) { member.cursor = limit.seq - 1; this.save(stored); return; } if (run.reason === STOP_REFUSED_REASON) run.reason = undefined; }
+    try { if (!await this.stopped(member)) { member.cursor = limit.seq - 1; this.save(stored); return; } this.stopBackoff.clear(member.memberId); clearStopRefusedReason(run, member); }
     catch { member.cursor = limit.seq - 1; member.status = "unavailable"; run.reason = STOP_REFUSED_REASON; this.save(stored); return; }
     member.stoppedReason = `${name} ${kind}${resets ? `, resets ${resets}` : ""}`;
     if (member.role === "permission-coordinator") {

@@ -409,17 +409,21 @@ export async function askForBrief(api: WatchApi, team: any, rows: TeamBriefRow[]
 }
 
 const BOARD_PAGE_LIMIT = 100;
+const MAX_SYNC_PAGES = 100;
 const MAX_RETAINED_BOARD_ENTRIES = 600;
 const BOARD_TAIL_REVALIDATE_ENTRIES = 100;
 const BOARD_REVALIDATE_EVERY_TICKS = 5;
 
-type BoardEntryCache = {
+export type BoardEntryCache = {
   entries: EntryHead[];
   cursor: number;
   ticks: number;
 };
 
-async function syncBoardEntryCache(
+const isValidBoardCursor = (value: unknown): value is number =>
+  typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+
+export async function syncBoardEntryCache(
   api: WatchApi,
   teamId: string,
   cache: BoardEntryCache,
@@ -431,13 +435,15 @@ async function syncBoardEntryCache(
   let nextSince = startCursor;
   let finalCursor = startCursor;
   let hasMore = false;
-  while (!signal.aborted) {
+  for (let hops = 0; hops < MAX_SYNC_PAGES && !signal.aborted; hops += 1) {
     const query = nextSince > 0 ? `&since=${nextSince}` : "";
     const page = await api.json<EntryPage>(`/teams/${teamId}/entries?limit=${BOARD_PAGE_LIMIT}${query}`, undefined, signal);
-    for (const entry of page.entries) merged.set(entry.entryId, entry);
-    if (page.cursor > finalCursor) finalCursor = page.cursor;
-    hasMore = page.more;
-    if (!page.more || page.entries.length === 0 || page.cursor <= nextSince) break;
+    const pageEntries = Array.isArray(page?.entries) ? page.entries : [];
+    for (const entry of pageEntries) merged.set(entry.entryId, entry);
+    const validCursor = isValidBoardCursor(page?.cursor);
+    if (validCursor && page.cursor > finalCursor) finalCursor = page.cursor;
+    hasMore = Boolean(page?.more);
+    if (!hasMore || pageEntries.length === 0 || !validCursor || page.cursor <= nextSince) break;
     nextSince = page.cursor;
   }
   const nextTicks = cache.ticks + 1;
@@ -447,8 +453,9 @@ async function syncBoardEntryCache(
       const refreshSince = Math.max(0, tail[0]!.seq - 1);
       const query = refreshSince > 0 ? `&since=${refreshSince}` : "";
       const refreshed = await api.json<EntryPage>(`/teams/${teamId}/entries?limit=${BOARD_PAGE_LIMIT}${query}`, undefined, signal);
-      for (const entry of refreshed.entries) merged.set(entry.entryId, entry);
-      if (refreshed.cursor > finalCursor) finalCursor = refreshed.cursor;
+      const refreshedEntries = Array.isArray(refreshed?.entries) ? refreshed.entries : [];
+      for (const entry of refreshedEntries) merged.set(entry.entryId, entry);
+      if (isValidBoardCursor(refreshed?.cursor) && refreshed.cursor > finalCursor) finalCursor = refreshed.cursor;
     }
   }
   const entries = [...merged.values()].sort((a, b) => a.seq - b.seq).slice(-MAX_RETAINED_BOARD_ENTRIES);

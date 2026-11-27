@@ -42,7 +42,9 @@ export function MissionDetail({ connection, id }: { connection: Connection; id: 
         id,
         mission: newer(previous?.id === id ? previous.mission : null, result),
       }));
-      if (sent.path.endsWith("/steer")) setDirection("");
+      if (sent.path === `/missions/${id}/steer`) {
+        setDirection(current => current.trim() === String(sent.fields.text ?? "") ? "" : current);
+      }
       poll.refresh();
     },
     refused: poll.refresh,

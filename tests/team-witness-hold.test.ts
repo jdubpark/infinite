@@ -133,7 +133,7 @@ test("a drained command gets one event for its process: the drain line, with the
 });
 
 test("a process that does not hold the output and ends between the two reads is not held", POSIX, async () => {
-  const run = await settled((_stored, cwd) => teamCommand({ command: "sh", args: ["-c", "sleep 0.2 >/dev/null 2>&1 &"] }, cwd));
+  const run = await settled((_stored, cwd) => teamCommand({ command: "sh", args: ["-c", "sleep 0.15 >/dev/null 2>&1 &"] }, cwd));
   try {
     await until(() => !run.stored.pending, "the operation settles");
     assert.equal(run.stored.leftover, undefined, "the process ended before the second read");

@@ -529,7 +529,7 @@ test("a halt holds a run whose answer queued a replacement that has not launched
   try {
     await teams.answer(waiting.id, waiting.decisionId, { requestId: randomUUID(), revision: 1, text: "Change a.txt" });
     await step(teams, waiting.id);
-    assert.equal(teams.get(waiting.id).status, "needs-input");
+    assert.equal(teams.get(waiting.id).status, "planning");
     assert.deepEqual(teams.get(waiting.id).members.map(member => member.status), ["stopped", "queued"]);
     assert.equal(f.launches.length, 0);
 
@@ -541,7 +541,7 @@ test("a halt holds a run whose answer queued a replacement that has not launched
     assert.equal(f.launches.length, 0, "and does not launch during the halt");
 
     await halt.release(fixtureScope, { requestId: randomUUID() }, owner);
-    assert.equal(teams.get(waiting.id).status, "needs-input", "the release resumes the run where it waited");
+    assert.equal(teams.get(waiting.id).status, "planning", "the release resumes the run at the replacement's stage");
     assert.equal(teams.get(waiting.id).revision, 1, "without a fresh plan");
     await step(teams, waiting.id);
     assert.equal(f.launches.length, 1, "the replacement launches after the release");

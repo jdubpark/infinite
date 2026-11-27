@@ -1529,7 +1529,7 @@ export class TeamService {
     const run = stored.run;
     if (!inPlace) await this.invalidatePermissionDecisions(stored, "A resume started before the permission request could be answered.");
     record?.();
-    if (inPlace) { run.status = "needs-input"; run.reason = undefined; return; }
+    if (inPlace) { run.status = this.heldStatus(run); run.reason = undefined; return; }
     run.revision++; run.tasks = []; run.review = undefined; run.round = 0; stored.checkHead = undefined;
     this.emit(stored, "run.revision-advanced", [run.revision], {}, { cause: "resume", fromRevision: run.revision - 1, baseChanged: false });
     run.brief = undefined; run.noChange = undefined;
@@ -1550,11 +1550,23 @@ export class TeamService {
     await this.invalidatePermissionDecisions(stored, `The team was ${action === "pause" ? "paused" : "cancelled"} before the permission request could be answered.`);
     this.commands.get(run.id)?.abort();
   }
+  private unlaunchedMember(member: TeamMember) { try { return member.status === "queued" && !this.hasLaunch(member); } catch { return false; } }
+  private answeredQueuedMembers(run: TeamRun) {
+    const decisions = run.decisions.filter(item => item.revision === run.revision);
+    if (!decisions.length || decisions.some(item => !item.answer)) return [];
+    const active = run.members.filter(member => activeMember(member) && member.role !== "permission-coordinator");
+    return active.length && active.every(member => member.status === "queued" && this.unlaunchedMember(member)) ? active : [];
+  }
   private waitsWithNothingInFlight(stored: Stored) {
     const run = stored.run;
-    const unlaunched = (member: TeamMember) => { try { return member.status === "queued" && !this.hasLaunch(member); } catch { return false; } };
-    return run.status === "needs-input" && !stored.halt && !stored.pending && !this.commands.has(run.id) &&
-      !run.members.some(member => activeMember(member) && member.role !== "permission-coordinator" && !unlaunched(member));
+    if (stored.halt || stored.pending || this.commands.has(run.id)) return false;
+    if (run.status === "needs-input") return !run.members.some(member => activeMember(member) && member.role !== "permission-coordinator" && !this.unlaunchedMember(member));
+    return HALT_PAUSED_TEAM.has(run.status) && this.answeredQueuedMembers(run).length > 0;
+  }
+  private heldStatus(run: TeamRun): TeamRun["status"] {
+    if (run.decisions.some(item => item.revision === run.revision && !item.answer) || run.members.some(member => member.revision === run.revision && member.status === "waiting" && member.role !== "permission-coordinator")) return "needs-input";
+    const queued = this.answeredQueuedMembers(run)[0];
+    return queued ? activeStageForRole(queued.role) : "needs-input";
   }
   private async haltStop(stored: Stored, mark: { haltId: string; reason: string }) {
     const run = stored.run;

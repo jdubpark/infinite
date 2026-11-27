@@ -46,6 +46,7 @@ test("omitted counts are named only when non-zero", () => {
   assert.deepEqual(omittedText(view([], { omittedSeries: 2, omittedValues: 1, dropped: 3 })), [
     "2 more series not shown", "1 value over the per-cycle limit not shown", "3 older cycles no longer kept",
   ]);
-  assert.equal(valueText(0.123456), "0.1235");
+  assert.equal(valueText(0.123456789), "0.123457");
+  assert.equal(valueText(1234.5678), "1234.57");
   assert.equal(valueText(42), "42");
 });

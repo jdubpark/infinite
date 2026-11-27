@@ -69,4 +69,4 @@ export function omittedText(view: Pick<CurveView, "omittedSeries" | "omittedValu
   return parts;
 }
 
-export const valueText = (value: number) => Number.isInteger(value) ? String(value) : String(Number(value.toPrecision(4)));
+export const valueText = (value: number) => Number.isInteger(value) ? String(value) : String(Number(value.toPrecision(6)));

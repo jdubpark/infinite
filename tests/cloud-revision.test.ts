@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
-import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { execFile, execFileSync, spawn } from "node:child_process";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
@@ -199,7 +199,12 @@ raise SystemExit(exit_code)
   async function push(sha: string) {
     return deliver("push", `push-${sha}`, { repository: { full_name: "fixture/project" }, ref: "refs/heads/main", after: sha });
   }
-  const runOnce = () => spawnSync("python3", [controller, "--config", configPath, "--once", "--api", `http://127.0.0.1:${apiPort}`], { encoding: "utf8", env: controllerEnv });
+  const runOnce = () => new Promise<{ status: number | string; stdout: string; stderr: string }>(resolve => {
+    execFile("python3", [controller, "--config", configPath, "--once", "--api", `http://127.0.0.1:${apiPort}`],
+      { encoding: "utf8", env: controllerEnv }, (error, stdout, stderr) => {
+        resolve({ status: error ? (error.code ?? 1) : 0, stdout, stderr });
+      });
+  });
 
   const badSignature = await deliver("push", "bad-signature", { repository: { full_name: "fixture/project" }, ref: "refs/heads/main", after: predecessor }, false);
   assert.equal(badSignature.status, 401);
@@ -213,7 +218,7 @@ raise SystemExit(exit_code)
     },
   });
   assert.equal(sameShaPull.status, 202);
-  const firstRun = runOnce();
+  const firstRun = await runOnce();
   assert.equal(firstRun.status, 0, firstRun.stdout + firstRun.stderr);
   assert.deepEqual(readFileSync(launcherCalls, "utf8").trim().split("\n"), [`${predecessor} --runner fixture-runner`]);
   assert.equal(published.some(row => row.sha === predecessor && row.state === "success"), true);
@@ -238,7 +243,7 @@ raise SystemExit(exit_code)
   assert.equal(unlistedRef.status, 400);
 
   assert.equal((await push(failing)).status, 202);
-  assert.equal(runOnce().status, 0);
+  assert.equal((await runOnce()).status, 0);
   assert.equal(published.some(row => row.sha === failing && row.state === "failure"), true);
   assert.equal(published.some(row => row.sha === predecessor && row.state === "success"), true);
   assert.equal(readFileSync(launcherCalls, "utf8").trim().split("\n").length, 2);
@@ -257,11 +262,11 @@ raise SystemExit(exit_code)
   failOneSuccess = true;
   unavailablePendingSha = newer;
   assert.equal((await push(newer)).status, 202);
-  const interrupted = runOnce();
+  const interrupted = await runOnce();
   assert.notEqual(interrupted.status, 0);
   assert.equal(published.some(row => row.sha === newer && row.state === "pending"), true);
   assert.equal(accepted.some(row => row.sha === newer && row.state === "pending"), false);
-  const retry = runOnce();
+  const retry = await runOnce();
   assert.equal(retry.status, 0, retry.stderr);
   assert.equal(published.some(row => row.sha === newer && row.state === "success"), true);
   assert.equal(accepted.some(row => row.sha === newer && row.state === "success" && row.token === "Bearer controller-rotated-token"), true);
@@ -282,7 +287,7 @@ raise SystemExit(exit_code)
     const badReceiptHead = git("rev-parse", "HEAD");
     git("push", "-q", "origin", "HEAD:refs/heads/main");
     assert.equal((await push(badReceiptHead)).status, 202);
-    assert.equal(runOnce().status, 0);
+    assert.equal((await runOnce()).status, 0);
     assert.equal(published.some(row => row.sha === badReceiptHead && row.state === "error"), true);
     assert.equal(published.some(row => row.sha === badReceiptHead && row.state === "success"), false);
   }
@@ -290,18 +295,18 @@ raise SystemExit(exit_code)
 
   const foreignOrigin = { ...config, origin: join(dir, "another-project.git") };
   writeFileSync(configPath, JSON.stringify(foreignOrigin), { mode: 0o600 });
-  const refusesForeignOrigin = runOnce();
+  const refusesForeignOrigin = await runOnce();
   assert.equal(refusesForeignOrigin.status, 2);
   assert.match(refusesForeignOrigin.stderr, /enrollment changed/);
   writeFileSync(configPath, JSON.stringify(config), { mode: 0o600 });
   const changedCommand = { ...config, mode: "command", command: ["node", "-e", "different verifier"] };
   writeFileSync(configPath, JSON.stringify(changedCommand), { mode: 0o600 });
-  const refusesContextReuse = runOnce();
+  const refusesContextReuse = await runOnce();
   assert.equal(refusesContextReuse.status, 2);
   assert.match(refusesContextReuse.stderr, /enrollment changed/);
   const newStateSameContext = { ...config, mode: "command", command: ["npm", "test"], stateDirectory: join(dir, "alternate-state") };
   writeFileSync(configPath, JSON.stringify(newStateSameContext), { mode: 0o600 });
-  const refusesContextReuseAcrossState = runOnce();
+  const refusesContextReuseAcrossState = await runOnce();
   assert.equal(refusesContextReuseAcrossState.status, 2);
   assert.match(refusesContextReuseAcrossState.stderr, /status context is already bound/);
 });

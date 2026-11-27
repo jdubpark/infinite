@@ -8,18 +8,20 @@ import { fileURLToPath } from "node:url";
 const teamOperationFailureFile = "team-operation-failure.test.ts";
 const mainCheckRealFile = "main-check-real.test.ts";
 const processIsolationImage = "buildpack-deps@sha256:c4e7382cc1abefe0bbaaf99324fad5122f9def4d3840fbfad17d3c2fd77b9dc9";
-const focusedTeamOperationFailure = process.argv.includes("--team-operation-failure");
-const focusedMainCheckReal = process.argv.includes("--main-check-real");
-if (focusedTeamOperationFailure && focusedMainCheckReal) {
-  throw new Error("Choose one focused suite at a time.");
-}
+const privateSuites = new Map([
+  ["--team-operation-failure", [teamOperationFailureFile]],
+  ["--team-leftovers", ["team-witness-hold.test.ts", "team-leftover-hold.test.ts"]],
+  ["--main-check-real", [mainCheckRealFile]],
+]);
+const privateFiles = new Set([...privateSuites.values()].flat());
+const requested = [...privateSuites.keys()].filter(flag => process.argv.includes(flag));
+if (requested.length > 1) throw new Error("Choose one focused suite at a time.");
 const serialFiles = new Set(["client-cli.test.ts"]);
 const testFiles = readdirSync(new URL("../tests/", import.meta.url))
   .filter((name) => name.endsWith(".test.ts"))
   .sort();
-const selectedFiles = focusedTeamOperationFailure ? [teamOperationFailureFile]
-  : focusedMainCheckReal ? [mainCheckRealFile] : testFiles;
-const parallelFiles = selectedFiles.filter((name) => name !== teamOperationFailureFile && name !== mainCheckRealFile && !serialFiles.has(name));
+const selectedFiles = requested.length ? privateSuites.get(requested[0]) : testFiles;
+const parallelFiles = selectedFiles.filter(name => !privateFiles.has(name) && !serialFiles.has(name));
 const serial = selectedFiles.filter((name) => serialFiles.has(name));
 const requestedConcurrency = process.argv.find((arg) => arg.startsWith("--concurrency="))?.split("=", 2)[1]
   ?? process.env.INFINITE_TEST_CONCURRENCY;
@@ -112,4 +114,6 @@ async function run(files, fileConcurrency) {
 if (selectedFiles.includes(teamOperationFailureFile)) await runInPrivateLinuxContainer(teamOperationFailureFile);
 if (parallelFiles.length) await run(parallelFiles, concurrency);
 if (serial.length) await run(serial, 1);
-if (selectedFiles.includes(mainCheckRealFile)) await runInPrivateLinuxContainer(mainCheckRealFile);
+for (const file of selectedFiles) {
+  if (file !== teamOperationFailureFile && privateFiles.has(file)) await runInPrivateLinuxContainer(file);
+}

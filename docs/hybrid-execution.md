@@ -62,7 +62,7 @@ This builds and qualifies an alternate app-server with its code-mode helper befo
 
 Both transfer endpoints require a paired owner. Executor attachment additionally requires a per-session capability. Capabilities stay out of model context and native frontend arguments. Checkpoint files and source data are plaintext in private runtime directories and need encrypted host storage; journals remain application-encrypted. All files within the selected roots are transferred, including any credentials stored there. The single-tenant trust boundary does not provide confidentiality from its owner or administrator.
 
-Worker and provider process restart recovery, automatic dependency provisioning, arbitrary descendant containment, atomic database snapshots, and automatic merge/application are not implemented. API restart preserves the detached worker. Source and content storage currently require operator-managed retention.
+Worker and provider process restart recovery, automatic dependency provisioning, arbitrary descendant containment, atomic database snapshots, and automatic merge/application are not implemented. API restart preserves the detached worker. Shared pool chunks are automatically reclaimed after superseded checkpoints and deleted sessions pass their safety grace window; legacy store-local chunks and mutable workspace copies still require operator-managed retention.
 
 ## Verification
 

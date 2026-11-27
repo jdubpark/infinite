@@ -7,6 +7,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { dirname, join, posix, resolve } from "node:path";
 import { createWorkspaceWatch, type WorkspaceWatch } from "./workspace-watch.js";
+import { acquireSharedPoolLease, registerSharedPoolScope, withSharedPoolLease, type SharedPoolLeaseHandle } from "./workspace-pool-gc.js";
 
 const CHUNK_BYTES = 256 * 1024;
 const MAX_ENTRIES = 500000;
@@ -208,6 +209,7 @@ async function storeAt(target: WorkspaceStoreTarget): Promise<Store> {
   if (sharedRoot) await privateDirectory(blobs);
   const references = sharedRoot ? join(root, "refs") : undefined;
   if (references) await privateDirectory(references);
+  if (sharedRoot) await registerSharedPoolScope(sharedRoot, root);
   return { root, blobs, localBlobs, sharedRoot, references, shards: new Set(), referenceShards: new Set() };
 }
 async function blobPath(store: Store, hash: string) {
@@ -369,8 +371,13 @@ export async function putWorkspaceBlob(storeDir: WorkspaceStoreTarget, hash: str
   const data = Buffer.from(base64, "base64");
   if (data.toString("base64") !== base64 || data.length > CHUNK_BYTES) throw new Error("Invalid workspace blob encoding");
   const store = await storeAt(storeDir);
-  await writeBlob(store, hash, data);
-  await publishReferences(store, [hash]);
+  const run = async (lease?: SharedPoolLeaseHandle) => {
+    await writeBlob(store, hash, data);
+    await lease?.assertHeld();
+    await publishReferences(store, [hash]);
+  };
+  if (store.sharedRoot) await withSharedPoolLease(store.sharedRoot, "write", { scope: store.root }, run);
+  else await run();
 }
 export function encodeChunkBatch(chunks: { hash: string; bytes: Buffer }[]): Buffer {
   const parts: Buffer[] = [];
@@ -400,28 +407,50 @@ export function decodeChunkBatch(body: Buffer): { hash: string; bytes: Buffer }[
 export async function putWorkspaceBlobs(storeDir: WorkspaceStoreTarget, chunks: { hash: string; bytes: Buffer }[]): Promise<void> {
   if (chunks.length > BATCH_CHUNKS) throw new Error("Workspace chunk batch exceeds its bound");
   const store: Store = { ...await storeAt(storeDir), unsynced: new Set() };
-  for (let offset = 0; offset < chunks.length; offset += 16) {
-    const results = await Promise.allSettled(chunks.slice(offset, offset + 16).map(({ hash, bytes }) => writeBlob(store, hash, bytes)));
-    const failed = results.find(result => result.status === "rejected");
-    if (failed) throw failed.reason;
-  }
-  if (store.references) await publishReferences(store, chunks.map(({ hash }) => hash));
-  else {
-    await Promise.all([...new Set(chunks.map(({ hash }) => join(store.blobs, hash.slice(0, 2))))].map(syncDirectory));
-    await syncDirectory(store.blobs);
-  }
+  const run = async (lease?: SharedPoolLeaseHandle) => {
+    let leaseError: unknown;
+    for (let offset = 0; offset < chunks.length; offset += 16) {
+      await lease?.refresh();
+      const results = await Promise.allSettled(chunks.slice(offset, offset + 16).map(({ hash, bytes }) => writeBlob(store, hash, bytes)));
+      const failed = results.find(result => result.status === "rejected");
+      if (failed) throw failed.reason;
+    }
+    await lease?.assertHeld();
+    if (store.references) {
+      await publishReferences(store, chunks.map(({ hash }) => hash), () => {
+        if (leaseError) throw leaseError;
+        if (lease && !leaseError) void lease.refresh().catch(error => { leaseError ??= error; });
+      });
+      if (lease && !leaseError) await lease.refresh();
+      if (leaseError) throw leaseError;
+    } else {
+      await Promise.all([...new Set(chunks.map(({ hash }) => join(store.blobs, hash.slice(0, 2))))].map(syncDirectory));
+      await syncDirectory(store.blobs);
+    }
+  };
+  if (store.sharedRoot) await withSharedPoolLease(store.sharedRoot, "write", { scope: store.root }, run);
+  else await run();
 }
-export async function readWorkspaceBlob(storeDir: WorkspaceStoreTarget, hash: string): Promise<string> { return (await readBlob(await storeAt(storeDir), hash)).toString("base64"); }
+export async function readWorkspaceBlob(storeDir: WorkspaceStoreTarget, hash: string): Promise<string> {
+  const store = await storeAt(storeDir);
+  if (store.sharedRoot) {
+    return withSharedPoolLease(store.sharedRoot, "read", { scope: store.root }, async () => (await readBlob(store, hash)).toString("base64"));
+  }
+  return (await readBlob(store, hash)).toString("base64");
+}
 export async function hasWorkspaceBlobs(storeDir: WorkspaceStoreTarget, hashes: string[]): Promise<string[]> {
   if (!Array.isArray(hashes) || hashes.length > MAX_ENTRIES || hashes.some(hash => typeof hash !== "string" || !HASH.test(hash))) throw new Error("Invalid workspace blob request");
   const store = await storeAt(storeDir), missing: string[] = [];
-  for (const hash of new Set(hashes)) {
-    try { await verifyBlob(store, hash); } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT" || (error instanceof Error && error.message === "Corrupt workspace blob")) missing.push(hash);
-      else throw error;
+  const run = async () => {
+    for (const hash of new Set(hashes)) {
+      try { await verifyBlob(store, hash); } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT" || (error instanceof Error && error.message === "Corrupt workspace blob")) missing.push(hash);
+        else throw error;
+      }
     }
-  }
-  return missing;
+    return missing;
+  };
+  return store.sharedRoot ? withSharedPoolLease(store.sharedRoot, "read", { scope: store.root }, run) : run();
 }
 
 async function futurePath(path: string): Promise<string> {
@@ -456,7 +485,10 @@ export async function captureWorkspace(options: {
   if (!cwdRoot) throw new Error("Workspace cwd is outside the selected roots");
   const handles: FileHandle[] = [];
   let reported = Date.now();
+  let poolLease: SharedPoolLeaseHandle | undefined;
+  let leaseError: unknown;
   const tick = () => {
+    if (poolLease && !leaseError) void poolLease.refresh().catch(error => { leaseError ??= error; });
     if (!options.onProgress || Date.now() - reported < 100) return;
     reported = Date.now(); options.onProgress();
   };
@@ -636,6 +668,7 @@ export async function captureWorkspace(options: {
   }
   let captureStartedAt = new Date().toISOString();
   try {
+    if (store.sharedRoot) poolLease = await acquireSharedPoolLease(store.sharedRoot, "write", { scope: store.root, signal: options.signal });
     for (const root of roots) handles.push(await openDirectory(root));
     if (process.platform === "darwin") {
       const watched = [...new Set([...roots, ...[...gitProjections.values()].flatMap(item => [item.common, item.selected])])];
@@ -659,13 +692,22 @@ export async function captureWorkspace(options: {
     const after = watch ? await watch.flush() : undefined;
     if (after && (!after.valid || after.revision !== before!.revision)) changed();
     abort(options.signal);
+    if (leaseError) throw leaseError;
+    await poolLease?.assertHeld();
     entries.sort((a, b) => a.root - b.root || (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
     const body: Omit<WorkspaceManifest, "id"> = {
       version: 1, capturedAt: new Date().toISOString(), captureStartedAt,
       cwd: { root: cwdRoot.index, path: posix.relative(cwdRoot.root, cwd) }, roots, entries,
     };
-    if (store.references) await publishReferences(store, [...written, ...store.requiredReferences!], () => { abort(options.signal); tick(); });
-    else for (const shard of store.unsynced!) { await syncDirectory(shard); tick(); }
+    if (store.references) {
+      await publishReferences(store, [...written, ...store.requiredReferences!], () => {
+        if (leaseError) throw leaseError;
+        abort(options.signal);
+        tick();
+      });
+      if (poolLease && !leaseError) await poolLease.refresh();
+      if (leaseError) throw leaseError;
+    } else for (const shard of store.unsynced!) { await syncDirectory(shard); tick(); }
     store.unsynced!.clear();
     abort(options.signal);
     return validateWorkspaceManifest({ ...body, id: manifestId(body) });
@@ -674,6 +716,7 @@ export async function captureWorkspace(options: {
     throw error;
   } finally {
     await Promise.all([...store.unsynced!].map(shard => syncDirectory(shard).catch(() => {})));
+    await poolLease?.release();
     await watch?.close();
     await Promise.all(handles.map(handle => handle.close()));
   }
@@ -770,7 +813,9 @@ export async function materializeWorkspace(options: {
   const paths = [...unique].sort(([a], [b]) => a.length - b.length || a.localeCompare(b));
   const linkTargets = checkLinks(manifest.roots, manifest.entries);
   const directoryModes = new Map<string, number>([[stage, options.sharedGroup ? 0o2700 : 0o700]]);
+  let poolLease: SharedPoolLeaseHandle | undefined;
   try {
+    if (store.sharedRoot) poolLease = await acquireSharedPoolLease(store.sharedRoot, "read", { scope: store.root });
     for (const [path, entry] of paths) {
       if (entry.kind !== "directory") continue;
       await mkdir(mapped(stage, path), { recursive: true, mode: 0o700 });
@@ -790,6 +835,7 @@ export async function materializeWorkspace(options: {
         await symlink(rewritten, file); continue;
       }
       if (await reuseFile(entry, file)) continue;
+      await poolLease?.refresh();
       const handle = await open(file, "wx", 0o600);
       try {
         let total = 0;
@@ -813,5 +859,8 @@ export async function materializeWorkspace(options: {
     await syncDirectory(parent);
     const roots = manifest.roots.map(root => mapped(destination, root));
     return { roots, cwd: join(roots[manifest.cwd.root], manifest.cwd.path) };
-  } finally { if (!published) await rm(stage, { recursive: true, force: true }); }
+  } finally {
+    await poolLease?.release();
+    if (!published) await rm(stage, { recursive: true, force: true });
+  }
 }

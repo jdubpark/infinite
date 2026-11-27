@@ -1887,23 +1887,22 @@ export class TeamService {
       if (held) stored.run.status = held;
       this.save(stored);
     });
-    }, async error => {
-      const live = error instanceof CommandStopUnconfirmed ? undefined : await this.stillRunning(pending);
-      return this.enqueue(stored.run.id, () => {
+    }, error => this.enqueue(stored.run.id, async () => {
       if (this.closed || stored.pending?.id !== pending.id) return;
       this.commands.get(stored.run.id)?.abort();
       this.commands.delete(stored.run.id);
       stored.leftover = settledLeftover(stored.leftover, pending);
-      this.holdLive(stored, pending, live);
       const failed = stored.pending, recorder = this.recorderOf(stored, failed);
       if (recorder?.spawning === 0 && (process.platform !== "win32" || recorder.inFlight === 0)) delete failed.recording;
       failed.failure = { code: error instanceof TeamError ? error.code : "workspace-operation-failed",
         reason: error instanceof Error ? error.message : "A team workspace operation failed.", at: timestamp() };
       this.save(stored);
+      const live = error instanceof CommandStopUnconfirmed ? undefined : await this.stillRunning(pending);
+      if (this.closed || stored.pending?.id !== pending.id) return;
+      this.holdLive(stored, pending, live);
       this.block(stored, error);
       this.fence.watch(stored);
-    });
-    }).catch(() => {});
+    })).catch(() => {});
   }
   private block(stored: Stored, error: unknown, sourceMember?: TeamMember) {
     if (stored.run.replay) return void this.replays.blocked(stored, error);

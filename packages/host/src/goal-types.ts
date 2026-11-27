@@ -129,6 +129,7 @@ export interface GoalCycle {
   deadlineStop?: { at: string; fuseOpen?: true };
   class?: CycleClass;
   assessment?: GoalAssessment;
+  supersededVerdictIds?: string[];
   settledAt?: string;
   wake?: CycleWake;
 }

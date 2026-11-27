@@ -443,22 +443,26 @@ ready-for-review, and blocked workspaces are removed. After a blocked run's
 workspace removal completes, the host closes it as `cancelled` with the last
 blocker in its reason; it does not claim the work is complete. Its record then
 uses the normal `cancelledMinutes` retention. The outcome ledger keeps the run
-as blocked: the close writes no second settled event. A blocked run that
-still holds an unresolved operation keeps its workspaces unless the host looks
-and finds no process of that operation. The host records each command an
+as blocked: the close writes no second settled event. A blocked or cancelled
+run that still holds an unresolved operation with a process record keeps its
+workspaces unless the host looks and finds no process of that operation.
+Such a cancelled run's workspaces are removed after `cancelledMinutes` only when
+a look taken at that moment, in two passes, finds neither kind of process
+described below. The host records each command an
 operation starts, as the leader of its own session and process group, in the
-step that starts it, and while the operation runs it samples the process table
-for descendants that moved to other sessions or groups. The saved intent says
-that this record may be incomplete from before a command starts until a save
-holds it. When an operation fails, the host ends the operation's commands that
-are still running, as a halt does, and refuses the commands that have not
-started: one that the operation asks for later, and one that was still waiting
-for its turn to start. Such a command is refused at its turn or, when its turn
-came before the failure, just before its start, because its stop came first.
-The saved failure holds every command that has started, so it marks
-the record incomplete only while a command is still starting, not while the host
-still reads a command's start time. While such a run
-is blocked or paused with no command of its own running, the host looks at most
+step that starts it, and while
+the operation runs it samples the process table for descendants that moved to
+other sessions or groups. The saved intent says that this record may be
+incomplete from before a command starts until a save holds it. When an
+operation fails, the host ends the operation's commands that are still running,
+as a halt does, and refuses the commands that have not started: one that the
+operation asks for later, and one that was still waiting for its turn to start.
+Such a command is refused at its turn or, when its turn came before the failure,
+just before its start, because its stop came first. The saved failure holds
+every command that has started, so it marks the record incomplete only while a
+command is still starting, not while the host still reads a command's start
+time. While such a run
+is blocked, paused or cancelled with no command of its own running, the host looks at most
 every ten minutes for processes that match the record, and for any process of
 the host account or of the account that runs team commands that uses the run
 directory as a working directory, open file, or command-line argument. The
@@ -487,15 +491,82 @@ process record, so its run keeps the earlier behavior: elapsed time alone never
 closes it, and the owner cancels or reconciles it. Started and completed removals are
 recorded as host events, and a failed removal is retried on later scheduler
 ticks. A blocked run whose workspace is being removed cannot resume, continue,
-or be steered. An owner can cancel a blocked run directly after its goal or
-mission is no longer active. `DELETE /api/teams/:id` and `infinite team delete ID` remove a settled
-cancelled, merged, or no-change run (clones and record) immediately. A live
+or be steered. An owner can cancel a stopped goal's leftover blocked or paused
+run directly via `POST /api/teams/:id/cancel` once the goal has stopped, has no
+queued control or pending time extension for that run, and cannot be extended
+from it after a deadline stop; cancelling updates the cycle to `cancelled` so
+goal cleanup removes the run record after workspace removal. An owner can also
+cancel a blocked mission subteam directly after its mission is no longer active.
+`DELETE /api/teams/:id` and `infinite team delete ID` remove a settled
+cancelled, merged, or no-change run (clones and record) immediately. A run that
+still holds an unresolved operation with a process record is removed only when a
+look taken at that moment finds no process of that operation and none using the
+run directory, or, when that look cannot tell, on the owner's statement described
+below; otherwise the request receives `team-operation-running`. A live
 goal, mission, or handoff that still uses the run as its source receives
 `team-retained`; `team-in-use` means another run has a pending preparation that
 clones from this workspace. Both removals can be retried once the reference
 settles. Deleted request IDs are kept in the sealed `retired.sealed` tombstone,
 up to 2,000 IDs with the oldest dropped. Replaying one returns `team-deleted`;
 start another run with a new request ID.
+
+A run whose command exited while a process it started still held its output
+(see the leader rule under checks), or whose operation ended while a process of
+the operation was still alive (see the settle look under checks), keeps a record
+of that command's processes: the ids, groups and sessions its operation
+recorded, whether the operation then succeeded or failed. In the second case the
+record holds only the processes, groups and sessions that still had a live
+member when the operation ended. Later operations of the run, a passing check among them,
+do not clear the record. While it stands, nothing removes the run's directories:
+not retention of a merged, no-change, ready-for-review, cancelled or blocked
+run, and not the owner's removal. Until the run is cancelled, merged,
+no-change, ready for review or blocked, the host also keeps its integrated
+member clones and takes no look for the record; the clones go with the run
+directory later. When a removal falls due, the host looks
+for processes that match the record and for processes that use the run
+directory, as described above, at most every ten minutes; the owner's removal
+takes a look of its own. When the run also holds an unresolved operation with a
+process record, the host looks for each record's processes separately, and each
+record's state and events describe only its own processes and the processes
+using the run directory. Requests that arrive during a look share it only when
+it covers the same process record. A look that finds neither kind clears the
+record, and the removal proceeds. The run's events record each change in what
+the host saw for a record, and a look that sees the same as the last one records
+nothing.
+The team view carries `leftoverProcesses` while the record stands:
+`{ since, state: "unchecked" }` before the first look, then
+`{ since, state, checkedAt }` with `state` set to `running`, `in-use` or
+`unknown`. It names no process ids or paths.
+
+The owner's removal of such a run answers `team-leftover-running` (409) while a
+look finds a process, and `team-leftover-unknown` (409) while the look cannot
+tell. `unknown` keeps the directories, and the only way out is the owner's
+statement that the processes ended, the same action that lifts a stopped
+command's hold: `POST /api/teams/:id/processes-ended` with
+`{ "requestId": "<uuid>" }`, or `infinite team processes-ended ID`. The host
+takes a look of its own for the statement. While it finds a process, the host
+answers `team-command-running` (409) and does not record the statement; the
+look's result is recorded as for any other look, with an event when it changed.
+The statement is refused in the same way while a process uses the run's
+directory, and while the look for either record finds a process even though
+the other record's look cannot tell; each refusal and each removal answer names
+the record whose look found the process.
+When it finds none,
+the record clears as after any look. When it cannot tell, the host records the
+statement as a run event that names what the look reported and clears the
+record; the next removal proceeds as for a run without one. The statement lifts
+an unresolved operation's record for removal in the same way. Run removal and
+the statement are not on the relay allowlist.
+
+The record covers only the case above. A process that a command leaves behind
+without holding the command's output is never noted, so the host takes no look
+for it, and the run's directory may be removed while that process runs.
+
+**Rollback.** A host without this change keeps the record in the sealed run
+file but ignores it. It removes a held run's directories under its retention
+policy and on the owner's removal while the process may still run. Before a
+rollback, check each run whose view carries `leftoverProcesses`, and end its
+processes or accept that its directories go.
 
 Retention marks a workspace removal as started in the run record, then removes
 the tree outside the serialized team mutation queue. At most two background
@@ -1027,13 +1098,13 @@ The Git commands that validation runs inside the grader's root are grader comman
 
 A baseline job runs replay trials. A trial gives one implementer one task of the project's `valid` set, under one configuration, in a workspace that holds only the task's base. The grader then grades the result against the hidden tests. A trial spends model tokens on one member launch, which runs as the eval account. Read [the eval member account install](../deploy/ubuntu/eval.md) and [the eval member account](security.md#eval-member-account) before you turn trials on.
 
-Trials are off in every project until the owner sets `trialsPerDay`. A project with no `trialsPerDay` runs no trial, and its baseline job is refused `409` `eval-config-incomplete`.
+Trials are off in every project until the owner configures a provider budget (`providerBudgets` in the project's `eval` block, or host `usage.budgets` for the job's providers) or sets the optional `trialsPerDay` safety cap. A project without a budget covering the requested providers and without `trialsPerDay` runs no trial, and its job is refused `409` `eval-config-incomplete`. Before removing eval firewall isolation, cancel active eval jobs and judge calibrations, remove `trialsPerDay` and `providerBudgets` from every project and any eval-enabling provider entries from host `usage.budgets` (or remove `eval.member`), and confirm no active or schedulable eval launches remain.
 
 #### Turn it on
 
 1. Set up validation: steps 1 to 4 and 6 of [the grader install](../deploy/ubuntu/grader.md), and launcher version 2 of its section 2.2.
 2. Set up the eval member account: steps 1 to 10 of [the eval member account install](../deploy/ubuntu/eval.md).
-3. In the project's `eval` block, set `focusedTest`, `reportFormat`, and `trialsPerDay`.
+3. In the project's `eval` block, set `focusedTest`, `reportFormat`, and `providerBudgets` (or host `usage.budgets`, with optional `trialsPerDay` as a secondary safety cap).
 4. Create a baseline job with `infinite eval run PROJECT --file job.json --request-id UUID`, with `"kind": "baseline"` in the file.
 
 No trial starts before step 4. The code installs nothing: the launchers, the sudo rules, the network rules, the template, and the configuration are the owner's steps.
@@ -1044,7 +1115,8 @@ The project's `eval` block takes these fields. They are read only for a `github`
 
 | Field | Limit | Default | Meaning |
 |---|---|---|---|
-| `trialsPerDay` | 1 to 50 | off | Trials a day, counted by UTC day, for a baseline job. It is the stand-in for a learning budget, see below. |
+| `providerBudgets` | `claude`, `codex`, `opencode`: `{ usd: 0..100000, period: "day" \| "week" \| "month" }` | off (`period` defaults to `"day"`) | Per-provider USD spend caps enforced fail-closed from `UsageService` alongside host `usage.budgets`. |
+| `trialsPerDay` | 1 to 50 | off | Optional secondary safety cap on trials per UTC day, kept for backwards compatibility and providers without USD metering. |
 | `trialMinutes` | 10 to 240 | 45 | Minutes a trial's member may run before it ends `timeout`. |
 | `candidateProfiles` | up to 8 model profiles | none | Profiles that the lineup does not have. A baseline job may use them, and no prompt shows them. |
 
@@ -1125,9 +1197,12 @@ One trial runs host-wide at a time. Validation and trials share the grader, one 
 | `halt` | The project is halted. |
 | `storage` | The grader has less than 10 GiB or 200,000 inodes free. |
 | `another-job` | A trial or a validation task of another job runs. |
+| `spend-fuse` | The host or project spend fuse is open or its baseline cannot be read. |
 | `provider-limit` | The configuration's provider has an active limit. |
+| `provider-budget` | A configured project or host USD budget for the configuration's provider is exhausted for the current period. |
+| `budget-unmeasurable` | A configured provider USD budget cannot be verified because spend is unavailable, unmeasured, partial, or unpriced. |
 | `session-slots` | Fewer than four host session slots are free. |
-| `daily-cap` | `trialsPerDay` trials have started today. |
+| `daily-cap` | The optional secondary `trialsPerDay` cap has been reached today. |
 | `mirror` | The project has no mirror head or no base branch. |
 | `grader-failed` | A step of the trial's source in the grader failed. |
 | `eval-failed` | A step of the trial's source in the eval account failed. |
@@ -1137,7 +1212,7 @@ A trial whose source cannot be built keeps its attempt and is tried again, and t
 
 The reasons that stop a job are `trial-voids` (three voids in a row), `eval-processes-alive` (a process of the eval account survived `stop`, and the job is blocked until the owner resumes it), and `configuration-changed`, with the validate job's reasons.
 
-`trialsPerDay` is the stand-in for the learning budget. It bounds the count of trials and nothing else. It has no USD limits, no reservation, no estimate, and no learning floor, and no duel gate exists yet. The delegated adoption design's standing budget (delivery step 4, "The standing budget") replaces it, and removes the field.
+Provider USD budgets (`providerBudgets` and host `usage.budgets`) enforce measured provider spend fail-closed across UTC day, week, and month periods, together with the spend fuse (`FuseService`) and provider quota limits (`ProviderLimits`). Creating a new trial job while the spend fuse is open, a provider USD budget is exhausted, or a configured USD budget is unmeasurable refuses with `409` (`spend-fuse-open`, `provider-budget-exceeded`, or `provider-budget-unmeasurable`). `trialsPerDay` remains optional as a secondary daily trial-count safety cap. The delegated adoption design's standing learning budget (delivery step 4) adds reservations, estimates, and weekly purpose shares on top of this enforcement.
 
 #### Missing while a launcher refuses
 
@@ -2321,14 +2396,14 @@ A profile on a limited provider is skipped. The router does not avoid `evaluator
 | Producer | State |
 | --- | --- |
 | `host`, check `command` or `artifact` | The register's receipt for that criterion at the head, whatever the evaluator said: `pass` is `met`, `fail` is `not-met`, `unknown` is `inconclusive` (`receipt-unknown`). No receipt is `inconclusive` (`no-receipt`). |
-| `host`, check `receipt` | `checks-passed` and `review-approved` are host facts at the hold. No fact is `inconclusive` (`no-receipt`). `merged` and `landed` are `inconclusive` (`before-delivery`); see the known limits. |
+| `host`, check `receipt` | `checks-passed` and `review-approved` are host facts at the hold. No fact is `inconclusive` (`no-receipt`). `merged` and `landed` are `inconclusive` (`before-delivery`) until the host sees the delivery; see Late delivery receipts. |
 | `owner` | The owner's newest rating on the same head, against the threshold: `met` or `not-met`. Otherwise `pending-owner`. A rating on an older head judges older work, so a new head waits for a new rating. An owner criterion whose check is not an owner rating is `inconclusive` (`no-receipt`). |
 | `evaluator` | The evaluator's state, when every handle it gave resolves and a `met` gives at least one. A handle resolves when it names a receipt in the context, or a `file:` path (at most 300 characters) that is one of the changed paths or is named by an active artifact check. The host reads no file to resolve it. Otherwise `inconclusive` (`unresolved-evidence`). Citation handles never resolve yet. A criterion the evaluator did not judge is `inconclusive` (`not-assessed`). With no evaluator answer at all, `inconclusive` (`no-evaluator`). |
 
 Two rules apply on top:
 
 - A criterion whose `pinned` file changed in the run cannot be `met`. It is `inconclusive` (`pinned-changed`) until the owner pins the new blob. A change list that is cut short voids `met` for every pinned criterion.
-- When a host criterion's receipt and the evaluator disagree (`met` against `not-met`), the receipt stands and the record's log gets an `evaluator-contradicted-receipt` entry. An evaluator `inconclusive` is no contradiction.
+- When a host criterion's receipt and the evaluator disagree (`met` against `not-met`), the receipt stands and the record's log gets an `evaluator-contradicted-receipt` entry. An evaluator `inconclusive` is no contradiction. A `merged` or `landed` criterion records none either: the evaluator answered before the delivery.
 
 The composed result is `not-met` when any criterion is `not-met`, whoever produced it. Otherwise it is `inconclusive` when any criterion is `inconclusive`, or when there are no active criteria. Otherwise it is `met`. A `pending-owner` criterion never blocks `met`. `c0` is always an evaluator criterion, so every composed result holds an agent judgement.
 
@@ -2343,37 +2418,82 @@ The composed result is `not-met` when any criterion is `not-met`, whoever produc
 - **One replacement.** An evaluator that stops, stalls, hits a limit, or sends no usable report is replaced once, by the same rules and without the failed profile. A read-only check of the evaluator's working copy that ends without a result counts as an evaluator failure. A second failure gives `inconclusive` with `evaluator-unavailable`. A pause, cancel, block, or recovery that stops the check counts no failure and writes nothing.
 - **No evaluator.** With no eligible profile (`no-independent-evaluator`), every eligible provider limited (`evaluator-unavailable`), or a context over the limit (`context-too-large`), no member starts. The host composes host and owner criteria, every evaluator criterion is `inconclusive`, and the run goes on.
 - **The attempt limit.** The evaluator counts as one agent attempt, and so does its replacement. A run at its limit of attempts gets no evaluator (`evaluator-unavailable`) and settles as it would without verdicts; the limit never stops a run because of the evaluator. A goal cycle with room for only its planner, one implementer, the integrator, and the reviewer therefore gets an `inconclusive` assessment.
+- **A working copy that cannot be made.** When the evaluator's working copy cannot be prepared, no member is added and the run is not blocked. The verdict ends `evaluator-unavailable`, evaluator criteria read `no-evaluator`, host criteria keep their receipts, and the run goes on as it would without verdicts. One run event names the cause. A members directory that the host refuses as unsafe (`team-root-unsafe`) still blocks the run, and so does a failed working copy of a reviewer or a delivery member.
 - **Unreadable record.** `record-unavailable` gives `inconclusive` for every criterion, sets the run's assessment, and adds one event. It writes no ledger row (see Known limits).
 - **Full or failing record write.** When the record's log is full, or its write fails, the assessment stays on the run and the goal, one event says so, and the record is unchanged.
 
 **What the verdict records.**
 
 - **On the run:** `run.assessment`, with ids, enumerations, and counts only: the verdict id, revision, head, kind (`reviewed` or `no-change`), the composed result, the evaluator's result, the reason, the four counts, and each criterion's state. It reaches every team view and relay device.
-- **In the record:** each active criterion's `latest` (`{ state, verdictId }`, never a note) and one `verdict.recorded` log entry per verdict, plus one `evaluator-contradicted-receipt` entry for each contradicted criterion. Verdict entries write only while the log stays under 300 entries and 160 KiB.
-- **In the ledger:** one `objective_verdicts` row per verdict, in the evidence store module `objective-verdicts`, projected from the run's `verdict.recorded` event. The row holds the verdict id, blind indexes of the project and the goal, the run id, the cycle, the revision, the kind, the record version, the rubric version, the evaluator's profile id, provider, model, and family, the flags `shared_family` and `also_reviewed`, the composed and the evaluator's result, the reason, one count per state, and the time. It holds no note, handle, or other text. Rows are kept 730 days, and a deleted run's rows are marked, not removed.
+- **In the record:** each active criterion's `latest` (`{ state, verdictId }`, never a note) and one `verdict.recorded` log entry per verdict (a late verdict, below, is another verdict), plus one `evaluator-contradicted-receipt` entry for each contradicted criterion. Verdict entries write only while the log stays under 300 entries and 160 KiB.
+- **In the ledger:** one `objective_verdicts` row per verdict, in the evidence store module `objective-verdicts`, projected from the run's `verdict.recorded` event. The row holds the verdict id, blind indexes of the project and the goal, the run id, the cycle, the revision, the kind, the record version, the rubric version, the evaluator's profile id, provider, model, and family, the flags `shared_family` and `also_reviewed`, the composed and the evaluator's result, the reason, one count per state, and the time. It holds no note, handle, or other text. A run revision can hold several verdicts, and the newest row wins. Rows are kept 730 days, and a deleted run's rows are marked, not removed.
 - **Reasons.** A verdict carries at most one of four reasons: `no-independent-evaluator`, `evaluator-unavailable`, `record-unavailable`, and `context-too-large`. A criterion carries at most one of seven: `no-receipt`, `receipt-unknown`, `before-delivery`, `pinned-changed`, `unresolved-evidence`, `not-assessed`, and `no-evaluator`.
 - **In events:** fixed text with a result and counts. They never hold evaluator text.
 
+**Late delivery receipts.** A verdict comes before the delivery, so a `merged` or `landed` criterion first reads `inconclusive` (`before-delivery`). Later the host's outcome ledger can show the delivery, and the team service composes the verdict again. Two definitions apply:
+
+- `merged`: the host saw this run's landing on the base branch at the reviewed head. It is `met` from then on, also after a revert. It is never `not-met`.
+- `landed`: the same landing, and it stands. It is `met` while the host sees no revert, and `not-met` once it sees one.
+
+The fact comes from the outcome ledger alone. No delivery report, merge commit, or run status makes a criterion `met`, and an unreadable ledger gives no fact.
+
+- **Which runs.** A run that is pinned, with status `merged` or `ready-for-review`, and a done reviewed verdict of its current revision and head, whose newest verdict held at least one criterion that waited for the delivery (`before-delivery`). A run is not judged again because its record gained a delivery criterion later.
+- **When.** After an applied scan, at start-up, each hour, and on a merge report. A pass that finds no change draws no id, saves nothing, and adds no event.
+- **The landing.** Every new landing stores the reviewed head the run had at the scan. A landing whose stored head differs from the verdict's head, or that was recorded before the verdict started, settles nothing.
+- **What it writes.** A new verdict id, and one record entry, one ledger row, and one assessment for each changed fact. The fact only moves forward: landed, then reverted. A restart between the two saves composes the same verdict and writes nothing twice.
+- **What it judges.** Only the criteria its earlier verdict held, as the record states them now. A criterion added to the record later is not judged by it, and a criterion edited since is judged as an edited criterion is today.
+- **What it replaces.** In the record, only the answers that one of this run's earlier verdicts wrote. An answer that a newer verdict of another run wrote stays.
+- **What it reads.** The host's other evidence as it is then. A register pass that finished after the first verdict counts, so a `command` criterion can change with it. The evaluator is not asked again.
+- **What it never does.** It changes no status, revision, head, member, or pending operation of the run, and it starts no work.
+
 **In a goal.** `GoalCycle.assessment` copies the run's assessment and adds `progress`: the change in the number of `met` criteria since the previous cycle that had an assessment. Only an autonomous goal acts on a verdict. A supervised goal and a standalone run show it and change nothing.
 
-- **Finite goal.** A composed `met` on a reviewed cycle stops the goal as `ready-for-review` with `stopReason: "provisional-met"`. Its status is never `achieved`, and its reason reads `An agent assessment, provisional, found every criterion met. Record your assessment: achieved, or not achieved with continue.` Any other result starts the next feature, as before.
-- **Owner answer.** `POST /api/goals/:id/outcome` takes two more optional fields. `verdictId` names the assessment the owner answers. `continue: true` is allowed only with `result: "not-achieved"` and a `verdictId`, on a goal stopped by `provisional-met` whose newest assessment that `verdictId` names. It appends the outcome's `summary` as a steering entry, which the next cycle's objective prints as a user direction, and sets the goal `running`. Roles and relay rules are the outcome route's own. Refusals: `409` `verdict-not-found` (the id names no assessment of this goal), `409` `goal-not-provisional`, `409` `goal-limit-reached` (the deadline, the ceiling, the member allowance, or the feature-run limit is spent), `409` `goal-steering-limit`, and `400` for `continue` without `verdictId` or with another result. A refused answer changes nothing. `achieved` with the same `verdictId` sets the goal `achieved`. Any outcome the owner records on a goal stopped by `provisional-met` ends that stop: the host clears `stopReason` and the reason, whatever the result.
+- **Finite goal.** A composed `met` on a reviewed cycle stops the goal as `ready-for-review` with `stopReason: "provisional-met"`. Its status is never `achieved`, and its reason reads `An agent assessment, provisional, found every criterion met. Record your assessment: achieved, or not achieved with continue.` Any other result starts the next feature, as before. The goal decides the stop at each step before it starts a feature: it stops when it is `running` with no active team and no pending launch or action, its newest cycle's assessment is a reviewed `met`, and no owner answer names one of that cycle's verdict ids. A `met` that arrived while the goal was paused therefore stops it when it resumes.
+- **Owner answer.** `POST /api/goals/:id/outcome` takes two more optional fields. `verdictId` names the assessment the owner answers. `continue: true` is allowed only with `result: "not-achieved"` and a `verdictId`, on a goal stopped by `provisional-met` whose newest assessment that `verdictId` names, as its current id or as an earlier id. It appends the outcome's `summary` as a steering entry, which the next cycle's objective prints as a user direction, and sets the goal `running`. Roles and relay rules are the outcome route's own. Refusals: `409` `verdict-not-found` (the id names no assessment of this goal, current or earlier), `409` `goal-not-provisional`, `409` `goal-limit-reached` (the deadline, the ceiling, the member allowance, or the feature-run limit is spent), `409` `goal-steering-limit`, and `400` for `continue` without `verdictId` or with another result. A refused answer changes nothing. `achieved` with the same `verdictId` sets the goal `achieved`. Any outcome the owner records on a goal stopped by `provisional-met` ends that stop: the host clears `stopReason` and the reason, whatever the result.
 - **Standing goal.** A `met` is recorded, and the next cycle starts at its cadence. A cycle of class `reviewed` with an assessment fails when its composed result is not `met` and its `progress` is not positive. Three failed cycles in a row pause the goal with `repeated-failures`, as before, and a resume resets the count. A no-change cycle, an excluded cycle, and a cycle with no assessment count as before, whatever their assessment says.
+- **Late receipt.** When the team service composes a run's verdict again after its delivery, the goal copies the new assessment into the cycle, and the cycle keeps the earlier ids in `supersededVerdictIds` (the last four, at the same revision and head). The goal adds one event. A late receipt never starts, restarts, relaunches, resumes, or cancels anything. An idle autonomous finite goal whose newest cycle is now `met` stops for the owner's assessment at its next step, by the finite-goal rule above. The owner's answer is accepted with the current id or with an earlier one. An answer that names an earlier id still shows on its cycle, without `agrees`.
+- **The hold.** A finite autonomous goal in a project that follows GitHub waits before its next launch while its newest cycle is `merged`, its verdict is `inconclusive` with nothing `not-met`, and every `inconclusive` criterion waits for the delivery (or the team is composing a late verdict). The wait ends 10 minutes after the cycle finished. The goal stays `running`, shows the reason `Waiting up to 10 minutes for the host to see this delivery on the base branch before the goal continues.`, and adds one event. A goal at its feature-run limit waits the same way, so a receipt can stop it `provisional-met` before the limit does. When the wait ends or no longer applies, the goal launches by the unchanged path. A supervised goal, a standing goal, a goal without an assessment, and a project without scans never wait.
+
+What a late receipt does:
+
+| Goal state | Effect |
+| --- | --- |
+| `running`, autonomous, finite, no active team, no launch or control, newest cycle, result now `met` | Cycle and record change. The goal stops `ready-for-review` with `provisional-met`. |
+| The same, result not `met` | Cycle and record change. The hold follows its rule. |
+| `running` or `needs-input` with an active team, a launch, or a control | Cycle and record change. Nothing else: a launch already recorded goes ahead, and the cycle is then no longer the newest. |
+| The cycle is not the newest | Cycle and record change. Nothing else. |
+| `paused` | Cycle and record change. The pause stays. At a resume the finite-goal rule applies, so a `met` newest cycle stops the goal. |
+| `ready-for-review` with `provisional-met` (for example `landed` turns `not-met`) | Cycle and record change. The stop and its text stay. |
+| `ready-for-review` at the run limit, `no-opportunity`, `limit-reached`, `blocked` | Cycle and record change. Nothing else. |
+| `achieved`, `cancelled` | Cycle and record change. The earlier outcome stays attached. |
+| Standing goal, supervised goal | Cycle and record change. No count, stop, or hold changes. |
+| The run's record is gone | Nothing. |
+
 - **Criteria rows.** The next cycle's project manager gets one row per active criterion that the newest assessment judged and that the owner has not edited since: its id, its status (`met`, `not-met`, `inconclusive`, or `pending-owner`), and its check label (at most 120 bytes), led by the line "Agent assessment, provisional, of the latest assessed cycle:" (a cycle without an assessment is skipped). The rows reach only the project manager's prompt and context file, and only for an autonomous goal with prompts and the evaluator on. No other role gets a row, and no row holds a note, score, threshold, count, model, or profile. A captured eval capsule keeps the goal without its rows.
 
 **Reads.**
 
 - `GET /api/goals/:id/verdicts` returns each cycle's verdict: the label, the composed and the evaluator's result, the counts, `progress`, the owner's outcome with that `verdictId` and whether it agrees (`met` with `achieved`, or `not-met` with `not-achieved`), and each criterion's producer, label, state, reason, receipt, handles, and note. A cycle's `detail` is `available` while the run's record lasts. After that it is `expired`, and the cycle shows its summary with no criteria. The roles are owner, controller, and viewer. The relay refuses the path.
-- A criterion's label follows one rule. A `pending-owner` criterion is `waiting for you`, whoever produces it. Otherwise a host criterion is `host receipt`, an owner criterion is `your rating`, and an evaluator criterion is `agent assessment`. The goal page and the phone show them as "Host receipt", "Waiting for you", "Your rating", and "Agent assessment, provisional".
+- A criterion's label follows one rule. A `pending-owner` criterion is `waiting for you`, whoever produces it. Otherwise a host criterion is `host receipt`, an owner criterion is `your rating`, and an evaluator criterion is `agent assessment`. The goal page shows them as "Host receipt", "Waiting for you", "Your rating", and "Agent assessment, provisional".
 - `infinite goal verdicts ID [--json]` prints one block per cycle. A block has the line `Cycle N · Agent assessment, provisional · RESULT`, with `(evaluator said RESULT)` when the results differ. It then has an optional `Reason:` line, a line of counts and progress (`Met 1 · not met 0 · inconclusive 1 · waiting for you 0 · progress 1`), and an optional `You answered RESULT` line, marked `(agrees)` when it agrees. A cycle whose detail expired has the line `Details expired: this run's record is gone.` Each criterion has one line: its id, state, label, and reason. The text form prints no note and no handle. `--json` prints the response, notes and handles included. A goal with no assessment prints `No cycle of this goal has an assessment.`
-- Through team and goal views, every device, relay devices included, sees `run.verdicts`, `run.assessment`, `GoalCycle.assessment`, and an outcome's `verdictId`. All hold ids, enumerations, and counts.
-- The goal page and the phone's goal screen show each cycle's "Agent assessment, provisional", its counts, and, when they differ, the evaluator's own result. The owner opens a cycle to read its criteria. The owner's outcome shows as "Your assessment". A goal stopped by `provisional-met` offers "Achieved" and "Not achieved, continue", keeps the ordinary outcome form below them, and says in one line that the other answers are recorded there. The owner can therefore always record not achieved without continue, or inconclusive, also when the host refuses continue. An answer from that form carries the assessment's `verdictId`. The Mac app does not show verdicts.
+- Through team and goal views, every device, relay devices included, sees `run.verdicts`, `run.assessment`, `GoalCycle.assessment`, `GoalCycle.supersededVerdictIds`, and an outcome's `verdictId`. All hold ids, enumerations, and counts. `supersededVerdictIds` holds verdict ids only, and it reaches relay devices.
+- The goal page and the phone's goal screen show each cycle's "Agent assessment, provisional", its counts, and, when they differ, the evaluator's own result. The owner opens a cycle on the web goal page to read its per-criterion details; the phone shows the provisional result and counts and points to the web client or `infinite goal verdicts` for per-criterion details, because remote machine access refuses the verdicts path. The owner's outcome shows as "Your assessment". A goal stopped by `provisional-met` offers "Achieved" and "Not achieved, continue", keeps the ordinary outcome form below them, and says in one line that the other answers are recorded there. The owner can therefore always record not achieved without continue, or inconclusive, also when the host refuses continue. An answer from that form carries the assessment's `verdictId`. The Mac app does not show verdicts.
 
 **What a restart does.** The host fences an operation that a restart interrupted. It never replays it, so nothing is written twice.
 
 **Known limits.**
 
-- `merged` and `landed` receipt criteria are `inconclusive` (`before-delivery`), because the verdict comes before delivery. A goal whose record holds one never reaches a provisional `met`: the owner retires or edits that criterion. A step after delivery is a later change.
+- A `merged` or `landed` criterion is `inconclusive` (`before-delivery`) until the host sees the delivery. A project without scans never sees it, so a goal whose record holds one never reaches a provisional `met` there: the owner retires or edits that criterion.
+- A goal stopped `provisional-met` keeps its stop and text after a revert.
+- A standing goal keeps the failure count it took when its cycle settled.
+- Later cycles' `progress` is not computed again after a late receipt.
+- A squash merge on a moved base never lands, so it never settles.
+- A revert after the ledger's hold writes no signal.
+- A pull-request run steered to a new revision after its delivery gets no receipt for the new revision, because the ledger holds one landing per run.
+- A first verdict whose record write failed is not repaired by a late verdict.
+- A landing recorded before this change stores no head for two of the three match rules. It is refused only when it is older than the verdict.
+- A pull-request run whose landing was seen while it was `delivering` settles at the next applied scan, at the next merge report, or within the hour.
+- A run whose status is not `merged` or `ready-for-review` gets no late verdict until its status settles.
 - The ledger undercounts: a `record-unavailable` verdict writes no row, because a row needs a record version.
 - After a crash between the goal record's write and the run's save, the record holds one `verdict.recorded` entry for a verdict that has no assessment on the run and no ledger row. The run is fenced, and nothing is written twice.
 - For a no-change verdict, the run can be saved as released one step before the service saves the no-change result.
@@ -2387,7 +2507,6 @@ The composed result is `not-met` when any criterion is `not-met`, whoever produc
 - Over the relay, the phone shows a cycle's assessment and counts but cannot open its criteria: the relay refuses the verdicts path, and the screen shows that refusal.
 - The evaluator's own session holds its notes and handles, as any member's session holds its report. The owner can open that session, from a relay device too. Sealing keeps the text from other members and from every later prompt, not from the owner.
 - The evaluator's fixed prompt gets the same graph and scratch-directory paragraphs the host appends to every member's prompt.
-- When the evaluator's working copy cannot be prepared, the run blocks, as it does when a reviewer's or a delivery member's cannot. This is new for a run that would otherwise settle with no further member. A resume starts a new revision and a new verdict.
 - A goal cycle whose evaluator is still running at the goal's deadline stops with `deadline` and does not settle. Without verdicts the same cycle settles at approval. An extension policy on the goal covers it, because the evaluator counts as active work.
 
 **Rollback.** Before a rollback to a host without this change:
@@ -2397,7 +2516,7 @@ The composed result is `not-met` when any criterion is `not-met`, whoever produc
 3. Finish or cancel a goal whose pending launch holds criteria rows. The older host refuses that context, so the goal blocks.
 4. Record the owner's outcome on every goal stopped with `stopReason: "provisional-met"`. The older host does not know that value.
 5. A record with verdict entries still parses, but a version before one answers `409` with `objective-version-unavailable`. The latest version still reads.
-6. The older host ignores `run.verdicts`, `run.assessment`, the sealed verdict, `GoalCycle.assessment`, and `verdictId`.
+6. The older host ignores `run.verdicts`, `run.assessment`, the sealed verdict, `GoalCycle.assessment`, `GoalCycle.supersededVerdictIds`, and `verdictId`.
 
 ### Reported numbers
 
@@ -2762,7 +2881,7 @@ Observations are grouped into an episode held in the worker. An episode starts a
 - A limit seen in any session, team member or not, updates the host-level entry. Nothing else happens to a non-team session.
 - Clients show the entry on the Teams list and the observation on session rows. Reset times are the provider's own statement, and a missing time means the provider gave none.
 
-The Codex working rule in a member prompt is recognised by exact text, so a retarget after a limit can find it. `packages/host/src/team-rule-texts.ts` lists every rule text main has generated; the list is append-only. When a member tool schema changes, the generated rule changes with it, and `tests/team-prompt-retarget.test.ts` fails until the new text is appended to the list and its hash to the pin.
+The sealed team wrapper persists structured prompt sections outside `run.members` under `Stored.memberPromptSections` (keyed by `memberId` as `{ promptSha256, sections }` and pruned to active matching run members on load and save), alongside each member's rendered `prompt` string. Keeping sections off `TeamMember` preserves rollback privacy so a rolled-back older host spreading `...member` through `TeamService.view()` cannot expose prompt sections or permission-coordinator evidence, and binding each entry to `sha256(member.prompt)` ensures that if a rolled-back host overwrites `member.prompt` on an existing member (for example, queuing a new permission-review turn on the same `memberId`), an upgraded host discards the stale sections rather than re-rendering an earlier request over the newer prompt. On launch and on provider-limit retargeting, the host renders provider-specific profile, escalation, Codex sandbox and tool-signature, context, entry, and reporting blocks deterministically from those sections in `packages/host/src/team-prompt-sections.ts` and validates the fully assembled launch prompt (including same-provider refreshes, unchanged retries, and appended scratch-directory instructions) against the 80 KiB prompt byte limit before saving or launching. Persisted pre-upgrade member records that only carry `prompt` continue to load, recognize the four previously shipped Codex working-rule texts via frozen hashes, upgrade to persisted structured sections on an unambiguous legacy retarget, and fail closed on unrecognized or ambiguous legacy retargets.
 
 ### What the host never does
 
@@ -2926,12 +3045,11 @@ remain visible.
 Each configured check may run for `teams.checkMinutes` (default 60). A check that
 runs past the limit is stopped and blocks the team with a resumable reason. The
 timeout does not count as one of the team's two correction rounds, because it is
-host evidence about the check, not about the agents' work. When the command runs
-through a `teams.commandPrefix` such as `sudo`, the stop does not reach it. The
-host is refused permission to signal it, and the check output then says so; or
-the signal ends only the `sudo` process, and the output says nothing. In both
-cases the command is left to finish and its result is not used. Size the limit
-for the project's full check on the execution host.
+host evidence about the check, not about the agents' work. A check that runs
+through a `teams.commandPrefix` such as `sudo` is stopped in the prefix's way
+described below, and the run is then held until the host sees that the check
+ended; its result is never used. Size the limit for the project's full check on
+the execution host.
 
 Setup and check commands run with a small fixed environment, not a login shell.
 Where the agent egress boundary is configured (see
@@ -2945,10 +3063,27 @@ test independent of the variables.
 Every command that the host's team command runner starts for a team (setup,
 checks, member setup, the Git commands it runs and, under a command prefix,
 workspace removal) ends with the process that the host started for it.
-While that process runs, a stop (the time limit, a pause, a cancel, a block or a
-host stop) kills its process group. A command whose stop comes before its start,
-for example while it waits for its turn to start, is never started: it returns
-as interrupted, with no output. Once that process has exited, the host sends
+While that process runs, a stop (the time limit, a pause, a cancel, a steer, a
+block or a host stop) ends the command in one of two ways. Without a command
+prefix the host kills the command's process group at once. Under a command
+prefix the host sends SIGTERM to the process group, and SIGKILL five seconds
+later if that process still runs, because a prefix such as `sudo` passes on the
+signals it can catch and cannot pass on SIGKILL. Under a prefix, project
+setup, member setup, checks and the main check's commands run behind a small
+shell anchor, which the prefix starts in place of the command. The anchor gives
+the command its input, and exits with the command's exit status or ends with
+the signal that ended the command. On SIGTERM, SIGHUP, SIGINT or SIGQUIT it
+sends SIGTERM to its own process group, which holds the command and the
+processes the command started, and SIGKILL to that group five seconds later.
+The SIGKILL comes from a helper that the anchor starts at the stop and that
+outlives the anchor, so it also reaches a process left in the group after the
+anchor exited. So a process that ignores SIGTERM still ends about five seconds
+after the stop, unless it moved to a process group or session of its own. Other
+prefixed commands, such as Git and workspace removal, run without the anchor.
+Without a prefix there is no anchor: the group SIGKILL already ends every
+process in the group. A command whose stop comes
+before its start, for example while it waits for its turn to start, is never
+started: it returns as interrupted, with no output. Once that process has exited, the host sends
 no signal to anything the command started: the group may be empty by then, and
 its id may already belong to an unrelated process. The host reads output that is
 still open for at most one second. It then reads what the pipes already hold:
@@ -2960,25 +3095,122 @@ for that output to close, so such a check ran into `teams.checkMinutes` and
 blocked the run. The host records the case in the run's events with one fixed
 line, "A configured command exited while a process it started still held its
 output. The host judged the command by its exit code and neither waited for that
-process nor stopped it." That process keeps running, in the verification copy
-for a check, until it ends. After an operation that succeeded, nothing looks for
-it, and the run's directory may be removed while it runs. A failed operation
-keeps its record: the census still finds the process by its recorded group, and
-retention holds the run's directories until the process ends. Most Git reads
+process nor stopped it. It keeps this run's directories until a process census
+finds none of that command's processes." That process keeps running, in the
+verification copy for a check, until it ends. The run keeps the record of that
+command's processes, whether the operation succeeded or failed, and no removal
+of the run's directories proceeds until a look finds none of them or, when a
+look cannot tell, the owner states that they ended (see retention above).
+
+A process that a command leaves behind without holding its output is found by
+the settle look. When an operation of a run ends, the host reads the process
+table. If a process, group or session the operation recorded still has a live
+member, the host reads the table again 250 ms later and keeps what is still
+alive in the run's process record, then writes one fixed event line: "N
+process(es) that a command of this run started still run after the command
+ended. The host keeps this run's directories until a census finds none." A
+removal then waits as described under retention. When nothing is alive at the
+first read, the host waits for nothing and keeps no record. The look does not
+apply to an operation that failed with `command-stop-unconfirmed` (see the
+rule's limits below): the stop's own census covers it. A command whose output
+stayed open (see the leader rule) gets only its own fixed line, with the look
+merged into the same record. The look misses a
+process that left its group and session, since the host records no id for it
+unless a sample caught it earlier. Most Git reads
 refuse a result whose output stayed open past that second, as they refuse any
 incomplete read; the few that decide by Git's exit code alone read only output
 that is complete when Git exits. A stop that arrives within the second ends the
 command at once with the output read so far, and still sends no signal.
 
-The rule has two limits. A command that was stopped before its process exited
-ends when its output closes, or at the caller's limit where the caller sets
-one. Setup and check commands set none, so a check or setup command that ran
-past its time limit and left a process in another session holding its output
-keeps its operation open until that process ends. Under a command prefix that
-runs the command as another account, such as `sudo`, the stop does not reach
-the command: the host's signal is refused, or it ends only the `sudo` process.
-The command keeps running and holds the output, so the operation stays open
-until the command ends. Two Git runners outside the
+The rule has three limits. First, a command that was stopped before its
+process exited ends when its output closes, or at the caller's limit where the
+caller sets one. Setup and check commands set ten seconds after the stop. A
+setup or check command whose output is still open then, because a process in
+another session holds it, fails its operation with `command-stop-unconfirmed`.
+
+Second, under a command prefix that runs the command as another account, the
+stop reaches only part of the command. Measured with sudo 1.9.15p5 started
+without a terminal, with and without `use_pty`: `sudo` passes the SIGTERM to the
+command's first process only, the processes that process started get no signal,
+and a SIGKILL ends `sudo` while the command keeps running. For the commands
+that run behind the anchor, that first process is the anchor, so the stop
+reaches the processes in the anchor's group as described above, and a process
+outside that group gets no signal. Neither a delivered
+signal nor closed output shows that such a command ended. A setup or check
+command stopped under a prefix therefore fails its operation with
+`command-stop-unconfirmed` in every case: when its output closes, and at the
+ten-second limit when it does not.
+
+An operation that failed with `command-stop-unconfirmed` stays pending with its
+process record, whatever stopped the command: the time limit, a pause, a cancel,
+a steer or a block. A host stop records no such failure: the host closes its
+team service before the stop settles, so after the restart the run is blocked
+with the reason for an operation that a restart interrupted, and its process
+record holds the run's directories in the same way. A restart after the failure
+was recorded keeps the failure, its reason and its process record.
+
+The run's reason says that the earlier command may still be running. Until the
+host looks and finds none of that operation's processes and none using the run
+directory, it starts nothing more for the run: no Git command, no further setup
+or check, no member, and no workspace removal. Resume and steering answer
+`team-command-running` (409) until then. Each of these requests takes a fresh
+look before it enters the run's queue; requests that arrive during a look share
+it, and the run's other requests are answered meanwhile. The host also looks
+once after it records the failure: at once without a command prefix, and under
+a prefix seven seconds later, which is at least two seconds after the anchor's
+SIGKILL, so that the look does not find the anchor's group still ending. The
+retention sweep looks every
+ten minutes. The run shows as resumable once a look has found the operation
+ended.
+
+The host clears the operation only in the step that accepts a request: a
+Resume, a steer, the owner's release of a halt, or a mission's release of its
+run. A refused request leaves the operation in place, and the next request
+looks again. A run paused during such a command accepts its first Resume after
+the command ended. A mission's release of a run whose command may still run is
+answered `team-operation-running`; the mission keeps its halt and retries, and
+a retry within 30 seconds reuses the last look. A goal's or a mission's Resume
+or steer of such a run is answered `team-command-running`. The goal or mission
+keeps the request and retries it, with the same 30-second reuse. The goal's
+reason, or one event of the mission for each answer it gets, says that the
+request waits for the run's stopped command. While the look cannot tell, that
+answer names the owner's statement for the run; while the look sees the
+command's processes, the host refuses the statement. The owner's review on
+GitHub waits the same way, whether it steers the run directly or through the
+mission coordinator's forward: the run records one event for each answer to a
+direct review, the mission one for each answer to its forward, and the wait
+does not count as a refusal of the coordinator's report. The owner's pause or
+cancel of the goal, or a halt, replaces a goal's Resume or steer that waits this
+way; a replaced steer's direction stays in the goal's steering and does not
+reach the run. A mission's pause or cancel is not held by such a request: the
+request waits while the mission is paused, and a cancel drops it.
+
+The look supports no prefix, or a `sudo` prefix whose launcher has the
+`process-census` wrapper beside it. Under any other prefix, the instance
+skeleton's root-owned launcher among them, the look cannot tell whether the
+command ended. The run's reason then says that the owner's statement is the
+only way out and names its command. After checking the host, the owner runs
+`infinite team processes-ended RUN_ID`, which sends
+`POST /api/teams/:id/processes-ended` with `{ "requestId": "<uuid>" }`. The
+route takes the owner role only, accepts no other field, and answers a repeated
+request ID with the run unchanged. The host looks first:
+
+- When the look finds the operation's processes, or processes using the run
+  directory, it answers `team-command-running` (409) and records nothing.
+- When the look finds none, it records nothing more, and Resume is accepted as
+  after any look that found the operation ended.
+- When the look cannot tell, the host records the statement on the pending
+  operation and an event that names the look's result. Resume, steering, a
+  halt release and workspace removal then treat the operation as ended.
+
+A run without a process record answers `team-no-process-record` (409). No client
+offers the statement yet; it is a CLI and API action only. Census support for
+the instance launcher is a follow-up. A process that survives the stop is held
+off in this way, not killed; ending it is follow-up INF-428. Other commands
+under the prefix, the Git commands among them, are stopped the same way but do
+not hold the run.
+
+Third, two Git runners outside the
 team command runner, the streamed patch and file reads and the team bundle
 download, are not covered yet: they wait for their output to close, and a stop
 signals the command's process group.
@@ -3751,7 +3983,7 @@ The host sends one push per device when the health of main changes. It sends the
 
 The main check never starts an agent, never writes a project signal, and never changes a session, a routine or a team. It does not merge, deploy or change a branch.
 
-A command of a check ends when the process that the host started for it exits, as every team command does. While that process runs, a halt, the command's time limit and a host stop end the command: the host kills the command's process group, and a check that ends this way has no result. After that process has exited, the host sends no signal to anything the command started. It reads output that is still open for at most one second, reads what the pipes already hold, then closes it, and the command passes or fails by its exit code. A stop that arrives in that second ends the check with no result, and still sends no signal. A process that a check left behind is therefore never signalled by the host. When such a process writes to the closed output, the write fails as a write to a closed pipe does. The host removes the copy only after a process census finds nothing of the run alive. Until then the project waits on `processes`, and no main check starts on the host. Under a command prefix the removal is a command too, and the same rule holds for it: once the process that the host started for the removal has exited, the host signals nothing.
+A command of a check ends when the process that the host started for it exits, as every team command does. While that process runs, a halt, the command's time limit and a host stop end the command: the host kills the command's process group, or under a command prefix sends SIGTERM to it and SIGKILL five seconds later if that process still runs, and a check that ends this way has no result. After that process has exited, the host sends no signal to anything the command started. It reads output that is still open for at most one second, reads what the pipes already hold, then closes it, and the command passes or fails by its exit code. A stop that arrives in that second ends the check with no result, and still sends no signal. A process that a check left behind is therefore never signalled by the host. When such a process writes to the closed output, the write fails as a write to a closed pipe does. The host removes the copy only after a process census finds nothing of the run alive. Until then the project waits on `processes`, and no main check starts on the host. Under a command prefix the removal is a command too, and the same rule holds for it: once the process that the host started for the removal has exited, the host signals nothing.
 
 If the host cannot read a project's main-check record, the owner's read answers `readable: false`. The record may name a copy that is not removed yet, so the host never overwrites it and starts no main check on the whole host until it can be read; it tries again on every pass. The record is `main-check/PROJECT_ID.sealed` in the host state directory. When it cannot be restored, removing that file clears the state at the next pass, and a copy the record named stays under the team workspace until someone removes it.
 
@@ -3765,8 +3997,8 @@ Limits of this first slice, stated in full:
 - If the host's API process ends before it has recorded the end of the check, for example when it crashes or is killed, in the short window while a command of the check is starting, the run directory is not removed until the host boots again, and no main check on the host starts until then: that project waits on `processes` and the others on `another-check`. An orderly stop records the end of a running check first. Once the end is recorded, the record holds the process id of every command the check started, even while the host still reads a command's start time, and the copy is removed once a census finds nothing of the run, without a reboot. Earlier versions also held the copy until the next boot when the host stopped after recording the end, while it still read a command's start time. A copy held that way at the upgrade still waits for the host to boot again. The record does not say whether the end of the check or a host start after a crash marked such a copy, and only a host start can leave a command's process id out of the record.
 - Preparing the copy has no time limit of its own. It ends by the Git helpers' own limits, a halt, or a host stop.
 - Two different heads observed with the same stamp are ordered by their results' order in the record. Fetches of one mirror are serial, so their stamps differ in practice.
-- The host may not signal a command that the command prefix runs as another account. A halt, a time limit or a host stop then cannot end the command. The check is recorded as an error ten seconds later, the command runs on, and no main check on the host starts until the command has ended: that project waits on `processes` and the others on `another-check`. A team's checks have the same limit.
-- The host learns that a command's process has exited when its event loop next runs. A stop that the host handles before it has learned of the exit is a stop of a running command, and it kills the command's process group.
+- The host may not signal a command that the command prefix runs as another account. A halt, a time limit or a host stop reaches it only as far as the prefix passes the SIGTERM on: `sudo` passes it to the command's first process only. That process is the anchor described under the team command runner: it sends SIGTERM to its process group and SIGKILL five seconds later, so a process outside that group gets no signal. When the anchor's group ends within those five seconds, the check is recorded as interrupted. When the check's output is still open ten seconds after the stop, because a process that the anchor's SIGKILL did not reach still holds it, the check is recorded as an error, that process runs on, and no main check on the host starts until it has ended: that project waits on `processes` and the others on `another-check`. A team's checks have the same limit.
+- The host learns that a command's process has exited when its event loop next runs. A stop that the host handles before it has learned of the exit is a stop of a running command, and it signals the command's process group.
 - The census cannot inspect some processes of the host's account and of the account that runs commands; on Linux a login session has such processes (its service manager and its SSH processes). When it admits a check, the host takes a census of a path under the team root that no copy uses (`main-check-gate`), and records each process that census cannot inspect by its id and start time, at most 256 of them, in a sealed anchor of that copy (`main-check-anchors/` in the host state directory). A process that names the team root in its arguments is recorded like any other. If `main-check-gate` under the team root is a symbolic link or another project's folder, a process the census cannot inspect that names that folder in its arguments is not recorded and holds the copy until it ends; this can delay a removal, never cause an early one. When it retires the copy, it disregards a process it cannot inspect only if the copy's anchor names the same id with the same start time, on the boot the check started in. Every other process it cannot inspect keeps the copy from being removed for as long as that process runs, whether or not a check started it: one that started after the admission, one past the first 256, one that received the id of an anchored process, and all of them when the anchor is missing or cannot be read. No main check on the host starts meanwhile: that project waits on `processes` and the others on `another-check`. A host that runs under a login account therefore also waits on a login session that starts while a copy waits; run the host under an account of its own, as the Ubuntu deployment does. A process that the account only started and that runs as another account, such as a `sudo` process, is not one of them. The anchor is deleted after the record no longer names the copy; after a host start, once every main-check record can be read, the host deletes every anchor that no record names.
 - An anchor is not an inspection. A process of the account that runs commands that was alive and could not be inspected before the admission enters the anchor without any tampering, for example a process that a team run's checks left behind, and the census never examines it while it stays that way: if it uses the copy, the copy is removed while it runs. A process that cannot be inspected and starts after the admission holds the copy until it ends, at every pass, so such processes that keep arriving during the wait extend it. On a machine where other login sessions of the account start at any time, such as a shared test runner, a copy can therefore wait for as long as each new session lasts.
 - Nothing of a run survives a reboot. On Linux, the host disregards every process it cannot inspect when it retires a copy recorded in an earlier boot. On macOS the boot id can change when the clock is set, so a changed boot id there keeps such a copy waiting on those processes, as before.
@@ -4269,7 +4501,7 @@ cycle's PM selects capacity for its work. The refusal uses `409` with
 | `POST /api/teams/:id/steer` | `requestId`, `revision`, `text` | Owner/controller; standalone teams |
 | `POST /api/teams/:id/continue` | `requestId` (UUID), `revision`, optional trimmed `text` (1–8,000 characters) | Owner; continuable standalone blocked runs |
 | `POST /api/teams/:id/decisions/:decisionId/answer` | `requestId`, `revision`, `text` | Owner/controller |
-| `POST /api/teams/:id/pause`, `/resume`, `/cancel` | `requestId`, `revision` | Owner; standalone teams |
+| `POST /api/teams/:id/pause`, `/resume`, `/cancel` | `requestId`, `revision` | Owner; standalone teams (`/cancel` also accepts a stopped goal's leftover blocked or paused run once the goal has stopped, has no queued control or pending time extension for the run, and cannot be extended from it after a deadline stop, updating the cycle to `cancelled` so goal cleanup removes the run record after workspace removal; and a blocked mission subteam after its mission is no longer active) |
 | `DELETE /api/teams/:id` | None; removes a settled cancelled, merged, or no-change run and its workspace | Owner |
 | `POST /api/teams/:id/tasks/:taskId/rating` | `requestId`, `score` (1–5), optional `note` (≤1,000 characters) | Owner |
 | `GET /api/teams/:id/entries`, `GET /api/teams/:id/entries/:entryId`, `POST /api/teams/:id/entries/:entryId/withdraw` | List/read blackboard entries (`?kind=`, `?task=`, `?since=`); withdraw hides an entry from members | Reads: any paired device; `withdraw`: Owner |
@@ -4703,6 +4935,11 @@ for a caller that is not the owner, `409` with
 Goal-owned team lifecycle and steering routes return `409` with
 `code: "goal-owned-team"`. Use the owning goal's endpoints. The decision route
 remains available for its active cycle while the goal is running.
+`POST /api/teams/:id/cancel` is also accepted for a stopped goal's leftover
+blocked or paused run once the goal has stopped, has no queued control or
+pending time extension for the run, and cannot be extended from it after a
+deadline stop; it updates the goal cycle to `cancelled` so goal cleanup removes
+the run record after workspace removal.
 
 The legacy team parallelism endpoint refuses owner capacity changes with `409`
 and `code: "agent-managed-capacity"`. Legacy team creation requests may include

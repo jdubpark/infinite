@@ -5,6 +5,7 @@ import { writeSealed, unseal } from "./vault.js";
 import { autonomyOf, type AutonomyMode } from "./autonomy.js";
 import { autonomyStartEvent, startMode } from "./evaluator-profiles.js";
 import { TeamService, TeamError } from "./teams.js";
+import { deliverControl, holdForStoppedCommand, supersedeWaiting } from "./goal-waiting-control.js";
 import { goalActionSchema, goalExtendSchema, goalOutcomeSchema, goalParallelismSchema, goalSteerSchema, parseCreateGoal, type CreateGoal, type CycleClass, type GoalCycle, type GoalOutcomeInput, type GoalReasonCode, type ProductGoal } from "./goal-types.js";
 import { SHARED_INPUT_LIMITS } from "./schema-primitives.js";
 import type { Config } from "./types.js";
@@ -21,13 +22,14 @@ import { cadenceDue, classifyCycle, cycleWakeOf, defaultWakeMinGapMinutes, folde
 import { KEPT_PAUSED, LEFT_AS_IS, LEFT_PAUSED, STILL_HALTED, isHaltReason, pauseFailure, releaseRefusal, type HaltCovers, type HaltHeldBy, type HaltMark, type HaltOutcome } from "./halt/rules.js";
 import { correctionGate, digestEvent, correctGoalObjective, createGoalObjective, goalObjectiveNote, goalObjectiveView, goalRecordDigest, goalRecordPort, loadGoalObjective, ratingStamp, steerGoalObjective, type ObjectiveUnavailable } from "./objective-goals.js";
 import { objectivePromptsOn, objectiveRegisterOn } from "./objective-digest.js";
-import { answerProvisional, assertVerdictAnswer, continueGoal, criteriaRowsFor, cycleVerdict, provisionalStop, verdictFailed, CONTINUE_EVENT, PROVISIONAL_EVENT, PROVISIONAL_REASON } from "./goal-verdicts.js";
+import { answerProvisional, applyLateVerdict, assertVerdictAnswer, continueGoal, criteriaRowsFor, cycleVerdict, deliveryHold, holdReasonChange, lateVerdict, markProvisional, owedStop, provisionalStop, verdictFailed, withdrawProvisional, CONTINUE_EVENT, DELIVERY_HOLD_REASON, LATE_RECEIPT_EVENT, PROVISIONAL_EVENT } from "./goal-verdicts.js";
 import { correctionSchema, type CriterionInput } from "./objective-input.js";
 import { objectiveError, recordView, type ObjectiveRecordView } from "./objective-record.js";
 import { goalMetricsRead, pruneMetrics, settleMetrics } from "./goal-metrics.js";
+import { cancelReleasedGoalRun } from "./goal-released-run.js";
 
 type Action = { requestId: string; revision: number };
-type PendingControl = { action: "pause" | "resume" | "cancel" | "steer" | "parallelism"; requestId: string; teamId: string; revision: number; text?: string; parallelism?: number; halt?: HaltRunMark };
+type PendingControl = { action: "pause" | "resume" | "cancel" | "steer" | "parallelism"; requestId: string; teamId: string; revision: number; text?: string; parallelism?: number; halt?: HaltRunMark; waiting?: true };
 type HaltRunMark = { token: string; reason: string };
 type GoalExtensionIntent = Action & { minutes: number; fingerprint: string; teamId?: string; targetDeadlineAt?: string; targetCeilingAt?: string; failures?: number };
 type PendingLaunch = { request: CreateTeam; context: TeamGoalContext; autonomy?: AutonomyMode; wake?: PendingWake };
@@ -159,10 +161,7 @@ export class GoalService {
     this.save(stored);
   }
   statuses() { return [...this.records.values()].map(({ goal }) => ({ id: goal.id, title: goal.title, status: goal.status, reason: goal.reason })); }
-  ownsActiveTeam(teamId: string) {
-    return [...this.records.values()].some(({ goal }) =>
-      !terminal.has(goal.status) && goal.activeTeamId === teamId);
-  }
+  ownsActiveTeam(teamId: string) { return [...this.records.values()].some(({ goal }) => !terminal.has(goal.status) && goal.activeTeamId === teamId); }
   retainsTeamRun(teamId: string) {
     return [...this.records.values()].some(({ goal, launch }) => !terminal.has(goal.status) && (goal.standing
       ? goal.activeTeamId === teamId || launch?.request.requestId === teamId || latestReviewed(goal.cycles)?.teamId === teamId
@@ -293,6 +292,8 @@ export class GoalService {
   pause(id: string, input: Action) { return this.action(id, "pause", goalActionSchema.parse(input)); }
   resume(id: string, input: Action) { return this.action(id, "resume", goalActionSchema.parse(input)); }
   cancel(id: string, input: Action) { return this.action(id, "cancel", goalActionSchema.parse(input)); }
+  cancelReleasedRun(teamId: string, body: Action) { return cancelReleasedGoalRun({ records: this.records, terminal, teams: this.teams,
+    enqueue: (id, task) => this.enqueue(id, task), refresh: (stored, team) => this.refresh(stored, team), event: (stored, text) => this.event(stored, text), save: stored => this.save(stored) }, teamId, body); }
   private action(id: string, action: "pause" | "resume" | "cancel", body: Action) {
     return this.enqueue(id, () => {
       const stored = this.record(id), goal = stored.goal;
@@ -302,6 +303,7 @@ export class GoalService {
       if (action === "resume" && goal.standing && autonomyOf(this.config.projects.find(value => value.id === goal.projectId)) !== "autonomous")
         throw new TeamError(409, "standing-requires-autonomy", "This standing goal can resume only after its project is autonomous again.");
       if (action === "resume" && !goal.standing && Date.now() >= Date.parse(goal.deadlineAt)) throw new TeamError(409, "goal-deadline", "This goal's time limit has expired. Extend it or start a new goal to approve more time.");
+      if (action !== "resume" && body.revision === goal.revision) supersedeWaiting(stored, `The owner's ${action}`, { event: text => this.event(stored, text) });
       this.admit(stored, action, body);
       goal.status = action === "pause" ? "paused" : action === "cancel" ? "cancelled" : "running";
       if (goal.standing) {
@@ -322,8 +324,9 @@ export class GoalService {
       const goal = stored.goal;
       if (!pausable(goal) || !covers([goal.projectId], goal.id)) return undefined;
       try {
-        if (stored.control?.action === "steer" && !await this.applyControl(stored)) throw new TeamError(409, "goal-control-pending", "The previous goal action is still being applied.");
+        if (stored.control?.action === "steer" && !await this.applyControl(stored) && !stored.control?.waiting) throw new TeamError(409, "goal-control-pending", "The previous goal action is still being applied.");
         if (!pausable(goal)) return undefined;
+        supersedeWaiting(stored, "The halt", { event: text => this.event(stored, text) });
         goal.revision++; goal.status = "paused"; goal.reason = mark.reason;
         const token = randomUUID();
         this.setControl(stored, "pause", { halt: { token, reason: mark.reason } });
@@ -574,7 +577,9 @@ export class GoalService {
   }
   private refresh(stored: Stored, team: TeamView) {
     const cycle = stored.goal.cycles.find(value => value.teamId === team.id)!;
+    const late = lateVerdict(stored.goal, cycle, team) !== undefined;
     Object.assign(cycle, { status: team.status, memberCount: team.members.length, baseCommit: team.baseCommit, headCommit: team.headCommit, branch: team.branch, workspace: team.workspace, brief: team.brief, reason: team.reason }, cycleVerdict(stored.goal, cycle, team));
+    if (late) { withdrawProvisional(stored.goal, cycle); this.event(stored, LATE_RECEIPT_EVENT); }
     if (team.usage.total.messages > 0 || team.usage.unmeasuredMembers === 0) cycle.usage = cycleUsageSnapshot(team.usage);
     else delete cycle.usage;
     if (["ready-for-review", "merged", "no-change", "blocked", "cancelled"].includes(team.status)) cycle.finishedAt ??= now();
@@ -599,13 +604,12 @@ export class GoalService {
     }
     const body = { requestId: control.requestId, revision: control.revision };
     try {
-      if (control.action === "steer") await this.teams.steer(control.teamId, { ...body, text: control.text! });
-      else if (control.action === "pause" && control.halt) await this.teams.haltPauseChild(control.teamId, control.halt.token, control.halt.reason);
-      else await this.teams[control.action](control.teamId, body);
+      await deliverControl(this.teams, control, body);
     } catch (error) {
       if (this.closed) return false;
       if (!(error instanceof TeamError)) throw error;
       if (["members-stopping", "team-operation-running"].includes(error.code)) return false;
+      if (holdForStoppedCommand(stored, control, error, { event: text => this.event(stored, text), save: () => this.save(stored) })) return false;
       if (error.code === "stale-team-revision" && ["pause", "cancel"].includes(control.action)) {
         let team: TeamView;
         try { team = this.teams.get(control.teamId); }
@@ -756,10 +760,11 @@ export class GoalService {
             goal.status = goal.cycles.some(cycle => ["ready-for-review", "merged"].includes(cycle.status)) ? "ready-for-review" : "no-opportunity";
             goal.reason = team.reason ?? "The coordinator found no further work justified by the available evidence.";
           } else {
-            const stop = provisionalStop(goal, team);
-            goal.status = stop ? "ready-for-review" : "running"; goal.reason = stop ? PROVISIONAL_REASON : undefined;
-            if (stop) goal.stopReason = "provisional-met";
-            this.event(stored, stop ? PROVISIONAL_EVENT : "A feature passed checks and independent review. The next feature will use its recorded commit.");
+            if (provisionalStop(goal, team)) this.stopProvisional(stored);
+            else {
+              goal.status = "running"; goal.reason = undefined;
+              this.event(stored, "A feature passed checks and independent review. The next feature will use its recorded commit.");
+            }
           }
         }
       } else if (["running", "needs-input"].includes(goal.status)) {
@@ -803,6 +808,9 @@ export class GoalService {
       this.setControl(stored, "cancel"); this.event(stored, goal.reason); this.save(stored); await this.applyControl(stored); return;
     }
     if (goal.activeTeamId) return;
+    this.lateReceipt(stored, goal.cycles.at(-1));
+    if (owedStop(goal, Boolean(stored.launch || stored.control))) { this.stopProvisional(stored); this.save(stored); return; }
+    if (this.holdForDelivery(stored)) return;
     if (goal.cycles.length >= (goal.maxRuns ?? 0)) {
       goal.status = "ready-for-review"; goal.reason = "The approved feature-run limit has been reached. Review the accumulated changes; product impact has not been inferred.";
       this.event(stored, goal.reason); this.save(stored); return;
@@ -870,6 +878,34 @@ export class GoalService {
     const reason = trackingHoldReason(stored.goal.linear);
     if (stored.goal.reason === reason) return;
     stored.goal.reason = reason; this.save(stored);
+  }
+  private stopProvisional(stored: Stored) {
+    markProvisional(stored.goal);
+    this.event(stored, PROVISIONAL_EVENT);
+  }
+  private lateReceipt(stored: Stored, cycle: GoalCycle | undefined): void {
+    const team = cycle === undefined ? undefined : this.teams.assessmentOf?.(cycle.teamId);
+    if (cycle === undefined || team === undefined || !applyLateVerdict(stored.goal, cycle, team)) return;
+    this.event(stored, LATE_RECEIPT_EVENT);
+    this.save(stored);
+  }
+  async syncReceipts(): Promise<void> {
+    if (this.closed) return;
+    await mapConcurrent([...this.records.keys()], 8, id => this.enqueue(id, () => {
+      const stored = this.records.get(id);
+      if (!stored || this.closed) return;
+      try { for (const cycle of stored.goal.cycles) if (cycle.assessment !== undefined) this.lateReceipt(stored, cycle); } catch {}
+    }));
+  }
+  private holdForDelivery(stored: Stored): boolean {
+    const goal = stored.goal, cycle = goal.cycles.at(-1);
+    const scanned = this.config.projects.find(item => item.id === goal.projectId)?.source?.mode === "github";
+    const detail = cycle?.assessment === undefined ? undefined : this.teams.verdicts?.detail(cycle.teamId);
+    const holds = deliveryHold(goal, { nowMs: Date.now(), scanned, detail });
+    const change = holdReasonChange(goal, holds);
+    if (change === "hold") this.event(stored, DELIVERY_HOLD_REASON);
+    if (change !== undefined) this.save(stored);
+    return holds;
   }
   private runCreated(requestId: string) { return this.teams.goalIdOf(requestId) !== undefined; }
   private withdrawLaunch(stored: Stored) {

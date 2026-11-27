@@ -129,6 +129,14 @@ export function dropTrial(tx: EvidenceTx, trialId: string): boolean {
   return tx.run("DELETE FROM eval_trials WHERE trial_id=? AND state='preparing'", trialId).changes === 1;
 }
 
+export function releaseRunningTrial(tx: EvidenceTx, trialId: string): boolean {
+  const row = tx.get<{ job_id: string }>("SELECT job_id FROM eval_trials WHERE trial_id=? AND state='running' AND session_id IS NULL", trialId);
+  if (row === undefined) return false;
+  const changes = tx.run("DELETE FROM eval_trials WHERE trial_id=? AND state='running' AND session_id IS NULL", trialId).changes;
+  if (changes === 1) tx.run("UPDATE eval_trial_counts SET started = max(0, started - 1) WHERE job_id=?", row.job_id);
+  return changes === 1;
+}
+
 export function startTrial(tx: EvidenceTx, trialId: string, at: string): boolean {
   const changes = tx.run("UPDATE eval_trials SET state='running', started_at=? WHERE trial_id=? AND state='preparing'", at, trialId).changes;
   if (changes === 0) return false;
@@ -262,8 +270,10 @@ export function jobTrialCount(db: EvidenceDb, jobId: string): number {
   return db.get<{ n: number }>(JOB_TRIALS_SQL, jobId)?.n ?? 0;
 }
 
-export function trialsSince(db: EvidenceDb, projectId: string, since: string): number {
-  return db.get<{ n: number }>(PROJECT_DAY_SQL, db.index("project", projectId), since)?.n ?? 0;
+export function trialsSince(db: EvidenceDb, projectId: string, since: string, excludeTrialId?: string): number {
+  const ref = db.index("project", projectId);
+  if (excludeTrialId === undefined) return db.get<{ n: number }>(PROJECT_DAY_SQL, ref, since)?.n ?? 0;
+  return db.get<{ n: number }>(`${PROJECT_DAY_SQL} AND trial_id != ?`, ref, since, excludeTrialId)?.n ?? 0;
 }
 
 export function trialCounts(db: EvidenceDb, jobIds: readonly string[]): Map<string, TrialCounts> {

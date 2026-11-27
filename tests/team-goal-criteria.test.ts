@@ -17,6 +17,7 @@ type Stored = { run: TeamRun; pending?: unknown; goalPlanCorrectionRevision?: nu
 type Internals = {
   record(id: string): Stored;
   prepareMember(stored: Stored, role: "project-manager"): void;
+  launch(stored: Stored, member: TeamMember): Promise<void>;
   replaceStalledMember(stored: Stored, member: TeamMember): Promise<void>;
   consume(stored: Stored, member: TeamMember): void;
   block(stored: Stored, error: unknown, member?: TeamMember): void;
@@ -158,7 +159,6 @@ test("a new goal plan gets one correction, replacement keeps its pin, and accept
   const fixture = schedulerFixture();
   const { store, events } = openEvents(fixture);
   try {
-    fixture.run.members[0]!.status = "stopped";
     prepareGoalPlanFixture(fixture);
     const teams = fixture.openTeam({ events });
     const scheduler = internals(teams);
@@ -166,13 +166,20 @@ test("a new goal plan gets one correction, replacement keeps its pin, and accept
     assert.deepEqual(member.goalCriteriaPlan, { objectiveVersion: 7 });
     assert.ok(member.prompt.includes('"objectiveVersion":7'));
 
-    await (scheduler as unknown as { launch(stored: Stored, member: TeamMember): Promise<void> }).launch(stored, member);
+    const obsolete = stored.run.members[0]!;
+    await scheduler.replaceStalledMember(stored, obsolete);
+    await teams.idle();
+    assert.equal(stored.pending, undefined, "the host queued no replacement for the superseded PM");
+    assert.equal(stored.run.members.length, 2, "obsolete planner is not replaced once a newer planner exists");
+
+    await scheduler.launch(stored, member);
     assert.equal(member.status, "running", "the scheduler starts the pinned planner before it stalls");
     member.lastActivityAt = new Date(Date.now() - 6 * 60000).toISOString();
     await scheduler.replaceStalledMember(stored, member);
     await waitFor(() => stored.pending === undefined && stored.run.members.length >= 3, "the marked PM replacement is prepared");
     await teams.idle();
     const replacement = stored.run.members.at(-1)!;
+    assert.equal(replacement.stalledSourceMemberId, member.memberId, "the replacement points to the stalled current planner");
     assert.deepEqual(replacement.goalCriteriaPlan, member.goalCriteriaPlan, "the replacement keeps the exact objective pin");
     assert.ok(replacement.prompt.includes('"objectiveVersion":7'), "the replacement prompt keeps the serialized objective pin");
     assert.ok(replacement.prompt.includes("every task, including each prerequisite"), "the saved prompt keeps the contract");

@@ -3,11 +3,16 @@ import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync 
 import { chmod, lstat, open, readdir, realpath, rename, rm, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
+import { z } from "zod";
 import { unseal, writeSealed } from "./vault.js";
 import {
   captureWorkspace, decodeChunkBatch, describeMaterializedTree, hasWorkspaceBlobs, materializeWorkspace, putWorkspaceBlob, putWorkspaceBlobs, readWorkspaceBlob,
   validateWorkspaceManifest, WorkspaceCaptureChangedError, type WorkspaceEntry, type WorkspaceManifest,
 } from "./workspace-checkpoint.js";
+import {
+  collectSharedPool, discoverHostWorkspaceScopes, emptyCollectResult, manifestChunkHashes, pruneHybridSessionRefs, pruneScopeRefs,
+  type CollectSharedPoolResult, type HybridSessionsInspection,
+} from "./workspace-pool-gc.js";
 import type { Config } from "./types.js";
 
 export type SyncFailureCategory = "permission" | "cross-device" | "no-space" | "special-file" | "missing-path" | "other";
@@ -26,17 +31,58 @@ export interface ProjectSyncStatus {
   skipped?: number;
 }
 type Received = { manifest: WorkspaceManifest; receivedAt: string; generation: string };
-export interface SyncWriter { deviceId: string; publisherId?: string }
+export interface SyncWriter { deviceId: string; publisherId: string }
 type UploadLease = { generation: string; writer: SyncWriter; updatedAt: string; committing: boolean };
 type ActiveUploadLease = { value: UploadLease; expiresAt: number; lastActivityAt: number; lastPersistedAt: number };
 export type RunningCheck = () => Promise<boolean>;
 type Applied = { manifest: WorkspaceManifest; appliedAt: string; baseline?: WorkspaceManifest };
+type ExportRootRecord = { version: 1; manifestId: string; hashes: string[]; exportedAt: number; expiresAt: number };
+type LegacyExportEntry = { manifest: WorkspaceManifest; exportedAt: string; expiresAt: number };
+type LegacyExportedStore = { version: 2; entries: LegacyExportEntry[] };
+type LegacyExported = { manifest: WorkspaceManifest; exportedAt: string };
+
+export interface ProjectSyncOptions {
+  inspectHybridSessions?: () => Promise<HybridSessionsInspection>;
+  hasLegacyHybridWriters?: () => Promise<boolean>;
+}
+
+export interface ProjectSyncGcOptions {
+  now?: () => number;
+  graceMs?: number;
+  refGraceMs?: number;
+  exportRetentionMs?: number;
+  activeReadGraceMs?: number;
+  sweepBatchSize?: number;
+  inspectHybridSessions?: () => Promise<HybridSessionsInspection>;
+  hasLegacyHybridWriters?: () => Promise<boolean>;
+  liveHybridSessionIds?: ReadonlySet<string>;
+  signal?: AbortSignal;
+}
+
+export interface ProjectSyncGcResult {
+  prunedProjects: number;
+  prunedSessions: number;
+  removedRefs: number;
+  pool: CollectSharedPoolResult;
+}
 
 export class ProjectSyncError extends Error {
-  constructor(message: string, readonly code: "cloud-changed" | "session-running" | "apply-failed" | "sync-failed" | "sync-applying" | "sync-in-progress" | "stale-generation" | "missing-content" | "invalid-manifest" | "unknown-project",
+  constructor(message: string, readonly code: "cloud-changed" | "session-running" | "apply-failed" | "sync-failed" | "sync-applying" | "sync-in-progress" | "stale-generation" | "missing-content" | "invalid-manifest" | "invalid-sync-headers" | "unknown-project",
     readonly status = 409, readonly category?: SyncFailureCategory, readonly retryAfterSeconds?: number) {
     super(message);
   }
+}
+
+const syncIdSchema = z.uuid();
+export function parseSyncPublisherId(value: unknown): string {
+  const parsed = syncIdSchema.safeParse(value);
+  if (!parsed.success) throw new ProjectSyncError("Missing or invalid X-Infinite-Sync-Publisher header", "invalid-sync-headers", 400);
+  return parsed.data;
+}
+export function parseSyncGeneration(value: unknown): string {
+  const parsed = syncIdSchema.safeParse(value);
+  if (!parsed.success) throw new ProjectSyncError("Missing or invalid X-Infinite-Sync-Generation header", "invalid-sync-headers", 400);
+  return parsed.data;
 }
 
 const FAILURES: Record<SyncFailureCategory, string> = {
@@ -62,7 +108,9 @@ const MAX_MANIFEST_BYTES = 32 * 1024 * 1024;
 const UPLOAD_LEASE_MS = 5 * 60 * 1000;
 const UPLOAD_LEASE_PERSIST_MS = 30 * 1000;
 const UPLOAD_LEASE_RECOVERY_GRACE_MS = 30 * 1000;
-const INTERNAL_WRITER: SyncWriter = { deviceId: "internal", publisherId: "internal" };
+const EXPORT_RETENTION_MS = 60 * 60 * 1000;
+const ACTIVE_READ_GRACE_MS = 5 * 60 * 1000;
+const GC_MIN_INTERVAL_MS = 5 * 60 * 1000;
 const OWNED_PREFIX = ".infinite";
 const ownedPath = (path: string) => path === OWNED_PREFIX || path.startsWith(`${OWNED_PREFIX}/`);
 const entrySignature = (entry: WorkspaceEntry) => JSON.stringify([entry.path, entry.kind, entry.mode, entry.size ?? null, entry.chunks ?? null, entry.target ?? null]);
@@ -83,7 +131,19 @@ export class ProjectSync {
   private readonly skipped = new Map<string, number>();
   private readonly recoveries = new Map<string, Promise<void>>();
   private readonly recovered = new Set<string>();
-  constructor(private readonly config: Config, private readonly key: Buffer) {
+  private readonly lastBlobReadAt = new Map<string, number>();
+  private readonly lastUploadActivityAt = new Map<string, number>();
+  private readonly activeOperations = new Map<string, number>();
+  private readonly pruningProjects = new Map<string, Promise<void>>();
+  private readonly inspectHybridSessions?: () => Promise<HybridSessionsInspection>;
+  private readonly hasLegacyHybridWriters?: () => Promise<boolean>;
+  private gcTask: Promise<void> | undefined;
+  private gcController: AbortController | undefined;
+  private lastScheduledGcAt = 0;
+  private closed = false;
+  constructor(private readonly config: Config, private readonly key: Buffer, options: ProjectSyncOptions = {}) {
+    this.inspectHybridSessions = options.inspectHybridSessions;
+    this.hasLegacyHybridWriters = options.hasLegacyHybridWriters;
     for (const project of config.projects) {
       const recovery = this.queue(project.id, async () => {
         let filesystemRecovered = false;
@@ -98,7 +158,9 @@ export class ProjectSync {
         });
         else if (saved) {
           const updatedAt = Date.parse(saved.updatedAt), now = Date.now();
-          if (!Number.isFinite(updatedAt) || now > updatedAt + UPLOAD_LEASE_MS + UPLOAD_LEASE_RECOVERY_GRACE_MS) this.clearLease(project.id);
+          const validSaved = typeof saved.writer?.deviceId === "string" && saved.writer.deviceId.length > 0 &&
+            syncIdSchema.safeParse(saved.writer.publisherId).success && syncIdSchema.safeParse(saved.generation).success;
+          if (!validSaved || !Number.isFinite(updatedAt) || now > updatedAt + UPLOAD_LEASE_MS + UPLOAD_LEASE_RECOVERY_GRACE_MS) this.clearLease(project.id);
           else this.uploads.set(project.id, {
             value: saved,
             expiresAt: updatedAt + UPLOAD_LEASE_MS + UPLOAD_LEASE_RECOVERY_GRACE_MS,
@@ -130,15 +192,97 @@ export class ProjectSync {
     mkdirSync(join(dir, "blobs"), { recursive: true, mode: 0o700 });
     return dir;
   }
-  private read<T>(projectId: string, name: "received" | "applied"): T | undefined {
-    const file = join(this.dir(projectId), `${name}.sealed`);
+  private read<T>(projectId: string, name: "received" | "applied" | "exported"): T | undefined {
+    return this.readAt<T>(this.dir(projectId), projectId, name);
+  }
+  private readAt<T>(syncDir: string, projectId: string, name: "received" | "applied" | "exported" | "upload-lease"): T | undefined {
+    const file = join(syncDir, `${name}.sealed`);
     return existsSync(file) ? unseal<T>(this.key, `project-sync:${projectId}:${name}`, readFileSync(file, "utf8")) : undefined;
   }
   private store(projectId: string) {
     return { directory: join(this.dir(projectId), "blobs"), sharedPoolDirectory: join(this.config.stateDir, "workspace-pool") };
   }
-  private write(projectId: string, name: "received" | "applied", value: unknown) {
-    writeSealed(join(this.dir(projectId), `${name}.sealed`), this.key, `project-sync:${projectId}:${name}`, value);
+  private write(projectId: string, name: "received" | "applied" | "exported", value: unknown) {
+    this.writeAt(this.dir(projectId), projectId, name, value);
+  }
+  private writeAt(syncDir: string, projectId: string, name: "received" | "applied" | "exported", value: unknown) {
+    writeSealed(join(syncDir, `${name}.sealed`), this.key, `project-sync:${projectId}:${name}`, value);
+  }
+  private async readExportRoots(
+    syncDir: string,
+    projectId: string,
+    nowMs: number,
+    exportRetentionMs?: number,
+  ): Promise<{ liveHashes: Set<string>; expiredFiles: string[]; legacyRewrite?: LegacyExportedStore | "delete" }> {
+    const liveHashes = new Set<string>();
+    const expiredFiles: string[] = [];
+    const exportsDir = join(syncDir, "exports");
+    let entries: string[] | undefined;
+    try {
+      entries = await readdir(exportsDir);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    if (entries) {
+      for (const name of entries) {
+        if (name.startsWith(".") && name.endsWith(".tmp")) continue;
+        if (!name.endsWith(".sealed")) throw new Error("Unexpected project export entry");
+        const manifestId = name.slice(0, -7);
+        if (!/^[a-f0-9]{64}$/.test(manifestId)) throw new Error("Invalid project export filename");
+        const file = join(exportsDir, name);
+        const record = unseal<ExportRootRecord>(this.key, `project-sync:${projectId}:export:${manifestId}`, readFileSync(file, "utf8"));
+        if (!record || typeof record !== "object" || record.version !== 1 || record.manifestId !== manifestId ||
+            !Array.isArray(record.hashes) || !record.hashes.every(hash => typeof hash === "string" && /^[a-f0-9]{64}$/.test(hash)) ||
+            typeof record.exportedAt !== "number" || !Number.isFinite(record.exportedAt) ||
+            typeof record.expiresAt !== "number" || !Number.isFinite(record.expiresAt)) {
+          throw new Error("Invalid project export root record");
+        }
+        const deadline = exportRetentionMs !== undefined ? record.exportedAt + exportRetentionMs : record.expiresAt;
+        if (nowMs < deadline) {
+          for (const hash of record.hashes) liveHashes.add(hash);
+        } else {
+          expiredFiles.push(file);
+        }
+      }
+    }
+    let legacyRewrite: LegacyExportedStore | "delete" | undefined;
+    const rawLegacy = this.readAt<LegacyExportedStore | LegacyExported>(syncDir, projectId, "exported");
+    if (rawLegacy) {
+      const legacyEntries: LegacyExportEntry[] = "version" in rawLegacy && rawLegacy.version === 2 && Array.isArray(rawLegacy.entries)
+        ? rawLegacy.entries
+        : "manifest" in rawLegacy && rawLegacy.manifest && typeof rawLegacy.exportedAt === "string"
+          ? [{ manifest: rawLegacy.manifest, exportedAt: rawLegacy.exportedAt, expiresAt: Date.parse(rawLegacy.exportedAt) + EXPORT_RETENTION_MS }]
+          : (() => { throw new Error("Invalid legacy export record"); })();
+      const keptLegacy: LegacyExportEntry[] = [];
+      for (const entry of legacyEntries) {
+        const exportedAtMs = Date.parse(entry.exportedAt);
+        if (!entry.manifest || !Number.isFinite(exportedAtMs) || !Number.isFinite(entry.expiresAt)) {
+          throw new Error("Invalid legacy export entry");
+        }
+        const deadline = exportRetentionMs !== undefined ? exportedAtMs + exportRetentionMs : entry.expiresAt;
+        if (nowMs < deadline) {
+          keptLegacy.push(entry);
+          for (const hash of manifestChunkHashes([entry.manifest])) liveHashes.add(hash);
+        }
+      }
+      if (keptLegacy.length !== legacyEntries.length) {
+        legacyRewrite = keptLegacy.length === 0 ? "delete" : { version: 2, entries: keptLegacy };
+      }
+    }
+    return { liveHashes, expiredFiles, legacyRewrite };
+  }
+  private async withProjectAccess<T>(projectId: string, run: () => Promise<T>): Promise<T> {
+    while (this.pruningProjects.has(projectId)) {
+      await this.pruningProjects.get(projectId);
+    }
+    this.activeOperations.set(projectId, (this.activeOperations.get(projectId) ?? 0) + 1);
+    try {
+      return await run();
+    } finally {
+      const left = (this.activeOperations.get(projectId) ?? 1) - 1;
+      if (left > 0) this.activeOperations.set(projectId, left);
+      else this.activeOperations.delete(projectId);
+    }
   }
   private readLease(projectId: string): UploadLease | undefined {
     const file = join(this.dir(projectId), "upload-lease.sealed");
@@ -175,16 +319,17 @@ export class ProjectSync {
       active.lastPersistedAt = now;
     }
   }
-  private ownedLease(projectId: string, writer: SyncWriter, generation: string | undefined, options: { touch?: boolean; allowLegacyContent?: boolean; allowCommitting?: boolean } = {}) {
+  private requireWriter(writer: SyncWriter): SyncWriter {
+    if (!writer || typeof writer.deviceId !== "string" || !writer.deviceId)
+      throw new ProjectSyncError("Missing sync device identity", "invalid-sync-headers", 400);
+    return { deviceId: writer.deviceId, publisherId: parseSyncPublisherId(writer.publisherId) };
+  }
+  private ownedLease(projectId: string, writer: SyncWriter, generation: string, options: { touch?: boolean; allowCommitting?: boolean } = {}): ActiveUploadLease {
+    const verifiedWriter = this.requireWriter(writer);
+    const verifiedGeneration = parseSyncGeneration(generation);
     this.project(projectId);
-    if (writer.publisherId && !generation) throw new ProjectSyncError("This sync request is missing its generation; begin again", "stale-generation");
     const active = this.expireLease(projectId);
-    if (!generation && !writer.publisherId && options.allowLegacyContent) {
-      if (active && !active.value.committing && !active.value.writer.publisherId && active.value.writer.deviceId === writer.deviceId && options.touch)
-        this.touchLease(projectId, active);
-      return undefined;
-    }
-    if (!active || (active.value.committing && !options.allowCommitting) || active.value.generation !== generation || !this.sameWriter(active.value.writer, writer))
+    if (!active || (active.value.committing && !options.allowCommitting) || active.value.generation !== verifiedGeneration || !this.sameWriter(active.value.writer, verifiedWriter))
       throw new ProjectSyncError("This sync generation is stale or belongs to another publisher; begin again", "stale-generation");
     if (options.touch) this.touchLease(projectId, active);
     return active;
@@ -252,55 +397,78 @@ export class ProjectSync {
     writeJson(file, value);
   }
 
-  async begin(projectId: string, writer: SyncWriter = INTERNAL_WRITER) {
+  async begin(projectId: string, writer: SyncWriter, options: { expectEmpty?: boolean } = {}) {
+    const verifiedWriter = this.requireWriter(writer);
     await this.ready(projectId);
     this.project(projectId);
-    const now = Date.now(), active = this.expireLease(projectId, now);
-    if (active) {
-      if (writer.publisherId !== undefined && this.sameWriter(active.value.writer, writer)) {
-        if (active.value.committing) this.conflict(active, now);
-        this.touchLease(projectId, active, now);
-        return { generation: active.value.generation };
+    return this.withProjectAccess(projectId, async () => {
+      const now = Date.now(), active = this.expireLease(projectId, now);
+      if (active && (active.value.committing || !this.sameWriter(active.value.writer, verifiedWriter))) this.conflict(active, now);
+      if (options.expectEmpty) {
+        if (this.changing.has(projectId))
+          throw new ProjectSyncError("A workspace sync is being applied to this project. Retry after it finishes.", "sync-applying");
+        if (this.read<Received>(projectId, "received") || this.read<Applied>(projectId, "applied") || this.readPending(projectId))
+          throw new ProjectSyncError("This project already received a workspace sync generation; inspect its status before uploading again.", "cloud-changed");
       }
-      this.conflict(active, now);
-    }
-    const value: UploadLease = { generation: randomUUID(), writer, updatedAt: new Date(now).toISOString(), committing: false };
-    this.writeLease(projectId, value);
-    this.uploads.set(projectId, { value, expiresAt: now + UPLOAD_LEASE_MS, lastActivityAt: now, lastPersistedAt: now });
-    return { generation: value.generation };
+      const emptyConfirmed = options.expectEmpty ? { emptyConfirmed: true as const } : {};
+      if (active) {
+        this.touchLease(projectId, active, now);
+        this.lastUploadActivityAt.set(projectId, now);
+        return { generation: active.value.generation, ...emptyConfirmed };
+      }
+      const value: UploadLease = { generation: randomUUID(), writer: verifiedWriter, updatedAt: new Date(now).toISOString(), committing: false };
+      this.writeLease(projectId, value);
+      this.uploads.set(projectId, { value, expiresAt: now + UPLOAD_LEASE_MS, lastActivityAt: now, lastPersistedAt: now });
+      this.lastUploadActivityAt.set(projectId, now);
+      return { generation: value.generation, ...emptyConfirmed };
+    });
   }
-  async missing(projectId: string, hashes: string[], writer: SyncWriter = INTERNAL_WRITER, generation?: string) {
-    this.ownedLease(projectId, writer, generation, { touch: true, allowLegacyContent: true });
-    if (!Array.isArray(hashes) || hashes.length > 512 || hashes.some(h => !/^[a-f0-9]{64}$/.test(h))) throw new ProjectSyncError("Invalid blob presence request", "invalid-manifest", 400);
-    return hasWorkspaceBlobs(this.store(projectId), hashes);
+  async missing(projectId: string, hashes: string[], writer: SyncWriter, generation: string) {
+    await this.ready(projectId);
+    return this.withProjectAccess(projectId, async () => {
+      this.ownedLease(projectId, writer, generation, { touch: true });
+      this.lastUploadActivityAt.set(projectId, Date.now());
+      if (!Array.isArray(hashes) || hashes.length > 512 || hashes.some(h => !/^[a-f0-9]{64}$/.test(h))) throw new ProjectSyncError("Invalid blob presence request", "invalid-manifest", 400);
+      return hasWorkspaceBlobs(this.store(projectId), hashes);
+    });
   }
-  async putBlob(projectId: string, hash: string, bytes: Buffer, writer: SyncWriter = INTERNAL_WRITER, generation?: string) {
-    this.ownedLease(projectId, writer, generation, { touch: true, allowLegacyContent: true });
-    if (!/^[a-f0-9]{64}$/.test(hash)) throw new ProjectSyncError("Invalid blob hash", "invalid-manifest", 400);
-    if (createHash("sha256").update(bytes).digest("hex") !== hash) throw new ProjectSyncError("The uploaded content does not match its hash", "invalid-manifest", 400);
-    await putWorkspaceBlob(this.store(projectId), hash, bytes.toString("base64"));
+  async putBlob(projectId: string, hash: string, bytes: Buffer, writer: SyncWriter, generation: string) {
+    await this.ready(projectId);
+    return this.withProjectAccess(projectId, async () => {
+      this.ownedLease(projectId, writer, generation, { touch: true });
+      this.lastUploadActivityAt.set(projectId, Date.now());
+      if (!/^[a-f0-9]{64}$/.test(hash)) throw new ProjectSyncError("Invalid blob hash", "invalid-manifest", 400);
+      if (createHash("sha256").update(bytes).digest("hex") !== hash) throw new ProjectSyncError("The uploaded content does not match its hash", "invalid-manifest", 400);
+      await putWorkspaceBlob(this.store(projectId), hash, bytes.toString("base64"));
+    });
   }
-  async putBlobs(projectId: string, body: Buffer, writer: SyncWriter = INTERNAL_WRITER, generation?: string) {
-    this.ownedLease(projectId, writer, generation, { touch: true, allowLegacyContent: true });
-    let chunks: { hash: string; bytes: Buffer }[];
-    try { chunks = decodeChunkBatch(body); } catch { throw new ProjectSyncError("Invalid chunk batch", "invalid-manifest", 400); }
-    if (chunks.some(({ hash, bytes }) => createHash("sha256").update(bytes).digest("hex") !== hash))
-      throw new ProjectSyncError("The uploaded content does not match its hash", "invalid-manifest", 400);
-    await putWorkspaceBlobs(this.store(projectId), chunks);
-    return chunks.length;
+  async putBlobs(projectId: string, body: Buffer, writer: SyncWriter, generation: string) {
+    await this.ready(projectId);
+    return this.withProjectAccess(projectId, async () => {
+      this.ownedLease(projectId, writer, generation, { touch: true });
+      this.lastUploadActivityAt.set(projectId, Date.now());
+      let chunks: { hash: string; bytes: Buffer }[];
+      try { chunks = decodeChunkBatch(body); } catch { throw new ProjectSyncError("Invalid chunk batch", "invalid-manifest", 400); }
+      if (chunks.some(({ hash, bytes }) => createHash("sha256").update(bytes).digest("hex") !== hash))
+        throw new ProjectSyncError("The uploaded content does not match its hash", "invalid-manifest", 400);
+      await putWorkspaceBlobs(this.store(projectId), chunks);
+      return chunks.length;
+    });
   }
   async readBlob(projectId: string, hash: string) {
     if (!/^[a-f0-9]{64}$/.test(hash)) throw new ProjectSyncError("Invalid blob hash", "invalid-manifest", 400);
-    try { return await readWorkspaceBlob(this.store(projectId), hash); } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new ProjectSyncError("This content is not stored for the project", "missing-content", 404);
-      throw error;
-    }
+    return this.withProjectAccess(projectId, async () => {
+      this.lastBlobReadAt.set(projectId, Date.now());
+      try { return await readWorkspaceBlob(this.store(projectId), hash); } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new ProjectSyncError("This content is not stored for the project", "missing-content", 404);
+        throw error;
+      }
+    });
   }
 
-  commit(projectId: string, generation: string, value: unknown, running: RunningCheck, writer: SyncWriter = INTERNAL_WRITER) {
+  commit(projectId: string, generation: string, value: unknown, running: RunningCheck, writer: SyncWriter) {
     const admit = () => {
       const active = this.ownedLease(projectId, writer, generation);
-      if (!active) throw new ProjectSyncError("This sync generation is stale; begin again", "stale-generation");
       const admitted = { ...active.value, updatedAt: new Date().toISOString(), committing: true };
       this.writeLease(projectId, admitted);
       active.value = admitted;
@@ -320,6 +488,7 @@ export class ProjectSync {
           this.writePending(projectId, undefined);
           const status = await this.applyReceived(projectId, { running });
           this.clearLease(projectId);
+          this.lastUploadActivityAt.delete(projectId);
           return status;
         } catch (error) {
           const current = this.uploads.get(projectId);
@@ -404,8 +573,10 @@ export class ProjectSync {
       throw error;
     } finally { if (restored) await removeTree(stage).catch(() => {}); }
     const baseline = written ?? await this.scan(projectId, target).catch(() => undefined);
+    const previousApplied = this.read<Applied>(projectId, "applied");
     this.write(projectId, "applied", { manifest: received.manifest, appliedAt: new Date().toISOString(), baseline } satisfies Applied);
     this.writePending(projectId, undefined);
+    if (previousApplied && previousApplied.manifest.id !== received.manifest.id) this.scheduleGarbageCollection();
     return this.status(projectId);
   }
 
@@ -454,7 +625,175 @@ export class ProjectSync {
   }
   async exportTree(projectId: string): Promise<WorkspaceManifest> {
     const project = this.project(projectId);
-    return this.queue(projectId, () => this.scan(projectId, project.path, this.read<Applied>(projectId, "applied")?.baseline));
+    return this.queue(projectId, async () => {
+      const manifest = await this.scan(projectId, project.path, this.read<Applied>(projectId, "applied")?.baseline);
+      const syncDir = this.dir(projectId);
+      const exportsDir = join(syncDir, "exports");
+      mkdirSync(exportsDir, { recursive: true, mode: 0o700 });
+      const nowMs = Date.now();
+      const record: ExportRootRecord = {
+        version: 1,
+        manifestId: manifest.id,
+        hashes: [...manifestChunkHashes([manifest])].sort(),
+        exportedAt: nowMs,
+        expiresAt: nowMs + EXPORT_RETENTION_MS,
+      };
+      writeSealed(join(exportsDir, `${manifest.id}.sealed`), this.key, `project-sync:${projectId}:export:${manifest.id}`, record);
+      this.lastBlobReadAt.set(projectId, nowMs);
+      return manifest;
+    });
+  }
+
+  private diskLeaseActive(syncDir: string, projectId: string, nowMs: number): boolean {
+    const active = this.expireLease(projectId, nowMs);
+    if (active) return true;
+    const saved = this.readAt<UploadLease>(syncDir, projectId, "upload-lease");
+    if (!saved) return false;
+    if (saved.committing) return true;
+    const updatedAt = Date.parse(saved.updatedAt);
+    return Number.isFinite(updatedAt) && nowMs <= updatedAt + UPLOAD_LEASE_MS + UPLOAD_LEASE_RECOVERY_GRACE_MS;
+  }
+
+  private async pruneProjectRefs(projectId: string, syncDir: string, options: ProjectSyncGcOptions): Promise<number> {
+    if (this.serial.has(projectId) || this.changing.has(projectId) ||
+        (this.activeOperations.get(projectId) ?? 0) > 0 || this.pruningProjects.has(projectId)) {
+      return 0;
+    }
+    const now = options.now ?? Date.now;
+    const activeReadGraceMs = options.activeReadGraceMs ?? ACTIVE_READ_GRACE_MS;
+    const sharedPoolDirectory = join(this.config.stateDir, "workspace-pool");
+    let releaseGate!: () => void;
+    const gate = new Promise<void>(resolve => { releaseGate = resolve; });
+    this.pruningProjects.set(projectId, gate);
+    try {
+      return await this.queue(projectId, async () => {
+        options.signal?.throwIfAborted();
+        const nowMs = now();
+        if (this.changing.has(projectId) || (this.activeOperations.get(projectId) ?? 0) > 0) return 0;
+        const lastUpload = this.lastUploadActivityAt.get(projectId);
+        if (lastUpload !== undefined && nowMs - lastUpload < UPLOAD_LEASE_MS) return 0;
+        const lastRead = this.lastBlobReadAt.get(projectId);
+        if (lastRead !== undefined && nowMs - lastRead < activeReadGraceMs) return 0;
+        let received: Received | undefined;
+        let applied: Applied | undefined;
+        let exportRoots: { liveHashes: Set<string>; expiredFiles: string[]; legacyRewrite?: LegacyExportedStore | "delete" };
+        try {
+          if (this.diskLeaseActive(syncDir, projectId, nowMs)) return 0;
+          received = this.readAt<Received>(syncDir, projectId, "received");
+          applied = this.readAt<Applied>(syncDir, projectId, "applied");
+          exportRoots = await this.readExportRoots(syncDir, projectId, nowMs, options.exportRetentionMs);
+        } catch {
+          return 0;
+        }
+        for (const file of exportRoots.expiredFiles) rmSync(file, { force: true });
+        if (exportRoots.legacyRewrite === "delete") rmSync(join(syncDir, "exported.sealed"), { force: true });
+        else if (exportRoots.legacyRewrite) this.writeAt(syncDir, projectId, "exported", exportRoots.legacyRewrite);
+        const keepHashes = new Set([
+          ...manifestChunkHashes([received?.manifest, applied?.manifest, applied?.baseline]),
+          ...exportRoots.liveHashes,
+        ]);
+        const pruned = await pruneScopeRefs({
+          scopeDirectory: join(syncDir, "blobs"),
+          keepHashes,
+          sharedPoolDirectory,
+          graceMs: options.refGraceMs,
+          now,
+          signal: options.signal,
+        });
+        return pruned.removed;
+      }, options.signal);
+    } finally {
+      this.pruningProjects.delete(projectId);
+      releaseGate();
+    }
+  }
+
+  async collectGarbage(options: ProjectSyncGcOptions = {}): Promise<ProjectSyncGcResult> {
+    await Promise.allSettled([...this.recoveries.values()]);
+    options.signal?.throwIfAborted();
+    const inspectHybrid = options.inspectHybridSessions ?? this.inspectHybridSessions;
+    const legacyCheck = options.hasLegacyHybridWriters ?? this.hasLegacyHybridWriters;
+    let liveHybridSessionIds: ReadonlySet<string> | undefined = options.liveHybridSessionIds;
+    if (inspectHybrid) {
+      let inspection: HybridSessionsInspection;
+      try { inspection = await inspectHybrid(); }
+      catch { return { prunedProjects: 0, prunedSessions: 0, removedRefs: 0, pool: emptyCollectResult("deferred-legacy-writer") }; }
+      if (inspection.legacyActive) {
+        return { prunedProjects: 0, prunedSessions: 0, removedRefs: 0, pool: emptyCollectResult("deferred-legacy-writer") };
+      }
+      liveHybridSessionIds = inspection.liveSessionIds;
+    } else if (legacyCheck) {
+      let legacyActive = true;
+      try { legacyActive = await legacyCheck(); } catch { legacyActive = true; }
+      if (legacyActive) {
+        return { prunedProjects: 0, prunedSessions: 0, removedRefs: 0, pool: emptyCollectResult("deferred-legacy-writer") };
+      }
+    }
+    const projectsRoot = join(this.config.stateDir, "projects");
+    const sharedPoolDirectory = join(this.config.stateDir, "workspace-pool");
+    let prunedProjects = 0;
+    let removedRefs = 0;
+    let projectNames: string[] = [];
+    try {
+      projectNames = await readdir(projectsRoot);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    for (const projectId of projectNames) {
+      options.signal?.throwIfAborted();
+      const syncDir = join(projectsRoot, projectId, "sync");
+      if (!existsSync(join(syncDir, "blobs"))) continue;
+      const removed = await this.pruneProjectRefs(projectId, syncDir, options).catch(() => 0);
+      if (removed > 0) {
+        prunedProjects += 1;
+        removedRefs += removed;
+      }
+    }
+    let prunedSessions = 0;
+    if (liveHybridSessionIds !== undefined) {
+      const hybridPruned = await pruneHybridSessionRefs({
+        stateDir: this.config.stateDir,
+        sharedPoolDirectory,
+        liveSessionIds: liveHybridSessionIds,
+        graceMs: options.refGraceMs,
+        exportRetentionMs: options.exportRetentionMs,
+        now: options.now,
+        signal: options.signal,
+      }).catch(() => ({ prunedSessions: 0, removedRefs: 0 }));
+      prunedSessions = hybridPruned.prunedSessions;
+      removedRefs += hybridPruned.removedRefs;
+    }
+    const scopeDirectories = await discoverHostWorkspaceScopes(this.config.stateDir);
+    const pool = await collectSharedPool({
+      sharedPoolDirectory,
+      scopeDirectories,
+      graceMs: options.graceMs,
+      sweepBatchSize: options.sweepBatchSize,
+      now: options.now,
+      signal: options.signal,
+    });
+    return { prunedProjects, prunedSessions, removedRefs, pool };
+  }
+
+  scheduleGarbageCollection(force = false): void {
+    if (this.closed || this.gcTask) return;
+    const nowMs = Date.now();
+    if (!force && nowMs - this.lastScheduledGcAt < GC_MIN_INTERVAL_MS) return;
+    this.lastScheduledGcAt = nowMs;
+    const controller = new AbortController();
+    this.gcController = controller;
+    let task: Promise<void>;
+    task = this.collectGarbage({ signal: controller.signal }).then(() => {}, () => {}).finally(() => {
+      if (this.gcTask === task) this.gcTask = undefined;
+      if (this.gcController === controller) this.gcController = undefined;
+    });
+    this.gcTask = task;
+  }
+
+  close(): Promise<void> {
+    this.closed = true;
+    this.gcController?.abort();
+    return this.gcTask ?? Promise.resolve();
   }
 }
 

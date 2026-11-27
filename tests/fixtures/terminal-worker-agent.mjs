@@ -1,4 +1,3 @@
-
 process.stdin.setRawMode(true);
 process.stdin.setEncoding("utf8");
 process.stdout.write("READY\r\n\x1b[?2004h\x1b[?25l\x1b[?1006h");
@@ -97,7 +96,9 @@ process.stdin.on("data", data => {
       process.stdout.write(sequence + "OSC DONE " + code + "\r\n");
     }
     else if (command === "stream") {
-      let i = 0;
+      for (let i = 1; i <= 10; i++) process.stdout.write("LIVE " + i + "\r\n");
+    } else if (command === "resume") {
+      let i = 10;
       const timer = setInterval(() => {
         process.stdout.write("LIVE " + (++i) + "\r\n");
         if (i === 150) { clearInterval(timer); process.stdout.write("STREAM DONE\r\n"); }

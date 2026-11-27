@@ -1,7 +1,7 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { ActivityIndicator, Alert, Pressable, RefreshControl, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import { useRouter } from "expo-router";
-import { api, connectionKey, type Connection, type GoalAssessment, type GoalVerdictView, type Me } from "../../api/client";
+import { api, connectionKey, type Connection, type GoalAssessment, type Me } from "../../api/client";
 import { usePoll } from "../../api/usePoll";
 import { Button } from "../../components/Button";
 import { useKeyboardPadding } from "../../components/keyboard";
@@ -19,7 +19,7 @@ import {
 import { Choices, Clamp, Disclosure, LinearChip, LineupView, RequestStatus, RunPill, Section, SteerBox, t } from "./parts";
 import { useRunRequest } from "./useRunRequest";
 import { CostLine, MoneyText } from "../cost/parts";
-import { ASSESSMENT_LABEL, awaitsProvisionalAnswer, countsText, criterionState, newestVerdictId, ownerOutcomeLabel, PRODUCER_LABELS, resultText, type AssessedGoal } from "./goal-verdicts";
+import { ASSESSMENT_LABEL, awaitsProvisionalAnswer, countsText, newestVerdictId, ownerOutcomeLabel, REMOTE_CRITERIA_NOTE, resultText, type AssessedGoal } from "./goal-verdicts";
 
 export function GoalDetail({ connection, id }: { connection: Connection; id: string }) {
   const router = useRouter();
@@ -130,7 +130,7 @@ export function GoalDetail({ connection, id }: { connection: Connection; id: str
           <RunPill label={TEAM_LABELS[cycle.status as TeamStatus] ?? cycle.status} tone={cycle.status in TEAM_LABELS ? teamTone(cycle.status as TeamStatus) : "muted"} />
           <Text style={t.note}>Goal revision {cycle.goalRevision} · {cycle.memberCount} members · {shortDate(cycle.startedAt)}</Text>
           {cycle.reason ? <Clamp text={cycle.reason} lines={3} /> : null}
-          {cycle.assessment ? <CycleAssessment connection={connection} goalId={id} teamId={cycle.teamId} assessment={cycle.assessment} /> : null}
+          {cycle.assessment ? <CycleAssessment assessment={cycle.assessment} /> : null}
           {cycle.branch ? <Text selectable style={t.mono}>{cycle.branch}</Text> : null}
           <Button compact title="Review team" secondary onPress={() => openTeam(cycle.teamId)} />
         </View>) : <Text style={t.note}>No earlier cycles recorded.</Text>}
@@ -194,33 +194,13 @@ export function GoalDetail({ connection, id }: { connection: Connection; id: str
   </View>;
 }
 
-function CycleAssessment({ connection, goalId, teamId, assessment }: { connection: Connection; goalId: string; teamId: string; assessment: GoalAssessment }) {
+function CycleAssessment({ assessment }: { assessment: GoalAssessment }) {
   return <View style={s.record}>
     <Text style={t.strong}>{ASSESSMENT_LABEL}</Text>
     <Text style={t.body}>{resultText(assessment)}</Text>
     <Text style={t.note}>{countsText(assessment.counts)}</Text>
-    <Disclosure title="Criteria"><CriteriaRows connection={connection} goalId={goalId} teamId={teamId} /></Disclosure>
+    <Text style={t.note}>{REMOTE_CRITERIA_NOTE}</Text>
   </View>;
-}
-
-function CriteriaRows({ connection, goalId, teamId }: { connection: Connection; goalId: string; teamId: string }) {
-  const [row, setRow] = useState<GoalVerdictView | null>(null);
-  const [error, setError] = useState("");
-  useEffect(() => {
-    let live = true;
-    api<{ verdicts: GoalVerdictView[] }>(connection, `/goals/${goalId}/verdicts`)
-      .then(value => { if (live) setRow(value.verdicts.find(item => item.teamId === teamId) ?? null); })
-      .catch(failure => { if (live) setError((failure as Error).message); });
-    return () => { live = false; };
-  }, [connection, goalId, teamId]);
-  if (error) return <Text style={t.warning}>{error}</Text>;
-  if (!row) return <ActivityIndicator />;
-  if (row.detail === "expired") return <Text style={t.note}>The criteria detail is no longer kept. Only the counts above remain.</Text>;
-  return <>{row.criteria.map(item => <View key={item.id} style={s.record}>
-    <Text style={t.mono}>{item.id}</Text>
-    <Text style={t.body}>{criterionState(item.state)} · {PRODUCER_LABELS[item.label]}{item.receipt ? ` · receipt ${item.receipt.outcome}` : ""}</Text>
-    {item.note ? <Text style={t.note}>Agent note: {item.note}</Text> : null}
-  </View>)}</>;
 }
 
 function ProvisionalStop({ reason, disabled, busy, onSubmit }: { reason: string; disabled: boolean; busy: boolean; onSubmit: (value: { result: GoalResult; summary: string; evidence: string; continue?: boolean }) => void }) {

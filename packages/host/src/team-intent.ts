@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { chooseIntentChecker } from "./evaluator-profiles.js";
-import { correctionFeedback, intentCheckerPrompt, intentContext } from "./intent-prompt.js";
+import { correctionFeedback, intentCheckerPromptSpec, intentContext } from "./intent-prompt.js";
+import type { TeamPromptSection } from "./team-prompt-sections.js";
 import type { IntentContext } from "./intent-prompt.js";
 import type { IntentCheckReport } from "./intent-report.js";
 import {
@@ -42,7 +43,7 @@ export type IntentCheckState = {
 export type IntentHolder = { run: TeamRun; intentCheck?: IntentCheckState; objectiveRecord?: unknown; objectiveNotice?: ObjectiveUnavailable };
 export type IntentHost = {
   prepare(holder: IntentHolder, role: "project-manager" | "intent-checker", feedback: string | undefined,
-    onPrepared: (member: TeamMember) => void, prebuilt?: { prompt: string; profile: TeamModelProfile }): void;
+    onPrepared: (member: TeamMember) => void, prebuilt?: { prompt: string; promptSections?: TeamPromptSection[]; profile: TeamModelProfile }): void;
   consume(holder: IntentHolder, member: TeamMember): void;
   operation(holder: IntentHolder, perform: (signal: AbortSignal) => Promise<boolean | undefined>, complete: (clean: boolean | undefined) => void, member: TeamMember): void;
   save(holder: IntentHolder): void;
@@ -284,7 +285,7 @@ export class TeamIntent {
     state.status = "checking";
     this.host.prepare(holder, "intent-checker", undefined, member => {
       state.checkerMemberId = member.memberId;
-    }, { prompt: intentCheckerPrompt(choice.profile.provider, choice.profile), profile: choice.profile });
+    }, { ...intentCheckerPromptSpec(choice.profile.provider, choice.profile), profile: choice.profile });
     this.host.save(holder);
     return true;
   }

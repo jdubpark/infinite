@@ -4,6 +4,7 @@ import { isAbsolute, join, relative } from "node:path";
 import { writeSealed, unseal } from "./vault.js";
 import type { ConnectorSource } from "./mcp-types.js";
 import { TeamService, TeamError, providerInputReason } from "./teams.js";
+import { HALT_CENSUS_MS } from "./team-command-fence.js";
 import type { Manager } from "./manager.js";
 import type { Config } from "./types.js";
 import { DEFAULT_TEAM_RETENTION, hostClosedBlockedReason, inputSourceLabel, type BlockerEvidence, type CreateTeam, type NativeContinuation, type TeamAssignment, type TeamView } from "./team-types.js";
@@ -27,7 +28,7 @@ import { projectMissionSource } from "./mission-progress.js";
 import { MissionReview, type MissionReviewRecord, type ReviewDirection, type ReviewForwardOp } from "./mission-review.js";
 import {
   CoordinatorContextReadTracker,
-  readSessionPromptContext,
+  readSessionPromptContext, sameRealPath,
   reconcileDeliveredUnapplied,
   returnConsumedMessages,
   selectCoordinatorContinuation,
@@ -55,7 +56,7 @@ type Attempt = { memberId: string; sessionId: string; revision: number; prompt: 
   usageCursor?: number; contextTokens?: number };
 type RotationRule = "idle" | "size" | "age";
 type ChildOp = { kind: "answer" | "steer" | "pause" | "resume" | "cancel" | "parallelism"; subtaskId: string; teamId: string; requestId: string; revision?: number; decisionId?: string; text?: string; parallelism?: number; by?: "owner" | "coordinator" | "connector"; source?: ConnectorSource;
-  halt?: { token: string; reason?: string } };
+  halt?: { token: string; reason?: string }; waiting?: string };
 type Stored = {
   mission: Mission;
   fingerprint: string;
@@ -262,11 +263,11 @@ export class MissionService {
   list() { return [...this.records.values()].map(stored => this.view(stored)).sort((a, b) => b.createdAt.localeCompare(a.createdAt)); }
   understandingRecords() { return [...this.records.values()].map(stored => structuredClone(stored.mission)); }
   progressSource(id: string) { return projectMissionSource(this.record(id)); }
-  understandingOwnsSession(missionId: string, memberId: string, sessionId: string, projectId: string): boolean {
+  understandingOwnsSession(missionId: string, memberId: string, sessionId: string, projectId: string, cwd?: string): boolean {
     const stored = this.records.get(missionId);
-    return Boolean(stored && stored.mission.repoProjectIds.includes(projectId) && stored.attempts.some(attempt =>
-      attempt.memberId === memberId && attempt.sessionId === sessionId));
+    return Boolean(stored && stored.mission.repoProjectIds.includes(projectId) && (cwd === undefined || sameRealPath(stored.folder, cwd)) && stored.attempts.some(attempt => attempt.memberId === memberId && attempt.sessionId === sessionId));
   }
+  understandingRepoPaths(missionId: string): Record<string, string> | undefined { const stored = this.records.get(missionId); return stored && Object.fromEntries(stored.repos.map(repo => [repo.projectId, repo.path])); }
   get(id: string) { return this.view(this.record(id)); }
 
   replayCreate(input: CreateMission) {
@@ -825,7 +826,7 @@ export class MissionService {
           if (live.has(mission.status))
             this.message(stored, teamId + ":cancelled", { type: "subtask-finished", subtaskId: subtask.id, teamId, status: "cancelled", teamStatus: "cancelled",
               ...(subtask.finalEvidence?.reason ? { reason: subtask.finalEvidence.reason } : {}),
-              retentionNote: "Cancelled run data and its workspace are deleted after its members settle. If work is still needed, dispatch a replacement subtask with a new ID in the same repository." });
+              retentionNote: "Cancelled run data and its workspace are deleted once its members settle and the host sees no process left running by its commands; such a process delays the deletion for as long as it runs. If work is still needed, dispatch a replacement subtask with a new ID in the same repository." });
           this.save(stored);
         }
         continue;
@@ -842,7 +843,7 @@ export class MissionService {
           ...(team.reason ? { reason: team.reason } : {}),
           ...(report ? { report } : {}),
           ...(blocker ? { blocker } : {}),
-          ...(status === "cancelled" ? { retentionNote: "Cancelled run data and its workspace are deleted after its members settle. If work is still needed, dispatch a replacement subtask with a new ID in the same repository." } : {}) });
+          ...(status === "cancelled" ? { retentionNote: "Cancelled run data and its workspace are deleted once its members settle and the host sees no process left running by its commands; such a process delays the deletion for as long as it runs. If work is still needed, dispatch a replacement subtask with a new ID in the same repository." } : {}) });
       }
       if (status === "cancelled" && team.workspaceRemovedAt) {
         this.save(stored);
@@ -910,8 +911,9 @@ export class MissionService {
       if (op.revision !== team.revision && !(op.kind === "steer" && op.revision !== undefined)) { op.requestId = randomUUID(); op.revision = team.revision; this.save(stored); }
       try {
         if (op.kind === "answer") await this.teams.answer(op.teamId, op.decisionId!, { requestId: op.requestId, revision: op.revision, text: op.text! }, undefined, op.by ?? "owner", op.source);
-        else if (op.kind === "steer") team = await this.teams.steer(op.teamId, { requestId: op.requestId, revision: op.revision!, text: op.text! }, op.source ?? (op.by === "coordinator" ? "coordinator" : undefined));
+        else if (op.kind === "steer") team = await this.teams.steer(op.teamId, { requestId: op.requestId, revision: op.revision!, text: op.text! }, op.source ?? (op.by === "coordinator" ? "coordinator" : undefined), HALT_CENSUS_MS);
         else if (op.kind === "parallelism") team = await this.teams.setMissionParallelism(op.teamId, { requestId: op.requestId, revision: op.revision!, parallelism: op.parallelism! });
+        else if (op.kind === "resume") await this.teams.resume(op.teamId, { requestId: op.requestId, revision: op.revision }, op.source, HALT_CENSUS_MS);
         else await this.teams[op.kind](op.teamId, { requestId: op.requestId, revision: op.revision }, op.source);
       } catch (error) {
         if (this.closed) return;
@@ -919,6 +921,12 @@ export class MissionService {
         if (["members-stopping", "team-operation-running", "team-paused", "stale-team-revision"].includes(error.code)) {
           if (op.kind === "steer" && error.code === "stale-team-revision") op.revision = undefined;
           remaining.push(op); continue;
+        }
+        if (error.code === "team-command-running") {
+          if (op.waiting !== error.message) this.event(stored, `A ${op.kind} for subtask ${op.subtaskId} waits for its subteam. ${error.message}`);
+          op.waiting = error.message;
+          remaining.push(op);
+          continue;
         }
         if (op.kind === "steer") { steered.push(`The direction for subtask ${op.subtaskId} was not applied: ${error.message}`); continue; }
         this.event(stored, `A ${op.kind} for subtask ${op.subtaskId} was not applied: ${error.message}`);

@@ -151,7 +151,7 @@ export async function endSessionWorkers(config: Config, started?: readonly numbe
   }
 }
 
-export async function startHost(options: { agents?: Config["agents"]; config?: Partial<Config>; env?: NodeJS.ProcessEnv } = {}): Promise<Host> {
+export async function startHost(options: { agents?: Config["agents"]; config?: Partial<Config>; env?: NodeJS.ProcessEnv; startStepMs?: number } = {}): Promise<Host> {
   const root = mkdtempSync(join(tmpdir(), "inf-"));
   const initialPort = options.config?.port ?? await freePort();
   let listenerOrigin = `http://127.0.0.1:${initialPort}`;
@@ -215,20 +215,30 @@ export async function startHost(options: { agents?: Config["agents"]; config?: P
     api.stderr!.on("data", (chunk) => {
       diagnostics += chunk;
     });
+    const step = options.startStepMs ?? HOST_STARTUP_TIMEOUT_MS;
+    const lock = join(config.runDir, "server.lock");
     const exited = new AbortController();
     const abortProbe = () => exited.abort();
     api.once("exit", abortProbe);
-    const signal = AbortSignal.any([exited.signal, AbortSignal.timeout(HOST_STARTUP_TIMEOUT_MS)]);
-    const probe = apiClient(listenerOrigin, tokens, signal);
-    try {
-      await waitFor(async () => {
+    const loaded = () => {
+      try { return readFileSync(lock, "utf8") === String(api.pid); } catch { return false; }
+    };
+    const waitForPhase = (acceptLock: boolean) => {
+      const signal = AbortSignal.any([exited.signal, AbortSignal.timeout(step)]);
+      const probe = apiClient(listenerOrigin, tokens, signal);
+      return waitFor(async () => {
+        if (acceptLock && loaded()) return true;
         const response = await probe("/me").catch(() => undefined);
         if (api.exitCode !== null || api.signalCode !== null) {
           await Promise.race([stderrDone, new Promise((resolveTimeout) => setTimeout(resolveTimeout, 1000))]);
           throw new Error(diagnostics || `Host exited before listening (${api.signalCode ?? api.exitCode})`);
         }
-        return response?.status ?? 0;
-      }, status => status === 200, HOST_STARTUP_TIMEOUT_MS);
+        return response?.status === 200;
+      }, Boolean, step);
+    };
+    try {
+      await waitForPhase(true);
+      await waitForPhase(false);
     } finally {
       api.off("exit", abortProbe);
     }

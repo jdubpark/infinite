@@ -1,7 +1,7 @@
 import { execFile, execFileSync, spawn } from "node:child_process";
 import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { readdir, readFile, readlink, realpath, stat } from "node:fs/promises";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { sudoShape } from "./sudo-profile.js";
 import type { TeamCommand } from "./team-types.js";
@@ -97,6 +97,19 @@ export function extendWitness(witness: ProcessWitness, table: ProcessTable): boo
   }
   return changed;
 }
+export function mergeWitness(base: ProcessWitness, extra: ProcessWitness): ProcessWitness {
+  if (base.boot !== extra.boot) return structuredClone(extra.boot === bootId() ? extra : base);
+  const merged = structuredClone(base);
+  for (const recorded of extra.processes) {
+    if (merged.processes.some(known => known.pid === recorded.pid && known.start === recorded.start)) continue;
+    if (merged.processes.length >= WITNESS_LIMIT) markOverflow(merged);
+    else merged.processes.push({ pid: recorded.pid, start: recorded.start });
+  }
+  for (const session of extra.sessions) addUnique(merged, merged.sessions, session);
+  for (const group of extra.groups) addUnique(merged, merged.groups, group);
+  if (extra.overflow) markOverflow(merged);
+  return merged;
+}
 export function witnessFindings(witness: ProcessWitness, table: ProcessTable): CensusFinding[] {
   if (table.boot !== witness.boot) return [];
   const findings: CensusFinding[] = [];
@@ -106,6 +119,25 @@ export function witnessFindings(witness: ProcessWitness, table: ProcessTable): C
     if (reason) findings.push({ pid: row.pid, reason });
   }
   return findings;
+}
+export function liveWitness(witness: ProcessWitness, table: ProcessTable): { witness: ProcessWitness; count: number } | undefined {
+  if (table.boot !== witness.boot) return undefined;
+  const live: ProcessWitness = { boot: witness.boot, processes: [], sessions: [], groups: [] };
+  let count = 0;
+  for (const row of table.rows) {
+    if (row.pid === process.pid) continue;
+    const byProcess = witness.processes.some(recorded => recorded.pid === row.pid && recorded.start === row.start);
+    const bySession = row.sid !== undefined && witness.sessions.includes(row.sid);
+    const byGroup = witness.groups.includes(row.pgid);
+    if (!byProcess && !bySession && !byGroup) continue;
+    count += 1;
+    if (byProcess) live.processes.push({ pid: row.pid, start: row.start });
+    if (bySession) addUnique(live, live.sessions, row.sid!);
+    if (byGroup) addUnique(live, live.groups, row.pgid);
+  }
+  if (count === 0) return undefined;
+  if (witness.overflow) live.overflow = true;
+  return { witness: live, count };
 }
 function accountedFor(witness: ProcessWitness, row: ProcessRow): CensusReason | undefined {
   return witness.processes.some(recorded => recorded.pid === row.pid && recorded.start === row.start) ? "recorded-process"
@@ -484,7 +516,8 @@ function problemText(error: unknown): string {
 }
 
 const entry = process.argv[1] ? resolve(process.argv[1]) : undefined;
-if (entry && existsSync(entry) && realpathSync(entry) === fileURLToPath(import.meta.url)) void runCommandLine();
+const self = fileURLToPath(import.meta.url);
+if (/^process-census\.(?:js|ts)$/.test(basename(self)) && entry && existsSync(entry) && existsSync(self) && realpathSync(entry) === realpathSync(self)) void runCommandLine();
 
 async function runCommandLine(): Promise<void> {
   if (process.argv.length !== 2) {

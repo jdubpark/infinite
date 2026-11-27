@@ -38,6 +38,7 @@ import {
   type TeamCheck,
   type TeamCommand,
   type TeamDecision,
+  type TeamLeftoverProcesses,
   type TeamMemberSavedWork,
   type TeamPendingOperation,
   type TeamPermissionAgentDecision,
@@ -134,6 +135,7 @@ export interface TeamPermissionDecision {
   requestedPaths?: string[];
   status: "pending" | "reviewing" | "approved" | "answering" | "answered" | "escalated" | "stale" | "uncertain";
   reason?: string;
+  promptClosedAt?: string;
   receipt?: Receipt & { result?: AnswerResult };
 }
 export interface TeamPermissionRecoveryStep {
@@ -417,6 +419,8 @@ export const teamMemberRetireSchema = z.object({ requestId: z.uuid(), revision: 
   identity: z.string().regex(/^[a-f0-9]{64}$/), text: z.string().trim().min(1).max(4000) }).strict();
 export type TeamMemberRetire = z.infer<typeof teamMemberRetireSchema>;
 export const teamActionSchema = z.object({ requestId: z.uuid(), revision: z.number().int().min(1) }).strict();
+export const teamProcessesEndedSchema = z.object({ requestId: z.uuid() }).strict();
+export type TeamProcessesEnded = z.infer<typeof teamProcessesEndedSchema>;
 export const teamContinueSchema = z.object({ requestId: z.uuid(), revision: z.number().int().min(1), text: z.string().trim().min(1).max(SHARED_INPUT_LIMITS.steeringChars).optional() }).strict();
 export type TeamContinue = z.infer<typeof teamContinueSchema>;
 export const teamTaskRatingSchema = z.object({ requestId: z.uuid(), score: z.number().int().min(1).max(5), note: z.string().trim().max(1000).optional() }).strict();
@@ -667,7 +671,7 @@ export interface TeamScout extends TeamScoutPlan {
   summary?: string;
   evidence?: TeamEvidence[];
 }
-export type ReplayLink = { jobId: string; trialId: string; purpose: "replay" | "gate" | "duel"; ending?: TrialEnding | JudgeEnding; resultCommit?: string; resetsAt?: string; judgement?: Judgement; judgeMinutes?: number };
+export type ReplayLink = { jobId: string; trialId: string; purpose: "replay" | "gate" | "duel"; ending?: TrialEnding | JudgeEnding; resultCommit?: string; resetsAt?: string; judgement?: Judgement; judgeMinutes?: number; pairedProviders?: Provider[]; launchWait?: string };
 export interface TeamRun {
   blackboard?: { tools: true };
   routing?: TeamRunRouting;
@@ -785,6 +789,7 @@ export interface TeamWaitReason {
 export type TeamView = Omit<TeamRun, "members" | "permissionDecisions" | "permissionRecovery"> & {
   lastActivityAt: string;
   pendingOperation?: TeamPendingOperation;
+  leftoverProcesses?: TeamLeftoverProcesses;
   publishing?: boolean;
   members: Omit<TeamMember, "prompt" | "contextFeedback" | "nativeSessionId" | "continuation" | "turns" | "pendingFeedback" | "goalCriteriaPlan">[];
   permissionDecisions?: Omit<TeamPermissionDecision, "prompt" | "coordinatorSessionId">[];

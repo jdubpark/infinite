@@ -1,89 +1,23 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
-import { copyFileSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { createConnection } from "node:net";
-import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { randomBytes, randomUUID } from "node:crypto";
 import headless from "@xterm/headless";
 import { WebSocket } from "ws";
 import { hashToken } from "../packages/host/src/config.js";
-import { workerCall } from "../packages/host/src/ipc.js";
 import { Manager } from "../packages/host/src/manager.js";
 import { connectTerminals, terminalPages } from "../packages/host/src/terminal-stream.js";
-import { readEvents, unseal, writeSealed } from "../packages/host/src/vault.js";
+import { writeSealed } from "../packages/host/src/vault.js";
 import { permissionEvidenceHash, oneShotPermissionOption } from "../packages/host/src/team-permissions.js";
 import { requesterNotice } from "../packages/host/src/permission-policy.js";
-import { moveWorkerClock, settleAll, waitFor } from "./helpers.js";
-import type { Bootstrap, Config, ControlActor, ControlLease, Event, Receipt, TerminalSnapshot, WorkerRequest, WorkerState } from "../packages/host/src/types.js";
+import { fixture, fixtures } from "./terminal-worker-fixture.js";
+import { settleAll, waitFor } from "./helpers.js";
+import type { Config, ControlActor, ControlLease, Receipt, TerminalSnapshot, WorkerRequest, WorkerState } from "../packages/host/src/types.js";
 import type { TeamAssignment } from "../packages/host/src/team-types.js";
 
-async function fixture(provider: "demo" | "claude" | "codex" = "demo", initialPrompt = "", team?: TeamAssignment) {
-  const root = mkdtempSync(join(tmpdir(), "inf-worker-"));
-  const id = randomUUID();
-  const key = randomBytes(32);
-  const runDir = join(root, "run");
-  const stateDir = join(root, "state");
-  const script = join(root, "agent.mjs");
-  mkdirSync(runDir);
-  copyFileSync(new URL("./fixtures/terminal-worker-agent.mjs", import.meta.url), script);
-  const runtime = { id: randomUUID(), location: "cloud" as const, transport: "pty" as const };
-  const bootstrap: Bootstrap = {
-    session: { id, ...(team ? { team } : {}), executionIdentity: "production", provider, title: "Terminal contract", projectId: "fixture", cwd: root, createdAt: new Date().toISOString(), status: "starting", contextVersion: 0, context: "", initialPrompt, runtime },
-    executionIdentity: "production", profile: { command: process.execPath, args: [script] },
-    runDir, stateDir, key: key.toString("base64"), prompt: initialPrompt, codeMode: false,
-    attention: { idleAfterMs: 60_000, limitConfirmMs: 30_000, hooks: { claude: true, codex: true } },
-  };
-  const worker = spawn(process.execPath, ["--import", "tsx", "--import", resolve("tests/fixtures/worker-clock.mjs"), resolve("packages/host/src/worker.ts")], { stdio: ["pipe", "ignore", "pipe"], env: { ...process.env, INFINITE_TEST_CLOCK_FILE: join(root, "clock") } });
-  let diagnostics = "";
-  worker.stderr.on("data", data => { diagnostics += data; });
-  worker.stdin.end(JSON.stringify(bootstrap));
-  const call = <T = WorkerState>(request: WorkerRequest) => workerCall<T>(runDir, id, request, 6000);
-  const events = () => {
-    const out: Event[] = [];
-    let cursor = 0;
-    for (;;) {
-      const page = readEvents(join(stateDir, "sessions", id, "events"), key, id, cursor);
-      out.push(...page.events); cursor = page.cursor;
-      if (!page.more) return out;
-    }
-  };
-  const output = () => events().filter(event => event.type === "output").map(event => String(event.data.text)).join("");
-  const command = (text: string) => call<Receipt>({ op: "raw", requestId: randomUUID(), text: text + "\n" });
-  const stop = async () => {
-    try {
-      const actor = { id: "test-cleanup", label: "Cleanup" };
-      const lease = await call<ControlLease>({ op: "control", action: "claim", actor, takeover: true });
-      await call({ op: "stop", requestId: randomUUID(), actor, leaseId: lease.id });
-    } catch {
-      try { await call({ op: "stop", requestId: randomUUID() }); } catch { }
-    }
-    if (worker.exitCode === null && worker.signalCode === null)
-      await Promise.race([new Promise(resolve => worker.once("exit", resolve)), new Promise(resolve => setTimeout(resolve, 3500))]);
-    worker.kill();
-    rmSync(root, { recursive: true, force: true });
-  };
-  try {
-    await waitFor(async () => {
-      try { return await call({ op: "state", screen: true }); }
-      catch (error) { if (worker.exitCode !== null) throw new Error(diagnostics || String(error)); return undefined; }
-    }, state => Boolean(state?.screen.includes("READY")), 15_000);
-  } catch (error) { await stop(); throw error; }
-  return { id, root, stateDir, runDir, key, session: bootstrap.session, cwd: realpathSync(root), runtime, call, events, output, command, moveClock: (ms: number) => moveWorkerClock(worker, join(root, "clock"), ms), stop, persisted: () => unseal<WorkerState>(key, `${id}:status`, readFileSync(join(stateDir, "sessions", id, "status.sealed"), "utf8")) };
-}
-
-async function fixtures(count: number, start: () => ReturnType<typeof fixture>) {
-  const started = await Promise.allSettled(Array.from({ length: count }, start));
-  const workers = started.flatMap(result => result.status === "fulfilled" ? [result.value] : []);
-  const failure = started.find(result => result.status === "rejected");
-  if (failure?.status === "rejected") {
-    await Promise.all(workers.map(worker => worker.stop()));
-    throw failure.reason;
-  }
-  return workers;
-}
 
 async function dialogHold() {
   let arrive!: () => void;
@@ -183,10 +117,13 @@ test("worker snapshots restore a bounded rendered prefix and contiguous live del
     await worker.command("stream");
     await waitFor(async () => worker.output(), output => output.includes("LIVE 10"));
     const snapshot = await worker.call<TerminalSnapshot>({ op: "snapshot" });
+    await worker.command("resume");
     await waitFor(async () => worker.output(), output => output.includes("STREAM DONE"));
     const events = worker.events();
     const deltas = events.filter(event => event.seq > snapshot.seq && event.type === "output");
     assert.ok(deltas.length > 0, "output continued after the snapshot fence");
+    const after = deltas.map(event => String(event.data.text)).join("");
+    assert.deepEqual([...after.matchAll(/LIVE (\d+)/g)].map(match => Number(match[1])), Array.from({ length: 140 }, (_, index) => index + 11), "every line streamed after the fence is recorded once, in order");
     assert.ok(events.filter(event => event.seq <= snapshot.seq && event.type === "output").map(event => String(event.data.text)).join("").includes("LIVE 10"));
     const replay = new headless.Terminal({ cols: snapshot.cols, rows: snapshot.rows, scrollback: 5000, allowProposedApi: true });
     const restored = new headless.Terminal({ cols: snapshot.cols, rows: snapshot.rows, scrollback: 5000, allowProposedApi: true });

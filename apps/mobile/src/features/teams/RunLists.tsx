@@ -12,6 +12,7 @@ import {
   blockedTeamsFirst, canContinueBlockedTeam, canResumeBlockedTeam, GOAL_LABELS, goalGroup, goalKind, groupRuns, newer, openDecisions, pendingApprovals, shortDate, TEAM_LABELS, teamGroup, teamKind, teamProgress, teamReady,
   type ProductGoal, type RunGroup, type TeamListItem, type TeamView,
 } from "./model";
+import { summarizeMobileListWaitReason } from "./inspector-model";
 import { providerName, RequestStatus } from "./parts";
 import { orderedMembers } from "./summary";
 import { useRunRequest } from "./useRunRequest";
@@ -78,9 +79,27 @@ function TeamRunRow({ connection, team: received, role, machine, now, kind, done
   const canContinue = canContinueBlockedTeam(team, role);
   const resume = () => request.send(`/teams/${team.id}/resume`, "Resume", team.revision);
   const { kind: rowKind } = canResume ? { kind: "blocked" as const } : { kind };
+  const waitSummary = summarizeMobileListWaitReason(team);
+  const normalizedNote = note.replace(/\s+/g, " ").trim();
+  const duplicateActionCount = Boolean(
+    waitSummary
+    && waitSummary.extraCount === 0
+    && ((waitSummary.kind === "owner-decision" && open > 0) || (waitSummary.kind === "provider-prompt" && asks > 0)),
+  );
+  const duplicateNote = Boolean(waitSummary && normalizedNote && normalizedNote === waitSummary.summary && waitSummary.extraCount === 0);
+  const shownWait = waitSummary && !duplicateActionCount && !duplicateNote ? waitSummary : undefined;
+  const waitAccessibility = shownWait
+    ? [shownWait.label, shownWait.summary, shownWait.extraCount > 0 ? `plus ${shownWait.extraCount} more` : ""].filter(Boolean).join(", ")
+    : "";
+  const rowAccessibilityLabel = [
+    `Open team ${team.title}`,
+    TEAM_LABELS[team.status],
+    total ? `${done} of ${total} tasks integrated` : "",
+    waitAccessibility,
+  ].filter(Boolean).join(", ");
   return <View style={s.runRowWrap}>
     <View style={s.listRow}>
-      <Pressable accessibilityRole="button" accessibilityLabel={`Open team ${team.title}, ${TEAM_LABELS[team.status]}${total ? `, ${done} of ${total} tasks integrated` : ""}`}
+      <Pressable accessibilityRole="button" accessibilityLabel={rowAccessibilityLabel}
         onPress={onOpen} style={({ pressed }) => [s.rowContent, pressed && s.pressed]}>
         <View style={s.icon}><StatusIcon kind={rowKind} fraction={team.status === "blocked" ? 0 : teamKind(team).fraction} size={18} /></View>
         <View style={s.main}>
@@ -100,6 +119,13 @@ function TeamRunRow({ connection, team: received, role, machine, now, kind, done
           {team.status === "blocked" ? <Text style={s.blockedReason} numberOfLines={2}>{team.reason ?? " "}</Text>
             : note ? <Text style={s.alert} numberOfLines={1}>{note}</Text>
               : <Text style={s.meta} numberOfLines={1}>{[project(team.projectId), team.linear?.issue?.identifier, team.goal ? `Goal cycle ${team.goal.cycle}` : ""].filter(Boolean).join(" · ")}</Text>}
+          {shownWait ? <View style={s.waitRow}>
+            <Text style={[s.waitLine, shownWait.tone === "attention" && s.attentionText, shownWait.tone === "error" && s.errorText]} numberOfLines={1}>
+              <Text style={s.waitLabel}>{shownWait.label}</Text>
+              {shownWait.summary ? ` · ${shownWait.summary}` : ""}
+            </Text>
+            {shownWait.extraCount > 0 ? <Text style={[s.waitExtra, shownWait.tone === "attention" && s.attentionText, shownWait.tone === "error" && s.errorText]}>(+{shownWait.extraCount})</Text> : null}
+          </View> : null}
         </View>
       </Pressable>
       {canResume ? <Button compact busy={request.busy} secondary title="Resume" disabled={request.busy || Boolean(request.pending)} onPress={resume} /> : null}
@@ -167,6 +193,10 @@ export const listStyles = StyleSheet.create({
   errorText: { color: theme.colors.error },
   meta: { fontSize: 12, lineHeight: 17, color: theme.colors.mutedInk, flexShrink: 1 },
   alert: { fontSize: 13, lineHeight: 18, color: theme.colors.warningInk },
+  waitRow: { flexDirection: "row", alignItems: "center", gap: 4 },
+  waitLine: { fontSize: 12, lineHeight: 17, color: theme.colors.mutedInk, flexShrink: 1 },
+  waitLabel: { fontWeight: "600" },
+  waitExtra: { fontSize: 12, lineHeight: 17, color: theme.colors.mutedInk, flexShrink: 0 },
   blockedReason: { minHeight: 34, fontSize: 12, lineHeight: 17, color: theme.colors.error, flexShrink: 1 },
   notice: { backgroundColor: theme.colors.warningSurface, color: theme.colors.warningInk, fontSize: 12, lineHeight: 18, padding: 12, borderRadius: theme.radius.card, marginTop: 12 },
   empty: { paddingVertical: 40, paddingHorizontal: 12, gap: 8, alignItems: "center" },

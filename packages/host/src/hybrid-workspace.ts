@@ -1,11 +1,15 @@
 import { randomUUID } from "node:crypto";
-import { chmod, lstat, mkdir, open, readFile, realpath, rename, rm } from "node:fs/promises";
+import { chmod, lstat, mkdir, open, readFile, realpath, rename, rm, unlink } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { startCloudExecutor } from "./cloud-executor.js";
 import {
   captureWorkspace, hasWorkspaceBlobs, materializeWorkspace, putWorkspaceBlob,
   readWorkspaceBlob, validateWorkspaceManifest, type WorkspaceManifest, type WorkspaceStoreTarget,
 } from "./workspace-checkpoint.js";
+import {
+  collectHybridExportRoots, HYBRID_EXPORT_RETENTION_MS, manifestChunkHashes, pruneScopeRefs,
+  recordHybridPoolLeaseCapability, WORKSPACE_POOL_GC_DEFAULTS, writeHybridExportRoot,
+} from "./workspace-pool-gc.js";
 import { createWorkspaceTransferPool } from "./workspace-transfer.js";
 import type { ExecutionState, LaptopWorkspace } from "./types.js";
 
@@ -96,6 +100,12 @@ export async function createHybridWorkspace(options: {
   sharedWorkspace?: boolean;
   sharedPoolDirectory?: string;
   egress?: Record<string, string>;
+  gc?: {
+    graceMs?: number;
+    exportRetentionMs?: number;
+    readGraceMs?: number;
+    now?: () => number;
+  };
 }) {
   const directory = resolve(options.directory), scopeDirectory = join(directory, "blobs");
   const storeDir: WorkspaceStoreTarget = options.sharedPoolDirectory
@@ -106,6 +116,7 @@ export async function createHybridWorkspace(options: {
       (process.getuid && directoryInfo.uid !== process.getuid()))
     throw new Error("Hybrid workspace state requires a private owner-controlled directory.");
   await mkdir(scopeDirectory, { recursive: true, mode: 0o700 });
+  await recordHybridPoolLeaseCapability(directory);
   if (options.sharedWorkspace && !options.workspaceDirectory) throw new Error("A shared execution identity requires a separate workspace directory.");
   const dataDirectory = resolve(options.workspaceDirectory ?? directory);
   if (options.workspaceDirectory) {
@@ -154,6 +165,14 @@ export async function createHybridWorkspace(options: {
   const blobTransfers = createWorkspaceTransferPool();
   const admittedBlobs = new Set<Promise<unknown>>();
   const abort = new AbortController();
+  const gcNow = options.gc?.now ?? Date.now;
+  const gcGraceMs = options.gc?.graceMs ?? WORKSPACE_POOL_GC_DEFAULTS.refGraceMs;
+  const gcExportRetentionMs = options.gc?.exportRetentionMs ?? HYBRID_EXPORT_RETENTION_MS;
+  const gcReadGraceMs = options.gc?.readGraceMs ?? Math.min(60_000, gcGraceMs);
+  let activeUpload: { epoch: number; lastActivityAt: number } | undefined;
+  let lastBlobReadAt: number | undefined;
+  let pruneTimer: ReturnType<typeof setTimeout> | undefined;
+  let pruneScheduledFor = Number.POSITIVE_INFINITY;
   let state: ExecutionState;
 
   const checkpoint = (): ExecutionState["checkpoint"] => latest && ({ id: latest.manifest.id, capturedAt: latest.manifest.capturedAt });
@@ -220,12 +239,17 @@ export async function createHybridWorkspace(options: {
   };
   const enqueueBlob = (params: any): Promise<{ base64: string } | { stored: true }> => {
     if (currentPhase().kind === "closed") return Promise.reject(new Error("Hybrid workspace is closed."));
+    const isRead = params?.base64 === undefined;
+    if (isRead) lastBlobReadAt = gcNow();
+    else if (activeUpload) activeUpload.lastActivityAt = gcNow();
     const previous = tail;
     const operation = previous.then(async () => {
       if (currentPhase().kind === "closed") throw new Error("Hybrid workspace is closed.");
       return blobTransfers.run(async () => {
         if (currentPhase().kind === "closed") throw new Error("Hybrid workspace is closed.");
-        const result = params?.base64 === undefined
+        if (isRead) lastBlobReadAt = gcNow();
+        else if (activeUpload) activeUpload.lastActivityAt = gcNow();
+        const result = isRead
           ? { base64: await readWorkspaceBlob(storeDir, params?.hash) }
           : (await putWorkspaceBlob(storeDir, params?.hash, params.base64), { stored: true as const });
         if (currentPhase().kind === "closed") throw new Error("Hybrid workspace is closed.");
@@ -235,6 +259,59 @@ export async function createHybridWorkspace(options: {
     admittedBlobs.add(operation);
     operation.then(() => admittedBlobs.delete(operation), () => admittedBlobs.delete(operation));
     return operation;
+  };
+  const schedulePrune = (delayMs: number) => {
+    if (!options.sharedPoolDirectory || currentPhase().kind === "closed") return;
+    const boundedDelay = Math.max(10, Math.min(delayMs, 24 * 60 * 60 * 1000));
+    const target = Date.now() + boundedDelay;
+    if (pruneTimer && pruneScheduledFor <= target) return;
+    if (pruneTimer) clearTimeout(pruneTimer);
+    pruneScheduledFor = target;
+    const timer = setTimeout(() => {
+      if (pruneTimer === timer) {
+        pruneTimer = undefined;
+        pruneScheduledFor = Number.POSITIVE_INFINITY;
+      }
+      void enqueue(pruneOwnRefs).catch(() => {});
+    }, boundedDelay);
+    timer.unref();
+    pruneTimer = timer;
+  };
+  const pruneOwnRefs = async (): Promise<void> => {
+    if (!options.sharedPoolDirectory) return;
+    const current = currentPhase();
+    if (current.kind === "closed" || current.kind === "selecting") return;
+    if (admittedBlobs.size > 0) {
+      schedulePrune(Math.max(50, gcGraceMs));
+      return;
+    }
+    if (activeUpload && current.kind === "laptop" && current.online && activeUpload.epoch === epoch) {
+      schedulePrune(Math.max(50, gcGraceMs));
+      return;
+    }
+    const nowMs = gcNow();
+    if (lastBlobReadAt !== undefined && nowMs - lastBlobReadAt < gcReadGraceMs) {
+      schedulePrune(Math.max(50, gcReadGraceMs - (nowMs - lastBlobReadAt) + 25));
+      return;
+    }
+    let exportRoots: { liveHashes: Set<string>; expiredFiles: string[]; removeLegacyExportJson: boolean };
+    try {
+      exportRoots = await collectHybridExportRoots(directory, nowMs, gcExportRetentionMs);
+    } catch {
+      return;
+    }
+    for (const file of exportRoots.expiredFiles) await unlink(file).catch(() => {});
+    if (exportRoots.removeLegacyExportJson) await unlink(join(directory, "export.json")).catch(() => {});
+    const keepHashes = new Set([...manifestChunkHashes([latest?.manifest]), ...exportRoots.liveHashes]);
+    const pruned = await pruneScopeRefs({
+      scopeDirectory,
+      keepHashes,
+      sharedPoolDirectory: options.sharedPoolDirectory,
+      graceMs: gcGraceMs,
+      now: gcNow,
+      signal: abort.signal,
+    }).catch(() => undefined);
+    if (pruned && pruned.skippedGrace > 0) schedulePrune(gcGraceMs + 50);
   };
   const placement = async (nextPhase: Placement["phase"]) => {
     await durableJson(directory, "placement.json", { epoch, phase: nextPhase, checkpoint: checkpoint() } satisfies Placement);
@@ -251,6 +328,7 @@ export async function createHybridWorkspace(options: {
       return;
     }
     clearTimeout(phase.reconnectTimer);
+    activeUpload = undefined;
     phase = {
       kind: "selecting",
       revision: phase.revision,
@@ -345,6 +423,8 @@ export async function createHybridWorkspace(options: {
         if (method === "sync/problem") {
           if (typeof params?.reason !== "string" || !params.reason.trim())
             throw new Error("A workspace preparation problem requires a reason.");
+          activeUpload = undefined;
+          if (options.sharedPoolDirectory && latest) schedulePrune(gcGraceMs + 50);
           if (phase.kind === "laptop") {
             phase.preparationProblem = params.reason.replace(/[\x00-\x1f\x7f-\x9f]/g, " ").slice(0, 300);
             publish();
@@ -354,6 +434,7 @@ export async function createHybridWorkspace(options: {
         if (method === "sync/has") {
           if (!Array.isArray(params?.hashes) || params.hashes.length > 512)
             throw new Error("A blob presence request must contain at most 512 hashes.");
+          if (activeUpload) activeUpload.lastActivityAt = gcNow();
           return { missing: await hasWorkspaceBlobs(storeDir, params.hashes) };
         }
         if (method === "sync/begin") {
@@ -364,6 +445,7 @@ export async function createHybridWorkspace(options: {
           await placement("laptop");
           if (phase.kind !== "laptop" || !phase.online || phase.busy || phase.uncertain || phase.revision !== startedRevision)
             throw new Error("Laptop activity changed before checkpoint capture began.");
+          activeUpload = { epoch, lastActivityAt: gcNow() };
           return { revision: phase.revision, epoch };
         }
         if (method === "sync/commit") {
@@ -397,6 +479,11 @@ export async function createHybridWorkspace(options: {
             if (!published) await rm(destination, { recursive: true, force: true }).catch(() => {});
           }
           if (previous?.tree) await rm(previous.tree.directory, { recursive: true, force: true }).catch(() => {});
+          if (activeUpload?.epoch === epoch) activeUpload = undefined;
+          if (options.sharedPoolDirectory && previous) {
+            await pruneOwnRefs().catch(() => {});
+            schedulePrune(gcGraceMs + 50);
+          }
           record({ action: "workspace-checkpoint-published", epoch, revision: phase.revision, checkpoint: manifest.id, capturedAt: manifest.capturedAt });
           publish();
           return { checkpoint: checkpoint(), epoch };
@@ -406,7 +493,11 @@ export async function createHybridWorkspace(options: {
             throw new Error("A cloud workspace is not available for reconciliation.");
           const manifest = await captureWorkspace({ ...phase.cloudWorkspace, storeDir, signal: abort.signal });
           if (currentPhase().kind === "closed") throw new Error("Hybrid workspace is closed.");
+          const exportedAt = gcNow();
+          await writeHybridExportRoot(directory, manifest.id, [...manifestChunkHashes([manifest])], exportedAt, gcExportRetentionMs);
           await durableJson(directory, "export.json", { epoch, manifest });
+          lastBlobReadAt = exportedAt;
+          schedulePrune(gcExportRetentionMs + 50);
           record({ action: "cloud-checkpoint-exported", epoch, checkpoint: manifest.id, capturedAt: manifest.capturedAt });
           return { manifest, epoch };
         }
@@ -430,6 +521,7 @@ export async function createHybridWorkspace(options: {
           phase.reconnectTimer = timer;
         }
       }
+      if (!value) activeUpload = undefined;
       if (changed) record({ action: value ? "laptop-executor-connected" : "laptop-executor-disconnected", epoch });
       publish();
       if (!value) schedule();
@@ -454,6 +546,8 @@ export async function createHybridWorkspace(options: {
     },
     close(): Promise<void> {
       if (phase.kind === "closed") return phase.closePromise;
+      if (pruneTimer) { clearTimeout(pruneTimer); pruneTimer = undefined; pruneScheduledFor = Number.POSITIVE_INFINITY; }
+      activeUpload = undefined;
       if (phase.kind === "laptop") clearTimeout(phase.reconnectTimer);
       const activeCloud = phase.kind === "cloud" || phase.kind === "selecting" || phase.kind === "failed" ? phase.cloud : undefined;
       epoch += 1;

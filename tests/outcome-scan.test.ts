@@ -205,7 +205,7 @@ test("each rule lands its run", async () => {
     assert.deepEqual(landed("run-a"), { kind: "landing", commit: mergeA, method: "merge-commit", scanSeq: 1, holdDays: 30, holdUntil: day(30) });
     assert.equal(landed("run-b")?.kind === "landing" && landed("run-b")?.method, "merge-parent");
     assert.equal(landed("run-b")?.kind === "landing" && landed("run-b")?.commit, mergeB);
-    assert.equal(landed("run-c")?.kind === "landing" && landed("run-c")?.method, "tree-equal");
+    assert.deepEqual(landed("run-c")?.kind === "landing" && [landed("run-c")?.method, landed("run-c")?.reviewedHead], ["tree-equal", tipC]);
     assert.equal(landed("run-c")?.kind === "landing" && landed("run-c")?.commit, tipC);
   } finally {
     store.close();

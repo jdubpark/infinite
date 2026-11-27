@@ -7,8 +7,17 @@ import { usageRecordKey } from "./transcript-usage.js";
 import type { UsageRecord, UsageTokens } from "./usage.js";
 
 export { SESSION_PURPOSES };
-export type LedgerCoverageReason = UsageCoverageReason | "running";
+export type LedgerCoverageReason = UsageCoverageReason | "running" | "recording-error";
 export interface LedgerCoverage { coverage: UsageCoverage; reason?: LedgerCoverageReason }
+
+export function combineCoverage(parts: readonly { coverage: UsageCoverage; coverageReason?: LedgerCoverageReason }[]): LedgerCoverage {
+  const live = parts.filter(part => part.coverage !== "none");
+  if (live.length === 0) return { coverage: "none" };
+  if (live.every(part => part.coverage === "complete")) return { coverage: "complete" };
+  const gap = live.find(part => part.coverage === "partial" && part.coverageReason !== "running");
+  if (!gap) return { coverage: "partial", reason: "running" };
+  return gap.coverageReason === undefined ? { coverage: "partial" } : { coverage: "partial", reason: gap.coverageReason };
+}
 export interface LedgerHeader {
   sessionId: string;
   provider: Provider;
@@ -222,10 +231,19 @@ export function writeSession(tx: EvidenceTx, header: LedgerHeader, state: Ledger
   return true;
 }
 
+export function closeMissingSession(tx: EvidenceTx, sessionId: string, lastActiveAt: string, reason: LedgerCoverageReason): boolean {
+  const at = isoTime(lastActiveAt);
+  if (!at || !REASON.test(reason)) return false;
+  return tx.run(
+    "UPDATE usage_sessions SET last_active_at=?, coverage='partial', coverage_reason=?, exited=1 WHERE session_id=? AND exited=0",
+    at, reason, sessionId,
+  ).changes === 1;
+}
+
 type Stored = { session_id?: string; input: number; output: number; reasoning: number; cache_read: number; cache_write: number; cache_write_1h: number };
 const total = (row: Stored) => row.input + row.output + row.reasoning + row.cache_read + row.cache_write;
 
-export function writeRecord(tx: EvidenceTx, sessionId: string, record: UsageRecord): "inserted" | "replaced" | "kept" {
+export function writeRecordWithOwner(tx: EvidenceTx, sessionId: string, record: UsageRecord): { status: "inserted" | "replaced" | "kept"; ownerSessionId: string } {
   const checked = ledgerRecord(record);
   if (!checked) throw new TypeError("A usage record must pass ledgerRecord before it is stored.");
   if (!tx.get("SELECT 1 AS found FROM usage_sessions WHERE session_id=?", sessionId)) throw new Error("The usage session row must exist before its records");
@@ -235,18 +253,30 @@ export function writeRecord(tx: EvidenceTx, sessionId: string, record: UsageReco
     input: checked.tokens.input, output: checked.tokens.output, reasoning: checked.tokens.reasoning,
     cache_read: checked.tokens.cacheRead, cache_write: checked.tokens.cacheWrite, cache_write_1h: checked.cacheWrite1h ?? 0,
   };
+  const owner = prior && checked.provider !== "opencode" ? prior.session_id as string : sessionId;
   if (prior && checked.provider !== "opencode") {
     const larger = total(next) !== total(prior) ? total(next) > total(prior)
       : next.reasoning !== prior.reasoning ? next.reasoning > prior.reasoning
         : next.cache_write_1h > prior.cache_write_1h;
-    if (!larger) return "kept";
+    if (!larger) return { status: "kept", ownerSessionId: owner };
   }
   const modelRef = ensureModel(tx, checked.providerId, checked.modelId);
-  const owner = prior && checked.provider !== "opencode" ? prior.session_id as string : sessionId;
   tx.run(upsert("usage_records", RECORD_COLUMNS, "record_key"), key, checked.provider, owner, checked.completedAt, modelRef,
     checked.modelSource, next.input, next.output, next.reasoning, next.cache_read, next.cache_write, next.cache_write_1h,
     checked.reportedCost, checked.secondary ? 1 : 0);
-  return prior ? "replaced" : "inserted";
+  tx.run(
+    "INSERT INTO usage_meta (key, value) VALUES (?, '1') ON CONFLICT(key) DO UPDATE SET value=CAST(CAST(value AS INTEGER) + 1 AS TEXT)",
+    `headroom_rev:${checked.provider}`,
+  );
+  return { status: prior ? "replaced" : "inserted", ownerSessionId: owner };
+}
+
+export function providerUsageRevision(db: EvidenceDb, provider: Provider): string {
+  return db.get<{ value: string }>("SELECT value FROM usage_meta WHERE key=?", `headroom_rev:${provider}`)?.value ?? "0";
+}
+
+export function writeRecord(tx: EvidenceTx, sessionId: string, record: UsageRecord): "inserted" | "replaced" | "kept" {
+  return writeRecordWithOwner(tx, sessionId, record).status;
 }
 
 export function writeBriefing(tx: EvidenceTx, key: string, projectId: string, at: string, record?: UsageRecord): void {
@@ -308,13 +338,18 @@ export function readSessions(db: EvidenceDb): StoredSession[] {
   });
 }
 
-export function readRecords(db: EvidenceDb, filter: { sessionIds?: string[]; from?: string; to?: string } = {}): { sessionId: string; record: UsageRecord }[] {
+export function readRecords(db: EvidenceDb, filter: { sessionIds?: string[]; providers?: readonly Provider[]; from?: string; to?: string } = {}): { sessionId: string; record: UsageRecord }[] {
   const where: string[] = [];
   const params: SQLInputValue[] = [];
   if (filter.sessionIds) {
     if (filter.sessionIds.length === 0) return [];
     where.push(`session_id IN (${filter.sessionIds.map(() => "?").join(", ")})`);
     params.push(...filter.sessionIds);
+  }
+  if (filter.providers) {
+    if (filter.providers.length === 0) return [];
+    where.push(`provider IN (${filter.providers.map(() => "?").join(", ")})`);
+    params.push(...filter.providers);
   }
   if (filter.from !== undefined) {
     const from = isoTime(filter.from);

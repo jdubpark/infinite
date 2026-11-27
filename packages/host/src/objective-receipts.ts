@@ -1,7 +1,9 @@
+import { createHash } from "node:crypto";
+import { canonicalJson } from "./evidence/crypto.js";
 import type { StreamRead } from "./git-stream.js";
 import { parseCitation, qualifyingEntries, quotePresent } from "./objective-citations.js";
 import { commandDigest } from "./objective-input.js";
-import type { AssumptionTest, Check, ObjectiveRecord, Threshold } from "./objective-types.js";
+import type { AssumptionTest, Check, Criterion, ObjectiveRecord, Threshold } from "./objective-types.js";
 import type { TeamCheck, TeamCommand } from "./team-types.js";
 
 export const PASS_LIMITS = { subjects: 40, reads: 40 } as const;
@@ -17,10 +19,10 @@ export type ReceiptDetail =
 export type ObjectiveReceipt = {
   handle: string;
   kind: ReceiptKind; subject: "criterion" | "assumption"; id: string;
-  commit: string; outcome: ReceiptOutcome; at: string; detail: ReceiptDetail;
+  commit: string; outcome: ReceiptOutcome; at: string; detail: ReceiptDetail; digest?: string;
 };
 export type Subject =
-  | { subject: "criterion"; id: string; check: Extract<Check, { kind: "command" | "artifact" }>; threshold: Threshold }
+  | { subject: "criterion"; id: string; check: Extract<Check, { kind: "command" | "artifact" }>; threshold: Threshold; pinned?: Criterion["pinned"] }
   | { subject: "assumption"; id: string; test: Extract<AssumptionTest, { kind: "command" | "artifact" | "citation" }> };
 export type BlobResult = StreamRead | { state: "not-run"; why: "deadline" | "stalled" };
 export type PassInput = {
@@ -41,7 +43,7 @@ export function passSubjects(record: ObjectiveRecord, kind: PassKind): Subject[]
   for (const criterion of record.criteria) {
     if (criterion.state !== "active" || !isCommandOrArtifact(criterion.check)) continue;
     if (kind === "check" && criterion.check.kind !== "command") continue;
-    subjects.push({ subject: "criterion", id: criterion.id, check: criterion.check, threshold: criterion.threshold });
+    subjects.push({ subject: "criterion", id: criterion.id, check: criterion.check, threshold: criterion.threshold, ...(criterion.pinned === undefined ? {} : { pinned: criterion.pinned }) });
   }
   for (const assumption of record.assumptions) {
     const { test } = assumption;
@@ -80,6 +82,10 @@ function targetOf(subject: Subject, head: string): Target | undefined {
   return undefined;
 }
 
+export function definitionDigest(criterion: Pick<Criterion, "check" | "threshold" | "pinned">): string {
+  return createHash("sha256").update(canonicalJson({ check: criterion.check, threshold: criterion.threshold, pinned: criterion.pinned ?? null })).digest("hex");
+}
+
 export function receiptsFor(subjects: readonly Subject[], input: PassInput): ObjectiveReceipt[] {
   const rounds = roundsOf(input);
   return subjects.map(subject => {
@@ -88,6 +94,7 @@ export function receiptsFor(subjects: readonly Subject[], input: PassInput): Obj
       handle: `receipt:${input.runId}:${input.revision}:${subject.id}`,
       kind: result.detail.kind, subject: subject.subject, id: subject.id,
       commit: result.commit, outcome: result.outcome, at: input.at, detail: result.detail,
+      ...(subject.subject === "criterion" ? { digest: definitionDigest(subject) } : {}),
     };
   });
 }

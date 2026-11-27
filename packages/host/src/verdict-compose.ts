@@ -1,3 +1,4 @@
+import { definitionDigest } from "./objective-receipts.js";
 import type { ObjectiveReceipt, ReceiptOutcome } from "./objective-receipts.js";
 import { VERDICT_OPS } from "./objective-record.js";
 import { canonicalBytes } from "./objective-types.js";
@@ -72,6 +73,7 @@ function judgeHost(criterion: Criterion, input: ComposeInput): Judged {
   if (check.kind === "command" || check.kind === "artifact") {
     const found = (input.receipts ?? []).filter(item => item.subject === "criterion" && item.id === criterion.id && item.commit === input.head).at(-1);
     if (found === undefined) return { state: "inconclusive", reason: "no-receipt" };
+    if (found.digest !== definitionDigest(criterion)) return { state: "inconclusive", reason: "receipt-stale" };
     const receipt = { handle: found.handle, outcome: found.outcome };
     if (found.outcome === "pass") return { state: "met", receipt };
     if (found.outcome === "fail") return { state: "not-met", receipt };

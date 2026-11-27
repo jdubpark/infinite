@@ -8,14 +8,14 @@ import type { Manager } from "../packages/host/src/manager.js";
 import { bootId, liveWitness, newWitness, type ProcessRow } from "../packages/host/src/process-census.js";
 import type { StoredLeftover } from "../packages/host/src/team-leftover.js";
 import { DEFAULT_TEAM_RETENTION, type TeamRun } from "../packages/host/src/team-types.js";
-import { teamCommand } from "../packages/host/src/team-workspace.js";
-import { TeamError, TeamService } from "../packages/host/src/teams.js";
+import { teamCommand, teamOperationCommand } from "../packages/host/src/team-workspace.js";
+import { commandLeftoverEvent, TeamError, TeamService } from "../packages/host/src/teams.js";
 import { schedulerFixture } from "./fixtures/team-scheduler.js";
 
 type StoredRun = { run: TeamRun; pending?: { witness?: unknown }; leftover?: StoredLeftover; halt?: string };
 type Internals = {
   records: Map<string, StoredRun>;
-  operation(stored: StoredRun, kind: "check", perform: () => Promise<unknown>, complete: () => void): void;
+  operation(stored: StoredRun, kind: "check", perform: (signal: AbortSignal) => Promise<unknown>, complete: () => void): void;
 };
 
 const code = (expected: string) => (error: unknown) => error instanceof TeamError && error.code === expected;
@@ -80,4 +80,63 @@ test("the witness kept at settle holds only what still has a live member", () =>
   assert.equal(kept?.count, 2);
   assert.equal(liveWitness(witness, { boot: witness.boot, rows: [row(1, 1, 1)] }), undefined, "nothing live holds nothing");
   assert.equal(liveWitness(witness, { boot: `${boot}-other`, rows: [row(60, 5, 9)] }), undefined, "another boot holds nothing");
+});
+
+const POSIX = { timeout: 60_000, skip: process.platform === "win32" && "process groups are POSIX" };
+const stillRun = (stored: StoredRun) => stored.run.events.filter(event => /still run after the command ended/.test(event.text)).length;
+
+async function settled(perform: (stored: StoredRun, cwd: string, signal: AbortSignal, teams: TeamService) => Promise<unknown>, prefix?: { command: string; args: string[] }) {
+  const f = schedulerFixture();
+  const cwd = mkdtempSync(join(tmpdir(), "witness-hold-"));
+  f.run.status = "implementing";
+  f.run.updatedAt = new Date().toISOString();
+  f.run.headCommit = f.run.baseCommit;
+  f.run.members.forEach(member => { member.status = "stopped"; });
+  if (prefix) f.config.teams!.commandPrefix = prefix;
+  f.writeTeam();
+  const teams = new TeamService(f.config, f.key, f.manager as unknown as Manager, (_project, start) => start(), undefined, undefined, { now: () => Date.now() });
+  const internal = teams as unknown as Internals & { commands: Map<string, AbortController> };
+  const stored = internal.records.get(f.run.id)!;
+  stored.halt = undefined;
+  internal.operation(stored, "check", signal => perform(stored, cwd, signal, teams), () => {});
+  return { f, teams, internal, stored, close: async () => { await teams.close(); f.close(); rmSync(cwd, { recursive: true, force: true }); } };
+}
+
+test("a command stopped under a prefix leaves no hold and no still-running event: the stop fence owns that case", POSIX, async () => {
+  const run = await settled((_stored, _cwd, signal) => teamOperationCommand({ command: "sleep", args: ["600"] }, tmpdir(), signal, 60_000, { command: "env", args: [] }), { command: "env", args: [] });
+  try {
+    await delay(600);
+    run.internal.commands.get(run.f.run.id)!.abort();
+    await until(() => Boolean(run.stored.pending?.failure), "the stop settles the operation");
+    assert.equal(run.stored.pending?.failure && (run.stored.pending as { failure: { code: string } }).failure.code, "command-stop-unconfirmed");
+    assert.equal(run.stored.leftover, undefined, "no hold is written for a stopped prefixed command");
+    assert.equal(stillRun(run.stored), 0);
+  } finally { await run.close(); }
+});
+
+test("a drained command gets one event for its process: the drain line, with the live look merged into the same record", POSIX, async () => {
+  let group: number | undefined;
+  const run = await settled(async (stored, cwd, _signal, teams) => {
+    const result = await teamCommand({ command: "sh", args: ["-c", "sleep 30 &"] }, cwd);
+    await (teams as unknown as { noteLeftover(stored: StoredRun, result: unknown): Promise<void> }).noteLeftover(stored, result);
+  });
+  try {
+    await until(() => !run.stored.pending, "the operation settles");
+    group = run.stored.leftover?.witness.groups[0];
+    assert.ok(group !== undefined, "the drained process is recorded");
+    assert.equal(run.stored.run.events.filter(event => event.text === commandLeftoverEvent).length, 1);
+    assert.equal(stillRun(run.stored), 0, "no second line for the same process");
+  } finally {
+    if (group !== undefined) try { process.kill(-group, "SIGKILL"); } catch { }
+    await run.close();
+  }
+});
+
+test("a process that does not hold the output and ends between the two reads is not held", POSIX, async () => {
+  const run = await settled((_stored, cwd) => teamCommand({ command: "sh", args: ["-c", "sleep 0.2 >/dev/null 2>&1 &"] }, cwd));
+  try {
+    await until(() => !run.stored.pending, "the operation settles");
+    assert.equal(run.stored.leftover, undefined, "the process ended before the second read");
+    assert.equal(stillRun(run.stored), 0);
+  } finally { await run.close(); }
 });

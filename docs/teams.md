@@ -3110,7 +3110,11 @@ alive in the run's process record, then writes one fixed event line: "N
 process(es) that a command of this run started still run after the command
 ended. The host keeps this run's directories until a census finds none." A
 removal then waits as described under retention. When nothing is alive at the
-first read, the host waits for nothing and keeps no record. The look misses a
+first read, the host waits for nothing and keeps no record. The look does not
+apply to a command stopped under a command prefix: the stop's own census, taken
+after the anchor's grace, covers it. A command whose output stayed open (see the
+leader rule) gets only its own fixed line, with the look merged into the same
+record. The look misses a
 process that left its group and session, since the host records no id for it
 unless a sample caught it earlier. Most Git reads
 refuse a result whose output stayed open past that second, as they refuse any

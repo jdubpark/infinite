@@ -764,8 +764,9 @@ export class TeamService {
   }
   private holdLive(stored: Stored, pending: PendingOperation, live: ReturnType<typeof liveWitness>) {
     if (!live) return;
+    const drained = stored.leftover?.operation === pending.id;
     stored.leftover = notedLeftover(stored.leftover, live.witness, pending.id, timestamp());
-    this.event(stored, commandStillRunningEvent(live.count));
+    if (!drained) this.event(stored, commandStillRunningEvent(live.count));
   }
   private async noteLeftover(stored: Stored, result: CommandResult) {
     if (!result.leftover) return;
@@ -1871,7 +1872,9 @@ export class TeamService {
         headCommit: stored.run.headCommit ?? sourceMember.baseCommit, workspace: sourceWorkspace } } : {}) };
     const controller = new AbortController(); this.commands.set(stored.run.id, controller);
     stored.pending = pending; this.save(stored);
-    void commandScope.run(this.commandRecorder(stored, pending.id), () => perform(controller.signal)).then(async value => { const live = await this.stillRunning(pending); return this.enqueue(stored.run.id, () => {
+    void commandScope.run(this.commandRecorder(stored, pending.id), () => perform(controller.signal)).then(async value => {
+      const live = await this.stillRunning(pending);
+      return this.enqueue(stored.run.id, () => {
       if (this.closed || stored.pending?.id !== pending.id) return;
       this.commands.delete(stored.run.id);
       stored.leftover = settledLeftover(stored.leftover, pending);
@@ -1883,7 +1886,10 @@ export class TeamService {
       try { complete(value); } catch (error) { this.block(stored, error); }
       if (held) stored.run.status = held;
       this.save(stored);
-    }); }, async error => { const live = await this.stillRunning(pending); return this.enqueue(stored.run.id, () => {
+    });
+    }, async error => {
+      const live = error instanceof CommandStopUnconfirmed ? undefined : await this.stillRunning(pending);
+      return this.enqueue(stored.run.id, () => {
       if (this.closed || stored.pending?.id !== pending.id) return;
       this.commands.get(stored.run.id)?.abort();
       this.commands.delete(stored.run.id);
@@ -1896,7 +1902,8 @@ export class TeamService {
       this.save(stored);
       this.block(stored, error);
       this.fence.watch(stored);
-    }); }).catch(() => {});
+    });
+    }).catch(() => {});
   }
   private block(stored: Stored, error: unknown, sourceMember?: TeamMember) {
     if (stored.run.replay) return void this.replays.blocked(stored, error);

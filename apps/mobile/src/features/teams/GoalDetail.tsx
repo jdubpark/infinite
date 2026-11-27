@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { ActivityIndicator, Alert, Pressable, RefreshControl, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import { useRouter } from "expo-router";
-import { api, connectionKey, type Connection, type GoalAssessment, type Me } from "../../api/client";
+import { api, connectionKey, type Connection, type GoalAssessment, type GoalMetricsView, type Me } from "../../api/client";
 import { usePoll } from "../../api/usePoll";
 import { Button } from "../../components/Button";
 import { useKeyboardPadding } from "../../components/keyboard";
@@ -18,6 +18,8 @@ import {
 } from "./model";
 import { Choices, Clamp, Disclosure, LinearChip, LineupView, RequestStatus, RunPill, Section, SteerBox, t } from "./parts";
 import { useRunRequest } from "./useRunRequest";
+import { buildCurves, NO_NUMBERS_NOTE, omittedText } from "./goal-curve";
+import { CurveRow } from "./GoalCurves";
 import { CostLine, MoneyText } from "../cost/parts";
 import { ASSESSMENT_LABEL, awaitsProvisionalAnswer, countsText, newestVerdictId, ownerOutcomeLabel, REMOTE_CRITERIA_NOTE, resultText, type AssessedGoal } from "./goal-verdicts";
 
@@ -26,6 +28,7 @@ export function GoalDetail({ connection, id }: { connection: Connection; id: str
   const keyboardPadding = useKeyboardPadding();
   const machine = connectionKey(connection);
   const poll = usePoll(async () => ({ goal: await api<ProductGoal>(connection, `/goals/${id}`), receivedAt: Date.now() }), 2000, [connection, id]);
+  const curve = usePoll(() => api<GoalMetricsView>(connection, `/goals/${id}/metrics`), 10000, [connection, id]);
   const { data: me } = usePoll(() => api<Me>(connection, "/me"), 10000, [connection]);
   const [recorded, setRecorded] = useState<ProductGoal | null>(null);
   const goal: AssessedGoal | null = poll.data ? newer(recorded, poll.data.goal) : recorded;
@@ -64,13 +67,14 @@ export function GoalDetail({ connection, id }: { connection: Connection; id: str
   const send = (action: string, label: string, fields?: Record<string, string | number | boolean>) => request.send(`/goals/${id}/${action}`, label, goal.revision, fields as Record<string, string | number> | undefined);
   const verdictId = newestVerdictId(goal.cycles);
   const provisional = awaitsProvisionalAnswer(goal);
+  const curves = curve.data ? buildCurves(curve.data, goal.cycles) : [];
 
   return <View style={[s.fill, s.overlayRoot, { paddingBottom: keyboardPadding }]}>
     {header}
     <FloatingNotice position="top" offset={58} message={poll.stale ? "Offline · last received state. Controls paused." : active.stale ? activeTeam ? "Active cycle may be out of date." : "Can't load the active cycle." : null} />
     <DictationNotice dictation={dictation} position="top" offset={110} />
     <ScrollView style={s.fill} contentContainerStyle={s.body} keyboardShouldPersistTaps="handled"
-      refreshControl={<RefreshControl refreshing={poll.refreshing} onRefresh={poll.refresh} tintColor={theme.colors.forest} colors={[theme.colors.forest]} />}>
+      refreshControl={<RefreshControl refreshing={poll.refreshing} onRefresh={() => { poll.refresh(); curve.refresh(); }} tintColor={theme.colors.forest} colors={[theme.colors.forest]} />}>
       <View style={s.titleBlock}>
         <Text style={t.note}>{project} · Product goal</Text>
         <Text style={t.title} numberOfLines={3}>{goal.title}</Text>
@@ -122,6 +126,13 @@ export function GoalDetail({ connection, id }: { connection: Connection; id: str
         <Text style={t.body}>{goal.cycles.length}/{goal.maxRuns} cycles · {goal.memberCount}/{goal.maxMembers} agents · Workers {goal.activeTeamId ? workerStatus(activeTeam ?? { parallelism: goal.parallelism }) : "Agent-managed"}</Text>
         <Text style={t.note}>The PM and coordinator adjust workers as work changes.</Text>
         <Text style={t.note}>Deadline {shortDate(goal.deadlineAt)}: {goal.maxMinutes} minutes from creation. Pausing does not extend it.</Text>
+      </Section>
+
+      <Section title="Reported numbers">
+        {curves.length ? curves.map(value => <CurveRow key={value.key} curve={value} />) : curve.data || curve.loading ? <Text style={t.note}>{curve.loading ? "Loading…" : NO_NUMBERS_NOTE}</Text> : null}
+        {curve.data ? omittedText(curve.data).map(line => <Text key={line} style={t.note}>{line}</Text>) : null}
+        {!curve.data && !curve.loading ? <Text style={t.warning}>The reported numbers could not be loaded.</Text> : null}
+        {curves.length ? <Text style={t.note}>Numbers reported by the goal’s checks, one point per cycle. A cycle with no point reported none.</Text> : null}
       </Section>
 
       <Section title="Previous cycles" count={previous.length}>

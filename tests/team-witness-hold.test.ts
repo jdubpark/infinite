@@ -30,7 +30,17 @@ async function until(check: () => boolean, message: string, timeoutMs = 30_000) 
   assert.fail(message);
 }
 
-test("a check that starts a server writing to a file leaves a hold: the cancelled run's directories stay, the view shows it running, and the next census after it ends removes them", { timeout: 120_000, skip: process.platform === "win32" && "process groups are POSIX" }, async () => {
+async function removeWhenCensusClears(teams: TeamService, id: string, timeoutMs = 30_000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try { return await teams.removeRun(id); } catch (error) {
+      if (!code("team-leftover-unknown")(error) || Date.now() > deadline) throw error;
+    }
+    await delay(250);
+  }
+}
+
+test("a check that starts a server writing to a file leaves a hold: the cancelled run's directories stay, the view shows it running, and a census after it ends removes them", { timeout: 120_000, skip: process.platform === "win32" && "process groups are POSIX" }, async () => {
   const f = schedulerFixture();
   const out = mkdtempSync(join(tmpdir(), "witness-hold-"));
   const at = new Date().toISOString();
@@ -59,8 +69,8 @@ test("a check that starts a server writing to a file leaves a hold: the cancelle
     assert.equal(teams.get(f.run.id).leftoverProcesses?.state, "running");
     process.kill(-group, "SIGKILL");
     await until(() => groupGone(group!), "the server ends");
-    await teams.removeRun(f.run.id);
-    assert.equal(existsSync(dirname(f.run.workspace)), false, "the next census finds none and the directories go");
+    await removeWhenCensusClears(teams, f.run.id);
+    assert.equal(existsSync(dirname(f.run.workspace)), false, "a census that finds none lets the directories go");
   } finally {
     if (group !== undefined) try { process.kill(-group, "SIGKILL"); } catch { }
     await teams.close();

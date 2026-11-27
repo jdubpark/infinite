@@ -433,7 +433,7 @@ export function buildLaunch(
       args.push("--dangerously-bypass-hook-trust");
       args.push(
         "-c",
-        `tui.notifications=["agent-turn-complete","approval-requested","async-question"]`,
+        `tui.notifications=["agent-turn-complete","approval-requested","async-question","plan-mode-prompt"]`,
       );
       args.push("-c", `tui.notification_method="osc9"`);
       args.push("-c", `tui.notification_condition="always"`);

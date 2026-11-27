@@ -36,6 +36,7 @@ import { handleClientCommand } from "./client.js";
 import { handleMachineCommand } from "./machine-cli.js";
 import { handleLocalBehaviorCheckCommand } from "./understanding-cli.js";
 import { githubProxyDoctorLine } from "./github-grants.js";
+import { ptyDoctorLine, ptyStartupWarning } from "./pty-preflight.js";
 
 function claudeSettingsDoctorLine(settingsPath: string): string | undefined {
   let raw: string;
@@ -451,6 +452,8 @@ else if (command === "plan-fleet") {
       throw error;
     }
     console.log(`Infinite: ${config.origin}\nExecution host: ${config.environment}\nClosing this API does not stop agent workers.`);
+    const ptyWarning = ptyStartupWarning();
+    if (ptyWarning) console.warn(ptyWarning);
     if (config.push?.enabled) {
       const accessToken = config.push.accessTokenFile
         ? readFileSync(config.push.accessTokenFile, "utf8").trim()
@@ -539,6 +542,8 @@ else if (command === "plan-fleet") {
       console.log(
         `Hook relay: ${existsSync(relay) ? relay : "MISSING (run npm run build)"}`,
       );
+      const ptyHelper = ptyDoctorLine();
+      if (ptyHelper) console.log(ptyHelper);
       const userSettingsWarning = claudeSettingsDoctorLine(join(homedir(), ".claude", "settings.json"));
       if (userSettingsWarning) console.log(userSettingsWarning);
       if (config.push?.enabled) {

@@ -45,10 +45,15 @@
 ### 6. Provider limit detection, reset parsing, and recovery proof
 - Reset hints (`resets 3:45pm`, `resets Mon 12:00am`, `Try again at ...`) parse clock times in UTC (matching host timezone) and resolve to the next occurrence after `now`.
 - Screen-based Codex usage-limit detection inspects only Codex's own status row (the final non-empty row, as a whole `·`-separated segment) so printed transcript text (`cat`/`grep`) cannot spoof a usage limit.
-- Only a non-failed `turn-end` from a source capable of reporting failure (`protocol` adapters or Claude `hook` `Stop`/`StopFailure`) clears an active `limit`. Codex terminal turn-end signals (`Stop` hook, `notify`, OSC 9) do not distinguish failure and therefore never clear a limit.
+- Only a non-failed `turn-end` from a source capable of reporting failure (`protocol` adapters or Claude `hook` `Stop`/`StopFailure`) clears an active `limit`. Codex terminal turn-end signals (`Stop` hook, `notify`, OSC 9/777) do not distinguish failure and therefore never clear a limit.
 - A `quota_auto_resume_fired` notice clears `limit` as a notice-only signal that the wait ended.
 
-### 7. Timeline moments and provenance labels
+### 7. Codex OSC 9 and OSC 777 notification parsing
+- Codex TUI notifications arrive either as OSC 9 (`\x1b]9;<body>\x07`) or OSC 777 (`\x1b]777;notify;Codex;<body>\x1b\\`). `mapCodexOsc777` accepts only `notify;Codex;<body>` (preserving semicolons in `<body>`) and ignores other OSC 777 titles or verbs without emitting a notice.
+- On nonempty turn completion, Codex places the assistant's response preview directly in the OSC notification body, so prompt-shaped text (`Approval requested: ...`, `Approval requested by <server>`, `Codex wants to edit <target>`, `Question: ...`, `Plan mode prompt: ...`) is ambiguous without terminal or structured corroboration and would otherwise open a hashless `source: "osc"` prompt that `screenDecision` could never close. `mapCodexOsc` therefore classifies those delimiter-bounded prefixes as notice-only signals (`osc_approval` / `osc_question`) rather than `prompt-open`, emits `turn-end` only on turn-complete markers (`Agent turn complete` / `Turn complete`, exact or with `:`), and leaves unrelated text as plain `osc` notices.
+- When the worker receives an `osc_approval` or `osc_question` notice, it triggers a coalesced screen inspection (`terminal.write("", () => checkScreen())`) so a genuine Codex dialog on screen opens as a screen-owned prompt (`source: "screen"`, `hash`, options, and clean `vanished` close, with Codex's Plan Mode choices `Yes, implement this plan` / `No, stay in Plan mode` classified as `question` in `prompts.ts`), while an assistant response preview with no dialog on screen stays safely notice-only. When the session is already `turn-finished`, the worker keeps any OSC `notice` but suppresses fallback OSC `turn-end` transitions so a late completion-shaped preview never erases a structured `codex-notify` `lastMessage` or duplicates completion moments. `launch.ts` includes `"plan-mode-prompt"` alongside `"agent-turn-complete"`, `"approval-requested"`, and `"async-question"` in `tui.notifications`.
+
+### 8. Timeline moments and provenance labels
 - Provider-submitted turns (`turn-start` with `automatic: true`, such as continuing after an owner's answer) are labeled as provider prompts rather than owner requests.
 - Timeline moments sort by latest activity timestamp so a completed tool surfaces above decisions opened while it ran.
 

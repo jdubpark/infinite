@@ -1,15 +1,22 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { execFile, execFileSync, spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { createServer, request } from "node:http";
 import { createHash, randomUUID } from "node:crypto";
 import { promisify } from "node:util";
 import { WebSocket, WebSocketServer } from "ws";
 import { spawn as ptySpawn, type IPty } from "node-pty";
 import headless from "@xterm/headless";
+import {
+  isUnsupportedPaginatedHistoryError,
+  parseCodexUserAgentVersion,
+  startNativeCodex,
+  supportsCodexPaginatedHistory,
+} from "../packages/host/src/native-codex.js";
 import { startHost, waitFor, claimControl, type Host } from "./helpers.js";
 
 function nativeUrl(host: Host, id: string, control: Awaited<ReturnType<typeof claimControl>>) {
@@ -440,5 +447,346 @@ test("--laptop Codex uses the laptop project, hands off a verified checkpoint, a
     for (const client of clients) client.terminate();
     for (const pid of executorPids) if (alive(pid)) process.kill(pid, "SIGTERM");
     await host.stop();
+  }
+});
+
+test("Codex paginated history capability parser checks explicit flags and strict semver userAgent", () => {
+  assert.deepEqual(parseCodexUserAgentVersion("probe/0.172.0 (Linux 6.8; x86_64)"), { major: 0, minor: 172, patch: 0 });
+  assert.deepEqual(parseCodexUserAgentVersion("codex_cli_rs/0.172.1-rc.1+build.4 (Darwin 24.0; arm64)"), {
+    major: 0, minor: 172, patch: 1, prerelease: "rc.1",
+  });
+  assert.deepEqual(parseCodexUserAgentVersion("codex-tui/1.0.0"), { major: 1, minor: 0, patch: 0 });
+  for (const invalid of [
+    undefined, null, "", "native-fixture", "0.172.0", "probe/0.172", "probe/0.0172.0",
+    "probe/0.172.0.1", "probe/v0.172.0", "probe/0.172.0-01", "native-fixture (Mac OS) Terminal/1.2.3",
+  ]) {
+    assert.equal(parseCodexUserAgentVersion(invalid), undefined, `expected invalid userAgent: ${String(invalid)}`);
+  }
+  for (const capable of [
+    { userAgent: "probe/0.172.0 (Linux 6.8; x86_64)" },
+    { userAgent: "probe/0.172.0+build.1 (Linux)" },
+    { userAgent: "probe/0.172.1-alpha.1 (Linux)" },
+    { userAgent: "probe/0.173.0 (Linux)" },
+    { userAgent: "codex_cli_rs/1.0.0 (Linux)" },
+    { userAgent: "native-fixture", capabilities: { paginatedHistory: true } },
+    { capabilities: { paginatedHistory: true } },
+    { userAgent: "probe/0.162.0 (Linux)", capabilities: { paginatedHistory: true } },
+  ]) {
+    assert.equal(supportsCodexPaginatedHistory(capable), true, `expected paginated support for ${JSON.stringify(capable)}`);
+  }
+  for (const legacy of [
+    undefined, null, [], {}, { userAgent: "native-fixture" },
+    { userAgent: "probe/0.162.0 (Linux 6.8; x86_64)" },
+    { userAgent: "probe/0.171.9 (Linux 6.8; x86_64)" },
+    { userAgent: "probe/0.172.0-alpha.1 (Linux)" },
+    { userAgent: "probe/0.172.0 (Linux)", capabilities: { paginatedHistory: false } },
+    { userAgent: "native-fixture (Mac OS) Terminal/0.172.0" },
+    { capabilities: { paginatedHistory: "true" } },
+  ]) {
+    assert.equal(supportsCodexPaginatedHistory(legacy), false, `expected legacy fallback for ${JSON.stringify(legacy)}`);
+  }
+  for (const unsupported of [
+    { code: -32600, message: "paginated threads require thread/turns/list and thread/items/list support" },
+    { code: -32600, message: "invalid_history_mode: paginated history is unsupported" },
+    { code: -32600, message: "rejected", data: { code: "invalid_history_mode" } },
+    { code: -32602, message: "unknown field `historyMode`" },
+    { code: -32602, message: "Server requires historyMode: legacy" },
+    { code: -32600, message: "thread store does not support paginated history" },
+  ]) {
+    assert.equal(isUnsupportedPaginatedHistoryError(unsupported), true, `expected unsupported-pagination match for ${JSON.stringify(unsupported)}`);
+  }
+  for (const unrelated of [
+    undefined, null, "paginated",
+    { code: -32000, message: "Internal error" },
+    { code: -32603, message: "Request timed out" },
+    { code: -32603, message: "paginated history store temporarily unavailable" },
+    { code: -32600, message: "paginated history store temporarily unavailable" },
+    { code: -32603, message: "paginated threads require thread/turns/list and thread/items/list support" },
+    { code: -32000, message: "paginated threads require thread/turns/list and thread/items/list support" },
+    { code: -32000, message: "Provider disconnected" },
+    { code: -32600, message: "Workspace cwd not found" },
+    { code: -32602, message: "Invalid model parameter" },
+  ]) {
+    assert.equal(isUnsupportedPaginatedHistoryError(unrelated), false, `must not retry unrelated error ${JSON.stringify(unrelated)}`);
+  }
+});
+
+test("native Codex capability-gates historyMode, hydrates paginated history across rejoin, and pins paginated read methods", { timeout: 45000 }, async () => {
+  const fixture = resolve("tests/fixtures/native-codex.mjs");
+  const rootTmp = realpathSync(mkdtempSync(join(tmpdir(), "infinite-codex-paginated-")));
+  const quote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
+  const wrapper = join(rootTmp, "codex-0172.sh");
+  writeFileSync(wrapper, `#!/bin/sh
+export FIXTURE_USER_AGENT="probe/0.172.0 (Linux 6.8; x86_64)"
+export FIXTURE_DEFAULT_HISTORY_MODE="paginated"
+exec ${quote(process.execPath)} ${quote(fixture)} "$@"
+`, { mode: 0o700 });
+  const host = await startHost({ agents: { codex: { command: wrapper, args: [] } }, config: { browserSessions: false } });
+  const clients: WebSocket[] = [];
+  const standalone: Array<Awaited<ReturnType<typeof startNativeCodex>>> = [];
+  try {
+    const id = randomUUID();
+    const path = `/sessions/${id}`;
+    const workspace = host.config.projects[0].path;
+    const bearer = { Authorization: `Bearer ${host.tokens.owner}` };
+    const created = await host.fetchApi("/sessions", "owner", {
+      provider: "codex", projectId: "rehearsal", title: "Paginated Native UI", localUi: true,
+      requestId: id, nativeArgs: ["initial prompt"],
+    });
+    assert.equal(created.status, 201);
+    const info = await waitFor(async () => (await host.fetchApi(`${path}/native`)).body, body => Boolean(body?.sessionId));
+    const threadId = info.sessionId as string;
+
+    const initialRequests = readFileSync(join(workspace, "provider-requests.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    const startRequests = initialRequests.filter(req => req.method === "thread/start");
+    assert.equal(startRequests.length, 1);
+    assert.equal(startRequests[0].params?.historyMode, undefined, "capable 0.172.0 server must not force historyMode: legacy");
+    assert.ok(
+      initialRequests.some(req => req.method === "thread/turns/list" && req.params?.threadId === threadId && req.params?.limit === 1),
+      "paginated readiness checkpoint must probe persisted turns via bounded thread/turns/list",
+    );
+
+    const control1 = await claimControl(host, id, "owner");
+    const first = await connect(nativeUrl(host, id, control1), bearer); clients.push(first.ws);
+    const firstResume = await first.rpc("thread/resume", { threadId, excludeTurns: true });
+    assert.equal(firstResume.error, undefined);
+    assert.equal(firstResume.result.thread.historyMode, "paginated");
+    assert.deepEqual(firstResume.result.thread.turns, []);
+    const completedTurn = await first.rpc("turn/start", { threadId, input: [{ type: "text", text: "complete" }] });
+    assert.equal(completedTurn.error, undefined);
+    await waitFor(async () => first.messages.some(msg => msg.method === "turn/completed" && msg.params?.turn?.id === completedTurn.result.turn.id && msg.params?.turn?.status === "completed"), Boolean);
+    const failedTurn = await first.rpc("turn/start", { threadId, input: [{ type: "text", text: "usage-limit" }] });
+    assert.equal(failedTurn.error, undefined);
+    await waitFor(async () => first.messages.some(msg => msg.method === "turn/completed" && msg.params?.turn?.id === failedTurn.result.turn.id && msg.params?.turn?.status === "failed"), Boolean);
+    first.ws.terminate();
+    await waitFor(async () => first.ws.readyState, state => state === WebSocket.CLOSED);
+
+    const control2 = await claimControl(host, id, "owner", { takeover: true });
+    const second = await connect(nativeUrl(host, id, control2), bearer); clients.push(second.ws);
+    const resumed = await second.rpc("thread/resume", { threadId, excludeTurns: true });
+    assert.equal(resumed.error, undefined);
+    assert.equal(resumed.result.thread.id, threadId);
+    assert.equal(resumed.result.thread.historyMode, "paginated");
+    assert.deepEqual(resumed.result.thread.turns, []);
+    assert.equal(typeof resumed.result.turnsBackwardsCursor, "string");
+    assert.ok(resumed.result.turnsBackwardsCursor.length > 0);
+    assert.equal(typeof resumed.result.itemsBackwardsCursor, "string");
+    assert.ok(resumed.result.itemsBackwardsCursor.length > 0);
+
+    const metaRead = await second.rpc("thread/read", { threadId, includeTurns: false });
+    assert.equal(metaRead.error, undefined);
+    assert.deepEqual(metaRead.result.thread.turns, []);
+    const fullRead = await second.rpc("thread/read", { threadId, includeTurns: true });
+    assert.equal(fullRead.error, undefined);
+    assert.equal(fullRead.result.thread.turns.length, 3);
+
+    const resumedWithInitial = await second.rpc("thread/resume", {
+      threadId,
+      excludeTurns: true,
+      initialTurnsPage: { limit: 2, sortDirection: "desc", itemsView: "summary" },
+    });
+    assert.deepEqual(resumedWithInitial.result.initialTurnsPage.data.map((turn: { text: string }) => turn.text), ["usage-limit", "complete"]);
+    assert.equal(typeof resumedWithInitial.result.initialTurnsPage.nextCursor, "string");
+    assert.ok(resumedWithInitial.result.initialTurnsPage.nextCursor.length > 0);
+
+    const descTurns: Array<{ id: string; text: string; status: string; items: Array<{ id: string; text: string }> }> = [];
+    let turnCursor: string | null = resumed.result.turnsBackwardsCursor;
+    do {
+      const page = await second.rpc("thread/turns/list", {
+        threadId, limit: 2, sortDirection: "desc", itemsView: "full", cursor: turnCursor,
+      });
+      assert.equal(page.error, undefined);
+      descTurns.push(...page.result.data);
+      turnCursor = page.result.nextCursor;
+    } while (turnCursor !== null);
+    assert.deepEqual(descTurns.map(turn => turn.text), ["usage-limit", "complete", "initial prompt"]);
+    assert.deepEqual(descTurns.map(turn => turn.status), ["failed", "completed", "inProgress"]);
+    assert.equal(descTurns[0].items.length, 2);
+
+    const descItems: Array<{ turnId: string; item: { id: string; text: string } }> = [];
+    let itemCursor: string | null = resumed.result.itemsBackwardsCursor;
+    do {
+      const page = await second.rpc("thread/items/list", {
+        threadId, limit: 3, sortDirection: "desc", cursor: itemCursor,
+      });
+      assert.equal(page.error, undefined);
+      descItems.push(...page.result.data);
+      itemCursor = page.result.nextCursor;
+    } while (itemCursor !== null);
+    assert.equal(descItems.length, 6);
+    assert.deepEqual(descItems.map(entry => entry.item.text), [
+      "reply:usage-limit", "usage-limit",
+      "reply:complete", "complete",
+      "reply:initial prompt", "initial prompt",
+    ]);
+
+    const completedTurnEntry = descTurns.find(turn => turn.text === "complete")!;
+    const secondTurnItems = await second.rpc("thread/items/list", { threadId, turnId: completedTurnEntry.id });
+    assert.equal(secondTurnItems.error, undefined);
+    assert.deepEqual(secondTurnItems.result.data.map((entry: { item: { text: string } }) => entry.item.text), ["complete", "reply:complete"]);
+
+    const readItems = await second.rpc("thread/items/read", {
+      threadId, turnId: completedTurnEntry.id, itemIds: [completedTurnEntry.items[1].id],
+    });
+    assert.equal(readItems.error, undefined);
+    assert.deepEqual(readItems.result.items.map((item: { text: string }) => item.text), ["reply:complete"]);
+
+    const timeline = await second.rpc("thread/timeline/list", { threadId, limit: 10 });
+    assert.equal(timeline.error, undefined);
+    assert.equal(timeline.result.data.length, 6);
+
+    const foreignId = randomUUID();
+    const guardedMethods = ["thread/turns/list", "thread/items/list", "thread/items/read", "thread/timeline/list", "thread/read"] as const;
+    let rawId = 1000;
+    const sendRaw = async (frame: Record<string, unknown>) => {
+      const id = rawId++;
+      second.ws.send(JSON.stringify({ id, ...frame }));
+      return waitFor(async () => second.messages.find(message => message.id === id && !message.method), Boolean);
+    };
+    for (const method of guardedMethods) {
+      for (const frame of [
+        { method, params: { threadId: foreignId } },
+        { method, params: {} },
+        { method, params: null },
+        { method },
+      ]) {
+        const response = await sendRaw(frame);
+        assert.equal(response.error?.code, -32600, `${method} must refuse missing or foreign threadId (${JSON.stringify(frame)})`);
+      }
+    }
+    const allProviderRequests = readFileSync(join(workspace, "provider-requests.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    for (const method of guardedMethods) {
+      for (const req of allProviderRequests.filter(entry => entry.method === method)) {
+        assert.equal(req.params?.threadId, threadId, `${method} must never forward foreign or missing threadId upstream`);
+      }
+    }
+
+    const startStandalone = async (name: string, env: Record<string, string>) => {
+      const cwd = join(rootTmp, name);
+      mkdirSync(cwd);
+      const native = await startNativeCodex({
+        profile: { command: process.execPath, args: [fixture] },
+        cwd,
+        env: { PATH: process.env.PATH ?? "", ...env },
+        checkControl: () => {},
+        onThread: () => {},
+        onExit: () => {},
+        onSignal: () => {},
+        noAltScreen: false,
+        record: () => {},
+      });
+      standalone.push(native);
+      const obs = await connect(new URL(native.url), { Authorization: `Bearer ${native.observerToken}` });
+      clients.push(obs.ws);
+      const readReqs = () => readFileSync(join(cwd, "provider-requests.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+      return { cwd, native, obs, readReqs };
+    };
+
+    const runDirectStart = async (name: string, env: Record<string, string>, startParams: Record<string, unknown>) => {
+      const { native, obs, readReqs } = await startStandalone(name, env);
+      const started = await obs.rpc("thread/start", startParams);
+      assert.equal(started.error, undefined, `${name}: unexpected thread/start error ${JSON.stringify(started.error)}`);
+      const startedId = started.result.thread.id as string;
+      const turn = await obs.rpc("turn/start", { threadId: startedId, input: [{ type: "text", text: "ping" }] });
+      assert.equal(turn.error, undefined);
+      await waitFor(async () => native.info().sessionId, value => value === startedId, 10000);
+      return { started, reqs: readReqs() };
+    };
+
+    const capPaginated = await runDirectStart("cap-paginated", {
+      FIXTURE_USER_AGENT: "custom-server",
+      FIXTURE_CAPABILITIES: JSON.stringify({ paginatedHistory: true }),
+      FIXTURE_DEFAULT_HISTORY_MODE: "paginated",
+    }, { historyMode: "paginated" });
+    assert.equal(capPaginated.reqs.find(req => req.method === "thread/start")?.params?.historyMode, "paginated");
+    assert.equal(capPaginated.started.result.thread.historyMode, "paginated");
+    assert.ok(capPaginated.reqs.some(req => req.method === "thread/turns/list" && req.params?.limit === 1));
+
+    const capExplicitLegacy = await runDirectStart("cap-explicit-legacy", {
+      FIXTURE_USER_AGENT: "probe/0.172.0 (Linux 6.8; x86_64)",
+      FIXTURE_DEFAULT_HISTORY_MODE: "paginated",
+    }, { historyMode: "legacy" });
+    assert.equal(capExplicitLegacy.reqs.find(req => req.method === "thread/start")?.params?.historyMode, "legacy");
+    assert.ok(capExplicitLegacy.reqs.some(req => req.method === "thread/read" && req.params?.includeTurns === true));
+
+    const fallback0172 = await runDirectStart("fallback-0172", {
+      FIXTURE_USER_AGENT: "probe/0.172.0 (Linux 6.8; x86_64)",
+      FIXTURE_UNSUPPORTED_PAGINATION: "1",
+    }, {});
+    const fallbackStarts = fallback0172.reqs.filter(req => req.method === "thread/start");
+    assert.equal(fallbackStarts.length, 2, "omitted-historyMode start must retry once with historyMode: legacy on unsupported-pagination rejection");
+    assert.equal(fallbackStarts[0].params?.historyMode, undefined);
+    assert.equal(fallbackStarts[1].params?.historyMode, "legacy");
+    assert.ok(fallback0172.reqs.some(req => req.method === "thread/read" && req.params?.includeTurns === true));
+
+    const explicitPaginatedNoRetry = await startStandalone("explicit-paginated-no-retry", {
+      FIXTURE_USER_AGENT: "probe/0.172.0 (Linux 6.8; x86_64)",
+      FIXTURE_UNSUPPORTED_PAGINATION: "1",
+    });
+    const explicitErr = await explicitPaginatedNoRetry.obs.rpc("thread/start", { historyMode: "paginated" });
+    assert.equal(explicitErr.error?.code, -32600);
+    assert.equal(explicitPaginatedNoRetry.readReqs().filter(req => req.method === "thread/start").length, 1);
+
+    const genericErrNoRetry = await startStandalone("generic-error-no-retry", {
+      FIXTURE_USER_AGENT: "probe/0.172.0 (Linux 6.8; x86_64)",
+      FIXTURE_FAIL_THREAD_START_MESSAGE: "Temporary backend store timeout",
+    });
+    const genericErr = await genericErrNoRetry.obs.rpc("thread/start", {});
+    assert.equal(genericErr.error?.code, -32000);
+    assert.equal(genericErrNoRetry.readReqs().filter(req => req.method === "thread/start").length, 1);
+
+    const unmaterializedFlag = join(rootTmp, "unmaterialized.flag");
+    writeFileSync(unmaterializedFlag, "1");
+    const gated = await startStandalone("paginated-unmaterialized-gate", {
+      FIXTURE_USER_AGENT: "probe/0.172.0 (Linux 6.8; x86_64)",
+      FIXTURE_DEFAULT_HISTORY_MODE: "paginated",
+      FIXTURE_UNMATERIALIZED_FLAG_FILE: unmaterializedFlag,
+    });
+    const gatedStart = await gated.obs.rpc("thread/start", {});
+    assert.equal(gatedStart.error, undefined);
+    const gatedId = gatedStart.result.thread.id as string;
+    await gated.obs.rpc("turn/start", { threadId: gatedId, input: [{ type: "text", text: "first" }] });
+    await waitFor(async () => gated.readReqs().some(req => req.method === "thread/turns/list"), Boolean, 10000);
+    await new Promise(done => setTimeout(done, 80));
+    assert.equal(gated.native.info().sessionId, undefined, "unmaterialized paginated thread must not advertise readiness before turns are readable");
+    assert.throws(() => gated.native.connect({ actor: { id: "owner-1", label: "Owner" }, leaseId: "lease-gated" }), /not ready/);
+    rmSync(unmaterializedFlag, { force: true });
+    await gated.obs.rpc("turn/start", { threadId: gatedId, input: [{ type: "text", text: "complete" }] });
+    await waitFor(async () => gated.native.info().sessionId, value => value === gatedId, 10000);
+
+    const race = await startStandalone("paginated-inflight-recheck", {
+      FIXTURE_USER_AGENT: "probe/0.172.0 (Linux 6.8; x86_64)",
+      FIXTURE_DEFAULT_HISTORY_MODE: "paginated",
+      FIXTURE_DELAY_EMPTY_FIRST_TURNS_LIST_MS: "150",
+    });
+    const raceStart = await race.obs.rpc("thread/start", {});
+    assert.equal(raceStart.error, undefined);
+    const raceId = raceStart.result.thread.id as string;
+    const raceTurn = await race.obs.rpc("turn/start", { threadId: raceId, input: [{ type: "text", text: "complete" }] });
+    assert.equal(raceTurn.error, undefined);
+    await waitFor(async () => race.obs.messages.some(msg => msg.method === "turn/completed" && msg.params?.turn?.id === raceTurn.result.turn.id), Boolean, 10000);
+    await waitFor(async () => race.native.info().sessionId, value => value === raceId, 10000);
+    assert.ok(
+      race.readReqs().filter(req => req.method === "thread/turns/list").length >= 2,
+      "notifications arriving during an empty in-flight checkpoint probe must trigger a follow-up probe automatically",
+    );
+
+    const legacy0162 = await runDirectStart("legacy-0162", {
+      FIXTURE_USER_AGENT: "probe/0.162.0 (Linux 6.8; x86_64)",
+      FIXTURE_REQUIRE_LEGACY_HISTORY: "1",
+    }, { historyMode: "paginated" });
+    assert.equal(legacy0162.reqs.find(req => req.method === "thread/start")?.params?.historyMode, "legacy");
+    assert.ok(legacy0162.reqs.some(req => req.method === "thread/read" && req.params?.includeTurns === true));
+
+    const missingUserAgent = await runDirectStart("missing-ua", {
+      FIXTURE_OMIT_USER_AGENT: "1",
+      FIXTURE_REQUIRE_LEGACY_HISTORY: "1",
+    }, {});
+    assert.equal(missingUserAgent.reqs.find(req => req.method === "thread/start")?.params?.historyMode, "legacy");
+  } finally {
+    for (const client of clients) client.terminate();
+    for (const instance of standalone) instance.stop();
+    await host.stop();
+    rmSync(rootTmp, { recursive: true, force: true });
   }
 });

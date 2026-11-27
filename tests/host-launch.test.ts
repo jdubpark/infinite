@@ -269,7 +269,7 @@ test("codex gets -c hook overrides, notify, osc notifications and trust bypass",
   assert.match(joined, /--dangerously-bypass-hook-trust/);
   assert.match(joined, /-c hooks\.PermissionRequest=\[\{hooks=\[\{type="command",command="node \/opt\/infinite\/packages\/host\/dist\/hook-relay\.js codex"\}\]\}\]/);
   assert.match(joined, /-c notify=\["node","\/opt\/infinite\/packages\/host\/dist\/hook-relay\.js","codex-notify"\]/);
-  assert.match(joined, /-c tui\.notifications=\["agent-turn-complete","approval-requested","async-question"\]/);
+  assert.match(joined, /-c tui\.notifications=\["agent-turn-complete","approval-requested","async-question","plan-mode-prompt"\]/);
   assert.match(joined, /-c tui\.notification_method="osc9"/);
   assert.match(joined, /-c tui\.notification_condition="always"/);
   assert.equal(launch.args.at(-1), "do it");

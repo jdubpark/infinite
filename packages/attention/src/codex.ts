@@ -37,18 +37,34 @@ export function mapCodexNotify(body: unknown): Signal[] {
   return [{ kind: "turn-end", message: str(b["last-assistant-message"], 4000), backgroundTasks: 0 }];
 }
 
-const OSC_APPROVAL = ["approval requested", "codex: approval requested"];
-const OSC_QUESTION = ["question", "codex: question"];
-const OSC_TURN_END = ["turn complete", "codex: turn complete"];
+const OSC_APPROVAL: readonly RegExp[] = [
+  /^(?:codex:[ \t]*)?approval requested(?:$|:|[ \t]+by[ \t]+\S)/,
+  /^codex wants to edit(?:$|:|[ \t]+\S)/,
+];
+const OSC_QUESTION: readonly RegExp[] = [
+  /^(?:codex:[ \t]*)?question(?:$|:)/,
+  /^(?:codex:[ \t]*)?plan mode prompt(?:$|:)/,
+];
+const OSC_TURN_END: readonly RegExp[] = [
+  /^(?:codex:[ \t]*)?(?:agent )?turn complete(?:$|:)/,
+];
+const OSC_777_CODEX = /^notify;codex;([\s\S]*)$/i;
 
 export function mapCodexOsc(text: string): Signal[] {
   if (typeof text !== "string") return [];
   const t = text.trim();
   const lower = t.toLowerCase();
-  const startsWith = (phrases: string[]) => phrases.some((p) => lower.startsWith(p));
-  const out: Signal[] = [{ kind: "notice", type: "osc", message: cut(t, 500) }];
-  if (startsWith(OSC_APPROVAL)) out.push({ kind: "prompt-open", prompt: { id: 0, kind: "permission", title: "Approval needed", options: [], acceptsText: false, source: "osc" } });
-  else if (startsWith(OSC_QUESTION)) out.push({ kind: "prompt-open", prompt: { id: 0, kind: "question", title: cut(t, 200), options: [], acceptsText: false, source: "osc" } });
-  else if (startsWith(OSC_TURN_END)) out.push({ kind: "turn-end", backgroundTasks: 0 });
+  const matches = (patterns: readonly RegExp[]) => patterns.some((p) => p.test(lower));
+  const message = cut(t, 500);
+  if (matches(OSC_APPROVAL)) return [{ kind: "notice", type: "osc_approval", message }];
+  if (matches(OSC_QUESTION)) return [{ kind: "notice", type: "osc_question", message }];
+  const out: Signal[] = [{ kind: "notice", type: "osc", message }];
+  if (matches(OSC_TURN_END)) out.push({ kind: "turn-end", backgroundTasks: 0 });
   return out;
+}
+
+export function mapCodexOsc777(data: string): Signal[] {
+  if (typeof data !== "string") return [];
+  const match = OSC_777_CODEX.exec(data);
+  return match ? mapCodexOsc(match[1]) : [];
 }

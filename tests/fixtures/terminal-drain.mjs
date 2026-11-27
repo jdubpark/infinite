@@ -10,7 +10,7 @@ if (delay) {
   const write = Terminal.prototype.write;
   Terminal.prototype.write = function (data, callback) {
     const slow = data === "" && callback && barrierDrain() && fast-- <= 0 && (!gate || existsSync(gate));
-    if (slow && log) appendFileSync(log, "slow\n");
+    if (slow && log) appendFileSync(log, `slow ${Date.now()}\n`);
     return write.call(this, data, slow ? () => setTimeout(callback, delay) : callback);
   };
 }

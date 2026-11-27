@@ -8,6 +8,8 @@ export const COMMAND_STOP_STATEMENT_REASON = "The host stopped a configured team
 export const commandStopReasons = new Set([COMMAND_STOP_UNCONFIRMED_REASON, COMMAND_STOP_STATEMENT_REASON]);
 export const HALT_CENSUS_MS = 30_000;
 export const ANCHOR_SETTLE_MS = STOP_GRACE_MS + 2_000;
+export const ANCHOR_RETRY_MS = 1_000;
+export const ANCHOR_RETRIES = 8;
 
 export type OwnerStatement = { requestId: string; at: string; detail: string };
 export type TakenCensus = { at: string; operation?: { pendingId: string; result: CensusResult }; leftover?: { record: StoredLeftover; result: CensusResult } };
@@ -146,8 +148,17 @@ export class CommandFence {
   }
   watch(stored: Stored) {
     if (!stopFenced(stored)) return;
-    const settled = this.host.config.teams?.commandPrefix ? new Promise<void>(resolve => setTimeout(resolve, ANCHOR_SETTLE_MS).unref()) : Promise.resolve();
-    void settled.then(() => this.take(stored.run.id)).then(taken => taken && this.host.enqueue(stored.run.id, () => this.apply(stored, taken))).catch(() => {});
+    const prefixed = Boolean(this.host.config.teams?.commandPrefix);
+    const pause = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms).unref());
+    const takeSettled = async () => {
+      let taken = await this.take(stored.run.id);
+      for (let retry = 0; prefixed && retry < ANCHOR_RETRIES && taken?.operation && censusCounts(taken.operation.result).state === "running"; retry++) {
+        await pause(ANCHOR_RETRY_MS);
+        taken = await this.take(stored.run.id);
+      }
+      return taken;
+    };
+    void (prefixed ? pause(ANCHOR_SETTLE_MS) : Promise.resolve()).then(takeSettled).then(taken => taken && this.host.enqueue(stored.run.id, () => this.apply(stored, taken))).catch(() => {});
   }
   recent(id: string, reuseMs: number): Promise<TakenCensus | undefined> {
     const stored = this.host.records.get(id), census = stored?.census;

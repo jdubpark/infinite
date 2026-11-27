@@ -120,6 +120,25 @@ export function witnessFindings(witness: ProcessWitness, table: ProcessTable): C
   }
   return findings;
 }
+export function liveWitness(witness: ProcessWitness, table: ProcessTable): { witness: ProcessWitness; count: number } | undefined {
+  if (table.boot !== witness.boot) return undefined;
+  const live: ProcessWitness = { boot: witness.boot, processes: [], sessions: [], groups: [] };
+  let count = 0;
+  for (const row of table.rows) {
+    if (row.pid === process.pid) continue;
+    const byProcess = witness.processes.some(recorded => recorded.pid === row.pid && recorded.start === row.start);
+    const bySession = row.sid !== undefined && witness.sessions.includes(row.sid);
+    const byGroup = witness.groups.includes(row.pgid);
+    if (!byProcess && !bySession && !byGroup) continue;
+    count += 1;
+    if (byProcess) live.processes.push({ pid: row.pid, start: row.start });
+    if (bySession) addUnique(live, live.sessions, row.sid!);
+    if (byGroup) addUnique(live, live.groups, row.pgid);
+  }
+  if (count === 0) return undefined;
+  if (witness.overflow) live.overflow = true;
+  return { witness: live, count };
+}
 function accountedFor(witness: ProcessWitness, row: ProcessRow): CensusReason | undefined {
   return witness.processes.some(recorded => recorded.pid === row.pid && recorded.start === row.start) ? "recorded-process"
     : row.sid !== undefined && witness.sessions.includes(row.sid) ? "recorded-session"

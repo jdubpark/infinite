@@ -13,12 +13,15 @@ import {
   CODEX_ENVIRONMENT_STATE_FILE,
   connectCodexEnvironments,
   openCodexEnvironmentStore,
+  parseCodexUserAgentVersion,
+  supportsCodexPaginatedHistory,
   type CodexEnvironmentClient,
   type CodexEnvironmentPersistenceOptions,
   type CodexEnvironmentStore,
   type CodexExecutor,
+  type CodexSemver,
 } from "./codex-environment.js";
-export { CODEX_ENVIRONMENT_STATE_FILE };
+export { CODEX_ENVIRONMENT_STATE_FILE, parseCodexUserAgentVersion, supportsCodexPaginatedHistory, type CodexSemver };
 
 export function validateNativeCodexArgs(args: string[], initialPrompt = "", allowEmpty = false) {
   const values = new Set(["-m", "--model", "-c", "--config", "-a", "--ask-for-approval", "-s", "--sandbox"]);
@@ -107,6 +110,46 @@ type Message = { id?: number | string; method?: string; params?: Record<string, 
 type Attachment = { authority: InputControl; used: boolean };
 type Executor = CodexExecutor;
 type PendingRequest = { method: string; generation?: number; trackedResume?: boolean };
+type ThreadHistoryMode = "paginated" | "legacy";
+type PendingStart = {
+  id: number | string;
+  canFallbackToLegacy: boolean;
+  requestedHistoryMode: ThreadHistoryMode;
+  fallbackRetryMessage?: Message;
+};
+type CheckpointStep = "legacy-read" | "paginated-turns" | "paginated-env";
+
+const THREAD_SCOPED_READ_METHODS = new Set([
+  "thread/read",
+  "thread/turns/list",
+  "thread/items/list",
+  "thread/items/read",
+  "thread/timeline/list",
+]);
+const UNSUPPORTED_PAGINATED_ERROR_PATTERNS = [
+  /paginated threads require thread\/turns\/list and thread\/items\/list support/i,
+  /\binvalid_history_mode\b/i,
+  /\bpaginated\b[^.\n]*\b(?:not supported|unsupported|requires?\s+thread\/turns\/list)/i,
+  /\b(?:not supported|unsupported|does not support)\b[^.\n]*\bpaginated\b/i,
+  /\b(?:historyMode|history_mode|history mode)\b[^.\n]*\b(?:not supported|unsupported|unknown field|unknown variant|invalid|legacy)/i,
+  /\b(?:unknown field|unknown variant|unsupported|invalid|requires?)\b[^.\n]*\b(?:historyMode|history_mode|history mode)\b/i,
+];
+
+export function isUnsupportedPaginatedHistoryError(error: unknown): boolean {
+  if (!error || typeof error !== "object" || Array.isArray(error)) return false;
+  const row = error as Record<string, unknown>;
+  if (row.code !== -32600 && row.code !== -32602) return false;
+  const candidates: string[] = [];
+  if (typeof row.message === "string") candidates.push(row.message);
+  if (typeof row.data === "string") candidates.push(row.data);
+  else if (row.data && typeof row.data === "object" && !Array.isArray(row.data)) {
+    const data = row.data as Record<string, unknown>;
+    for (const key of ["code", "error", "reason", "message"]) {
+      if (typeof data[key] === "string") candidates.push(data[key]);
+    }
+  }
+  return candidates.some(text => UNSUPPORTED_PAGINATED_ERROR_PATTERNS.some(pattern => pattern.test(text)));
+}
 
 function appServerLaunch(profile: AgentProfile) {
   if (profile.appServerCommand) return { command: profile.appServerCommand, args: profile.appServerArgs ?? [] };
@@ -163,6 +206,10 @@ export async function startNativeCodex(options: {
   let child: ChildProcess | undefined;
   let restoredClean = true;
   let verifyingResumes = 0;
+  let backendGeneration = 0;
+  let supportsPaginatedHistory = false;
+  let backendCapabilitiesKnown = false;
+  let activeThreadHistoryMode: ThreadHistoryMode = "legacy";
   const http = createServer((_req, res) => { res.writeHead(404); res.end(); });
   const sockets = new WebSocketServer({ noServer: true, maxPayload: NATIVE_MAX_MESSAGE, perMessageDeflate: false });
   const upstreams = new Set<WebSocket>();
@@ -210,6 +257,9 @@ export async function startNativeCodex(options: {
     })();
   };
   const bootProvider = async (targetThreadId?: string): Promise<"started" | "restored" | "fenced"> => {
+    backendGeneration += 1;
+    supportsPaginatedHistory = false;
+    backendCapabilitiesKnown = false;
     const nextToken = randomBytes(32).toString("hex");
     const spawned = spawn(backend.command, [...backend.args, "--listen", "ws://127.0.0.1:0",
       "--ws-auth", "capability-token", "--ws-token-sha256", createHash("sha256").update(nextToken).digest("hex")], {
@@ -251,10 +301,12 @@ export async function startNativeCodex(options: {
         ...(options.environmentStore ? { store: options.environmentStore } : {}),
       });
       environments = nextEnvironments;
+      supportsPaginatedHistory = supportsCodexPaginatedHistory(nextEnvironments.initializeResult);
+      backendCapabilitiesKnown = true;
       await nextEnvironments.register(execution);
       if (targetThreadId) {
         try {
-          await nextEnvironments.restoreThread(targetThreadId);
+          await nextEnvironments.restoreThread(targetThreadId, { excludeTurns: supportsPaginatedHistory });
           ready = true;
           restoredClean = true;
           options.onThread(targetThreadId);
@@ -281,10 +333,12 @@ export async function startNativeCodex(options: {
         if (attachment) { options.checkControl(attachment.authority); attachment.used = true; }
       } catch { socket.end("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n"); return; }
       sockets.handleUpgrade(req, socket, head, frontend => {
+        const socketGeneration = backendGeneration;
         const upstream = new WebSocket(endpoint, { headers: { Authorization: `Bearer ${token}` }, maxPayload: NATIVE_MAX_MESSAGE, perMessageDeflate: false, handshakeTimeout: 10000 });
         upstreams.add(upstream);
         const queue: string[] = [];
-        let bytes = 0, startRequest: number | string | undefined;
+        let bytes = 0;
+        let pendingStart: PendingStart | undefined;
         let endStartupDiscovery: (() => void) | undefined;
         let holdingFrontend = 0;
         const heldUpstream: string[] = [];
@@ -292,6 +346,8 @@ export async function startNativeCodex(options: {
         let socketPendingResumes = 0;
         const checkpointRequest = `infinite-checkpoint-${randomBytes(16).toString("hex")}`;
         let checking = false;
+        let recheckCheckpoint = false;
+        let checkpointStep: CheckpointStep | undefined;
         let checkpointGeneration: number | undefined;
         const pending = new Map<number | string, PendingRequest>();
         const releaseDiscovery = () => {
@@ -370,8 +426,11 @@ export async function startNativeCodex(options: {
             const refuse = (reason = "This Infinite attachment is pinned to one conversation. Start or switch sessions through Infinite.") => {
               if (message.id !== undefined) send(frontend, JSON.stringify({ id: message.id, error: { code: -32600, message: reason } }));
             };
+            let pendingStartCandidate: { canFallbackToLegacy: boolean; requestedHistoryMode: ThreadHistoryMode } | undefined;
             if (method === "thread/start") {
-              if (!observer || threadId || startRequest !== undefined || message.id === undefined) { refuse(); return; }
+              if (!observer || threadId || pendingStart !== undefined || message.id === undefined) { refuse(); return; }
+              if (execution && selecting) { refuse("Execution is moving to the cloud. Retry after handoff completes."); return; }
+              if (params?.threadId !== undefined && params.threadId !== threadId) { refuse(); return; }
               if (execution && environments) {
                 try {
                   endStartupDiscovery = environments.beginStartupDiscovery(execution.environmentId);
@@ -380,10 +439,18 @@ export async function startNativeCodex(options: {
                   return;
                 }
               }
-              message.params = { ...params, historyMode: "legacy" };
-              startRequest = message.id;
+              const explicitHistoryMode = params?.historyMode;
+              const useLegacyOverride = !supportsPaginatedHistory;
+              if (useLegacyOverride) {
+                message.params = { ...params, historyMode: "legacy" };
+              }
+              pendingStartCandidate = {
+                canFallbackToLegacy: !useLegacyOverride && (explicitHistoryMode === undefined || explicitHistoryMode === null),
+                requestedHistoryMode: useLegacyOverride || explicitHistoryMode === "legacy" ? "legacy" : "paginated",
+              };
             } else if (method === "thread/fork" || method === "thread/delete" || method === "thread/archive" || method === "thread/unarchive") { refuse(); return; }
             if (params?.threadId !== undefined && params.threadId !== threadId) { refuse(); return; }
+            if (method && THREAD_SCOPED_READ_METHODS.has(method) && (!threadId || params?.threadId !== threadId)) { refuse(); return; }
             if (method === "thread/resume" && (params?.path || params?.history || !threadId || params?.threadId !== threadId)) { refuse(); return; }
             if (execution && method) {
               if (selecting && ["thread/start", "thread/resume", "thread/settings/update", "turn/start", "turn/settings/update"].includes(method)) { refuse("Execution is moving to the cloud. Retry after handoff completes."); return; }
@@ -421,6 +488,16 @@ export async function startNativeCodex(options: {
                 refuse("This workspace action is unavailable for laptop execution. Use the conversation's laptop tools; the cloud workspace will not be substituted."); return;
               }
             }
+            if (pendingStartCandidate && message.id !== undefined) {
+              pendingStart = {
+                id: message.id,
+                canFallbackToLegacy: pendingStartCandidate.canFallbackToLegacy,
+                requestedHistoryMode: pendingStartCandidate.requestedHistoryMode,
+                ...(pendingStartCandidate.canFallbackToLegacy
+                  ? { fallbackRetryMessage: { ...message, params: { ...message.params, historyMode: "legacy" } } }
+                  : {}),
+              };
+            }
             if (method && message.id !== undefined) {
               if (pending.size >= 1024) throw new Error("Too many pending native requests");
               const currentView = environments && threadId ? environments.placement(threadId) : undefined;
@@ -443,38 +520,123 @@ export async function startNativeCodex(options: {
             else close();
           } catch { close(); }
         });
+        const startCheckpoint = () => {
+          if (!threadId || upstream.readyState !== WebSocket.OPEN) return;
+          checking = true;
+          recheckCheckpoint = false;
+          const view = environments ? environments.placement(threadId) : undefined;
+          checkpointGeneration = view?.status === "verified" ? view.placement.generation : undefined;
+          if (activeThreadHistoryMode === "paginated") {
+            checkpointStep = "paginated-turns";
+            send(upstream, JSON.stringify({ id: checkpointRequest, method: "thread/turns/list", params: { threadId, limit: 1 } }));
+          } else {
+            checkpointStep = "legacy-read";
+            send(upstream, JSON.stringify({ id: checkpointRequest, method: "thread/read", params: { threadId, includeTurns: true } }));
+          }
+        };
+        const maybeRecheckCheckpoint = () => {
+          if (ready) {
+            recheckCheckpoint = false;
+            return;
+          }
+          if (!checking && recheckCheckpoint && threadId && upstream.readyState === WebSocket.OPEN) {
+            recheckCheckpoint = false;
+            startCheckpoint();
+          }
+        };
+        const verifyCheckpointEnvironment = (thread: Record<string, any> | undefined, observedCheckpointGen: number | undefined, retryStep: "legacy-read" | "paginated-env") => {
+          if (!environments || !execution || !threadId) return;
+          const view = environments.placement(threadId);
+          if (!restoredClean || view.status !== "verified") {
+            ready = false;
+          } else if (observedCheckpointGen !== undefined && observedCheckpointGen !== view.placement.generation) {
+            ready = false;
+            if (upstream.readyState === WebSocket.OPEN) {
+              checking = true;
+              checkpointStep = retryStep;
+              checkpointGeneration = view.placement.generation;
+              send(upstream, JSON.stringify({
+                id: checkpointRequest,
+                method: "thread/read",
+                params: { threadId, includeTurns: retryStep === "legacy-read" },
+              }));
+            }
+          } else if (!Array.isArray(thread?.environments)) {
+            ready = false;
+          } else {
+            try { environments.assertObservedEnvironments(threadId, thread.environments); } catch { ready = false; }
+          }
+        };
         upstream.on("open", () => { try { for (const data of queue) { authority(); send(upstream, data); } queue.length = 0; bytes = 0; } catch { close(); } });
         upstream.on("message", (data, binary) => {
           try {
             if (binary) throw new Error("Expected native JSON");
             const message = JSON.parse(data.toString()) as Message;
-            if (message.id === checkpointRequest) {
-              checking = false;
+            if (message.id === checkpointRequest && !message.method) {
+              const step = checkpointStep;
               const observedCheckpointGen = checkpointGeneration;
+              checkpointStep = undefined;
               checkpointGeneration = undefined;
-              const thread = message.result?.thread;
-              ready = !message.error && thread?.id === threadId;
-              if (ready && environments && execution && threadId) {
-                const view = environments.placement(threadId);
-                if (!restoredClean || view.status !== "verified") {
+              if (step === "paginated-turns") {
+                const hasPersistedTurns = !message.error && Array.isArray(message.result?.data) && message.result.data.length > 0;
+                if (!hasPersistedTurns) {
+                  checking = false;
                   ready = false;
-                } else if (observedCheckpointGen !== undefined && observedCheckpointGen !== view.placement.generation) {
-                  ready = false;
-                  if (upstream.readyState === WebSocket.OPEN) {
-                    checking = true;
-                    checkpointGeneration = view.placement.generation;
-                    send(upstream, JSON.stringify({ id: checkpointRequest, method: "thread/read", params: { threadId, includeTurns: true } }));
-                  }
-                } else if (!Array.isArray(thread?.environments)) {
-                  ready = false;
-                } else {
-                  try { environments.assertObservedEnvironments(threadId, thread.environments); } catch { ready = false; }
+                  maybeRecheckCheckpoint();
+                  return;
                 }
+                if (environments && execution && threadId) {
+                  const view = environments.placement(threadId);
+                  if (!restoredClean || view.status !== "verified" || upstream.readyState !== WebSocket.OPEN) {
+                    checking = false;
+                    ready = false;
+                    maybeRecheckCheckpoint();
+                    return;
+                  }
+                  checkpointStep = "paginated-env";
+                  checkpointGeneration = view.placement.generation;
+                  send(upstream, JSON.stringify({ id: checkpointRequest, method: "thread/read", params: { threadId, includeTurns: false } }));
+                  return;
+                }
+                checking = false;
+                ready = true;
+                recheckCheckpoint = false;
+                return;
               }
+              checking = false;
+              const thread = message.result?.thread;
+              if (step === "paginated-env") {
+                ready = !message.error && thread?.id === threadId;
+                if (ready) verifyCheckpointEnvironment(thread, observedCheckpointGen, "paginated-env");
+                maybeRecheckCheckpoint();
+                return;
+              }
+              ready = !message.error && thread?.id === threadId && Array.isArray(thread?.turns) && thread.turns.length > 0;
+              if (ready) verifyCheckpointEnvironment(thread, observedCheckpointGen, "legacy-read");
+              maybeRecheckCheckpoint();
               return;
             }
-            if (observer && startRequest !== undefined && message.id === startRequest) {
-              startRequest = undefined;
+            if (observer && pendingStart !== undefined && message.id === pendingStart.id && !message.method) {
+              const currentStart = pendingStart;
+              if (
+                message.error &&
+                currentStart.canFallbackToLegacy &&
+                currentStart.fallbackRetryMessage &&
+                isUnsupportedPaginatedHistoryError(message.error) &&
+                socketGeneration === backendGeneration &&
+                upstream.readyState === WebSocket.OPEN
+              ) {
+                supportsPaginatedHistory = false;
+                backendCapabilitiesKnown = true;
+                pendingStart = {
+                  id: currentStart.id,
+                  canFallbackToLegacy: false,
+                  requestedHistoryMode: "legacy",
+                };
+                send(upstream, JSON.stringify(currentStart.fallbackRetryMessage));
+                return;
+              }
+              pendingStart = undefined;
               pending.delete(message.id);
               releaseDiscovery();
               if (message.error || typeof message.result?.thread?.id !== "string" || !message.result.thread.id) {
@@ -484,6 +646,10 @@ export async function startNativeCodex(options: {
               const startedThreadId: string = message.result.thread.id;
               if (threadId && threadId !== startedThreadId) throw new Error("Native conversation changed");
               threadId = startedThreadId;
+              activeThreadHistoryMode =
+                message.result.thread.historyMode === "legacy" || currentStart.requestedHistoryMode === "legacy"
+                  ? "legacy"
+                  : "paginated";
               environments?.observe({ method: "thread/started", params: { thread: { id: startedThreadId } } });
               if (environments && execution) {
                 const startPayload = JSON.stringify(message);
@@ -524,11 +690,9 @@ export async function startNativeCodex(options: {
               }
               options.onThread(startedThreadId);
             }
-            if (observer && threadId && !ready && !checking && ["turn/started", "turn/completed"].includes(message.method ?? "")) {
-              checking = true;
-              const view = environments ? environments.placement(threadId) : undefined;
-              checkpointGeneration = view?.status === "verified" ? view.placement.generation : undefined;
-              send(upstream, JSON.stringify({ id: checkpointRequest, method: "thread/read", params: { threadId, includeTurns: true } }));
+            if (observer && threadId && !ready && ["turn/started", "item/completed", "turn/completed"].includes(message.method ?? "")) {
+              if (checking) recheckCheckpoint = true;
+              else startCheckpoint();
             }
             if (observer) environments?.observe(message);
             if (observer && message.params?.threadId === threadId) {
@@ -543,6 +707,14 @@ export async function startNativeCodex(options: {
             const req = message.id === undefined ? undefined : pending.get(message.id);
             if (message.id !== undefined && !message.method) pending.delete(message.id);
             const method = req?.method;
+            if (!message.method && method === "initialize" && !message.error && socketGeneration === backendGeneration && !backendCapabilitiesKnown) {
+              supportsPaginatedHistory = supportsCodexPaginatedHistory(message.result);
+              backendCapabilitiesKnown = true;
+            }
+            if (!message.method && method === "thread/resume" && !message.error &&
+                (message.result?.thread?.historyMode === "paginated" || message.result?.thread?.historyMode === "legacy")) {
+              activeThreadHistoryMode = message.result.thread.historyMode;
+            }
             if (method === "thread/resume" && req?.trackedResume) {
               if (message.error || !execution || !environments || !threadId) {
                 finishSocketResume();
@@ -634,7 +806,7 @@ export async function startNativeCodex(options: {
             threadId,
             executor: next,
             releaseHeldOperation: () => { execution = next; release?.(); },
-          });
+          }, { excludeTurns: supportsPaginatedHistory });
           restoredClean = true;
           ready = true;
           options.onThread(threadId);

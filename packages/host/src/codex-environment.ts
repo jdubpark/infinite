@@ -39,6 +39,44 @@ export {
   type PersistedCodexThreadPlacement,
 };
 
+export interface CodexSemver {
+  major: number;
+  minor: number;
+  patch: number;
+  prerelease?: string;
+}
+
+const MIN_PAGINATED_HISTORY_VERSION = { major: 0, minor: 172, patch: 0 } as const;
+const CODEX_USER_AGENT_SEMVER_RE =
+  /^[A-Za-z0-9._-]+\/(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?=$|\s)/;
+
+export function parseCodexUserAgentVersion(userAgent: unknown): CodexSemver | undefined {
+  if (typeof userAgent !== "string") return undefined;
+  const match = userAgent.trim().match(CODEX_USER_AGENT_SEMVER_RE);
+  if (!match) return undefined;
+  const major = Number(match[1]);
+  const minor = Number(match[2]);
+  const patch = Number(match[3]);
+  if (!Number.isSafeInteger(major) || !Number.isSafeInteger(minor) || !Number.isSafeInteger(patch)) return undefined;
+  return { major, minor, patch, ...(match[4] ? { prerelease: match[4] } : {}) };
+}
+
+export function supportsCodexPaginatedHistory(initializeResult: unknown): boolean {
+  if (!initializeResult || typeof initializeResult !== "object" || Array.isArray(initializeResult)) return false;
+  const result = initializeResult as Record<string, unknown>;
+  const capabilities = result.capabilities;
+  if (capabilities && typeof capabilities === "object" && !Array.isArray(capabilities)) {
+    const advertised = (capabilities as Record<string, unknown>).paginatedHistory;
+    if (typeof advertised === "boolean") return advertised;
+  }
+  const version = parseCodexUserAgentVersion(result.userAgent);
+  if (!version) return false;
+  if (version.major !== MIN_PAGINATED_HISTORY_VERSION.major) return version.major > MIN_PAGINATED_HISTORY_VERSION.major;
+  if (version.minor !== MIN_PAGINATED_HISTORY_VERSION.minor) return version.minor > MIN_PAGINATED_HISTORY_VERSION.minor;
+  if (version.patch !== MIN_PAGINATED_HISTORY_VERSION.patch) return version.patch > MIN_PAGINATED_HISTORY_VERSION.patch;
+  return version.prerelease === undefined;
+}
+
 export interface CodexExecutor {
   environmentId: string;
   url: string;
@@ -604,7 +642,7 @@ export async function connectCodexEnvironments(options: {
 
   const verify = (threadId: string): Promise<CodexPlacement> => serialThread(threadId, () => verifyUnlocked(threadId));
 
-  const restoreThread = (threadId: string): Promise<CodexPlacement> => serialThread(threadId, async () => {
+  const restoreThread = (threadId: string, resumeOptions?: { excludeTurns?: boolean }): Promise<CodexPlacement> => serialThread(threadId, async () => {
     if (closed) throw new CodexEnvironmentError("unavailable", "The internal provider connection is unavailable");
     if (!storeHealth.ok) throw new CodexEnvironmentError("uncertain", storeHealth.reason);
     const current = placements.get(threadId);
@@ -618,9 +656,10 @@ export async function connectCodexEnvironments(options: {
       throw new CodexEnvironmentError("conflict", "Executor has not completed validated registration matching persisted placement");
     }
     const endDiscovery = beginStartupDiscovery(expected.environmentId);
+    const excludeTurns = resumeOptions?.excludeTurns ?? supportsPaginatedResume;
     let resumed: RecordValue | undefined;
     try {
-      resumed = object(await call("thread/resume", { threadId }));
+      resumed = object(await call("thread/resume", { threadId, ...(excludeTurns ? { excludeTurns: true } : {}) }));
     } finally {
       endDiscovery();
     }
@@ -817,12 +856,13 @@ export async function connectCodexEnvironments(options: {
   const applySelection = (request: CodexSelectionRequest, allowReconcile: boolean): Promise<CodexSelectionReceipt> =>
     serialThread(request.threadId, () => applySelectionUnlocked(request, allowReconcile));
 
-  const reconcileThread = (request: Omit<CodexSelectionRequest, "turnId">): Promise<CodexSelectionReceipt> =>
+  const reconcileThread = (request: Omit<CodexSelectionRequest, "turnId">, resumeOptions?: { excludeTurns?: boolean }): Promise<CodexSelectionReceipt> =>
     serialThread(request.threadId, async () => {
       if (closed) throw new CodexEnvironmentError("unavailable", "The internal provider connection is unavailable");
       if (!storeHealth.ok) throw new CodexEnvironmentError("uncertain", storeHealth.reason);
       if (!turns.has(request.threadId)) {
-        const resumed = object(await call("thread/resume", { threadId: request.threadId }));
+        const excludeTurns = resumeOptions?.excludeTurns ?? supportsPaginatedResume;
+        const resumed = object(await call("thread/resume", { threadId: request.threadId, ...(excludeTurns ? { excludeTurns: true } : {}) }));
         const thread = object(resumed?.thread);
         if (thread?.id !== request.threadId) {
           throw new CodexEnvironmentError("unavailable", "Provider did not resume the requested thread");
@@ -833,6 +873,8 @@ export async function connectCodexEnvironments(options: {
     });
 
   let providerSupportsSelection = false;
+  let initializeResult: RecordValue | undefined;
+  let supportsPaginatedResume = false;
   try {
     fence = await createCodexToolFence({
       authorize: (environmentId, method, params) => checkEnvironmentDispatch(environmentId, method, params),
@@ -843,7 +885,8 @@ export async function connectCodexEnvironments(options: {
       socket.once("error", () => rejectOpen(new CodexEnvironmentError("unavailable", "Could not connect to the provider")));
       socket.once("close", () => rejectOpen(new CodexEnvironmentError("unavailable", "Provider closed during initialization")));
     });
-    await call("initialize", { clientInfo: { name: "infinite_execution", version: "0.1.0" }, capabilities: { experimentalApi: true } });
+    initializeResult = object(await call("initialize", { clientInfo: { name: "infinite_execution", version: "0.1.0" }, capabilities: { experimentalApi: true } }));
+    supportsPaginatedResume = supportsCodexPaginatedHistory(initializeResult);
     socket.send(JSON.stringify({ method: "initialized" }));
     try {
       const diagnostics = object(await call("server/diagnostics", {}));
@@ -859,6 +902,7 @@ export async function connectCodexEnvironments(options: {
   return {
     supportsSelection,
     storeStatus,
+    initializeResult,
     register,
     observe,
     current: (threadId: string) => {

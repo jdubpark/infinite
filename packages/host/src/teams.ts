@@ -1502,7 +1502,7 @@ export class TeamService {
         if (run.status !== "paused" && !this.canResume(stored)) { record(); this.save(stored); return this.view(stored); }
         this.fence.lift(stored);
         await this.resumeRun(stored, inPlace, record);
-        this.event(stored, `Team ${inPlace ? "resumed where it waited for input" : "resumed with a fresh plan"}${body.source ? ` by ${inputSourceLabel(body.source)}` : ""}.`); this.save(stored);
+        this.event(stored, `Team ${inPlace ? "resumed the same revision" : "resumed with a fresh plan"}${body.source ? ` by ${inputSourceLabel(body.source)}` : ""}.`); this.save(stored);
       } else { record(); await this.stopRun(stored, action, undefined, body.source, `Team ${action === "pause" ? "paused" : "cancelled"}${body.source ? ` by ${inputSourceLabel(body.source)}` : ""}.`); }
       return this.view(stored);
     });
@@ -1560,7 +1560,7 @@ export class TeamService {
     const run = stored.run;
     if (this.waitsWithNothingInFlight(stored)) {
       stored.ownerHalt = { ...mark, waiting: true, resumeStage: run.status }; run.status = "paused"; run.reason = mark.reason;
-      this.event(stored, `Team paused where it waits for input: ${mark.reason} Its questions stay open; an answer is kept until it resumes.`);
+      this.event(stored, `Team paused on this revision. ${mark.reason} It keeps open questions and queued answers until it resumes.`);
       await this.invalidatePermissionDecisions(stored, "The team was paused before the permission request could be answered.");
     } else {
       await this.stopRun(stored, "pause", mark, undefined, `Team paused: ${mark.reason}`, mark.reason);
@@ -1575,7 +1575,7 @@ export class TeamService {
     const inPlace = heldStage(stored);
     await this.resumeRun(stored, inPlace);
     stored.ownerHalt = undefined;
-    this.event(stored, inPlace ? "Team resumed where it waited for input: the owner released the halt." : "Team resumed with a fresh plan: the owner released the halt.");
+    this.event(stored, inPlace ? "The owner released the halt. The team resumed the same revision." : "Team resumed with a fresh plan: the owner released the halt.");
     this.save(stored);
   }
   haltPause(mark: HaltMark, covers: HaltCovers): Promise<HaltOutcome[]> {

@@ -8,6 +8,7 @@ import { basename, dirname, join, resolve, relative, isAbsolute, parse, sep } fr
 import type { TeamCommand, TeamPublicationCategory, TeamTaskPlan } from "./team-types.js";
 import { fetchCategory } from "./project-source.js";
 import { hostEgressEnvironment } from "./egress.js";
+import { teamAnchored } from "./group-supervisor.js";
 
 export class TeamError extends Error {
   constructor(readonly status: number, readonly code: string, message: string) { super(message); }
@@ -42,7 +43,7 @@ export class CommandStopUnconfirmed extends TeamError {
   constructor(readonly output: string, readonly exitCode?: number | null) { super(409, "command-stop-unconfirmed", COMMAND_STOP_UNCONFIRMED_REASON); }
 }
 export async function teamOperationCommand(command: TeamCommand, cwd: string, signal: AbortSignal | undefined, timeoutMs: number, prefix?: TeamCommand, input?: string, onOutput?: (chunk: Buffer, stream: "stdout" | "stderr") => void): Promise<CommandResult> {
-  const result = await teamCommand(command, cwd, signal, timeoutMs, prefix, input, undefined, STOP_SETTLE_MS, onOutput);
+  const result = await teamCommand(prefix ? teamAnchored(command, STOP_GRACE_MS) : command, cwd, signal, timeoutMs, prefix, input, undefined, STOP_SETTLE_MS, onOutput);
   if (prefix && result.interrupted && !result.notStarted) throw new CommandStopUnconfirmed(result.output, result.exitCode);
   return result;
 }

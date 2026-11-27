@@ -704,7 +704,7 @@ export class TeamService {
   }
   private linkReplacement(stored: Stored, next: TeamMember, previous: TeamMember, cause: ReplacementCause): void {
     if (previous.goalCriteriaPlan) next.goalCriteriaPlan = previous.goalCriteriaPlan;
-    if (!this.options?.events && cause !== "answer") return;
+    if (!this.options?.events) return;
     (stored.ledgerReplaces ??= {})[next.memberId] = { memberId: previous.memberId, cause };
   }
   private memberStopped(stored: Stored, member: TeamMember, reason: MemberStopReason, detail?: MemberStopDetail): void {

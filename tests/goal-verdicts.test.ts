@@ -19,6 +19,7 @@ import {
   owedStop,
   lateVerdict,
   provisionalStop,
+  refreshCycleVerdict,
   verdictFailed,
   verdictIdsOf,
   PROVISIONAL_WITHDRAWN_REASON,
@@ -177,6 +178,45 @@ test("a later verdict that is no longer met withdraws the provisional reason and
   const elsewhere = stopped([older, cycle(2, { teamId: "team-2", assessment: { ...assessment(), progress: 1 } })]);
   assert.equal(applyLateVerdict(elsewhere, older, team({ assessment: reverted })), true);
   assert.equal(elsewhere.reason, PROVISIONAL_REASON);
+});
+
+test("refresh withdraws a provisional reason when the newest cycle gets a verdict for a newer revision or head", () => {
+  const held = assessment();
+  const newest = cycle(1, { assessment: { ...held, progress: 1 } });
+  const subject = goal({ status: "ready-for-review", stopReason: "provisional-met", reason: PROVISIONAL_REASON, cycles: [newest] });
+  const replacement = assessment({ revision: 2, result: "not-met", counts: { met: 0, notMet: 1, inconclusive: 0, pendingOwner: 0 }, criteria: [{ id: "c0", state: "not-met" }] });
+
+  refreshCycleVerdict(subject, newest, team({ revision: 2, assessment: replacement }));
+
+  assert.equal(newest.assessment?.verdictId, replacement.verdictId);
+  assert.equal(newest.assessment?.result, "not-met");
+  assert.equal(subject.status, "ready-for-review");
+  assert.equal(subject.stopReason, "provisional-met");
+  assert.equal(subject.reason, PROVISIONAL_WITHDRAWN_REASON);
+});
+
+test("refresh withdraws a provisional reason when the newest cycle's verdict is cleared", () => {
+  const held = assessment();
+  const newest = cycle(1, { assessment: { ...held, progress: 1 } });
+  const subject = goal({ status: "ready-for-review", stopReason: "provisional-met", reason: PROVISIONAL_REASON, cycles: [newest] });
+
+  refreshCycleVerdict(subject, newest, team({ revision: 2 }));
+
+  assert.equal(newest.assessment, undefined);
+  assert.equal(subject.status, "ready-for-review");
+  assert.equal(subject.stopReason, "provisional-met");
+  assert.equal(subject.reason, PROVISIONAL_WITHDRAWN_REASON);
+
+  const historical = cycle(1, { assessment: { ...held, progress: 1 } });
+  const latest = cycle(2, { teamId: "team-2", assessment: { ...assessment(), progress: 1 } });
+  const withHistory = goal({ status: "ready-for-review", stopReason: "provisional-met", reason: PROVISIONAL_REASON, cycles: [historical, latest] });
+  refreshCycleVerdict(withHistory, historical, team({ id: historical.teamId, revision: 2 }));
+  assert.equal(withHistory.reason, PROVISIONAL_REASON, "Refreshing a historical cycle does not change the goal's reason");
+
+  const ownerStopped = goal({ status: "ready-for-review", stopReason: "deadline", reason: "The deadline passed.", cycles: [cycle(1, { assessment: { ...held, progress: 1 } })] });
+  refreshCycleVerdict(ownerStopped, ownerStopped.cycles[0]!, team({ revision: 2 }));
+  assert.equal(ownerStopped.stopReason, "deadline");
+  assert.equal(ownerStopped.reason, "The deadline passed.");
 });
 
 const FINISHED = Date.parse("2026-01-01T00:00:00.000Z");

@@ -22,7 +22,7 @@ import { cadenceDue, classifyCycle, cycleWakeOf, defaultWakeMinGapMinutes, folde
 import { KEPT_PAUSED, LEFT_AS_IS, LEFT_PAUSED, STILL_HALTED, isHaltReason, pauseFailure, releaseRefusal, type HaltCovers, type HaltHeldBy, type HaltMark, type HaltOutcome } from "./halt/rules.js";
 import { correctionGate, digestEvent, correctGoalObjective, createGoalObjective, goalObjectiveNote, goalObjectiveView, goalRecordDigest, goalRecordPort, loadGoalObjective, ratingStamp, steerGoalObjective, type ObjectiveUnavailable } from "./objective-goals.js";
 import { objectivePromptsOn, objectiveRegisterOn } from "./objective-digest.js";
-import { answerProvisional, applyLateVerdict, assertVerdictAnswer, continueGoal, criteriaRowsFor, cycleVerdict, deliveryHold, holdReasonChange, lateVerdict, markProvisional, owedStop, provisionalStop, verdictFailed, withdrawProvisional, CONTINUE_EVENT, DELIVERY_HOLD_REASON, LATE_RECEIPT_EVENT, PROVISIONAL_EVENT } from "./goal-verdicts.js";
+import { answerProvisional, applyLateVerdict, assertVerdictAnswer, continueGoal, criteriaRowsFor, deliveryHold, holdReasonChange, markProvisional, owedStop, provisionalStop, refreshCycleVerdict, verdictFailed, CONTINUE_EVENT, DELIVERY_HOLD_REASON, LATE_RECEIPT_EVENT, PROVISIONAL_EVENT } from "./goal-verdicts.js";
 import { correctionSchema, type CriterionInput } from "./objective-input.js";
 import { objectiveError, recordView, type ObjectiveRecordView } from "./objective-record.js";
 import { goalMetricsRead, pruneMetrics, settleMetrics } from "./goal-metrics.js";
@@ -577,9 +577,9 @@ export class GoalService {
   }
   private refresh(stored: Stored, team: TeamView) {
     const cycle = stored.goal.cycles.find(value => value.teamId === team.id)!;
-    const late = lateVerdict(stored.goal, cycle, team) !== undefined;
-    Object.assign(cycle, { status: team.status, memberCount: team.members.length, baseCommit: team.baseCommit, headCommit: team.headCommit, branch: team.branch, workspace: team.workspace, brief: team.brief, reason: team.reason }, cycleVerdict(stored.goal, cycle, team));
-    if (late) { withdrawProvisional(stored.goal, cycle); this.event(stored, LATE_RECEIPT_EVENT); }
+    const late = refreshCycleVerdict(stored.goal, cycle, team);
+    Object.assign(cycle, { status: team.status, memberCount: team.members.length, baseCommit: team.baseCommit, headCommit: team.headCommit, branch: team.branch, workspace: team.workspace, brief: team.brief, reason: team.reason });
+    if (late) this.event(stored, LATE_RECEIPT_EVENT);
     if (team.usage.total.messages > 0 || team.usage.unmeasuredMembers === 0) cycle.usage = cycleUsageSnapshot(team.usage);
     else delete cycle.usage;
     if (["ready-for-review", "merged", "no-change", "blocked", "cancelled"].includes(team.status)) cycle.finishedAt ??= now();

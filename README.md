@@ -194,7 +194,7 @@ npm run check
 python3 scripts/cloud-check.py -- node --import tsx --test tests/chat.test.ts
 ```
 
-Process retirement tests need their own Linux process table. The normal `npm test` command runs failed-operation, leftover-process and main-check suites in disposable, digest-pinned containers on the enrolled guest. To run one group, use `infinite-check -- node scripts/run-tests.mjs` with `--team-operation-failure`, `--team-leftovers` or `--main-check-real`.
+Process retirement tests need their own Linux process table. The normal `npm test` command runs failed-operation, leftover-process and main-check suites in disposable, digest-pinned containers on the enrolled guest. The team check-stop suite runs in a private PID and mount namespace on the Linux guest, preserving the enrolled user and real nested `sudo` cases. To run one group, use `infinite-check -- node scripts/run-tests.mjs` with `--team-operation-failure`, `--team-check-stop`, `--team-leftovers` or `--main-check-real`.
 
 Each run transfers the current Git revision, staged and unstaged edits, deletions, and eligible nonignored untracked files into a disposable cloud checkout. Git history stops at the captured commit. Ignored inputs, credentials, Git remotes and unrelated refs stay outside the snapshot. The runner installs dependencies with `npm ci` from that checkout's lockfile. The receipt identifies the source snapshot, lockfile, platform, tool versions, and exit status. Concurrent calls use separate directories. Keep commands that share build output, a service, or a browser session in a single invocation.
 

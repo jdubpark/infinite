@@ -6,10 +6,12 @@ import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 
 const teamOperationFailureFile = "team-operation-failure.test.ts";
+const teamCheckStopFile = "team-check-stop.test.ts";
 const mainCheckRealFile = "main-check-real.test.ts";
 const processIsolationImage = "buildpack-deps@sha256:c4e7382cc1abefe0bbaaf99324fad5122f9def4d3840fbfad17d3c2fd77b9dc9";
 const privateSuites = new Map([
   ["--team-operation-failure", [teamOperationFailureFile]],
+  ["--team-check-stop", [teamCheckStopFile]],
   ["--team-leftovers", ["team-witness-hold.test.ts", "team-leftover-hold.test.ts"]],
   ["--main-check-real", [mainCheckRealFile]],
 ]);
@@ -90,6 +92,52 @@ exec node --import tsx --test --test-concurrency=1 tests/${file}`;
   });
 }
 
+async function runTeamCheckStop(file) {
+  if (process.platform !== "linux") return run([file], 1);
+
+  const uid = process.getuid?.() ?? -1;
+  const gid = process.getgid?.() ?? -1;
+  if (!Number.isInteger(uid) || !Number.isInteger(gid) || uid < 1 || gid < 1) {
+    throw new Error("Team check-stop tests require a non-root Linux cloud job with a valid UID and GID.");
+  }
+  const requiredCommands = ["/usr/bin/sudo", "/usr/bin/unshare", "/usr/bin/setpriv", "/usr/bin/env", "/usr/bin/docker-init", "/bin/sh"];
+  if (requiredCommands.some(command => {
+    try { realpathSync(command); return false; } catch { return true; }
+  })) {
+    throw new Error("Team check-stop tests require sudo, unshare, setpriv, env, docker-init, and sh on the Linux cloud guest.");
+  }
+
+  const nodePath = realpathSync(process.execPath);
+  const helper = fileURLToPath(new URL("./cloud-check/multi-user-tests.sh", import.meta.url));
+  const userEnv = [
+    `PATH=${process.env.PATH ?? "/usr/bin:/bin"}`,
+    `HOME=${process.env.HOME ?? "/tmp"}`,
+    `TMPDIR=${process.env.TMPDIR ?? "/tmp"}`,
+    `TZ=${process.env.TZ ?? "UTC"}`,
+    `LANG=${process.env.LANG ?? "C.UTF-8"}`,
+    "CI=1",
+    "GIT_CONFIG_NOSYSTEM=1",
+    "GIT_CONFIG_GLOBAL=/dev/null",
+    "GIT_TERMINAL_PROMPT=0",
+    "GIT_OPTIONAL_LOCKS=0",
+    ...(process.env.INFINITE_TEST_STAGING_ROOT ? [`INFINITE_TEST_STAGING_ROOT=${process.env.INFINITE_TEST_STAGING_ROOT}`] : []),
+    ...(process.env.XDG_RUNTIME_DIR ? [`XDG_RUNTIME_DIR=${process.env.XDG_RUNTIME_DIR}`] : []),
+  ];
+  const args = [
+    "-n", "--", "/usr/bin/unshare", "--pid", "--fork", "--mount-proc", "--propagation", "private", "--kill-child=KILL", "--",
+    "/usr/bin/setpriv", `--reuid=${uid}`, `--regid=${gid}`, "--init-groups", "--",
+    "/usr/bin/env", "-i", ...userEnv, "/usr/bin/docker-init", "--", "/bin/sh", helper, nodePath,
+  ];
+  await new Promise((resolve, reject) => {
+    const child = spawn("/usr/bin/sudo", args, { cwd: checkout, stdio: "inherit" });
+    child.once("error", reject);
+    child.once("close", (code, signal) => {
+      if (code === 0) resolve();
+      else reject(new Error(`Private team check-stop namespace failed (${signal ?? code})`));
+    });
+  });
+}
+
 async function run(files, fileConcurrency) {
   const report = !process.stdout.isTTY;
   const child = spawn(process.execPath, [tsx, "--test", `--test-concurrency=${fileConcurrency}`, ...files.map((file) => `tests/${file}`)], {
@@ -112,8 +160,9 @@ async function run(files, fileConcurrency) {
 }
 
 if (selectedFiles.includes(teamOperationFailureFile)) await runInPrivateLinuxContainer(teamOperationFailureFile);
+if (selectedFiles.includes(teamCheckStopFile)) await runTeamCheckStop(teamCheckStopFile);
 if (parallelFiles.length) await run(parallelFiles, concurrency);
 if (serial.length) await run(serial, 1);
 for (const file of selectedFiles) {
-  if (file !== teamOperationFailureFile && privateFiles.has(file)) await runInPrivateLinuxContainer(file);
+  if (file !== teamOperationFailureFile && file !== teamCheckStopFile && privateFiles.has(file)) await runInPrivateLinuxContainer(file);
 }

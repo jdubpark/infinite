@@ -3187,9 +3187,12 @@ way; a replaced steer's direction stays in the goal's steering and does not
 reach the run. A mission's pause or cancel is not held by such a request: the
 request waits while the mission is paused, and a cancel drops it.
 
-The look supports no prefix, or a `sudo` prefix whose launcher has the
-`process-census` wrapper beside it. Under any other prefix, the instance
-skeleton's root-owned launcher among them, the look cannot tell whether the
+The look supports no prefix, a `sudo` prefix whose launcher has the
+`process-census` wrapper beside it, and the instance skeleton's direct
+`/usr/local/libexec/infinite[-NAME]/team-command` launcher with no arguments:
+there the host runs `sudo -n -H -u infinite[-NAME]-agent` on the `process-census`
+wrapper in the launcher's directory. Under any other prefix, or a direct
+launcher without the wrapper beside it, the look cannot tell whether the
 command ended. The run's reason then says that the owner's statement is the
 only way out and names its command. After checking the host, the owner runs
 `infinite team processes-ended RUN_ID`, which sends

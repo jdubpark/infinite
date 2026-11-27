@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { mapClaudeHook, claudeAgent } from "../packages/attention/src/claude.js";
-import { mapCodexHook, mapCodexNotify, mapCodexOsc } from "../packages/attention/src/codex.js";
+import { mapCodexHook, mapCodexNotify, mapCodexOsc, mapCodexOsc777 } from "../packages/attention/src/codex.js";
 import { cut, isTruncatedArrayMarker, MAX_ARRAY_ITEMS, truncateInput } from "../packages/attention/src/truncate.js";
 import { hasTruncatedEvidence } from "../packages/attention/src/delegation.js";
 
@@ -70,16 +70,140 @@ test("codex hooks and notify", () => {
   assert.equal(notify.kind === "turn-end" && notify.message, "Rename complete");
 });
 
-test("codex OSC text opens a prompt or ends a turn only on a known leading phrase", () => {
-  const kinds = (text: string) => mapCodexOsc(text).map((s) => s.kind === "prompt-open" ? `prompt-open:${s.prompt.kind}` : s.kind);
-  assert.deepEqual(kinds("Codex: approval requested"), ["notice", "prompt-open:permission"]);
-  assert.deepEqual(kinds("  Approval requested: npm test"), ["notice", "prompt-open:permission"]);
-  assert.deepEqual(kinds("Codex: question"), ["notice", "prompt-open:question"]);
-  assert.deepEqual(kinds("Question: which database?"), ["notice", "prompt-open:question"]);
-  assert.deepEqual(kinds("Codex: turn complete"), ["notice", "turn-end"]);
-  assert.deepEqual(kinds("Turn complete"), ["notice", "turn-end"]);
-  for (const text of ["Build complete", "Waiting for your input", "No approval needed", "Your question was answered", "Codex: task complete"])
-    assert.deepEqual(kinds(text), ["notice"], text);
+test("codex OSC 9 classifies observed Codex TUI prefixes as structured notices or turn-end without false positives", () => {
+  const summary = (text: string) => mapCodexOsc(text).map((s) => s.kind === "notice" ? `notice:${s.type}` : s.kind);
+  const approvalCases = [
+    "Approval requested: npm test",
+    "Approval requested: git push --force",
+    "Approval requested by github",
+    "Approval requested by linear-mcp",
+    "Codex wants to edit 2 files",
+    "Codex wants to edit packages/attention/src/codex.ts",
+    "Codex wants to edit",
+    "Approval requested",
+    "Codex: approval requested",
+    "Codex: approval requested: npm test",
+    "Codex: approval requested by github",
+    "  Approval requested: npm test  ",
+    "  CODEX WANTS TO EDIT 3 FILES\n",
+    "\tAPPROVAL REQUESTED BY GITHUB  ",
+  ];
+  for (const text of approvalCases) {
+    const signals = mapCodexOsc(text);
+    assert.deepEqual(summary(text), ["notice:osc_approval"], text);
+    assert.equal(signals[0]?.kind === "notice" && signals[0].message, text.trim(), text);
+  }
+  const questionCases = [
+    "Question: which database?",
+    "Plan mode prompt: Implement this plan?",
+    "Question",
+    "Codex: question",
+    "Codex: question: which database?",
+    "Plan mode prompt",
+    "Codex: plan mode prompt: Implement this plan?",
+    "  PLAN MODE PROMPT: Ship it?  ",
+    "  QUESTION: Ready to deploy?  ",
+  ];
+  for (const text of questionCases) {
+    const signals = mapCodexOsc(text);
+    assert.deepEqual(summary(text), ["notice:osc_question"], text);
+    assert.equal(signals[0]?.kind === "notice" && signals[0].message, text.trim(), text);
+  }
+  const turnEndCases = [
+    "Agent turn complete",
+    "Agent turn complete: Fixed tests",
+    "Turn complete",
+    "Turn complete: Done",
+    "Codex: turn complete",
+    "Codex: turn complete: Done",
+    "Codex: agent turn complete",
+    "  Agent turn complete  \n",
+    "\tAGENT TURN COMPLETE",
+  ];
+  for (const text of turnEndCases) {
+    assert.deepEqual(summary(text), ["notice:osc", "turn-end"], text);
+  }
+  const nonMatchingCases = [
+    "Build complete",
+    "Waiting for your input",
+    "No approval needed",
+    "No approval requested",
+    "Your question was answered",
+    "Codex: task complete",
+    "Questioning...",
+    "Questions: 3 remaining",
+    "Question answered",
+    "Plan mode prompt dismissed",
+    "Plan mode prompting...",
+    "Plan mode prompt? no",
+    "Approval requested? no",
+    "Approval requested earlier",
+    "Approval requested by",
+    "Approval requestedness",
+    "Codex wants to edit?",
+    "Codex wants to editing files",
+    "Turn completed? no",
+    "Turn complete? no",
+    "Agent turn completed",
+    "Agent turn complete? no",
+    "Agent turn complete failed",
+    "4;1;50",
+    "",
+    "   ",
+  ];
+  for (const text of nonMatchingCases) {
+    assert.deepEqual(summary(text), ["notice:osc"], text);
+  }
+});
+
+test("codex OSC 777 maps notify;Codex payloads and ignores non-Codex or malformed payloads", () => {
+  const summary = (data: string) => mapCodexOsc777(data).map((s) => s.kind === "notice" ? `notice:${s.type}` : s.kind);
+  assert.deepEqual(summary("notify;Codex;Approval requested: npm test"), ["notice:osc_approval"]);
+  assert.deepEqual(summary("notify;Codex;Approval requested: cd /tmp; npm test"), ["notice:osc_approval"]);
+  assert.deepEqual(summary("notify;Codex;Approval requested by github"), ["notice:osc_approval"]);
+  assert.deepEqual(summary("notify;Codex;Codex wants to edit 2 files"), ["notice:osc_approval"]);
+  assert.deepEqual(summary("notify;Codex;Question: which database?"), ["notice:osc_question"]);
+  assert.deepEqual(summary("notify;Codex;Plan mode prompt: Implement this plan?"), ["notice:osc_question"]);
+  assert.deepEqual(summary("notify;Codex;Agent turn complete"), ["notice:osc", "turn-end"]);
+  assert.deepEqual(summary("notify;codex;  Agent turn complete  "), ["notice:osc", "turn-end"]);
+  assert.deepEqual(summary("notify;Codex;Unrelated status"), ["notice:osc"]);
+  const semicolonCmd = mapCodexOsc777("notify;Codex;Approval requested: cd /tmp; npm test");
+  assert.equal(semicolonCmd[0]?.kind === "notice" && semicolonCmd[0].message, "Approval requested: cd /tmp; npm test");
+  for (const ignored of [
+    "notify;Other;Agent turn complete",
+    "notify;CodexExtra;Agent turn complete",
+    "notify;Codex",
+    "perl;Codex;Agent turn complete",
+    "",
+  ]) {
+    assert.deepEqual(mapCodexOsc777(ignored), [], ignored);
+  }
+  assert.deepEqual(mapCodexOsc777(undefined as never), []);
+  assert.deepEqual(mapCodexOsc777(42 as never), []);
+});
+
+test("replays redacted Codex 0.172.0 OSC 9 and OSC 777 wire frames through parser", () => {
+  const parseFrame = (frame: string) => {
+    const osc9 = /^\x1b\]9;([\s\S]*)\x07$/.exec(frame);
+    if (osc9) return mapCodexOsc(osc9[1]);
+    const osc777 = /^\x1b\]777;([\s\S]*)\x1b\\$/.exec(frame);
+    if (osc777) return mapCodexOsc777(osc777[1]);
+    throw new Error(`Unexpected OSC frame: ${JSON.stringify(frame)}`);
+  };
+  const summarize = (frame: string) => parseFrame(frame).map((s) => (s.kind === "notice" ? `notice:${s.type}` : s.kind));
+  const capturedCodex0172Frames: ReadonlyArray<[string, string, string[]]> = [
+    ["exec-approval-osc9", "\x1b]9;Approval requested: npm test\x07", ["notice:osc_approval"]],
+    ["mcp-approval-osc9", "\x1b]9;Approval requested by linear-mcp\x07", ["notice:osc_approval"]],
+    ["edit-approval-osc9", "\x1b]9;Codex wants to edit 2 files\x07", ["notice:osc_approval"]],
+    ["async-question-osc9", "\x1b]9;Question: Which target branch?\x07", ["notice:osc_question"]],
+    ["plan-mode-osc777", "\x1b]777;notify;Codex;Plan mode prompt: Implement this plan?\x1b\\", ["notice:osc_question"]],
+    ["empty-turn-complete-osc9", "\x1b]9;Agent turn complete\x07", ["notice:osc", "turn-end"]],
+    ["nonempty-turn-preview-osc9", "\x1b]9;Updated the parser and ran unit tests.\x07", ["notice:osc"]],
+    ["non-codex-osc777", "\x1b]777;notify;Terminal;Agent turn complete\x1b\\", []],
+  ];
+  for (const [name, frame, expected] of capturedCodex0172Frames) {
+    assert.deepEqual(summarize(frame), expected, name);
+  }
 });
 
 test("claude PermissionDenied closes the open prompt and keeps the reason as a notice", () => {

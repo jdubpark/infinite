@@ -1824,3 +1824,13 @@ small,
   .halt-release { display: none; }
   .app:not(.has-detail) .halt-rail { display: flex; margin: 14px 4px 0; padding: 10px 12px; border: 1px solid #e3d0ad; border-radius: 8px; }
 }
+.goal-metric-list { list-style: none; margin: 14px 0 0; padding: 0; display: grid; gap: 14px; }
+.goal-metric-head { display: flex; align-items: baseline; gap: 4px 10px; flex-wrap: wrap; min-width: 0; font-size: 13px; }
+.goal-metric-label { min-width: 0; max-width: 32ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: 11px; }
+.goal-metric-head .quiet { font-size: 11px; }
+.goal-metric-body { display: flex; align-items: center; gap: 14px; margin-top: 4px; }
+.goal-metric-curve { flex: 0 0 auto; max-width: 100%; }
+.goal-metric-line { fill: none; stroke: var(--green); stroke-width: 1.75; stroke-linejoin: round; stroke-linecap: round; }
+.goal-metric-dot { fill: var(--green); }
+.goal-metric-latest { font-variant-numeric: tabular-nums; font-size: 14px; }
+.goal-metric-omitted, .goal-metric-error { margin-top: 12px; font-size: 12px; }

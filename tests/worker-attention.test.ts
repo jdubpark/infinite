@@ -674,3 +674,132 @@ test("repeated identical Codex usage-limited repaints still reach corroboration"
     await host.stop();
   }
 });
+
+test("Codex worker keeps OSC prompt text notice-only until screen corroborates, handles codex-notify previews, and parses OSC 9/777 turn-ends", { timeout: 60000 }, async (t) => {
+  const gate = await stepGate();
+  t.after(() => gate.close());
+  const host = await limitHost("codex-osc-agent.mjs", "codex", ["--gate", gate.url]);
+  try {
+    const id = await startLimitSession(host, "codex", "osc");
+    await waitFor(() => host.fetchApi(`/sessions/${id}`), (r) => r.body.status === "running" && r.body.screen.includes("Codex ready"), 15000);
+
+    await gate.reached("preview-before-notify");
+    gate.release("preview-before-notify");
+    await waitFor(
+      () => signalsOf(host, id),
+      (rows) => rows.some((e) => e.data.kind === "notice" && e.data.type === "osc_approval" && e.data.source === "osc"),
+      15000,
+    );
+    await waitFor(() => host.fetchApi(`/sessions/${id}`), (r) => r.body.screen.includes("preview-rendered"), 15000);
+    const beforeNotify = await host.fetchApi(`/sessions/${id}`);
+    assert.equal(beforeNotify.body.attention.state, "working");
+    assert.equal(beforeNotify.body.attention.prompt, undefined);
+    assert.equal((await signalsOf(host, id)).filter((e) => e.data.kind === "prompt-open").length, 0);
+
+    await gate.reached("codex-notify");
+    gate.release("codex-notify");
+    const finished = await waitFor(
+      () => host.fetchApi(`/sessions/${id}`),
+      (r) => r.body.attention?.state === "turn-finished",
+      15000,
+    );
+    assert.equal(finished.body.attention.prompt, undefined);
+    assert.equal(finished.body.attention.lastMessage, "Codex wants to edit 2 files before merging.");
+
+    await gate.reached("late-preview");
+    gate.release("late-preview");
+    await waitFor(
+      () => signalsOf(host, id),
+      (rows) => rows.filter((e) => e.data.kind === "notice" && e.data.type === "osc_approval").length === 2,
+      15000,
+    );
+    await waitFor(() => host.fetchApi(`/sessions/${id}`), (r) => r.body.screen.includes("late-preview-rendered"), 15000);
+    const afterLatePreview = await host.fetchApi(`/sessions/${id}`);
+    assert.equal(afterLatePreview.body.attention.state, "turn-finished");
+    assert.equal(afterLatePreview.body.attention.prompt, undefined);
+    assert.equal(afterLatePreview.body.attention.lastMessage, "Codex wants to edit 2 files before merging.");
+
+    await gate.reached("late-completion-preview");
+    gate.release("late-completion-preview");
+    await waitFor(
+      () => signalsOf(host, id),
+      (rows) => rows.some((e) => e.data.kind === "notice" && e.data.type === "osc" && e.data.message === "Agent turn complete: Fixed tests"),
+      15000,
+    );
+    await waitFor(() => host.fetchApi(`/sessions/${id}`), (r) => r.body.screen.includes("late-completion-rendered"), 15000);
+    const afterLateCompletion = await host.fetchApi(`/sessions/${id}`);
+    assert.equal(afterLateCompletion.body.attention.state, "turn-finished");
+    assert.equal(afterLateCompletion.body.attention.lastMessage, "Codex wants to edit 2 files before merging.");
+    assert.equal((await signalsOf(host, id)).filter((e) => e.data.kind === "turn-end" && e.data.source === "osc").length, 0);
+
+    await gate.reached("dialog-open");
+    gate.release("dialog-open");
+    const editPrompt = await waitFor(
+      () => host.fetchApi(`/sessions/${id}`),
+      (r) => r.body.attention?.state === "needs-you" && Boolean(r.body.attention.prompt?.hash),
+      15000,
+    );
+    assert.equal(editPrompt.body.attention.prompt.source, "screen");
+    assert.equal(editPrompt.body.attention.prompt.kind, "permission");
+    assert.equal(editPrompt.body.attention.prompt.options.length, 2);
+
+    await gate.reached("dialog-clear");
+    gate.release("dialog-clear");
+    await waitFor(
+      () => host.fetchApi(`/sessions/${id}`),
+      (r) => r.body.attention?.prompt === undefined && r.body.screen.includes("Dialog cleared"),
+      15000,
+    );
+    const afterClear = await signalsOf(host, id);
+    assert.ok(afterClear.some((e) => e.data.kind === "prompt-closed" && e.data.source === "screen"));
+
+    await gate.reached("osc9-turn-end");
+    gate.release("osc9-turn-end");
+    await waitFor(
+      () => signalsOf(host, id),
+      (rows) => rows.filter((e) => e.data.kind === "turn-end" && e.data.source === "osc").length === 1,
+      15000,
+    );
+    assert.equal((await host.fetchApi(`/sessions/${id}`)).body.attention.state, "turn-finished");
+
+    await gate.reached("osc777-plan");
+    gate.release("osc777-plan");
+    const planPrompt = await waitFor(
+      () => host.fetchApi(`/sessions/${id}`),
+      (r) => r.body.attention?.state === "needs-you" && r.body.attention.prompt?.kind === "question" && Boolean(r.body.attention.prompt?.hash),
+      15000,
+    );
+    assert.equal(planPrompt.body.attention.prompt.source, "screen");
+    assert.equal(planPrompt.body.attention.prompt.title, "Implement this plan?");
+    assert.deepEqual(
+      planPrompt.body.attention.prompt.options.map((o: { label: string }) => o.label),
+      ["Yes, implement this plan", "No, stay in Plan mode"],
+    );
+    assert.ok((await signalsOf(host, id)).some((e) => e.data.kind === "notice" && e.data.type === "osc_question" && e.data.source === "osc"));
+
+    await gate.reached("osc777-other");
+    gate.release("osc777-other");
+    await waitFor(() => host.fetchApi(`/sessions/${id}`), (r) => r.body.screen.includes("after-other-osc777"), 15000);
+    const stillOpen = await host.fetchApi(`/sessions/${id}`);
+    assert.equal(stillOpen.body.attention.state, "needs-you");
+    assert.equal(stillOpen.body.attention.prompt.kind, "question");
+    const afterOther = await signalsOf(host, id);
+    assert.equal(afterOther.filter((e) => e.data.kind === "turn-end" && e.data.source === "osc").length, 1);
+    assert.equal(afterOther.filter((e) => e.data.kind === "notice" && e.data.type === "osc").length, 2);
+
+    await gate.reached("osc777-turn-end");
+    gate.release("osc777-turn-end");
+    const finalSignals = await waitFor(
+      () => signalsOf(host, id),
+      (rows) => rows.filter((e) => e.data.kind === "turn-end" && e.data.source === "osc").length === 2,
+      15000,
+    );
+    assert.equal((await host.fetchApi(`/sessions/${id}`)).body.attention.state, "turn-finished");
+    assert.equal((await host.fetchApi(`/sessions/${id}`)).body.attention.prompt, undefined);
+    assert.equal(finalSignals.filter((e) => e.data.kind === "prompt-open" && e.data.source === "osc").length, 0);
+    assertClosedOnce(finalSignals);
+  } finally {
+    await gate.close();
+    await host.stop();
+  }
+});

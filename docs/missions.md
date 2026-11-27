@@ -175,7 +175,12 @@ primary was not configured; otherwise the primary. Alternate checkouts are not
 listed to the coordinator. The mission pins the chosen IDs in `repoProjectIds`,
 so later edits to the project do not change a running mission. `groupId` accepts
 a host project ID as an alias, and the mission stores the resolved project ID and
-its name at start. The phone never sends `checkouts`.
+its name at start. The phone never sends `checkouts`. Retained mission coordinator
+understanding briefs (`packages/host/src/understanding-binding.ts`) bind every
+repository in `repoProjectIds` by enrolled path, checkout identity, and pinned
+`HEAD` commit, invalidating on read whenever any bound repository advances,
+changes identity, or splits across workspaces; see
+[Workspace Understanding](repository-briefings.md#host-maintenance).
 
 The coordinator reports through its mission report tool:
 

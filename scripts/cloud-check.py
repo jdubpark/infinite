@@ -474,6 +474,8 @@ def stop_process_group(process: subprocess.Popen[bytes]) -> None:
         os.killpg(process.pid, signal.SIGTERM)
     except ProcessLookupError:
         return
+    except PermissionError:
+        process.terminate()
     if process.poll() is not None:
         return
     try:
@@ -483,6 +485,8 @@ def stop_process_group(process: subprocess.Popen[bytes]) -> None:
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
+        except PermissionError:
+            process.kill()
         process.wait()
 
 
@@ -531,8 +535,10 @@ def dispatch(transport_argv: list[str], archive: bytes, envelope: str, receipt: 
         line += separator
         if line == BUSY_LINE and not trailing:
             process.stdin.close()
-            stop_process_group(process)
-            process.wait()
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                stop_process_group(process)
             return None
         if line != READY_LINE:
             sys.stdout.buffer.write(line)
@@ -581,11 +587,11 @@ def dispatch(transport_argv: list[str], archive: bytes, envelope: str, receipt: 
             return 2
         return code
     except BaseException:
-        stop_process_group(process)
         try:
             process.stdin.close()
         except (BrokenPipeError, OSError):
             pass
+        stop_process_group(process)
         raise
 
 

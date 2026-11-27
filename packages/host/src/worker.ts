@@ -58,6 +58,7 @@ import { claudeConfigPath, recordClaudeTrustAsync } from "./workspace-trust.js";
 import { TerminalSnapshots } from "./terminal-snapshot.js";
 import { DEFAULT_TERMINAL_SIZE, isPtyTerminalSize, TERMINAL_SIZE_INDEX_FILE, TerminalBarrier, TerminalSizeIndex } from "./terminal-size.js";
 import { ptyTails } from "./pty-tail.js";
+import { describePtySpawnError } from "./pty-preflight.js";
 import { SignalIndex } from "./signal-index.js";
 import { CODEX_ENVIRONMENT_STATE_FILE, nativeCodexObserverArgs, prepareCodexWorkerExecution, startNativeCodex } from "./native-codex.js";
 import { startNativeOpenCode, validateNativeOpenCodeArgs } from "./native-opencode.js";
@@ -1556,8 +1557,17 @@ server.listen(workerSocket, async () => {
       env.OPENCODE_SERVER_USERNAME = "infinite";
       launch = { command: profile.command, args: [...profile.args, ...(settings.pure ? ["--pure"] : []), "attach", native.url, "--session", native.info().sessionId, "--dir", session.cwd] };
     }
+    const spawnPty: typeof spawn = (file, args, options) => {
+      try {
+        return spawn(file, args, options);
+      } catch (error) {
+        const message = describePtySpawnError(error);
+        if (error instanceof Error && message === error.message) throw error;
+        throw new Error(message, { cause: error });
+      }
+    };
     for (const credential of sessionCredentials(env)) issuedCredentials.add(credential);
-    child = spawn(launch.command, launch.args, {
+    child = spawnPty(launch.command, launch.args, {
       cwd: session.cwd,
       env,
       cols: terminal.cols,
@@ -1662,7 +1672,7 @@ server.listen(workerSocket, async () => {
       const previous = child;
       const args = [...profile.args, "--remote", native.url, "--remote-auth-token-env", "INFINITE_NATIVE_TOKEN",
         ...nativeCodexObserverArgs(session.nativeArgs ?? [], config.prompt, Boolean(session.workspace), restoredThreadId)];
-      const pty = spawn(profile.command, args, { cwd: session.cwd, env, cols: terminal.cols, rows: terminal.rows, name: "xterm-256color" });
+      const pty = spawnPty(profile.command, args, { cwd: session.cwd, env, cols: terminal.cols, rows: terminal.rows, name: "xterm-256color" });
       child = pty;
       previous?.kill("SIGTERM");
       state = { ...state, status: "running", pid: pty.pid };
@@ -1681,7 +1691,7 @@ server.listen(workerSocket, async () => {
         session.workspaceTrusted ? session.cwd : undefined, Boolean(session.team?.entryTools), permissionChannel!.run, egress.status !== "off",
         config.codeMode,
       );
-      const pty = spawn(next.command, next.args, { cwd: session.cwd, env, cols: terminal.cols, rows: terminal.rows, name: "xterm-256color" });
+      const pty = spawnPty(next.command, next.args, { cwd: session.cwd, env, cols: terminal.cols, rows: terminal.rows, name: "xterm-256color" });
       child = pty;
       state = { ...state, status: "running", pid: pty.pid };
       const resumedEvent = append("lifecycle", { status: "running", pid: pty.pid, cols: terminal.cols, rows: terminal.rows, permissionChannel: { event: "resumed" } });

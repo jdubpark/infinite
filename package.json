@@ -10,7 +10,7 @@
   ],
   "scripts": {
     "prepare:codex": "node scripts/build-codex-handoff.mjs",
-    "postinstall": "node scripts/prepare-pty.mjs && npm run build -w @infinite/attention && npm run build -w @infinite/remote",
+    "postinstall": "npm run build -w @infinite/attention && npm run build -w @infinite/remote",
     "build": "sh scripts/cloud-npm.sh 'npm run build -w @infinite/attention && npm run build -w @infinite/remote && npm run build -w @infinite/host && npm run build -w @infinite/web'",
     "typecheck": "sh scripts/cloud-npm.sh 'npm run typecheck --workspaces --if-present && tsc -p tsconfig.type-tests.json && tsc -p tsconfig.mcp-exact.json'",
     "test": "sh scripts/cloud-npm.sh 'npm run build -w @infinite/attention && npm run build -w @infinite/remote && node scripts/run-tests.mjs'",

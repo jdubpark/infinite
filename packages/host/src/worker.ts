@@ -23,6 +23,7 @@ import {
   mapCodexHook,
   mapCodexNotify,
   mapCodexOsc,
+  mapCodexOsc777,
   mergeHookIntoPrompt,
   mergeScreenIntoPrompt,
   recoveryTurnEnd,
@@ -133,17 +134,24 @@ let hybrid: Awaited<ReturnType<typeof createHybridWorkspace>> | undefined;
 terminal.onData((data) => {
   if (state.status === "running") child?.write(data);
 });
-terminal.parser.registerOscHandler(9, (data) => {
-  if (provider !== "codex" || state.status !== "running") return false;
-  try {
-    for (const signal of mapCodexOsc(data)) {
-      if (signal.kind === "prompt-open" && attention.prompt) continue;
-      record(signal, "osc");
-    }
-  } catch {
+let oscScreenCheckPending = false;
+const recordCodexOsc = (signals: Signal[]) => {
+  let check = false;
+  for (const signal of signals) {
+    if (signal.kind === "turn-end" && attention.state === "turn-finished") continue;
+    record(signal, "osc");
+    if (signal.kind === "notice" && (signal.type === "osc_approval" || signal.type === "osc_question")) check = true;
   }
-  return false;
-});
+  if (!check || oscScreenCheckPending) return;
+  oscScreenCheckPending = true;
+  terminal.write("", () => { oscScreenCheckPending = false; checkScreen(); });
+};
+for (const [code, map] of [[9, mapCodexOsc], [777, mapCodexOsc777]] as const) {
+  terminal.parser.registerOscHandler(code, (data) => {
+    if (provider === "codex" && state.status === "running") try { recordCodexOsc(map(data)); } catch {}
+    return false;
+  });
+}
 let pending = "";
 const usageLines = provider === "opencode" && session.team ? new JsonLineAssembler() : undefined;
 let flushTimer: ReturnType<typeof setTimeout> | undefined;

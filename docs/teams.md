@@ -558,9 +558,12 @@ record; the next removal proceeds as for a run without one. The statement lifts
 an unresolved operation's record for removal in the same way. Run removal and
 the statement are not on the relay allowlist.
 
-The record covers only the case above. A process that a command leaves behind
-without holding the command's output is never noted, so the host takes no look
-for it, and the run's directory may be removed while that process runs.
+The record covers only the two cases above (output still held at leader exit,
+and processes still matching the operation's recorded processes, groups, or
+sessions when the operation settles). A process that a command leaves behind
+without holding the command's output and that left its recorded group and
+session before a sample caught it is not noted, so the host takes no look for
+it, and the run's directories may be removed while that process runs.
 
 What holds a run's directories, in three rules:
 
@@ -4552,6 +4555,7 @@ cycle's PM selects capacity for its work. The refusal uses `409` with
 | `GET /api/teams/:id/context-usage` | None; returns recorded launch and blackboard read sizes per member (`member_scopes`) | Any paired device |
 | `GET /api/teams/:id/routing/:taskId` | None; explains the shadow or auto routing decision for a task | Any paired device |
 | `POST /api/teams/:id/reconcile-delivery`, `/reconcile-verification` | `requestId`, `revision`, reconciliation attestation fields (standalone runs) | Owner |
+| `POST /api/teams/:id/processes-ended` | `requestId` (UUID); states that a stopped command's or leftover processes have ended when the census reports `unknown` (not on the remote relay allowlist) | Owner |
 | `GET /api/teams/:id/members/:memberId/runtime`, `POST /api/teams/:id/members/:memberId/retire` | Inspect live process census or retire a member runtime tree (`SIGSTOP` -> `SIGKILL`) | Owner |
 | `POST /api/teams/:id/permissions/revoke`, `/routing/revoke` | `requestId`, `revision`; revokes active permission delegation or auto routing for the run | Owner |
 | `GET /api/teams/:id/bundle` | None; downloads the run's inspection bundle | Owner bearer key (owner CLI; session cookies refused) |

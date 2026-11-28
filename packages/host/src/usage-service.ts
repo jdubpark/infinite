@@ -82,6 +82,7 @@ const sessionOverlaps = (session: StoredSession, records: readonly UsageRecord[]
       if (at > sEnd) sEnd = at;
     }
   }
+  if (!Number.isFinite(sStart) || !Number.isFinite(sEnd)) return true;
   return sStart < endMs && sEnd >= startMs;
 };
 const keyOf = (state: { lastActiveAt?: string; exited: boolean; cursor: number; seen: number; refused: number; coverage: string; reason?: string; journaled?: object }) =>
@@ -690,9 +691,12 @@ export class UsageService {
       : this.clock() - this.lastReconciledAt > this.reconcileStaleMs ? "reconciliation-stale" as const
       : undefined;
     const ingestion = this.ingestionGap(provider, projectId);
+    const startMs = start.getTime();
+    const endMs = end.getTime();
     const undrainedStored = data.sessions.some(session => session.provider === provider
       && (projectId === undefined || session.projectId === projectId)
-      && !session.exited && session.coverage === "partial" && session.reason === "drain-incomplete");
+      && !session.exited && session.coverage === "partial" && session.reason === "drain-incomplete"
+      && sessionOverlaps(session, data.bySession.get(session.sessionId), startMs, endMs));
     const gap = reconciliation !== undefined ? reconciliation
       : ingestion !== undefined ? ingestion
       : undrainedStored ? "ingestion-incomplete" as const

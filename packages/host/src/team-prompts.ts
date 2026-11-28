@@ -151,6 +151,7 @@ export type TeamContextSnapshot = {
   continuations: TeamContinuationSnapshot[];
   memberReports: Pick<TeamMember, "memberId" | "revision" | "role" | "taskId" | "status" | "baseCommit" | "report" | "stoppedReason" | "permissionBlocked">[];
   permissionAgentDecisions?: TeamRun["permissionAgentDecisions"];
+  advisoryMemory?: string;
   feedback: string | null;
 };
 function withoutPrivateSettings<T extends object>(project: T): T {
@@ -174,7 +175,7 @@ function goalContextText(goal: NonNullable<TeamRun["goal"]>, role?: TeamMember["
   const criteria = record.criteria.map(item => item.id === "c0" ? { ...item, statement: successCriteria } : item);
   return `${JSON.stringify(rest)}\nSuccess criteria from the owner's objective record, version ${record.version}. Each names how it is checked; c0 is the owner's success text${record.criteria.some(item => item.derived) ? "; a criterion marked derived came from the intent check and the owner has not confirmed it" : ""}:\n${JSON.stringify(criteria)}${record.register ? `\n${registerText(record.register)}` : ""}${rows}`;
 }
-export function teamContext(run: TeamRun, feedback?: string, configuredProject?: Pick<TeamProject, "setup" | "checks">, role?: TeamMember["role"], permissionRecoveryHistory: TeamPermissionRecoveryView[] = []): TeamContextSnapshot {
+export function teamContext(run: TeamRun, feedback?: string, configuredProject?: Pick<TeamProject, "setup" | "checks">, role?: TeamMember["role"], permissionRecoveryHistory: TeamPermissionRecoveryView[] = [], advisoryMemory?: string): TeamContextSnapshot {
   const continuations = (run as TeamRun & { continuations?: TeamContinuationSnapshot[] }).continuations ?? [];
   const snapshot: TeamContextSnapshot = {
     schemaVersion: 1,
@@ -217,6 +218,7 @@ export function teamContext(run: TeamRun, feedback?: string, configuredProject?:
     continuations: continuations.map(item => ({ ...item, tasks: item.tasks.map(withoutRouting) })),
     memberReports: (run.members ?? []).filter(member => !UNREPORTED_ROLES.has(member.role)).map(({ memberId, revision, role, taskId, status, baseCommit, report, stoppedReason, permissionBlocked }) => ({ memberId, revision, role, ...(taskId ? { taskId } : {}), status, baseCommit, ...(report ? { report } : {}), ...(stoppedReason ? { stoppedReason } : {}), ...(permissionBlocked ? { permissionBlocked } : {}) })),
     ...(run.permissionAgentDecisions?.length ? { permissionAgentDecisions: run.permissionAgentDecisions.slice(-20) } : {}),
+    ...(role === "project-manager" && advisoryMemory ? { advisoryMemory } : {}),
     feedback: feedback ?? null,
   };
   if (role === "implementer") {
@@ -327,7 +329,7 @@ function fitDerivedPromptSections(baseSections: TeamPromptSection[], target: Pro
 }
 const HOST_SCOUT_SENTENCE = "The host assigns each scout's profile; omit agentProfileId from scouts.";
 const textSections = (...texts: string[]): TeamPromptSection[] => texts.filter(Boolean).map(text => ({ kind: "text", text }));
-export function teamPromptSpec(run: TeamRun, role: TeamMember["role"], task?: TeamTask | TeamScout, feedback?: string, provider: Provider = run.provider, modelProfile?: TeamModelProfile, configuredProject?: Pick<TeamProject, "setup" | "checks">, permissionRecoveryHistory: TeamPermissionRecoveryView[] = [], publishHeads = true): { prompt: string; promptSections: TeamPromptSection[] } {
+export function teamPromptSpec(run: TeamRun, role: TeamMember["role"], task?: TeamTask | TeamScout, feedback?: string, provider: Provider = run.provider, modelProfile?: TeamModelProfile, configuredProject?: Pick<TeamProject, "setup" | "checks">, permissionRecoveryHistory: TeamPermissionRecoveryView[] = [], publishHeads = true, advisoryMemory?: string): { prompt: string; promptSections: TeamPromptSection[] } {
   const deliveryBranch = teamDeliveryBranch(run) ?? "";
   if (role === "delivery" && run.delivery && !deliveryBranch) throw new TeamError(409, "delivery-branch-unknown", UNKNOWN_DELIVERY_BRANCH);
   const implementerTask = task && role === "implementer" && "paths" in task
@@ -471,6 +473,7 @@ Confirm the remote branch and PR head equal ${run.headCommit}. Confirm required 
     role === "project-manager" && run.recovery ? `Recovery evidence: ${JSON.stringify({ ...run.recovery.source, reason: boundedEvidence(run.recovery.source.reason, 1600) })}` : "",
     role === "project-manager" ? promptPermissionRecoverySummary(run, permissionRecoveryHistory) : "",
     role === "project-manager" ? promptContinuationSummary(run) : "",
+    role === "project-manager" && advisoryMemory ? advisoryMemory : "",
     ["reviewer", "integrator"].includes(role) ? promptTaskSummary(run.tasks ?? []) : "",
     ["reviewer", "integrator"].includes(role) ? promptCheckSummary(run) : "",
     promptBriefSummary(run),
@@ -495,8 +498,8 @@ Confirm the remote branch and PR head equal ${run.headCommit}. Confirm required 
   return built;
 }
 
-export function teamPrompt(run: TeamRun, role: TeamMember["role"], task?: TeamTask | TeamScout, feedback?: string, provider: Provider = run.provider, modelProfile?: TeamModelProfile, configuredProject?: Pick<TeamProject, "setup" | "checks">, permissionRecoveryHistory: TeamPermissionRecoveryView[] = [], publishHeads = true) {
-  return teamPromptSpec(run, role, task, feedback, provider, modelProfile, configuredProject, permissionRecoveryHistory, publishHeads).prompt;
+export function teamPrompt(run: TeamRun, role: TeamMember["role"], task?: TeamTask | TeamScout, feedback?: string, provider: Provider = run.provider, modelProfile?: TeamModelProfile, configuredProject?: Pick<TeamProject, "setup" | "checks">, permissionRecoveryHistory: TeamPermissionRecoveryView[] = [], publishHeads = true, advisoryMemory?: string) {
+  return teamPromptSpec(run, role, task, feedback, provider, modelProfile, configuredProject, permissionRecoveryHistory, publishHeads, advisoryMemory).prompt;
 }
 
 export function ownerDirectionLines(run: Pick<TeamRun, "steering" | "decisions">): string[] {

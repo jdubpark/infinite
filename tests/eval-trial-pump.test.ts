@@ -419,13 +419,15 @@ test("a session's cost is recorded before its removal", async () => {
   const r = rig({ sessionsRemoved: removed, cost: sessionId => { order.push(`cost:${sessionId}`); return lookups[sessionId]; } });
   try {
     const long = new Date(Date.now() - 2 * 3_600_000).toISOString();
+    const dayPast = new Date(Date.now() - 25 * 3_600_000).toISOString();
     const jobId = r.addJob();
     const ids: Record<string, string> = {};
     let slot = 0;
     for (const sessionId of Object.keys(lookups)) {
       const trialId = r.seed(jobId, slot++, "running");
       ids[sessionId] = trialId;
-      r.store.write(tx => finishTrial(tx, trialId, { grade: VOID_GRADE, configId: null, profileEpoch: null, sessionId, patchKeepDays: 90 }, long));
+      const endedAt = sessionId === "session-partial" ? dayPast : long;
+      r.store.write(tx => finishTrial(tx, trialId, { grade: VOID_GRADE, configId: null, profileEpoch: null, sessionId, patchKeepDays: 90 }, endedAt));
     }
     await r.pump.sweep();
     assert.equal(removed.length, 3, "every session is removed");

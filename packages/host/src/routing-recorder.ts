@@ -1,5 +1,6 @@
 import type { AutonomyMode } from "./autonomy.js";
 import type { UsageConfig } from "./config.js";
+import { EVAL_TRIALS_MODULE } from "./eval-trial-store.js";
 import type { EvidenceDb } from "./evidence/types.js";
 import type { ProviderLimitEvent } from "./provider-limits.js";
 import { appendRunEvent } from "./run-events.js";
@@ -211,7 +212,8 @@ export class RoutingRecorder {
     const routing = run.routing;
     if (routing === undefined || routing.mode === "auto" || run.lineup === undefined || !routing.knobs.points.includes("start")) return;
     const frame = startFrame(cached);
-    this.shadowAt(run, task.id, "start", (db, keys) => evaluateStart(db, cached, frame, keys, this.now(), false));
+    const evalPriorsReady = this.store.status().modules[EVAL_TRIALS_MODULE] === "ready";
+    this.shadowAt(run, task.id, "start", (db, keys) => evaluateStart(db, { ...cached, evalPriorsReady }, frame, keys, this.now(), false));
   }
 
   private shadowAt(run: TeamRun, id: string, point: RoutingPoint, evaluate: (db: EvidenceDb, keys: { taskKey: string; key: string }) => Evaluated | undefined): void {

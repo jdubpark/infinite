@@ -993,8 +993,9 @@ export class Manager {
       if (!request.team && [...this.handoffProjects.values()].some(path => handoffPathsOverlap(path, realpathSync(project.path)))) throw new ContentError("This project is capturing an accepted team handoff");
       const configuredProfile = sessionAgentProfile(this.config, request.provider, executionIdentity);
       if (!configuredProfile) throw new Error("Provider is not configured on this host");
-      const openCode = request.provider === "opencode" ? await readOpenCodeVersion(reviewerCommand("opencode", configuredProfile)) : undefined;
+      const openCode = request.provider === "opencode" && (request.localUi || request.teamModelProfile) ? await readOpenCodeVersion(reviewerCommand("opencode", configuredProfile)) : undefined;
       if (request.localUi && openCode?.major === 2) throw new ContentError("Local native OpenCode sessions need OpenCode 1; the installed OpenCode is version 2. Use terminal mode or a team member.");
+      if (openCode?.major === 2 && configuredProfile.args.some(arg => arg === "--pure" || arg.startsWith("--pure="))) process.stderr.write("[Infinite] OpenCode 2 has no --pure: the --pure argument was dropped and plugins from the operator configuration load into members\n");
       let profile = request.teamModelProfile ? teamModelLaunch(configuredProfile, request.teamModelProfile, openCode?.major) : configuredProfile;
       if (request.team?.role === "permission-coordinator") profile = permissionCoordinatorLaunch(request.provider, profile);
       if (request.team?.role === "mission-coordinator") profile = missionCoordinatorLaunch(parseMissionCoordinatorProvider(request.provider), profile);

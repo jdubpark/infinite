@@ -277,20 +277,19 @@ export function openCodeReviewerArgs(turn: Pick<PermissionTurn, "profile" | "pro
 }
 
 export function openCodeAgentsDenyEverything(stdout: string): boolean {
-  const start = stdout.search(/^\[/m);
-  if (start < 0) return false;
-  try {
-    const agents = JSON.parse(stdout.slice(start)) as { id?: unknown; permissions?: unknown }[];
-    const agent = agents.find(item => item.id === REVIEW_AGENT);
+  const offsets = [...stdout.matchAll(/^\[/gm)].map(match => match.index);
+  for (const start of offsets) {
+    let agents: { id?: unknown; permissions?: unknown }[];
+    try { agents = JSON.parse(stdout.slice(start)); } catch { continue; }
+    if (!Array.isArray(agents)) continue;
+    const agent = agents.find(item => item?.id === REVIEW_AGENT);
     if (!agent || !Array.isArray(agent.permissions)) return false;
     const rules = agent.permissions as { action?: unknown; resource?: unknown; effect?: unknown }[];
-    const denied = (action: string) => {
-      const rule = [...rules].reverse().find(item => item.action === "*" || item.action === action);
-      return rule?.resource === "*" && rule.effect === "deny";
-    };
-    return rules.some(rule => rule.action === "execute" && rule.resource === "*" && rule.effect === "deny")
-      && ["*", "execute", "read", "edit", "bash", "webfetch", "task", "question"].every(denied);
-  } catch { return false; }
+    const last = rules.map(rule => rule.action === "*" && rule.resource === "*" && rule.effect === "deny").lastIndexOf(true);
+    return last >= 0 && rules.slice(last).every(rule => rule.effect === "deny")
+      && rules.some(rule => rule.action === "execute" && rule.resource === "*" && rule.effect === "deny");
+  }
+  return false;
 }
 
 const OPENCODE_ENV = {

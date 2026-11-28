@@ -30,7 +30,7 @@ export function usageFromRunLine(line: unknown, model: string, now = new Date())
     providerId: slash < 0 ? model : model.slice(0, slash), modelId: slash < 0 ? model : model.slice(slash + 1) });
 }
 
-type ToolPart = { id?: unknown; partID?: unknown; tool?: unknown; callID?: unknown; state?: { status?: unknown; metadata?: { toolCalls?: unknown } } };
+type ToolPart = { id?: unknown; partID?: unknown; tool?: unknown; callID?: unknown; state?: { status?: unknown; metadata?: { metadata?: { toolCalls?: unknown } } } };
 
 export function toolFromRunLine(line: unknown): { tool: string; toolUseId?: string; ok: boolean } | undefined {
   const event = line as { type?: unknown; part?: ToolPart } | null;
@@ -47,7 +47,7 @@ export function nestedToolsFromRunLine(line: unknown): { tool: string; toolUseId
   const event = line as { type?: unknown; part?: ToolPart } | null;
   const parent = toolFromRunLine(event);
   if (!parent || parent.tool !== "execute") return [];
-  const calls = event?.part?.state?.metadata?.toolCalls;
+  const calls = event?.part?.state?.metadata?.metadata?.toolCalls;
   if (!Array.isArray(calls)) return [];
   const nested: { tool: string; toolUseId?: string; ok: boolean }[] = [];
   for (const [index, call] of calls.slice(0, MAX_NESTED).entries()) {

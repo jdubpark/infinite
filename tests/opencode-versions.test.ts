@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { teamModelLaunch } from "../packages/host/src/launch.js";
@@ -59,6 +59,14 @@ test("the installed OpenCode major version picks the member launch form, and an 
     const future = fakeOpenCode(join(dir, "four"), "3.0.0");
     const ahead = await readOpenCodeVersion({ command: future.command, prefix: [] });
     assert.deepEqual([ahead.major, ahead.known], [1, false]);
+
+    const flaky = fakeOpenCode(join(dir, "six"), "2.3.2");
+    const marker = join(dir, "six", "down");
+    writeFileSync(marker, "");
+    writeFileSync(flaky.command, `#!/bin/sh\nif [ -f '${marker}' ]; then exit 1; fi\necho 2.3.2\n`);
+    assert.equal((await readOpenCodeVersion({ command: flaky.command, prefix: [] })).known, false);
+    unlinkSync(marker);
+    assert.equal((await readOpenCodeVersion({ command: flaky.command, prefix: [] })).major, 2, "an unreadable version is retried at the next launch");
 
     const upgraded = fakeOpenCode(join(dir, "five"), "1.19.6");
     assert.equal((await readOpenCodeVersion({ command: upgraded.command, prefix: [] })).major, 1);
@@ -128,6 +136,9 @@ test("the version 2 reviewer check accepts only an agent whose last matching rul
   assert.equal(openCodeAgentsDenyEverything(listing([...deny, { action: "*", resource: "*", effect: "ask" }])), false);
   assert.equal(openCodeAgentsDenyEverything(listing([...deny, { action: "execute", resource: "src/*", effect: "allow" }])), false);
   assert.equal(openCodeAgentsDenyEverything(listing([{ action: "*", resource: "*", effect: "deny" }])), false, "execute must be denied by name too");
+  assert.equal(openCodeAgentsDenyEverything(listing([...deny, { action: "web*", resource: "*", effect: "allow" }])), false, "a wildcard allow after the deny");
+  assert.equal(openCodeAgentsDenyEverything(listing([...deny, { action: "web*", resource: "*", effect: "deny" }])), true);
+  assert.equal(openCodeAgentsDenyEverything(`[warn] noisy\n${listing(deny)}`), true, "a log line starting with a bracket does not hide the listing");
   assert.equal(openCodeAgentsDenyEverything(listing(deny, "other")), false);
   assert.equal(openCodeAgentsDenyEverything("not json"), false);
 });
@@ -136,8 +147,8 @@ const sessionID = "ses_01HXYZ";
 const stepFinish = { type: "step_finish", timestamp: 1_790_000_000_000, sessionID, part: { id: "prt_01", sessionID, messageID: "msg_01", type: "step-finish", reason: "stop", snapshot: "snap_1", cost: 0.004, tokens: { input: 900, output: 80, reasoning: 20, cache: { read: 300, write: 10 } } } };
 const textLine = { type: "text", timestamp: 1_790_000_000_001, sessionID, part: { id: "prt_02", sessionID, messageID: "msg_01", type: "text", text: "{\"verdict\":\"refer\",\"note\":\"n\"}", time: { start: 1, end: 2 } } };
 const toolLine = (status: string, calls?: unknown[]) => ({ type: "tool_use", timestamp: 3, sessionID, part: { partID: "prt_03", sessionID, messageID: "msg_01", type: "tool", id: "call_abc", tool: "execute", state: status === "error"
-  ? { status, input: { code: "x" }, error: "boom", metadata: calls ? { toolCalls: calls } : {}, time: { start: 1, end: 2 } }
-  : { status, input: { code: "x" }, output: "done", title: "execute", metadata: calls ? { toolCalls: calls } : {}, time: { start: 1, end: 2 } } } });
+  ? { status, input: { code: "x" }, error: "boom", metadata: calls ? { metadata: { toolCalls: calls }, content: [] } : {}, time: { start: 1, end: 2 } }
+  : { status, input: { code: "x" }, output: "done", title: "execute", metadata: calls ? { metadata: { toolCalls: calls }, content: [] } : { metadata: {}, content: [] }, time: { start: 1, end: 2 } } } });
 
 test("OpenCode 2 run lines give usage, the call id, and the calls nested inside an execute call", () => {
   const usage = usageFromRunLine(stepFinish, "deepseek/deepseek-pro", new Date(0));
@@ -156,6 +167,8 @@ test("OpenCode 2 run lines give usage, the call id, and the calls nested inside 
   assert.deepEqual(nestedToolsFromRunLine(toolLine("completed")), []);
   assert.deepEqual(nestedToolsFromRunLine({ ...toolLine("completed", calls), part: { ...toolLine("completed", calls).part, tool: "bash" } }), []);
   assert.deepEqual(nestedToolsFromRunLine(textLine), []);
+  const bare = toolLine("completed");
+  assert.deepEqual(nestedToolsFromRunLine({ ...bare, part: { ...bare.part, state: { ...bare.part.state, metadata: { toolCalls: calls } } } }), [], "tool calls directly under state.metadata are not the shape version 2 emits");
 });
 
 test("the reviewer parser reads OpenCode 2 usage and still stops on any tool call", () => {

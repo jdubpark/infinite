@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { statSync } from "node:fs";
-import { isAbsolute } from "node:path";
+import { delimiter, isAbsolute, join } from "node:path";
 
 export type OpenCodeMajor = 1 | 2;
 
@@ -15,15 +15,16 @@ export interface OpenCodeRead {
 
 const TIMEOUT_MS = 5_000;
 const MAX_OUTPUT = 4_096;
-const CACHE_MS = 60_000;
+const CACHE_MS = 10_000;
 const ENV_NAMES = ["PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TMPDIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"];
 
-interface Entry { at: number; signature: string; read: Promise<OpenCodeRead> }
+interface Entry { at: number; signature: string | undefined; read: Promise<OpenCodeRead> }
 
 const cache = new Map<string, Entry>();
 const reported = new Map<string, string>();
 
 export function openCodeModelArg(model: string, variant: string | undefined, major: OpenCodeMajor): string {
+  if (model.includes("#") || variant?.includes("#")) throw new Error("An OpenCode model and variant cannot contain #.");
   return major === 2 && variant ? `${model}#${variant}` : model;
 }
 
@@ -32,13 +33,23 @@ export function parseOpenCodeVersion(output: string): { version: string; major: 
   return match ? { version: match[1], major: Number(match[2]) } : undefined;
 }
 
-function executableSignature(launch: OpenCodeLaunch): string {
-  const path = [launch.command, ...launch.prefix].filter(isAbsolute).at(-1);
-  if (!path) return "";
+function resolveOnPath(name: string): string | undefined {
+  for (const dir of (process.env.PATH ?? "").split(delimiter)) {
+    if (!dir) continue;
+    const candidate = join(dir, name);
+    try { if (statSync(candidate).isFile()) return candidate; } catch {}
+  }
+  return undefined;
+}
+
+function executableSignature(launch: OpenCodeLaunch): string | undefined {
+  const named = [launch.command, ...launch.prefix].filter(isAbsolute).at(-1);
+  const path = named ?? resolveOnPath(launch.command);
+  if (!path) return undefined;
   try {
     const stat = statSync(path);
     return `${stat.ino}:${stat.size}:${stat.mtimeMs}`;
-  } catch { return ""; }
+  } catch { return undefined; }
 }
 
 function probe(launch: OpenCodeLaunch): Promise<OpenCodeRead> {
@@ -72,11 +83,12 @@ export async function readOpenCodeVersion(launch: OpenCodeLaunch | undefined): P
   const signature = executableSignature(launch);
   const now = Date.now();
   let entry = cache.get(key);
-  if (!entry || entry.signature !== signature || now - entry.at > CACHE_MS) {
+  if (!entry || signature === undefined || entry.signature !== signature || now - entry.at > CACHE_MS) {
     entry = { at: now, signature, read: probe(launch) };
     cache.set(key, entry);
   }
   const read = await entry.read;
+  if (!read.known || signature === undefined) cache.delete(key);
   const line = describeOpenCodeRead(read);
   if (reported.get(key) !== line) {
     reported.set(key, line);

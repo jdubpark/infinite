@@ -300,3 +300,26 @@ test("a run outside the rule is returned before any store read", () => {
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("a late verdict interrupted at its pending save keeps the earlier assessment until the record reads again", () => {
+  const a = delivered();
+  const earlier = a.holder.run.assessment!.verdictId;
+  a.host.deliveryFact = "landed";
+  a.host.failSaveAt = 3;
+  assert.throws(() => a.verdicts.settleReceipt(a.holder));
+  const b = reopen(a);
+  assert.equal(b.holder.verdict?.status, "recording");
+  const record = b.holder.objectiveRecord;
+  delete b.holder.objectiveRecord;
+  for (let pass = 0; pass < 2; pass += 1) {
+    b.verdicts.restore([b.holder]);
+    b.verdicts.settleReceipt(b.holder);
+    assert.equal(b.holder.run.assessment?.verdictId, earlier, "the earlier assessment stands");
+    assert.equal(b.holder.verdict?.status, "recording", "the late verdict stays retryable");
+  }
+  b.holder.objectiveRecord = record;
+  assert.equal(b.verdicts.settleReceipt(b.holder), true);
+  assert.notEqual(b.holder.run.assessment?.verdictId, earlier, "the late verdict's assessment");
+  assert.equal(b.holder.run.assessment?.verdictId, b.holder.verdict!.verdictId);
+  assert.equal(stateOf(b, "c3"), "met");
+});

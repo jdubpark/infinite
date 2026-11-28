@@ -2006,8 +2006,7 @@ export class TeamService {
   }
   private async stopObsoletePermissionCoordinators(stored: Stored) {
     const run = stored.run;
-    for (const member of run.members.filter(item => item.role === "permission-coordinator" &&
-      (activeMember(item) || item.status === "waiting"))) {
+    for (const member of run.members.filter(item => item.role === "permission-coordinator" && (activeMember(item) || item.status === "waiting"))) {
       if (member.status === "unavailable" && terminalPermissionCoordinator(run, member)) continue;
       const terminal = member.revision !== run.revision || run.permissionsRevokedAt !== undefined ||
         !run.permissions || ["paused", "cancelled", "blocked", "ready-for-review", "merged", "no-change"].includes(run.status);
@@ -2197,7 +2196,8 @@ export class TeamService {
             continue;
           }
           if (!member.report) {
-            const state = await this.manager.state(member.sessionId);
+            let state = await this.manager.state(member.sessionId);
+            if (state.status === "unavailable") state = (await this.manager.confirmDeadTeamSession?.(member.sessionId, assignment(member), state)) ?? state;
             syncObservedMemberState(run, member, state, timestamp());
             const journalDrained = !page.more && member.cursor >= state.seq;
             if (state.status === "exited" && (page.more || member.cursor < state.seq)) { this.save(stored); continue; }

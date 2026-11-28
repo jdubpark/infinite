@@ -77,6 +77,7 @@ function editOf(current: Criterion, op: EditOp, configured: readonly TeamCommand
     check,
     producer: producerOf(check),
     threshold: op.threshold ?? current.threshold,
+    ...(op.check === undefined && current.pinned !== undefined ? { pinned: current.pinned } : {}),
     state: "active",
   });
 }

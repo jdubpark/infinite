@@ -6,11 +6,7 @@ import { readFileSync, mkdirSync, readdirSync, existsSync, rmSync, realpathSync,
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createHash, randomUUID } from "node:crypto";
-import {
-  applyLifecycle,
-  initialAttention,
-  type Attention,
-} from "@infinite/attention";
+import { applyLifecycle, initialAttention, type Attention } from "@infinite/attention";
 import { unseal, writeSealed } from "./vault.js";
 import { readIndexedEvents } from "./signal-index.js";
 import { canonicalOrResolved, collectLivePermissionSockets, ensureSocketDir, existingWorkerSocket, readRecordedSocketPath, removeWorkerSockets, trustedWorkerSocket, workerCall, workerCallAt, type SocketTarget } from "./ipc.js";
@@ -33,7 +29,7 @@ import { hasHostLaunchFields, headlessLaunch, matchesSessionRequestFingerprint, 
 import { withNativeContinuation } from "./native-continuation.js";
 import { SESSION_PERMISSION_ACTOR_LABEL, isRequesterNotice, sessionPermissionRequestId, type SessionPermissionAnswer } from "./permission-session-requests.js";
 import { deferredCallOpen, type HeadlessPermissionChannel } from "./permission-headless.js";
-import { agentBoundary, inventoryRuntimeProcesses, runtimeIdentity, stopRuntimeTree, type RuntimeProcess, type TeamRuntimeInspection, type TeamRuntimeRetirement } from "./team-retirement.js";
+import { agentBoundary, confirmDeadTeamRuntime, inventoryRuntimeProcesses, runtimeIdentity, stopRuntimeTree, type RuntimeProcess, type TeamRuntimeInspection, type TeamRuntimeRetirement } from "./team-retirement.js";
 import { TeamError } from "./team-workspace.js";
 import { prepareMemberTrace } from "./member-traces.js";
 import { projectGithubRepository, sessionGithubGrant, sessionGithubScopeFor, type GithubGrantScope, type SessionGithubOrigin } from "./github-grants.js";
@@ -144,19 +140,10 @@ export function publicAttention(att: Attention): Attention {
     lastMessage,
   };
 }
-export function withDefaultAttention(
-  state: Omit<WorkerState, "attention"> & { attention?: Attention },
-  now = new Date().toISOString(),
-): WorkerState {
+export function withDefaultAttention(state: Omit<WorkerState, "attention"> & { attention?: Attention }, now = new Date().toISOString()): WorkerState {
   if (state.attention) return state as WorkerState;
-  const status =
-    state.status === "exited" || state.status === "recording-error"
-      ? state.status
-      : "unavailable";
-  return {
-    ...state,
-    attention: applyLifecycle(initialAttention(now, false), status, now),
-  };
+  const status = state.status === "exited" || state.status === "recording-error" ? state.status : "unavailable";
+  return { ...state, attention: applyLifecycle(initialAttention(now, false), status, now) };
 }
 export class Manager {
   private contexts?: ProjectContexts;
@@ -506,12 +493,24 @@ export class Manager {
       throw error;
     }
   }
+  async confirmDeadTeamSession(sessionId: string, team: TeamAssignment, state?: WorkerState): Promise<WorkerState | undefined> {
+    if (!this.config?.stateDir || !this.key) return undefined;
+    let stored: TeamAssignment | undefined;
+    try { stored = this.meta(sessionId).session.team; } catch { return undefined; }
+    if (!stored || stored.runId !== team.runId || stored.memberId !== team.memberId || stored.revision !== team.revision) return undefined;
+    const current = state ?? await this.state(sessionId);
+    return confirmDeadTeamRuntime({ stateDir: this.config.stateDir, key: this.key, socketTarget: this.socketTarget, sessionId, state: current });
+  }
   async stopTeamSession(sessionId: string, requestId: string, team: TeamAssignment): Promise<WorkerState> {
     const stored = this.meta(sessionId).session.team;
     if (!stored || stored.runId !== team.runId || stored.memberId !== team.memberId || stored.revision !== team.revision)
       throw new TeamStopRefused("This session does not belong to the team assignment", 403);
     const state = await this.state(sessionId);
     if (state.status === "exited") return state;
+    if (state.status === "unavailable" || state.status === "recording-error") {
+      const dead = await this.confirmDeadTeamSession?.(sessionId, team, state);
+      if (dead) return dead;
+    }
     if (state.status !== "running") throw new TeamStopRefused("The team member has not confirmed a controllable runtime");
     await workerCall(this.socketTarget, sessionId, { op: "stop", requestId });
     return this.state(sessionId);

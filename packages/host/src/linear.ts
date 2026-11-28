@@ -41,7 +41,7 @@ type Stored = {
   create: { id: string; title: string; description: string; teamId: string; projectId?: string; parentId?: string };
   attempted: boolean; issue?: Issue; baseline?: string; checkedAt?: string;
   blocked?: string; error?: string; failures: number; retryAt: number;
-  terminal: boolean; comments: Record<string, Comment>;
+  terminal: boolean; comments: Record<string, Comment>; deliveredComments?: string[];
   label?: "add" | "added" | "remove"; labelVersion?: number; labelFailures?: number; labelRetryAt?: number; labelProviderRetryAt?: number;
   retitle?: string; retitleFailures?: number; retitleRetryAt?: number;
   retitleWanted?: string;
@@ -53,6 +53,7 @@ const hash = (value: unknown) => createHash("sha256").update(JSON.stringify(valu
 const terminalStatuses = new Set(["ready-for-review", "merged", "no-change", "no-opportunity", "blocked", "cancelled", "limit-reached", "achieved"]);
 const evidenceStatuses = new Set([...terminalStatuses, "needs-input", "paused"]);
 const RETITLE_SENT_LIMIT = 16;
+const MAX_DELIVERED_KEYS = 4096;
 const normalized = (value: string | null) => (value ?? "").replace(/\r\n/g, "\n").trim();
 const createMatchNormalized = (value: string | null) => {
   let fenced = false;
@@ -158,6 +159,26 @@ export class LinearService {
   private comment(stored: Stored, event: string, text: string, keyText = text) {
     const body = sharedText(text), eventKey = hash({ event, body: sharedText(keyText) });
     if (stored.comments[eventKey]) return;
+    if (stored.deliveredComments) {
+      const idx = stored.deliveredComments.indexOf(eventKey);
+      if (idx >= 0) {
+        if (stored.deliveredComments.length >= MAX_DELIVERED_KEYS - 256 && idx < stored.deliveredComments.length - 1) {
+          stored.deliveredComments.splice(idx, 1);
+          stored.deliveredComments.push(eventKey);
+        }
+        return;
+      }
+    }
+    if (Object.keys(stored.comments).length >= 256) {
+      const pruned: string[] = [];
+      for (const [key, entry] of Object.entries(stored.comments)) {
+        if (entry.delivered) { delete stored.comments[key]; pruned.push(key); }
+      }
+      if (pruned.length) {
+        const seen = new Set(stored.deliveredComments ?? []);
+        stored.deliveredComments = [...(stored.deliveredComments ?? []), ...pruned.filter(key => !seen.has(key))].slice(-MAX_DELIVERED_KEYS);
+      }
+    }
     if (Object.keys(stored.comments).length >= 256 || Buffer.byteLength(body) > 64000) {
       stored.blocked ??= "Linear evidence exceeded its bounded outbox. Review the saved execution before starting another run.";
       this.save(stored); return;

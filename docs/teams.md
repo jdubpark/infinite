@@ -562,6 +562,32 @@ The record covers only the case above. A process that a command leaves behind
 without holding the command's output is never noted, so the host takes no look
 for it, and the run's directory may be removed while that process runs.
 
+What holds a run's directories, in three rules:
+
+- A process that nothing can inspect holds them only if the host recorded it:
+  the settle look or the operation's record names it by process, group or
+  session id. A process that the census cannot inspect and the host never
+  recorded, such as an unrelated process of another account, holds nothing.
+  The look at a left-behind process record and the look before a removal
+  count it as not seen. A look that fails as a whole still answers `unknown`.
+  The census of a stopped operation (see the stop fence) keeps answering
+  `unknown` for a process it cannot inspect.
+- Before the owner's removal and before retention removes a run's directories,
+  the host looks for processes that use them, even when the run has no
+  operation record and no left-behind record. A process whose working
+  directory, open file or command line is under the run's directory holds the
+  directories. The owner's removal answers `team-leftover-running` (409) with a
+  message that names the directories, not an earlier command. Retention skips
+  the run, and the view carries `leftoverProcesses` with `state` `in-use`. The
+  event reads "N process(es) use this run's directories. The host keeps them
+  until a census finds none." A look that finds none clears the hold, and the
+  removal proceeds. A look that cannot run at all holds nothing for a run
+  that has no record.
+- A hold does not expire. The owner's statement clears only a look that
+  answers `unknown`, never one that sees a process. Runs from before the
+  host recorded live processes at settle have no hold of that kind; the
+  look at removal covers them.
+
 **Rollback.** A host without this change keeps the record in the sealed run
 file but ignores it. It removes a held run's directories under its retention
 policy and on the owner's removal while the process may still run. Before a

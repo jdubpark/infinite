@@ -325,14 +325,14 @@ export class TeamRetention {
     }
   }
   removeRun(id: string): Promise<TeamView> {
-    return this.host.fence.take(id, true, true).then(taken => this.host.enqueue(id, async () => {
+    return this.host.fence.take(id, true, true, true).then(taken => this.host.enqueue(id, async () => {
       const stored = this.host.visible(id), run = stored.run;
       if (this.host.needsPublication(stored)) throw new TeamError(409, "head-not-published", "The integrated head must be published to GitHub before this run can be removed.");
       if (this.removingRuns.has(id)) throw new TeamError(409, "team-operation-running", "A background workspace removal is still running. Retry deletion after it settles.");
       this.assertRunRetentionSafe(stored);
       if (!(["cancelled", "merged", "no-change"].includes(run.status) && await this.membersSettled(stored)))
         throw new TeamError(409, "team-active", "Only a settled cancelled, merged or no-change run can be removed.");
-      if (stored.pending?.witness || stored.leftover) this.confirmProcessesEnded(stored, taken);
+      if (stored.pending?.witness || stored.leftover || taken?.leftover?.record.directory) this.confirmProcessesEnded(stored, taken);
       if (this.needsMemberWorkSaved(stored)) {
         this.startMemberWorkSave(stored);
         throw new TeamError(409, "member-work-not-saved", "Unfinished member work is being saved to GitHub before this run's workspaces are removed. Retry removal shortly.");
@@ -367,6 +367,9 @@ export class TeamRetention {
     if (state !== undefined && pendingCleared && !stored.leftover) return;
     const left = state === undefined ? undefined : stored.leftover?.census?.state;
     if (!stored.leftover || !pendingCleared && left !== "running" && left !== "in-use") throw this.operationRunning(stored);
+    if (stored.leftover.directory) throw left === "unknown"
+      ? new TeamError(409, "team-leftover-unknown", "The host cannot tell whether a process uses this run's directories, so it keeps them. After checking the host, state that none does with `infinite team processes-ended RUN_ID`, then retry removal.")
+      : new TeamError(409, "team-leftover-running", "The host sees a process using this run's directories, so it keeps them. Retry removal after it has exited.");
     if (left === "unknown") throw new TeamError(409, "team-leftover-unknown", "The host cannot tell whether a process an earlier command of this run left behind still runs, so it keeps this run's directories. After checking the host, state that it ended with `infinite team processes-ended RUN_ID`, then retry removal.");
     throw new TeamError(409, "team-leftover-running", "The host still sees a process an earlier command of this run left behind, or a process using this run's directory. Retry removal after it has exited.");
   }
@@ -377,6 +380,10 @@ export class TeamRetention {
     if (checked && now - Date.parse(checked.at) < CENSUS_TTL_MS) return false;
     const state = await this.host.refreshOperationCensus(stored, true, true);
     return state !== undefined && (!stored.pending?.witness || processesCleared(stored)) && !stored.leftover;
+  }
+  private async directoriesClear(stored: Stored) {
+    const taken = await this.host.fence.take(stored.run.id, true, true, true);
+    return taken !== undefined && this.host.fence.apply(stored, taken) !== undefined && !stored.leftover;
   }
   private async membersSettled(stored: Stored, operationEnded = false) {
     const { run } = stored;
@@ -540,6 +547,9 @@ export class TeamRetention {
       if (this.host.needsPublication(stored)) { this.host.startPublication(stored); return; }
       if (witnessed || (stored.leftover && retentionDue)) {
         if (!(await this.processesEnded(stored, witnessed))) return;
+        if (run.status !== statusAtStart || this.host.commands.has(run.id) || this.removingRuns.has(run.id)) return;
+      } else if (retentionDue) {
+        if (!(await this.directoriesClear(stored))) return;
         if (run.status !== statusAtStart || this.host.commands.has(run.id) || this.removingRuns.has(run.id)) return;
       }
       if (this.needsMemberWorkSaved(stored)) { this.startMemberWorkSave(stored); return; }

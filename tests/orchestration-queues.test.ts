@@ -646,6 +646,7 @@ test("TeamService deletion purges entry ingest queue, blocks rateTask, and does 
     ingestEntriesAsync(): Promise<void>;
     retention: {
       removingRuns: Set<string>;
+      deletingRuns: Set<string>;
       memberTraces?: { inUse: () => boolean; settle: () => Promise<void>; forget: () => Promise<void> };
     };
   };
@@ -674,7 +675,8 @@ test("TeamService deletion purges entry ingest queue, blocks rateTask, and does 
     f.post(pm.sessionId, "team-entry", { op: "post", ...binding, requestId: memberEntryId(binding, secondEntry), entry: secondEntry });
 
     const removal = teams.removeRun(f.run.id);
-    await new Promise(resolve => setTimeout(resolve, 20));
+    for (const deadline = Date.now() + 10_000; !internal.retention.deletingRuns.has(f.run.id) && Date.now() < deadline;) await new Promise(resolve => setTimeout(resolve, 5));
+    assert.equal(internal.retention.deletingRuns.has(f.run.id), true, "the removal should reach the record deletion");
 
     assert.throws(
       () => teams.rateTask(f.run.id, "a", { requestId: randomUUID(), score: 5 }),

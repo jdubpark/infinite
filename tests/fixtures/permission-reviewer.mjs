@@ -2,7 +2,9 @@ import { appendFileSync, readdirSync, readFileSync } from "node:fs";
 
 const argv = process.argv.slice(2);
 const mode = process.env.PERMISSION_FIXTURE_MODE ?? "decide";
-const opencode = argv.includes("--pure");
+if (argv[0] === "--version") { process.stdout.write(`${process.env.PERMISSION_FIXTURE_VERSION ?? "1.19.6"}\n`); process.exit(0); }
+const second = argv.includes("--standalone");
+const opencode = argv.includes("--pure") || second;
 const stdin = opencode ? "" : (() => { try { return readFileSync(0, "utf8"); } catch { return ""; } })();
 
 if (process.env.PERMISSION_FIXTURE_LOG) {
@@ -36,14 +38,19 @@ function decide(system, prompt) {
 }
 
 if (opencode) {
+  const config = JSON.parse(process.env.OPENCODE_CONFIG_CONTENT ?? "{}");
+  const agent = second ? config.agents?.["infinite-permission-review"] : config.agent?.["infinite-permission-review"];
   if (argv.includes("debug")) {
-    const config = JSON.parse(process.env.OPENCODE_CONFIG_CONTENT ?? "{}");
-    const agent = config.agent?.["infinite-permission-review"];
+    if (second) {
+      const permissions = mode === "tools-on" ? [{ action: "*", resource: "*", effect: "allow" }] : agent?.permissions ?? [];
+      process.stdout.write(`${JSON.stringify([{ id: "build", permissions: [] }, { id: "infinite-permission-review", permissions }], null, 2)}\n`);
+      process.exit(agent ? 0 : 1);
+    }
     const tools = mode === "tools-on" ? { bash: true, read: false } : { bash: false, read: false, edit: false };
     process.stdout.write(`${JSON.stringify({ name: "infinite-permission-review", mode: agent?.mode ?? "primary", tools }, null, 2)}\n`);
     process.exit(agent ? 0 : 1);
   }
-  const system = JSON.parse(process.env.OPENCODE_CONFIG_CONTENT ?? "{}").agent?.["infinite-permission-review"]?.prompt ?? "";
+  const system = (second ? agent?.system : agent?.prompt) ?? "";
   const prompt = argv[argv.indexOf("--") + 1] ?? "";
   print({ type: "step_start", part: { type: "step-start" } });
   if (mode === "tool-use") print({ type: "tool_use", part: { tool: "bash", callID: "call-1", state: { status: "completed" } } });

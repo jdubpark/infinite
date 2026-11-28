@@ -9,7 +9,7 @@ export type CensusCounts =
   | { state: "unknown"; detail: string }
   | { state: "ended" };
 export type LeftoverCensus = Exclude<CensusCounts, { state: "ended" }> & { at: string };
-export type StoredLeftover = { since: string; operation?: string; witness: ProcessWitness; census?: LeftoverCensus };
+export type StoredLeftover = { since: string; operation?: string; directory?: true; witness: ProcessWitness; census?: LeftoverCensus };
 
 export function censusCounts(result: CensusResult): CensusCounts {
   if (!result.ok) return { state: "unknown", detail: result.problem.slice(0, 200) };
@@ -42,7 +42,24 @@ export function settledLeftover(leftover: StoredLeftover | undefined, operation:
   return { ...leftover, witness: mergeWitness(leftover.witness, operation.witness) };
 }
 
-export function leftoverCensusEvent(census: CensusCounts) {
+export function directoryLeftover(at: string): StoredLeftover {
+  return { since: at, directory: true, witness: newWitness() };
+}
+
+function directoryCensusEvent(census: CensusCounts) {
+  switch (census.state) {
+    case "running":
+    case "in-use":
+      return `${census.state === "running" ? census.recorded + (census.using ?? 0) : census.using} process(es) use this run's directories. The host keeps them until a census finds none.`;
+    case "unknown":
+      return `The host cannot tell whether a process uses this run's directories: ${census.detail}. It keeps them; after checking the host, the owner can state that none does with \`infinite team processes-ended RUN_ID\`.`;
+    case "ended":
+      return "The host sees no process using this run's directories. They can be removed.";
+  }
+}
+
+export function leftoverCensusEvent(census: CensusCounts, directory?: boolean) {
+  if (directory) return directoryCensusEvent(census);
   switch (census.state) {
     case "running":
       return `The host still sees ${census.recorded} process(es) left behind by an earlier command of this run${census.using ? `, and ${census.using} more using this run's directory` : ""}. It keeps this run's directories until a census finds none.`;
@@ -59,7 +76,8 @@ export function commandStillRunningEvent(count: number) {
   return `${count} process(es) that a command of this run started still run after the command ended. The host keeps this run's directories until a census finds none.`;
 }
 
-export function leftoverStatementEvent(detail: string) {
+export function leftoverStatementEvent(detail: string, directory?: boolean) {
+  if (directory) return `The owner stated that no process uses this run's directories. The host's census could not tell (${detail}); it no longer keeps them for that.`;
   return `The owner stated that the processes an earlier command of this run left behind have ended. The host's census could not tell (${detail}); it no longer keeps this run's directories for them.`;
 }
 

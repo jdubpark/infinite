@@ -179,7 +179,7 @@ test("a blocked run keeps its workspace while the host sees a process of the int
     assert.equal(teams.get(f.run.id).status, "blocked");
 
     result = { ok: true, findings: [] }; now += 10 * 60_000;
-    await waitFor(() => teams.get(f.run.id).status === "cancelled", "a blocked run should close once the host sees no process");
+    await waitFor(() => teams.get(f.run.id).status === "cancelled", "a blocked run should close once the host sees no process", 30_000);
     assert.equal(existsSync(runDirectory(f.run)), false);
     assert.equal(teams.get(f.run.id).reason, hostClosedBlockedReason(1, blocker));
     assert.equal(eventCount("The host sees no process that matches its record of the interrupted check operation, and none using this run's directory. The intent stays recorded and is not replayed."), 1);

@@ -562,6 +562,32 @@ The record covers only the case above. A process that a command leaves behind
 without holding the command's output is never noted, so the host takes no look
 for it, and the run's directory may be removed while that process runs.
 
+What holds a run's directories, in three rules:
+
+- A process that nothing can inspect holds them only if the host recorded it:
+  the settle look or the operation's record names it by process, group or
+  session id. A process that the census cannot inspect and the host never
+  recorded, such as an unrelated process of another account, holds nothing.
+  The look at a left-behind process record and the look before a removal
+  count it as not seen. A look that fails as a whole still answers `unknown`.
+  The census of a stopped operation (see the stop fence) keeps answering
+  `unknown` for a process it cannot inspect.
+- Before the owner's removal and before retention removes a run's directories,
+  the host looks for processes that use them, even when the run has no
+  operation record and no left-behind record. A process whose working
+  directory, open file or command line is under the run's directory holds the
+  directories. The owner's removal answers `team-leftover-running` (409) with a
+  message that names the directories, not an earlier command. Retention skips
+  the run, and the view carries `leftoverProcesses` with `state` `in-use`. The
+  event reads "N process(es) use this run's directories. The host keeps them
+  until a census finds none." A look that finds none clears the hold, and the
+  removal proceeds. A look that cannot run at all holds nothing for a run
+  that has no record.
+- A hold does not expire. The owner's statement clears only a look that
+  answers `unknown`, never one that sees a process. Runs from before the
+  host recorded live processes at settle have no hold of that kind; the
+  look at removal covers them.
+
 **Rollback.** A host without this change keeps the record in the sealed run
 file but ignores it. It removes a held run's directories under its retention
 policy and on the owner's removal while the process may still run. Before a
@@ -2397,7 +2423,7 @@ A profile on a limited provider is skipped. The router does not avoid `evaluator
 
 | Producer | State |
 | --- | --- |
-| `host`, check `command` or `artifact` | The register's receipt for that criterion at the head, whatever the evaluator said: `pass` is `met`, `fail` is `not-met`, `unknown` is `inconclusive` (`receipt-unknown`). No receipt is `inconclusive` (`no-receipt`). |
+| `host`, check `command` or `artifact` | The register's receipt for that criterion at the head, whatever the evaluator said: `pass` is `met`, `fail` is `not-met`, `unknown` is `inconclusive` (`receipt-unknown`). A receipt whose definition digest (check, threshold and pinned files, not the wording) differs from the criterion now, or that has none, is `inconclusive` (`receipt-stale`). No receipt is `inconclusive` (`no-receipt`). |
 | `host`, check `receipt` | `checks-passed` and `review-approved` are host facts at the hold. No fact is `inconclusive` (`no-receipt`). `merged` and `landed` are `inconclusive` (`before-delivery`) until the host sees the delivery; see Late delivery receipts. |
 | `owner` | The owner's newest rating on the same head, against the threshold: `met` or `not-met`. Otherwise `pending-owner`. A rating on an older head judges older work, so a new head waits for a new rating. An owner criterion whose check is not an owner rating is `inconclusive` (`no-receipt`). |
 | `evaluator` | The evaluator's state, when every handle it gave resolves and a `met` gives at least one. A handle resolves when it names a receipt in the context, or a `file:` path (at most 300 characters) that is one of the changed paths or is named by an active artifact check. The host reads no file to resolve it. Otherwise `inconclusive` (`unresolved-evidence`). Citation handles never resolve yet. A criterion the evaluator did not judge is `inconclusive` (`not-assessed`). With no evaluator answer at all, `inconclusive` (`no-evaluator`). |
@@ -2429,7 +2455,7 @@ The composed result is `not-met` when any criterion is `not-met`, whoever produc
 - **On the run:** `run.assessment`, with ids, enumerations, and counts only: the verdict id, revision, head, kind (`reviewed` or `no-change`), the composed result, the evaluator's result, the reason, the four counts, and each criterion's state. It reaches every team view and relay device.
 - **In the record:** each active criterion's `latest` (`{ state, verdictId }`, never a note) and one `verdict.recorded` log entry per verdict (a late verdict, below, is another verdict), plus one `evaluator-contradicted-receipt` entry for each contradicted criterion. Verdict entries write only while the log stays under 300 entries and 160 KiB.
 - **In the ledger:** one `objective_verdicts` row per verdict, in the evidence store module `objective-verdicts`, projected from the run's `verdict.recorded` event. The row holds the verdict id, blind indexes of the project and the goal, the run id, the cycle, the revision, the kind, the record version, the rubric version, the evaluator's profile id, provider, model, and family, the flags `shared_family` and `also_reviewed`, the composed and the evaluator's result, the reason, one count per state, and the time. It holds no note, handle, or other text. A run revision can hold several verdicts, and the newest row wins. Rows are kept 730 days, and a deleted run's rows are marked, not removed.
-- **Reasons.** A verdict carries at most one of four reasons: `no-independent-evaluator`, `evaluator-unavailable`, `record-unavailable`, and `context-too-large`. A criterion carries at most one of seven: `no-receipt`, `receipt-unknown`, `before-delivery`, `pinned-changed`, `unresolved-evidence`, `not-assessed`, and `no-evaluator`.
+- **Reasons.** A verdict carries at most one of four reasons: `no-independent-evaluator`, `evaluator-unavailable`, `record-unavailable`, and `context-too-large`. A criterion carries at most one of eight: `no-receipt`, `receipt-unknown`, `receipt-stale`, `before-delivery`, `pinned-changed`, `unresolved-evidence`, `not-assessed`, and `no-evaluator`.
 - **In events:** fixed text with a result and counts. They never hold evaluator text.
 
 **Late delivery receipts.** A verdict comes before the delivery, so a `merged` or `landed` criterion first reads `inconclusive` (`before-delivery`). Later the host's outcome ledger can show the delivery, and the team service composes the verdict again. Two definitions apply:
@@ -3368,7 +3394,16 @@ model when a requested selection is unavailable.
 
 Claude launches receive `--model` and `--effort`; Codex receives `--model` and
 `-c model_reasoning_effort=...`; OpenCode launches in headless `run` mode with
-`--model` and optional `--variant`. These are requested settings, not evidence
+`--model` and optional `--variant`.
+On OpenCode 2 the host launches `run --standalone` with the variant inside the
+model string (`provider/model#variant`) and no `--variant`. Version 2 has no
+`--pure`, so the argument is dropped and plugins from the agent account's
+OpenCode configuration load into members; a plugin one member writes reaches
+later members. The host reads the version by running `opencode --version` as
+the agent account (5 s timeout, 4 KiB of output), caches it for 10 s, and reads
+it again when the executable changes. An unreadable version is retried at the
+next launch and uses the OpenCode 1 form meanwhile. Local native OpenCode
+sessions need version 1 and are refused on version 2. These are requested settings, not evidence
 of the backend model that served a turn. Provider account access and
 organization restrictions still apply. A provider failure leaves the assignment
 unresolved. The configuration example does not establish model availability on

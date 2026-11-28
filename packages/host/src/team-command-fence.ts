@@ -1,7 +1,7 @@
-import { bootId, hostProcesses, type CensusResult, type ProcessWitness } from "./process-census.js";
-import { teamRunDirectory, type TeamKernel } from "./team-kernel.js";
+import { bootId, hostProcesses, type CensusResult, type EarlierProcesses, type ProcessWitness } from "./process-census.js";
+import { filesystemEntryExists, teamRunDirectory, type TeamKernel } from "./team-kernel.js";
 import { COMMAND_STOP_UNCONFIRMED_REASON, STOP_GRACE_MS, TeamError } from "./team-workspace.js";
-import { CENSUS_TTL_MS, censusCounts, countsKey, leftoverCensusEvent, leftoverStatementEvent, type StoredLeftover } from "./team-leftover.js";
+import { CENSUS_TTL_MS, censusCounts, countsKey, directoryLeftover, leftoverCensusEvent, leftoverStatementEvent, type StoredLeftover } from "./team-leftover.js";
 import type { PendingOperation, Stored, TeamServiceOptions } from "./teams.js";
 
 export const COMMAND_STOP_STATEMENT_REASON = "The host stopped a configured team command but cannot confirm that it ended, and its process census cannot tell whether that command's processes still run. While the census cannot tell, the owner's statement is the only way out: after checking the host, run `infinite team processes-ended RUN_ID` (POST /api/teams/RUN_ID/processes-ended); Resume is accepted after that.";
@@ -66,22 +66,25 @@ export class CommandFence {
     this.flights.set(key, taken);
     return taken;
   }
-  async take(id: string, anyOperation = false, withLeftover = false): Promise<TakenCensus | undefined> {
+  async take(id: string, anyOperation = false, withLeftover = false, withDirectory = false): Promise<TakenCensus | undefined> {
     const stored = this.host.records.get(id);
     if (!stored || this.host.commands.has(id)) return undefined;
-    const pending = stored.pending?.witness && (anyOperation || stopFenced(stored)) ? stored.pending : undefined, record = withLeftover ? stored.leftover : undefined;
+    const pending = stored.pending?.witness && (anyOperation || stopFenced(stored)) ? stored.pending : undefined, held = withLeftover ? stored.leftover : undefined;
     const witness = pending?.witness;
-    if (!witness && !record) return undefined;
+    if (!witness && !held && !withDirectory) return undefined;
     const at = new Date(this.now()).toISOString();
+    const looking = !witness && !held && filesystemEntryExists(teamRunDirectory(stored.run.workspace));
+    const probe = looking ? directoryLeftover(at) : undefined, record = held ?? probe;
     const [operation, leftover] = await Promise.all([
       pending && witness ? this.census(stored, `operation:${pending.id}`, witness) : undefined,
-      record ? this.census(stored, "leftover", record.witness) : undefined,
+      record ? this.census(stored, probe ? "directory" : "leftover", record.witness, "all") : undefined,
     ]);
-    return { at, ...(pending && operation ? { operation: { pendingId: pending.id, result: operation } } : {}), ...(record && leftover ? { leftover: { record, result: leftover } } : {}) };
+    const found = record && leftover && !(probe && !leftover.ok) ? { record, result: leftover } : undefined;
+    return { at, ...(pending && operation ? { operation: { pendingId: pending.id, result: operation } } : {}), ...(found ? { leftover: found } : {}) };
   }
-  private census(stored: Stored, kind: string, witness: ProcessWitness): Promise<CensusResult> {
+  private census(stored: Stored, kind: string, witness: ProcessWitness, earlier?: EarlierProcesses): Promise<CensusResult> {
     const recorded = structuredClone(witness), processes = this.host.options?.processes ?? hostProcesses;
-    return this.flight(`${stored.run.id}:${kind}:${JSON.stringify(recorded)}`, () => processes.census(recorded, teamRunDirectory(stored.run.workspace), this.host.config.teams?.commandPrefix));
+    return this.flight(`${stored.run.id}:${kind}:${JSON.stringify(recorded)}`, () => processes.census(recorded, teamRunDirectory(stored.run.workspace), this.host.config.teams?.commandPrefix, earlier));
   }
   async refresh(stored: Stored, force = false, withLeftover = false): Promise<CensusState | undefined> {
     const { run } = stored, pending = stored.pending?.witness ? stored.pending : undefined, leftover = withLeftover ? stored.leftover : undefined;
@@ -92,9 +95,14 @@ export class CommandFence {
     return taken && this.apply(stored, taken);
   }
   apply(stored: Stored, taken: TakenCensus): CensusState | undefined {
-    const { run } = stored, pending = stored.pending, operation = taken.operation, leftover = taken.leftover;
+    const { run } = stored, pending = stored.pending, operation = taken.operation;
+    let leftover = taken.leftover;
     if (this.host.records.get(run.id) !== stored || this.host.commands.has(run.id)) return undefined;
     if (operation && (!pending?.witness || pending.id !== operation.pendingId)) return undefined;
+    if (leftover?.record.directory && !stored.leftover) {
+      if (censusCounts(leftover.result).state === "ended") leftover = undefined;
+      else stored.leftover = leftover.record;
+    }
     if (leftover && stored.leftover?.witness !== leftover.record.witness) return undefined;
     const state = operation ? this.applyOperation(stored, taken.at, censusCounts(operation.result)) : "ended";
     const left = leftover ? this.applyLeftover(stored, taken.at, censusCounts(leftover.result)) : "ended";
@@ -110,7 +118,7 @@ export class CommandFence {
     const current = stored.leftover!;
     stored.leftover = counts.state === "ended" ? undefined : { ...current, census: { ...counts, at } };
     if (!current.census || countsKey(current.census) !== countsKey(counts)) {
-      this.host.event(stored, leftoverCensusEvent(counts));
+      this.host.event(stored, leftoverCensusEvent(counts, current.directory));
       this.host.save(stored);
     }
     return counts.state;
@@ -142,7 +150,7 @@ export class CommandFence {
       this.host.event(stored, ownerStatementEvent(pending.kind, pending.processesEnded.detail));
     }
     if (leftover?.census?.state === "unknown") {
-      this.host.event(stored, leftoverStatementEvent(leftover.census.detail));
+      this.host.event(stored, leftoverStatementEvent(leftover.census.detail, leftover.directory));
       stored.leftover = undefined;
     }
   }

@@ -310,10 +310,12 @@ test("a late verdict interrupted at its pending save keeps the earlier assessmen
   const b = reopen(a);
   assert.equal(b.holder.verdict?.status, "recording");
   const record = b.holder.objectiveRecord;
-  delete b.holder.objectiveRecord;
+  b.holder.objectiveRecord = null as never;
   for (let pass = 0; pass < 2; pass += 1) {
+    const before = snapshot(b);
     b.verdicts.restore([b.holder]);
     b.verdicts.settleReceipt(b.holder);
+    unchanged(b, before);
     assert.equal(b.holder.run.assessment?.verdictId, earlier, "the earlier assessment stands");
     assert.equal(b.holder.verdict?.status, "recording", "the late verdict stays retryable");
   }
@@ -322,4 +324,24 @@ test("a late verdict interrupted at its pending save keeps the earlier assessmen
   assert.notEqual(b.holder.run.assessment?.verdictId, earlier, "the late verdict's assessment");
   assert.equal(b.holder.run.assessment?.verdictId, b.holder.verdict!.verdictId);
   assert.equal(stateOf(b, "c3"), "met");
+});
+
+test("a late verdict for a revert does not keep a met assessment when its record cannot be read", () => {
+  const a = evaluating({ record: recordOf(RUN, 1, [MERGED, LANDED]) });
+  reportEvaluator(a, a.member, reportOf({ c0: "met" }));
+  settle(a.host);
+  a.holder.run.status = "merged";
+  a.host.save(a.holder);
+  a.host.deliveryFact = "landed";
+  assert.equal(a.verdicts.settleReceipt(a.holder), true);
+  assert.equal(a.holder.run.assessment?.result, "met");
+  const b = reopen(a, "reverted");
+  b.host.failSaveAt = 3;
+  assert.throws(() => b.verdicts.settleReceipt(b.holder));
+  const c = reopen(b);
+  assert.equal(c.holder.verdict?.status, "recording");
+  c.holder.objectiveRecord = null as never;
+  c.verdicts.restore([c.holder]);
+  assert.notEqual(c.holder.run.assessment?.result, "met", "the revert withdraws the met assessment");
+  assert.equal(c.holder.run.assessment?.reason, "record-unavailable");
 });

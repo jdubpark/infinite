@@ -5,6 +5,7 @@ import type { FuseService, FuseInterrupt } from "./fuse/service.js";
 import type { MainCheckNotice, MainCheckService } from "./main-check.js";
 import type { PermissionDeliveryService } from "./permission-agent-types.js";
 import { INTERRUPT_CLASSES, type InterruptClass } from "./permission-policy.js";
+import type { AutonomyMode } from "./autonomy.js";
 import { isEvalSession, type ExecutionIdentity, type SessionPurpose } from "./types.js";
 import { createHash } from "node:crypto";
 
@@ -16,10 +17,10 @@ type Row = {
   permissionChannel?: { waiting?: { interruptClass: string }; notice?: { id: string; interruptClass?: string } };
   permissionNotice?: true;
 };
-type TeamRow = { id: string; title: string; status: string; reason?: string; resumable?: boolean; goal?: boolean; mission?: boolean };
+type TeamRow = { id: string; title: string; status: string; reason?: string; resumable?: boolean; goal?: boolean; mission?: boolean; autonomy?: AutonomyMode };
 export type PromptOwner = "coordinator" | "user" | "undecided";
 type Teams = { statuses(): TeamRow[]; promptOwner?(sessionId: string, prompt: Prompt): PromptOwner };
-type GoalRow = { id: string; title: string; status: string; reason?: string };
+type GoalRow = { id: string; title: string; status: string; reason?: string; autonomy?: AutonomyMode };
 type Lifecycle = { id: string; title: string; status: string; reason?: string; resumable?: boolean; kind: "goal" | "team"; event: string; titleText: string; body: string; priority: "default" | "high" };
 type StorageVolume = { label: string; path: string; fullness: number; availableInodes: number; availableBytes: number; fullnessBy?: "bytes" | "inodes" };
 type StorageAlert = { label: string; fullness: number; availableInodes: number; availableBytes: number; fullnessBy: "bytes" | "inodes"; critical: boolean };
@@ -79,7 +80,7 @@ export class Notifier {
     private readonly manager: Pick<Manager, "list">,
     private readonly store: PushStore,
     private readonly sender: PushSender,
-    private readonly options: { detail: "minimal" | "full"; events: string[]; intervalMs: number; machineId?: string; reviewGraceMs?: number; reviewHoldLimitMs?: number },
+    private readonly options: { detail: "minimal" | "full"; events: string[]; intervalMs: number; machineId?: string; reviewGraceMs?: number; reviewHoldLimitMs?: number; quietAutonomous?: boolean },
     private readonly teams?: Teams,
     private readonly goals?: { statuses(): GoalRow[] },
     private readonly storage?: { sample(): Promise<StorageVolume[]> },
@@ -262,17 +263,19 @@ export class Notifier {
     this.goalsPrimed = true;
     return due;
   }
-  private lifecycle(kind: "goal" | "team", rows: TeamRow[], statuses: Map<string, string>, primed: boolean, map: typeof TEAM_EVENTS, startedTitle: string) {
+  private lifecycle(kind: "goal" | "team", rows: (TeamRow | GoalRow)[], statuses: Map<string, string>, primed: boolean, map: typeof TEAM_EVENTS, startedTitle: string) {
     const due: Lifecycle[] = [];
     for (const row of rows) {
       const previous = this.previous(kind, row.id, statuses);
       statuses.set(row.id, row.status);
-      if (!primed || previous === row.status || (kind === "team" && (row.goal || row.mission))) continue;
-      const base = { id: row.id, title: row.title, status: row.status, reason: row.reason, resumable: row.resumable, kind };
-      if (previous === undefined && this.enabled(`${kind}-started`))
+      if (!primed || previous === row.status || (kind === "team" && ((row as TeamRow).goal || (row as TeamRow).mission))) continue;
+      const quiet = this.options.quietAutonomous === true && row.autonomy === "autonomous";
+      const base = { id: row.id, title: row.title, status: row.status, reason: row.reason, resumable: (row as TeamRow).resumable, kind };
+      if (!quiet && previous === undefined && this.enabled(`${kind}-started`))
         due.push({ ...base, event: `${kind}-started`, titleText: startedTitle, body: "started", priority: "default" });
       const category = map[row.status];
-      if (category && this.enabled(category.event)) due.push({ ...base, event: category.event, titleText: category.title, body: category.body, priority: category.priority });
+      if (category && (!quiet || category.priority === "high") && this.enabled(category.event))
+        due.push({ ...base, event: category.event, titleText: category.title, body: category.body, priority: category.priority });
     }
     this.prune(kind, statuses, new Set(rows.map(row => row.id)));
     return due;

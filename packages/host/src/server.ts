@@ -81,6 +81,7 @@ import { RoutineService } from "./routines.js";
 import { createRoutineSchema, routineActionSchema } from "./routine-types.js";
 import { MissionService, missionBoard } from "./missions.js";
 import { registerMissionReadRoutes } from "./mission-read-routes.js";
+import { registerDigestRoute } from "./daily-digest.js";
 import { IntakeStore } from "./intake-store.js";
 import { IntakeLinear } from "./intake-linear.js";
 import { IntakeService } from "./intake.js";
@@ -1209,6 +1210,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
     return res.json(missionBoard(missions.list(), teams.list(), goals.list(), config.projects, id => memberships.get(id)));
   });
   app.get("/api/decision-queue", async (_req, res) => res.json(await readDecisionQueue({ manager, cmux, permissions: sessionPermissions, teams, goals, missions })));
+  registerDigestRoute(app, { teams, goals, missions, fuse, halt });
   app.get("/api/teams/:id", (req, res) => res.json(teams.get(id.parse(req.params.id))));
   const contextTouches = new ContextTouches({
     read: (sessionId, after) => manager.events(sessionId, after, 200, new Set(["signal"])),
@@ -2040,13 +2042,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
     );
     serveWeb(req, res, next);
   });
-  app.use(
-    (
-      error: unknown,
-      req: express.Request,
-      res: express.Response,
-      _next: express.NextFunction,
-    ) => {
+  app.use((error: unknown, req: express.Request, res: express.Response, _next: express.NextFunction) => {
       if (error instanceof TeamError) return res.status(error.status).json({ code: error.code, error: error.message });
       if (error instanceof CatalogError) return res.status(error.statusCode).json({ code: "understanding-catalog", error: error.message });
       if (error instanceof BehaviorError) return res.status(error.statusCode).json({ code: "understanding-behavior", error: error.message });

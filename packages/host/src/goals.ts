@@ -160,7 +160,7 @@ export class GoalService {
     if (!goal.events.some(event => event.text === reason)) this.event(stored, reason);
     this.save(stored);
   }
-  statuses() { return [...this.records.values()].map(({ goal }) => ({ id: goal.id, title: goal.title, status: goal.status, reason: goal.reason })); }
+  statuses() { return [...this.records.values()].map(({ goal }) => ({ id: goal.id, title: goal.title, status: goal.status, reason: goal.reason, ...(goal.autonomy ? { autonomy: goal.autonomy } : {}) })); }
   ownsActiveTeam(teamId: string) { return [...this.records.values()].some(({ goal }) => !terminal.has(goal.status) && goal.activeTeamId === teamId); }
   retainsTeamRun(teamId: string) {
     return [...this.records.values()].some(({ goal, launch }) => !terminal.has(goal.status) && (goal.standing

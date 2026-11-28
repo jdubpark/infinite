@@ -3,6 +3,7 @@ import type { CheckScan } from "./team-check-output.js";
 import type { UsageTotals } from "./usage.js";
 import type { StoredRollup, UsageRollup } from "./team-usage.js";
 import { z } from "zod";
+import { questionInterruptSchema, type QuestionInterruptKind } from "./autonomous-questions.js";
 import { questionRecommendationSchema, type DecisionRecommendation } from "./question-recommendation.js";
 import { INTERRUPT_CLASSES, REJECT_CODES, type InterruptClass, type RejectCode } from "./permission-policy.js";
 import { TEAM_ROLE_VALUES, type TeamRole } from "./team-role.js";
@@ -257,24 +258,27 @@ export interface TeamDecision {
   question: string;
   options: string[];
   answerMode?: "approval" | "single" | "multiple";
+  interrupt?: QuestionInterruptKind;
   createdAt: string;
   answer?: string;
   answeredBy?: "owner" | "coordinator" | "connector";
+  defaultContinued?: true;
   source?: ConnectorSource;
   answeredAt?: string;
   intentQuestions?: string[];
   recommendation?: DecisionRecommendation;
 }
-type TeamDecisionCore = Omit<TeamDecision, "answer" | "answeredBy" | "source" | "answeredAt">;
+type TeamDecisionCore = Omit<TeamDecision, "answer" | "answeredBy" | "source" | "answeredAt" | "defaultContinued">;
 export type OpenTeamDecision = TeamDecisionCore & {
   answer?: never;
   answeredBy?: never;
   source?: never;
   answeredAt?: never;
+  defaultContinued?: never;
 };
 export type AnsweredTeamDecision = TeamDecisionCore & (
-  | { answer: string; answeredBy?: "owner" | "coordinator"; source?: never; answeredAt?: string }
-  | { answer: string; answeredBy: "connector"; source?: ConnectorSource; answeredAt?: string }
+  | { answer: string; answeredBy?: "owner" | "coordinator"; source?: never; answeredAt?: string; defaultContinued?: true }
+  | { answer: string; answeredBy: "connector"; source?: ConnectorSource; answeredAt?: string; defaultContinued?: never }
 );
 export type TeamDecisionState =
   | { state: "open"; decision: OpenTeamDecision }
@@ -283,11 +287,13 @@ export function isOpenTeamDecision(decision: TeamDecision): decision is OpenTeam
   return decision.answer === undefined
     && decision.answeredBy === undefined
     && decision.answeredAt === undefined
-    && decision.source === undefined;
+    && decision.source === undefined
+    && decision.defaultContinued === undefined;
 }
 export function isAnsweredTeamDecision(decision: TeamDecision): decision is AnsweredTeamDecision {
   if (typeof decision.answer !== "string" || decision.answer.length === 0) return false;
   if (decision.source !== undefined && decision.answeredBy !== "connector") return false;
+  if (decision.defaultContinued !== undefined && decision.answeredBy === "connector") return false;
   return true;
 }
 export function projectTeamDecision(decision: TeamDecision): TeamDecisionState {
@@ -302,6 +308,7 @@ const teamDecisionBaseShape = {
   question: z.string().min(1),
   options: z.array(z.string()),
   answerMode: z.enum(["approval", "single", "multiple"]).optional(),
+  interrupt: questionInterruptSchema.optional(),
   createdAt: z.iso.datetime(),
   intentQuestions: z.array(z.string().min(1)).optional(),
   recommendation: decisionRecommendationSchema.optional(),
@@ -313,6 +320,7 @@ export const teamDecisionSchema: z.ZodType<OpenTeamDecision | AnsweredTeamDecisi
     answer: z.string().min(1),
     answeredBy: z.enum(["owner", "coordinator"]).optional(),
     answeredAt: z.iso.datetime().optional(),
+    defaultContinued: z.literal(true).optional(),
   }).strict(),
   z.object({
     ...teamDecisionBaseShape,

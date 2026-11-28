@@ -467,6 +467,7 @@ else if (command === "plan-fleet") {
           events: config.push.events,
           intervalMs: 2000,
           machineId: config.machine?.id,
+          ...(config.push.quietAutonomous ?? true ? { quietAutonomous: true } : {}),
         },
         teams,
         goals,

@@ -42,7 +42,9 @@ const placeholdered = (text: string) => text.split(reportCommand()).join("<repor
 const promptOf = (run: TeamRun, role: TeamMember["role"]) =>
   teamPrompt(run, role, undefined, undefined, "claude", PROFILE, { checks: CHECKS }, [], true);
 const goalPlanInstruction = "Task criterion references for this goal plan:";
+const autonomousQuestionInstruction = "In autonomous mode, non-approval questions with a recommendation proceed on the proposed default";
 const withoutGoalPlanInstruction = (text: string) => text.split("\n\n").filter(paragraph => !paragraph.startsWith(goalPlanInstruction)).join("\n\n");
+const withoutAutonomousQuestionInstruction = (text: string) => text.split("\n\n").filter(paragraph => !paragraph.startsWith(autonomousQuestionInstruction)).join("\n\n");
 
 const PIN_PROMPTS_SHA256 = "b17ea4ed8a3f97861036bd9b10e6547d825e06a7963a5a927cee7da8be339c35";
 
@@ -56,8 +58,12 @@ test("without the register the goal section is byte for byte", () => {
             const prompt = teamPrompt(runFor({ autonomy, entry, record }), role, undefined, undefined, provider, PROFILE, { checks: CHECKS }, [], true);
             const hasGoalRecord = record !== undefined;
             const shouldMapCriteria = hasGoalRecord && role === "project-manager";
+            const shouldAutonomousQuestion = autonomy === "autonomous" && role === "project-manager";
             assert.equal(prompt.includes(goalPlanInstruction), shouldMapCriteria, `${role}, record=${hasGoalRecord}, ${autonomy}, entry=${entry}, ${provider}`);
-            prompts.push(placeholdered(shouldMapCriteria ? withoutGoalPlanInstruction(prompt) : prompt));
+            assert.equal(prompt.includes(autonomousQuestionInstruction), shouldAutonomousQuestion, `${role}, record=${hasGoalRecord}, ${autonomy}, entry=${entry}, ${provider}`);
+            let normalized = shouldMapCriteria ? withoutGoalPlanInstruction(prompt) : prompt;
+            if (shouldAutonomousQuestion) normalized = withoutAutonomousQuestionInstruction(normalized);
+            prompts.push(placeholdered(normalized));
           }
         }
       }

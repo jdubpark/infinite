@@ -246,7 +246,7 @@ export type MissionProgressSources = {
 };
 
 type ParsedCursor = { generation: string; missionId: string; instance: string; sequence: number };
-type History = { instance: string; sequence: number; fingerprint: string; observations: MissionProgressObservation[]; livenessCursor: number };
+type History = { instance: string; sequence: number; fingerprint: string; observations: MissionProgressObservation[]; livenessCursor: number; sampledLiveness: Map<string, MissionProgressWorkerStatus> };
 type ExpectedAssignment = MissionProgressMemberSource | NonNullable<MissionProgressMissionSource["coordinator"]>;
 type LivenessRequest = { key: string; assignment: ExpectedAssignment };
 type SampledProgress = { missionId: string; observedAt: string; snapshot: MissionProgressSnapshot; history: History; hadHistory: boolean };
@@ -268,8 +268,31 @@ function cursorFor(generation: string, missionId: string, instance: string, sequ
   return `mp1.${generation}.${missionId}.${instance}.${sequence}`;
 }
 
-function fingerprint(snapshot: MissionProgressSnapshot) {
-  return createHash("sha256").update(JSON.stringify(snapshot)).digest("hex");
+function fingerprint(snapshot: MissionProgressSnapshot, sampledLiveness: ReadonlyMap<string, MissionProgressWorkerStatus>) {
+  const effective: MissionProgressSnapshot = {
+    ...snapshot,
+    mission: {
+      ...snapshot.mission,
+      ...(snapshot.mission.coordinator ? {
+        coordinator: {
+          ...snapshot.mission.coordinator,
+          workerStatus: snapshot.mission.coordinator.workerStatus === "not-sampled"
+            ? (sampledLiveness.get(`coordinator:${snapshot.mission.coordinator.memberId}`) ?? "not-sampled")
+            : snapshot.mission.coordinator.workerStatus,
+        },
+      } : {}),
+    },
+    subtasks: snapshot.subtasks.map(subtask => subtask.child.kind !== "linked" ? subtask : {
+      ...subtask,
+      child: {
+        ...subtask.child,
+        assignments: subtask.child.assignments.map(member => member.workerStatus === "not-sampled"
+          ? { ...member, workerStatus: sampledLiveness.get(`member:${subtask.id}:${member.memberId}`) ?? "not-sampled" }
+          : member),
+      },
+    }),
+  };
+  return createHash("sha256").update(JSON.stringify(effective)).digest("hex");
 }
 
 function boundedSnapshot(snapshot: MissionProgressSnapshot): MissionProgressSnapshot {
@@ -394,15 +417,26 @@ export class MissionProgressService {
     });
     const hadHistory = historyAtStart !== undefined && this.histories.get(missionId) === historyAtStart;
     let history = hadHistory ? historyAtStart : undefined;
-    const stateFingerprint = fingerprint(snapshot);
+    const activeKeys = new Set(requests.map(request => request.key));
+    const sampledLiveness = new Map<string, MissionProgressWorkerStatus>();
+    if (history) {
+      for (const [key, status] of history.sampledLiveness) {
+        if (activeKeys.has(key)) sampledLiveness.set(key, status);
+      }
+    }
+    for (const [key, status] of liveness) {
+      if (status !== "not-sampled") sampledLiveness.set(key, status);
+    }
+    const stateFingerprint = fingerprint(snapshot, sampledLiveness);
     const livenessCursor = memberRequests.length && sampledMemberCount > 0
       ? ((historyAtStart?.livenessCursor ?? 0) + sampledMemberCount) % memberRequests.length
       : 0;
     if (!history) {
-      history = { instance: randomUUID(), sequence: 1, fingerprint: stateFingerprint, observations: [], livenessCursor: historyAtStart ? 0 : livenessCursor };
+      history = { instance: randomUUID(), sequence: 1, fingerprint: stateFingerprint, observations: [], livenessCursor: historyAtStart ? 0 : livenessCursor, sampledLiveness };
       this.histories.set(missionId, history);
       this.trimHistories();
     } else {
+      history.sampledLiveness = sampledLiveness;
       if (memberRequests.length && sampledMemberCount > 0) history.livenessCursor = livenessCursor;
       if (history.fingerprint !== stateFingerprint) {
         history.sequence++;

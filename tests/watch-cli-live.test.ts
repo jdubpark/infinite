@@ -10,7 +10,7 @@ import express from "express";
 import { z } from "zod";
 import { createClientApi } from "../packages/host/src/client-api.js";
 import { Blackboard } from "../packages/host/src/evidence/blackboard.js";
-import { ENTRY_KINDS } from "../packages/host/src/evidence/entry-types.js";
+import { ENTRY_KINDS, type EntryHead } from "../packages/host/src/evidence/entry-types.js";
 import { memberEntryId, memberEntryPostSchema } from "../packages/host/src/evidence/member-entry.js";
 import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/evidence/store.js";
 import { MissionProgressService, missionProgressQuerySchema, projectMissionChild } from "../packages/host/src/mission-progress.js";
@@ -586,13 +586,12 @@ test("runTeamWatch --board drives real HTTP Blackboard, supersedes, filters, mem
     const frames: string[] = [];
     restoreStreams = withInteractiveStreams({
       ttyOut: true,
-      onOut: chunk => frames.push(stripAnsi(chunk)),
     });
 
     watchDone = runTeamWatch({
       subcommand: "watch",
       id: TEAM_1,
-      options: { json: false, logs: false, board: true },
+      options: { json: false, logs: false, board: true, onOut: chunk => frames.push(stripAnsi(chunk)) },
       api,
     }).finally(() => {
       watchSettled = true;
@@ -794,4 +793,108 @@ test("runMissionWatch drives real MissionProgressService cursor advance, restart
     store?.close();
     if (root) rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("runTeamWatch --board uses incremental cursor on tick 2, fetches past 600 entries, and revalidates withdrawn entries", async () => {
+  const team1 = makeTeam1Run();
+  const makeEntries = (count: number): EntryHead[] =>
+    Array.from({ length: count }, (_, index) => {
+      const seq = index + 1;
+      return {
+        entryId: `00000000-0000-4000-8000-${String(seq).padStart(12, "0")}`,
+        seq,
+        scope: "run",
+        runId: TEAM_1,
+        revision: 2,
+        at: AT,
+        kind: "check",
+        author: "host",
+        authority: "receipt",
+        paths: [],
+        summary: `entry summary ${seq}`,
+        bodyBytes: 64,
+        state: "active",
+      };
+    });
+
+  const runWithEntries = async (count: number, withdrawSeqOnTick?: { seq: number; afterTicks: number }) => {
+    const entries = makeEntries(count);
+    const entryQueries: string[] = [];
+    const frames: string[] = [];
+    let teamFetches = 0;
+    let server: Server | null = null;
+    let restoreStreams: (() => void) | null = null;
+    let watchDone: Promise<boolean> | null = null;
+    let settled = false;
+    const app = express();
+    app.get("/api/teams/:id", (_req, res) => {
+      teamFetches += 1;
+      if (withdrawSeqOnTick && teamFetches === withdrawSeqOnTick.afterTicks) {
+        const target = entries[withdrawSeqOnTick.seq - 1];
+        if (target) target.state = "withdrawn";
+      }
+      res.json(team1);
+    });
+    app.get("/api/teams/:id/entries", (req, res) => {
+      entryQueries.push(req.originalUrl);
+      const since = Number(req.query.since ?? "0");
+      const limit = Number(req.query.limit ?? "100");
+      const matching = entries.filter(item => item.seq > since);
+      const slice = matching.slice(0, limit);
+      res.json({
+        entries: slice,
+        cursor: slice.length > 0 ? slice[slice.length - 1]!.seq : since,
+        more: matching.length > limit,
+      });
+    });
+    try {
+      server = app.listen(0, "127.0.0.1");
+      await new Promise<void>(resolve => server!.once("listening", resolve));
+      const { port } = server.address() as AddressInfo;
+      const api = createClientApi({ origin: `http://127.0.0.1:${port}`, token: TOKEN });
+      restoreStreams = withInteractiveStreams({
+        ttyOut: true,
+      });
+      watchDone = runTeamWatch({
+        subcommand: "watch",
+        id: TEAM_1,
+        options: { json: false, logs: false, board: true, pollIntervalMs: 15, onOut: chunk => frames.push(stripAnsi(chunk)) },
+        api,
+      }).finally(() => {
+        settled = true;
+      });
+      await waitFor(() => teamFetches >= (withdrawSeqOnTick ? 6 : 2), "expected team watch ticks");
+      if (withdrawSeqOnTick) {
+        await waitFor(
+          () => (frames[frames.length - 1] ?? "").includes(`seq ${withdrawSeqOnTick.seq}`) && (frames[frames.length - 1] ?? "").includes("withdrawn"),
+          "withdrawn entry revalidated on board",
+        );
+      }
+      process.stdin.emit("data", "q");
+      assert.equal(await watchDone, true);
+      return { entryQueries, frames };
+    } finally {
+      if (watchDone) {
+        if (!settled) process.stdin.emit("data", "q");
+        await watchDone.catch(() => {});
+      }
+      restoreStreams?.();
+      if (server) {
+        server.closeAllConnections?.();
+        await new Promise<void>(resolve => server!.close(() => resolve()));
+      }
+    }
+  };
+
+  const incremental = await runWithEntries(150);
+  assert.deepEqual(incremental.entryQueries.slice(0, 3), [
+    `/api/teams/${TEAM_1}/entries?limit=100`,
+    `/api/teams/${TEAM_1}/entries?limit=100&since=100`,
+    `/api/teams/${TEAM_1}/entries?limit=100&since=150`,
+  ]);
+
+  const pastCap = await runWithEntries(650, { seq: 650, afterTicks: 4 });
+  assert.ok(pastCap.entryQueries.includes(`/api/teams/${TEAM_1}/entries?limit=100&since=600`));
+  assert.ok(pastCap.frames.some(frame => frame.includes("seq 650")));
+  assert.ok(!pastCap.frames.some(frame => /\bseq 50\b/.test(frame)));
 });

@@ -3,7 +3,7 @@ import test from "node:test";
 import {
   appendBoardComposer, answerPinnedMissionDecision, boardItemIdentity, boardLines, handleBoardClientCommand,
   createBoardInputParser, MissionSubmitter, orderedBoardItems, parseBoardInputChunk, pinOpenMissionDecision,
-  projectsLines, reconcileBoardCursor, resolveMissionProject,
+  projectsLines, reconcileBoardCursor, resolveMissionProject, runBoard,
 } from "../packages/host/src/board-cli.js";
 import type { Board, Mission } from "../packages/host/src/mission-types.js";
 import type { ProjectGroup, ProjectGroupCheckout, ProjectGroupList, ProjectGroupRepo } from "../packages/host/src/project-group-types.js";
@@ -335,4 +335,165 @@ test("pasted input chunks append printable text and turn embedded newlines into 
   assert.deepEqual(parse("second\u001b[201~"), [{ type: "text", text: "second", pasted: true }]);
   assert.deepEqual(parse("\u001b["), []);
   assert.deepEqual(parse("A"), [{ type: "key", key: "up" }]);
+});
+
+function overrideBoardProp(target: object, key: string, value: unknown): () => void {
+  const saved = Object.getOwnPropertyDescriptor(target, key);
+  Object.defineProperty(target, key, { value, configurable: true, writable: true });
+  return () => {
+    if (saved) Object.defineProperty(target, key, saved);
+    else delete (target as Record<string, unknown>)[key];
+  };
+}
+
+function withBoardTty(tty: boolean): () => void {
+  const stdout = process.stdout;
+  const stdin = process.stdin;
+  const restorers = [
+    overrideBoardProp(stdout, "isTTY", tty),
+    overrideBoardProp(stdout, "columns", 100),
+    overrideBoardProp(stdin, "isTTY", tty),
+    overrideBoardProp(stdin, "setRawMode", () => stdin),
+    overrideBoardProp(stdin, "setEncoding", () => stdin),
+    overrideBoardProp(stdin, "resume", () => stdin),
+    overrideBoardProp(stdin, "pause", () => stdin),
+  ];
+  return () => {
+    for (const restore of restorers.reverse()) restore();
+  };
+}
+
+async function waitUntil(check: () => boolean, description: string, timeoutMs = 4000): Promise<void> {
+  const deadline = performance.now() + timeoutMs;
+  while (performance.now() < deadline) {
+    if (check()) return;
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  throw new Error(`Timed out waiting for: ${description}`);
+}
+
+test("runBoard survives a 503 poll tick in TTY mode, recovers on the next tick, and rethrows in non-TTY mode", async () => {
+  const out: string[] = [];
+  let restore = withBoardTty(false);
+  try {
+    await assert.rejects(
+      runBoard(
+        {
+          json: async (path: string) => {
+            if (path === "/project-groups") return projects;
+            throw Object.assign(new Error("Service Unavailable"), { status: 503 });
+          },
+        } as never,
+        config,
+        "/unused",
+        {},
+        { write: chunk => out.push(chunk) },
+      ),
+      { message: "Service Unavailable" },
+    );
+  } finally {
+    restore();
+  }
+
+  const ttyOut: string[] = [];
+  let pollCount = 0;
+  restore = withBoardTty(true);
+  let boardDone: Promise<void> | null = null;
+  try {
+    const recoveredBoard: Board = {
+      items: [{ ...board.items[0]!, title: "Recovered mission title" }],
+    };
+    boardDone = runBoard(
+      {
+        json: async (path: string) => {
+          if (path === "/project-groups") return projects;
+          if (path === "/board") {
+            pollCount += 1;
+            if (pollCount === 1) return board;
+            if (pollCount === 2) throw Object.assign(new Error("Service Unavailable"), { status: 503 });
+            return recoveredBoard;
+          }
+          throw new Error(`Unexpected path: ${path}`);
+        },
+      } as never,
+      config,
+      "/unused",
+      {},
+      { pollIntervalMs: 15, write: chunk => ttyOut.push(chunk.replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, "")) },
+    );
+    const latest = () => ttyOut[ttyOut.length - 1] ?? "";
+    await waitUntil(() => ttyOut.some(chunk => chunk.includes("Update failed: Service Unavailable. Showing last received board.") && chunk.includes("A long mission")), "503 poll failure notice preserving last board");
+    await waitUntil(() => latest().includes("Recovered mission title") && !latest().includes("Update failed:"), "recovery on subsequent poll tick");
+    process.stdin.emit("data", "q");
+    await boardDone;
+  } finally {
+    process.stdin.emit("data", "\u0003");
+    if (boardDone) await boardDone.catch(() => {});
+    restore();
+  }
+});
+
+test("runBoard answer submission reuses requestId across a 503 retry and ignores double-Enter while in flight", async () => {
+  const frames: string[] = [];
+  const restore = withBoardTty(true);
+  let boardDone: Promise<void> | null = null;
+  const openMission = { ...mission(7, [decision("dec-1")]), id: "m1" };
+  const postRequestIds: string[] = [];
+  let postAttempt = 0;
+  let releaseInFlight!: () => void;
+  let inFlightStarted!: () => void;
+  const inFlightReady = new Promise<void>(resolve => { inFlightStarted = resolve; });
+
+  try {
+    boardDone = runBoard(
+      {
+        json: async (path: string, body?: unknown) => {
+          if (path === "/project-groups") return projects;
+          if (path === "/board") return { items: [board.items[0]!] };
+          if (path === "/missions/m1") return openMission;
+          if (path === "/missions/m1/answer/dec-1") {
+            postRequestIds.push((body as { requestId: string }).requestId);
+            postAttempt += 1;
+            if (postAttempt === 1) throw Object.assign(new Error("Temporary outage"), { status: 503 });
+            inFlightStarted();
+            await new Promise<void>(resolve => { releaseInFlight = resolve; });
+            return openMission;
+          }
+          throw new Error(`Unexpected path: ${path}`);
+        },
+      } as never,
+      config,
+      "/unused",
+      {},
+      { pollIntervalMs: 50, write: chunk => frames.push(chunk.replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, "")) },
+    );
+
+    const latest = () => frames[frames.length - 1] ?? "";
+    await waitUntil(() => latest().includes("A long mission"), "initial board rendered");
+
+    process.stdin.emit("data", "a");
+    await waitUntil(() => latest().includes("Type your answer for the selected row, then press Enter."), "answer mode active");
+
+    process.stdin.emit("data", "Ship now");
+    process.stdin.emit("data", "\r");
+    await waitUntil(() => latest().includes("Temporary outage"), "first answer attempt failed with 503");
+    assert.equal(postRequestIds.length, 1);
+
+    process.stdin.emit("data", "\r");
+    await inFlightReady;
+    process.stdin.emit("data", "\r");
+    await new Promise(resolve => setTimeout(resolve, 20));
+    assert.equal(postRequestIds.length, 2);
+    assert.equal(postRequestIds[1], postRequestIds[0]);
+
+    releaseInFlight();
+    await waitUntil(() => latest().includes("Answer submitted."), "answer accepted on retry");
+
+    process.stdin.emit("data", "q");
+    await boardDone;
+  } finally {
+    process.stdin.emit("data", "\u0003");
+    if (boardDone) await boardDone.catch(() => {});
+    restore();
+  }
 });

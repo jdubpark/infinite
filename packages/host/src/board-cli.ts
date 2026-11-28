@@ -88,13 +88,14 @@ export async function answerPinnedMissionDecision(
   pin: PinnedMissionAnswer,
   text: string,
   stillSelected: () => boolean = () => true,
+  requestId: string = randomUUID(),
 ): Promise<"answered" | "stale"> {
   const latest = await api.json<Mission>(`/missions/${pin.missionId}`);
   if (!stillSelected()) return "stale";
   const decision = latest.decisions.find(item => item.id === pin.decisionId);
   if (!decision || decision.answer) return "stale";
   await api.json(`/missions/${pin.missionId}/answer/${pin.decisionId}`, {
-    requestId: randomUUID(), revision: pin.revision, text,
+    requestId, revision: pin.revision, text,
   });
   return "answered";
 }
@@ -287,17 +288,18 @@ async function answerSelected(
   text: string,
   pinnedMission?: PinnedMissionAnswer,
   stillSelected: () => boolean = () => true,
+  requestId: string = randomUUID(),
 ): Promise<"answered" | "stale" | undefined> {
   if (item.kind === "mission") {
     if (!pinnedMission || pinnedMission.missionId !== item.id) throw new Error("The selected row changed. Review the latest state before answering.");
-    return answerPinnedMissionDecision(api, pinnedMission, text, stillSelected);
+    return answerPinnedMissionDecision(api, pinnedMission, text, stillSelected, requestId);
   }
   if (item.kind === "team") {
     const team = await api.json<TeamRun>(`/teams/${item.id}`);
     if (!stillSelected()) throw new Error("The selected row changed. Review the latest state before answering.");
     const decision = openDecision(team.decisions);
     if (!decision) throw new Error("The selected team has no open decision.");
-    await api.json(`/teams/${item.id}/decisions/${decision.id}/answer`, { requestId: randomUUID(), revision: team.revision, text });
+    await api.json(`/teams/${item.id}/decisions/${decision.id}/answer`, { requestId, revision: team.revision, text });
     return undefined;
   }
   throw new Error("Goals cannot be answered from this board.");
@@ -452,11 +454,19 @@ function formatMission(mission: Mission) {
   return lines.join("\n");
 }
 
-async function runBoard(api: Api, config: ClientConfig, configPath: string, options: Options) {
+export async function runBoard(
+  api: Api,
+  config: ClientConfig,
+  configPath: string,
+  options: Options,
+  runtime?: { pollIntervalMs?: number; write?: (chunk: string) => void },
+) {
+  const writeOut = runtime?.write ?? ((chunk: string) => { process.stdout.write(chunk); });
   const abort = new AbortController();
   const tty = Boolean(process.stdout.isTTY && process.stdin.isTTY && !options["--json"]);
-  let active = true, cursor = 0, projectIndex = 0, composer = "", answerMode = false, answerPreparing = false, notice = "", board: Board = { items: [] };
+  let active = true, cursor = 0, projectIndex = 0, composer = "", answerMode = false, answerPreparing = false, answerInFlight = false, notice = "", board: Board = { items: [] };
   let answerPin: { itemIdentity: string; mission?: PinnedMissionAnswer } | undefined;
+  let pendingAnswer: { pin: { itemIdentity: string; mission?: PinnedMissionAnswer }; text: string; requestId: string } | undefined;
   const missionSubmitter = new MissionSubmitter(api);
   const reviewNotice = "The selected decision changed. Review the latest state before answering.";
   let openAfterBoard: BoardItem | undefined;
@@ -473,26 +483,27 @@ async function runBoard(api: Api, config: ClientConfig, configPath: string, opti
     : board;
   const selectedItem = () => boardItem(visibleBoard(), cursor);
   const clearAnswerMode = (message?: string) => {
-    answerMode = false; answerPreparing = false; answerPin = undefined; composer = "";
+    answerMode = false; answerPreparing = false; answerPin = undefined; pendingAnswer = undefined; composer = "";
     if (message) notice = message;
   };
   const reconcilePinnedSelection = () => {
+    if (answerInFlight) return;
     if (answerPin && boardItemIdentity(selectedItem()) !== answerPin.itemIdentity) clearAnswerMode(reviewNotice);
   };
   const validatePinnedDecision = async () => {
-    if (!answerMode || !answerPin?.mission) return;
+    if (answerInFlight || !answerMode || !answerPin?.mission) return;
     reconcilePinnedSelection();
-    if (!answerMode || !answerPin?.mission) return;
+    if (answerInFlight || !answerMode || !answerPin?.mission) return;
     const pin = answerPin;
     const missionPin = pin?.mission;
     if (!pin || !missionPin) return;
     try {
       const latest = await api.json<Mission>(`/missions/${missionPin.missionId}`, undefined, abort.signal);
-      if (!answerMode || answerPin !== pin) return;
+      if (answerInFlight || !answerMode || answerPin !== pin) return;
       const decision = latest.decisions.find(item => item.id === missionPin.decisionId);
       if (!decision || decision.answer) clearAnswerMode(reviewNotice);
     } catch (error) {
-      if (!abort.signal.aborted && answerMode && answerPin === pin) notice = `Could not verify the selected decision: ${safe((error as Error).message)}`;
+      if (!abort.signal.aborted && !answerInFlight && answerMode && answerPin === pin) notice = `Could not verify the selected decision: ${safe((error as Error).message)}`;
     }
   };
   const beginAnswer = async () => {
@@ -502,6 +513,7 @@ async function runBoard(api: Api, config: ClientConfig, configPath: string, opti
     if (item.kind === "goal") { notice = "Goals cannot be answered from this board."; paint(); return; }
     answerPreparing = true;
     composer = "";
+    pendingAnswer = undefined;
     notice = "Loading the selected decision…";
     paint();
     try {
@@ -525,19 +537,19 @@ async function runBoard(api: Api, config: ClientConfig, configPath: string, opti
     const visible = visibleBoard();
     const lines = boardLines(visible, projects, cursor, target(), composer, process.stdout.columns || 80, now);
     const text = `${notice ? `${notice}\n\n` : ""}${lines.join("\n")}`;
-    if (tty) process.stdout.write(`\x1b[H\x1b[J${text}\n`);
+    if (tty) writeOut(`\x1b[H\x1b[J${text}\n`);
     else if (options["--json"]) {
       const encoded = JSON.stringify(board);
       if (encoded !== previous) console.log(encoded);
       previous = encoded;
     } else {
       const frame = teamWatchFrame(previous, text, false);
-      if (frame) process.stdout.write(frame);
+      if (frame) writeOut(frame);
       previous = text;
     }
   };
   const submit = async () => {
-    if (answerPreparing) return;
+    if (answerPreparing || answerInFlight) return;
     if (answerMode && !composer.trim()) {
       notice = "Type an answer before pressing Enter.";
       return;
@@ -555,10 +567,15 @@ async function runBoard(api: Api, config: ClientConfig, configPath: string, opti
         return;
       }
       const submittedPin = answerPin;
+      if (!pendingAnswer || pendingAnswer.pin !== submittedPin || pendingAnswer.text !== text) {
+        pendingAnswer = { pin: submittedPin, text, requestId: randomUUID() };
+      }
+      const request = pendingAnswer;
       const isStillPinned = () => answerMode && answerPin === submittedPin && boardItemIdentity(selectedItem()) === submittedPin.itemIdentity;
+      answerInFlight = true;
       let result: "answered" | "stale" | undefined;
       try {
-        result = await answerSelected(item, api, text, submittedPin.mission, isStillPinned);
+        result = await answerSelected(item, api, request.text, submittedPin.mission, isStillPinned, request.requestId);
       } catch (error) {
         if (answerMode && answerPin === submittedPin) {
           const status = (error as { status?: unknown })?.status;
@@ -566,12 +583,18 @@ async function runBoard(api: Api, config: ClientConfig, configPath: string, opti
           else notice = safe((error as Error).message);
         }
         return;
+      } finally {
+        answerInFlight = false;
       }
-      if (!answerMode || answerPin !== submittedPin) return;
+      if (!answerMode || answerPin !== submittedPin) {
+        if (pendingAnswer === request) pendingAnswer = undefined;
+        return;
+      }
       if (result === "stale") { clearAnswerMode(reviewNotice); return; }
       notice = "Answer submitted.";
       answerMode = false;
       answerPin = undefined;
+      pendingAnswer = undefined;
       composer = "";
     } else {
       const result = await missionSubmitter.submit(target(), text);
@@ -593,16 +616,27 @@ async function runBoard(api: Api, config: ClientConfig, configPath: string, opti
     for (const token of parseInputChunk(data)) {
       if (token.type === "key") {
         if (token.key === "interrupt") { active = false; abort.abort(); return; }
-        if (token.key === "up") { cursor = Math.max(0, cursor - 1); reconcilePinnedSelection(); paint(); continue; }
-        if (token.key === "down") { cursor = Math.min(Math.max(0, orderedBoardItems(visibleBoard()).length - 1), cursor + 1); reconcilePinnedSelection(); paint(); continue; }
+        if (token.key === "up") {
+          if (answerInFlight) { notice = "Answer submission is in progress."; paint(); continue; }
+          cursor = Math.max(0, cursor - 1); reconcilePinnedSelection(); paint(); continue;
+        }
+        if (token.key === "down") {
+          if (answerInFlight) { notice = "Answer submission is in progress."; paint(); continue; }
+          cursor = Math.min(Math.max(0, orderedBoardItems(visibleBoard()).length - 1), cursor + 1); reconcilePinnedSelection(); paint(); continue;
+        }
         if (token.key === "tab") {
           if (missionSubmitter.hasPending) { notice = "Delivery is unconfirmed. Press Enter to retry this exact request"; paint(); continue; }
+          if (answerInFlight) { notice = "Answer submission is in progress."; paint(); continue; }
           projectIndex = (projectIndex + 1) % projects.length; cursor = 0; reconcilePinnedSelection(); paint(); continue;
         }
         if (token.key === "enter") { void submit().then(() => paint()).catch(error => { notice = safe((error as Error).message); paint(); }); continue; }
         if (token.key === "backspace") {
           if (missionSubmitter.hasPending) notice = "Delivery is unconfirmed. Press Enter to retry this exact request";
-          else composer = composer.slice(0, -1);
+          else if (answerInFlight) notice = "Answer submission is in progress.";
+          else {
+            composer = composer.slice(0, -1);
+            if (pendingAnswer && pendingAnswer.text !== composer.trim()) pendingAnswer = undefined;
+          }
           paint(); continue;
         }
       } else {
@@ -610,7 +644,12 @@ async function runBoard(api: Api, config: ClientConfig, configPath: string, opti
         if (!token.pasted && text === "q" && !composer) { active = false; abort.abort(); return; }
         if (!token.pasted && text === "a" && !composer && !answerMode && !answerPreparing) { void beginAnswer(); continue; }
         if (missionSubmitter.hasPending) notice = "Delivery is unconfirmed. Press Enter to retry this exact request";
-        else { composer = appendBoardComposer(composer, text); notice = ""; }
+        else if (answerInFlight) notice = "Answer submission is in progress.";
+        else {
+          composer = appendBoardComposer(composer, text);
+          if (pendingAnswer && pendingAnswer.text !== composer.trim()) pendingAnswer = undefined;
+          notice = "";
+        }
         paint();
       }
     }
@@ -618,22 +657,30 @@ async function runBoard(api: Api, config: ClientConfig, configPath: string, opti
   const onResize = () => paint();
   const onSigint = () => { active = false; abort.abort(); };
   if (tty) {
-    process.stdout.write("\x1b[?2004h\x1b[?1049h\x1b[?25l");
+    writeOut("\x1b[?2004h\x1b[?1049h\x1b[?25l");
     process.stdin.setRawMode(true); process.stdin.setEncoding("utf8"); process.stdin.resume();
     process.stdin.on("data", onData); process.stdout.on("resize", onResize);
   }
   process.once("SIGINT", onSigint);
   try {
     do {
-      const refreshedBoard = await api.json<Board>("/board", undefined, abort.signal);
-      const previousSelection = selectedItem();
-      board = refreshedBoard;
-      cursor = reconcileBoardCursor(visibleBoard(), previousSelection, cursor);
-      reconcilePinnedSelection();
-      await validatePinnedDecision();
-      paint();
+      try {
+        const refreshedBoard = await api.json<Board>("/board", undefined, abort.signal);
+        const previousSelection = selectedItem();
+        board = refreshedBoard;
+        if (notice.startsWith("Update failed: ")) notice = "";
+        cursor = reconcileBoardCursor(visibleBoard(), previousSelection, cursor);
+        reconcilePinnedSelection();
+        await validatePinnedDecision();
+        paint();
+      } catch (error) {
+        if (abort.signal.aborted) break;
+        if (!tty) throw error;
+        notice = `Update failed: ${safe((error as Error).message)}. Showing last received board.`;
+        paint();
+      }
       if (!tty) break;
-      try { await delay(2000, undefined, { signal: abort.signal }); }
+      try { await delay(runtime?.pollIntervalMs ?? 2000, undefined, { signal: abort.signal }); }
       catch { if (abort.signal.aborted) break; }
     } while (active && !abort.signal.aborted);
   } finally {
@@ -641,11 +688,11 @@ async function runBoard(api: Api, config: ClientConfig, configPath: string, opti
     if (tty) {
       process.stdin.off("data", onData); process.stdout.off("resize", onResize);
       process.stdin.setRawMode(false); process.stdin.pause();
-      process.stdout.write("\x1b[?25h\x1b[?1049l\x1b[?2004l");
+      writeOut("\x1b[?25h\x1b[?1049l\x1b[?2004l");
     }
   }
   if (openAfterBoard) {
     await openItem(openAfterBoard, api, config, configPath);
-    await runBoard(api, config, configPath, options);
+    await runBoard(api, config, configPath, options, runtime);
   }
 }

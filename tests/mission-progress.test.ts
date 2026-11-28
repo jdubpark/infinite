@@ -480,3 +480,51 @@ test("child projection retains bounded same-revision prior attempts without attr
     currentTwelve.map(item => item.memberId),
   );
 });
+
+test("sampled liveness prevents idle not-sampled oscillations from advancing sequence or causing retention-gap", async () => {
+  const id = randomUUID();
+  const coordinator = { runId: id, memberId: randomUUID(), sessionId: randomUUID(), revision: 1, role: "mission-coordinator" as const, status: "running" as const };
+  const assignments = new Map<string, TeamAssignment>([[coordinator.sessionId, coordinator]]);
+  const children = new Map<string, MissionProgressChild>();
+  const subtasks: MissionProgressMissionSource["subtasks"] = [];
+  for (let teamIndex = 0; teamIndex < 2; teamIndex++) {
+    const teamId = randomUUID();
+    const repoProjectId = `repo-${teamIndex}`;
+    const members = Array.from({ length: 4 }, (_, workerIndex) => {
+      const member = { runId: teamId, memberId: randomUUID(), sessionId: randomUUID(), revision: 1, role: "implementer" as const, taskId: `task-${workerIndex}`, status: "running" as const };
+      assignments.set(member.sessionId, { runId: teamId, memberId: member.memberId, revision: 1, role: member.role, taskId: member.taskId });
+      return member;
+    });
+    children.set(teamId, linkedChild({ runId: teamId, missionId: id, projectId: repoProjectId, revision: 1, assignments: members, checks: [] }));
+    subtasks.push({ id: repoProjectId, title: repoProjectId, repoProjectId, status: "running", teamId });
+  }
+  const source: MissionProgressMissionSource = { id, title: "Steady mission", status: "working", revision: 1, updatedAt: at, coordinator, subtasks };
+  const service = new MissionProgressService({
+    missions: { progressSource: requestedId => { assert.equal(requestedId, id); return source; } },
+    teams: { missionProgressChild: teamId => children.get(teamId)! },
+    manager: {
+      meta: sessionId => ({ session: { team: assignments.get(sessionId) } }),
+      state: async () => ({ status: "running" }),
+    },
+  });
+
+  const first = await service.read(id);
+  const c0 = first.cursor;
+  assert.equal(Number(c0.split(".").at(-1)), 1);
+
+  let cursor = c0;
+  const sequences: number[] = [];
+  for (let i = 0; i < 12; i++) {
+    const page = await service.read(id, cursor);
+    assert.equal(page.resync.required, false);
+    cursor = page.cursor;
+    sequences.push(Number(page.cursor.split(".").at(-1)));
+  }
+
+  assert.equal(sequences[0], 2);
+  assert.ok(sequences.every(seq => seq === 2), "sequence must stop advancing once every worker has been sampled");
+
+  const fromC0 = await service.read(id, c0);
+  assert.equal(fromC0.resync.required, false);
+  assert.deepEqual(fromC0.observations.map(item => item.sequence), [2]);
+});

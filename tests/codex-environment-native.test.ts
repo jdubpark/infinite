@@ -536,3 +536,235 @@ test("live worker recovers persisted Codex placement across real provider restar
     rmSync(rootTmp, { recursive: true, force: true });
   }
 });
+
+test("startNativeCodex preserves paginated history and placement verification across detach, rejoin, handoff, and legacy fallback", { timeout: 35000 }, async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "infinite-native-paginated-env-")));
+  const hostPaginatedCwd = join(root, "host-paginated"), hostFallbackCwd = join(root, "host-fallback"), hostLegacyCwd = join(root, "host-legacy");
+  const laptopCwd = join(root, "laptop"), cloudCwd = join(root, "cloud");
+  mkdirSync(hostPaginatedCwd); mkdirSync(hostFallbackCwd); mkdirSync(hostLegacyCwd); mkdirSync(laptopCwd); mkdirSync(cloudCwd);
+  writeFileSync(join(laptopCwd, "marker.txt"), "PAGINATED_LAPTOP");
+  writeFileSync(join(cloudCwd, "marker.txt"), "PAGINATED_CLOUD");
+  const key = randomBytes(32);
+  const scope = `session-${randomUUID()}:codex-environments`;
+  const fixture = resolve("tests/fixtures/native-codex.mjs");
+  const profile = { command: process.execPath, args: [fixture] };
+  const exec1 = await startFakeExecServer(laptopCwd);
+  const exec2 = await startFakeExecServer(cloudCwd);
+  const execFallback = await startFakeExecServer(laptopCwd);
+  const execLegacy = await startFakeExecServer(laptopCwd);
+  const omitReadFlagFile = join(root, "omit-read.flag");
+  let nativePaginated: Awaited<ReturnType<typeof startNativeCodex>> | undefined;
+  let nativeFallback: Awaited<ReturnType<typeof startNativeCodex>> | undefined;
+  let nativeLegacy: Awaited<ReturnType<typeof startNativeCodex>> | undefined;
+  let obs1: Awaited<ReturnType<typeof connectObserver>> | undefined;
+  let client2: Awaited<ReturnType<typeof connectObserver>> | undefined;
+  let obsAfterFail: Awaited<ReturnType<typeof connectObserver>> | undefined;
+  let obsFallback: Awaited<ReturnType<typeof connectObserver>> | undefined;
+  let obsLegacy: Awaited<ReturnType<typeof connectObserver>> | undefined;
+  try {
+    nativePaginated = await startNativeCodex({
+      profile,
+      cwd: hostPaginatedCwd,
+      env: {
+        PATH: process.env.PATH ?? "",
+        FIXTURE_USER_AGENT: "infinite_execution/0.172.0 (Linux 6.8; x86_64)",
+        FIXTURE_DEFAULT_HISTORY_MODE: "paginated",
+        FIXTURE_OMIT_RESUME_ENVIRONMENTS: "1",
+        FIXTURE_OMIT_READ_FLAG_FILE: omitReadFlagFile,
+      },
+      execution: makeExecutor("paginated-laptop-1", exec1),
+      environmentState: { file: join(root, "paginated.sealed"), key, scope },
+      checkControl: () => {},
+      onThread: () => {},
+      onExit: () => {},
+      onSignal: () => {},
+      noAltScreen: false,
+      record: () => {},
+    });
+    obs1 = await connectObserver(nativePaginated.url, nativePaginated.observerToken);
+    const started = await obs1.rpc("thread/start", { historyMode: "paginated" });
+    assert.equal(started.error, undefined);
+    const threadId = started.result.thread.id as string;
+    assert.equal(started.result.thread.historyMode, "paginated");
+
+    const turn1 = await obs1.rpc("turn/start", { threadId, input: [{ type: "text", text: "workspace edit" }] });
+    assert.equal(turn1.error, undefined);
+    await waitFor(async () => obs1!.messages.some(item => item.method === "turn/completed" && item.params?.turn?.id === turn1.result.turn.id), Boolean, 10000);
+    await waitFor(async () => nativePaginated!.info().sessionId, value => value === threadId, 10000);
+    assert.equal(exec1.received.filter(item => item.method === "fixture/read-write").length, 1);
+
+    const reqsAfterStart = readFileSync(join(hostPaginatedCwd, "provider-requests.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    const startReq = reqsAfterStart.find(req => req.method === "thread/start");
+    assert.equal(startReq?.params?.historyMode, "paginated");
+    assert.equal(startReq?.params?.cwd, laptopCwd);
+    assert.equal(startReq?.params?.environments?.[0]?.environmentId, "paginated-laptop-1");
+    assert.ok(reqsAfterStart.some(req => req.method === "thread/turns/list" && req.params?.threadId === threadId && req.params?.limit === 1));
+    assert.ok(reqsAfterStart.some(req => req.method === "thread/read" && req.params?.threadId === threadId && req.params?.includeTurns === false));
+
+    obs1.ws.terminate();
+    await waitFor(async () => obs1!.ws.readyState, state => state === WebSocket.CLOSED, 5000);
+
+    const attach = nativePaginated.connect({ actor: { id: "owner-1", label: "Owner" }, leaseId: "lease-paginated-1" });
+    client2 = await connectObserver(attach.url, attach.token);
+    const resumed = await client2.rpc("thread/resume", { threadId, excludeTurns: true, cwd: hostPaginatedCwd });
+    assert.equal(resumed.error, undefined);
+    assert.equal(resumed.result.thread.historyMode, "paginated");
+    assert.equal(resumed.result.thread.environments, undefined);
+    assert.deepEqual(resumed.result.thread.turns, []);
+    assert.equal(typeof resumed.result.turnsBackwardsCursor, "string");
+    assert.equal(typeof resumed.result.itemsBackwardsCursor, "string");
+
+    const turnsPage = await client2.rpc("thread/turns/list", { threadId, cursor: resumed.result.turnsBackwardsCursor, sortDirection: "desc", itemsView: "full" });
+    assert.equal(turnsPage.error, undefined);
+    assert.deepEqual(turnsPage.result.data.map((turn: { text: string; status: string }) => [turn.text, turn.status]), [["workspace edit", "completed"]]);
+    const itemsPage = await client2.rpc("thread/items/list", { threadId, cursor: resumed.result.itemsBackwardsCursor, sortDirection: "desc" });
+    assert.equal(itemsPage.error, undefined);
+    assert.deepEqual(itemsPage.result.data.map((entry: { item: { text: string } }) => entry.item.text), ["reply:workspace edit", "workspace edit"]);
+
+    for (const method of ["thread/turns/list", "thread/items/list"] as const) {
+      assert.equal((await client2.rpc(method, { threadId: randomUUID() })).error?.code, -32600);
+      assert.equal((await client2.rpc(method, {})).error?.code, -32600);
+    }
+
+    const turn2 = await client2.rpc("turn/start", { threadId, input: [{ type: "text", text: "workspace edit held" }] });
+    assert.equal(turn2.error, undefined);
+    await waitFor(async () => client2!.messages.some(item => item.method === "fixture/turn-held" && item.params?.turnId === turn2.result.turn.id), Boolean, 10000);
+    const heldTurns = await client2.rpc("thread/turns/list", { threadId, sortDirection: "desc", limit: 1 });
+    assert.equal(heldTurns.result.data[0]?.status, "inProgress", "held turn must stay inProgress in paginated history until completion");
+    assert.equal((await client2.rpc("fixture/release-turn", {})).result.released, true);
+    await waitFor(async () => client2!.messages.some(item => item.method === "turn/completed" && item.params?.turn?.id === turn2.result.turn.id), Boolean, 10000);
+    const finishedTurns = await client2.rpc("thread/turns/list", { threadId, sortDirection: "desc", limit: 1 });
+    assert.equal(finishedTurns.result.data[0]?.status, "completed");
+    assert.equal(exec1.received.filter(item => item.method === "fixture/read-write").length, 2);
+
+    const reqsAfterResume = readFileSync(join(hostPaginatedCwd, "provider-requests.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    const resumeReq = reqsAfterResume.find(req => req.method === "thread/resume");
+    assert.equal(resumeReq?.params?.cwd, undefined, "paginated thread/resume must still strip cwd");
+    assert.equal(resumeReq?.params?.excludeTurns, true, "paginated thread/resume must preserve excludeTurns");
+
+    const handoff = await nativePaginated.selectExecution(makeExecutor("paginated-cloud-2", exec2), () => {});
+    assert.equal(handoff.generation, 2);
+
+    const stateFile = join(root, "paginated-restore.json");
+    const restoreCwd = join(root, "host-restore");
+    mkdirSync(restoreCwd);
+    const execRestore = await startFakeExecServer(laptopCwd);
+    let nativeRestore1: Awaited<ReturnType<typeof startNativeCodex>> | undefined;
+    let nativeRestore2: Awaited<ReturnType<typeof startNativeCodex>> | undefined;
+    let obsRestore: Awaited<ReturnType<typeof connectObserver>> | undefined;
+    try {
+      const restoreEnvState = { file: join(root, "restore.sealed"), key, scope: `session-${randomUUID()}:codex-environments` };
+      const restoreEnv = {
+        PATH: process.env.PATH ?? "",
+        FIXTURE_USER_AGENT: "infinite_execution/0.172.0 (Linux 6.8; x86_64)",
+        FIXTURE_DEFAULT_HISTORY_MODE: "paginated",
+        FIXTURE_THREAD_STATE_FILE: stateFile,
+      };
+      nativeRestore1 = await startNativeCodex({
+        profile, cwd: restoreCwd, env: restoreEnv, execution: makeExecutor("restore-laptop-1", execRestore),
+        environmentState: restoreEnvState, checkControl: () => {}, onThread: () => {}, onExit: () => {}, onSignal: () => {}, noAltScreen: false, record: () => {},
+      });
+      obsRestore = await connectObserver(nativeRestore1.url, nativeRestore1.observerToken);
+      const restoreStarted = await obsRestore.rpc("thread/start", {});
+      const restoreThreadId = restoreStarted.result.thread.id as string;
+      await obsRestore.rpc("turn/start", { threadId: restoreThreadId, input: [{ type: "text", text: "complete" }] });
+      await waitFor(async () => nativeRestore1!.info().sessionId, value => value === restoreThreadId, 10000);
+      obsRestore.ws.terminate();
+      nativeRestore1.stop();
+      nativeRestore1 = undefined;
+      writeFileSync(join(restoreCwd, "provider-requests.jsonl"), "");
+
+      nativeRestore2 = await startNativeCodex({
+        profile, cwd: restoreCwd, env: restoreEnv, execution: makeExecutor("restore-laptop-1", execRestore),
+        environmentState: restoreEnvState, resumeThreadId: restoreThreadId,
+        checkControl: () => {}, onThread: () => {}, onExit: () => {}, onSignal: () => {}, noAltScreen: false, record: () => {},
+      });
+      assert.equal(nativeRestore2.info().sessionId, restoreThreadId);
+      const restoreReqs = readFileSync(join(restoreCwd, "provider-requests.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+      const internalResume = restoreReqs.find(req => req.method === "thread/resume");
+      assert.equal(internalResume?.params?.threadId, restoreThreadId);
+      assert.equal(internalResume?.params?.excludeTurns, true, "internal restoreThread must pass excludeTurns: true on pagination-capable backends");
+    } finally {
+      obsRestore?.ws.terminate();
+      nativeRestore1?.stop();
+      nativeRestore2?.stop();
+      await execRestore.close();
+    }
+
+    writeFileSync(omitReadFlagFile, "1");
+    const unverifiedResume = await client2.rpc("thread/resume", { threadId, excludeTurns: true });
+    assert.equal(unverifiedResume.error?.code, -32000, "paginated thread/resume omitting environments must still fail closed when thread/read cannot verify placement");
+    await waitFor(async () => client2!.ws.readyState, state => state === WebSocket.CLOSED, 5000);
+    assert.equal(nativePaginated.info().sessionId, undefined);
+    obsAfterFail = await connectObserver(nativePaginated.url, nativePaginated.observerToken);
+    const fencedTurn = await obsAfterFail.rpc("turn/start", { threadId, input: [{ type: "text", text: "workspace edit" }] });
+    assert.ok(fencedTurn.error);
+    assert.equal(exec2.received.filter(item => item.method === "fixture/read-write").length, 0);
+
+    nativeFallback = await startNativeCodex({
+      profile,
+      cwd: hostFallbackCwd,
+      env: {
+        PATH: process.env.PATH ?? "",
+        FIXTURE_USER_AGENT: "infinite_execution/0.172.0 (Linux 6.8; x86_64)",
+        FIXTURE_UNSUPPORTED_PAGINATION: "1",
+      },
+      execution: makeExecutor("fallback-laptop-1", execFallback),
+      environmentState: { file: join(root, "fallback.sealed"), key, scope },
+      checkControl: () => {},
+      onThread: () => {},
+      onExit: () => {},
+      onSignal: () => {},
+      noAltScreen: false,
+      record: () => {},
+    });
+    obsFallback = await connectObserver(nativeFallback.url, nativeFallback.observerToken);
+    const fallbackStarted = await obsFallback.rpc("thread/start", {});
+    assert.equal(fallbackStarted.error, undefined);
+    const fallbackReqs = readFileSync(join(hostFallbackCwd, "provider-requests.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    const fallbackStarts = fallbackReqs.filter(req => req.method === "thread/start");
+    assert.equal(fallbackStarts.length, 2);
+    assert.equal(fallbackStarts[0].params?.historyMode, undefined);
+    assert.equal(fallbackStarts[1].params?.historyMode, "legacy");
+    assert.equal(fallbackStarts[1].params?.environments?.[0]?.environmentId, "fallback-laptop-1");
+
+    nativeLegacy = await startNativeCodex({
+      profile,
+      cwd: hostLegacyCwd,
+      env: {
+        PATH: process.env.PATH ?? "",
+        FIXTURE_USER_AGENT: "infinite_execution/0.162.0 (Linux 6.8; x86_64)",
+        FIXTURE_REQUIRE_LEGACY_HISTORY: "1",
+      },
+      execution: makeExecutor("legacy-laptop-1", execLegacy),
+      environmentState: { file: join(root, "legacy.sealed"), key, scope },
+      checkControl: () => {},
+      onThread: () => {},
+      onExit: () => {},
+      onSignal: () => {},
+      noAltScreen: false,
+      record: () => {},
+    });
+    obsLegacy = await connectObserver(nativeLegacy.url, nativeLegacy.observerToken);
+    const legacyStarted = await obsLegacy.rpc("thread/start", { historyMode: "paginated" });
+    assert.equal(legacyStarted.error, undefined);
+    const legacyReqs = readFileSync(join(hostLegacyCwd, "provider-requests.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    const legacyStart = legacyReqs.find(req => req.method === "thread/start");
+    assert.equal(legacyStart?.params?.historyMode, "legacy");
+    assert.equal(legacyStart?.params?.environments?.[0]?.environmentId, "legacy-laptop-1");
+  } finally {
+    obs1?.ws.terminate();
+    client2?.ws.terminate();
+    obsAfterFail?.ws.terminate();
+    obsFallback?.ws.terminate();
+    obsLegacy?.ws.terminate();
+    nativePaginated?.stop();
+    nativeFallback?.stop();
+    nativeLegacy?.stop();
+    await exec1.close();
+    await exec2.close();
+    await execFallback.close();
+    await execLegacy.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});

@@ -5,6 +5,7 @@ import { cpSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
+import { directLauncherCensus } from "../packages/host/src/process-census.js";
 
 const renderer = resolve("scripts/render-instance.mjs");
 const repositoryRoot = fileURLToPath(new URL("..", import.meta.url));
@@ -117,6 +118,26 @@ test("the instance census wrapper runs the instance's census, and the instance s
     /^exec \/usr\/local\/bin\/node \/opt\/infinite-work\/packages\/host\/dist\/process-census\.js$/m);
   assert.match(readFileSync(join(out, "infinite-work.sudoers"), "utf8"),
     /^infinite-work-host ALL=\(infinite-work-agent\) NOPASSWD: \/usr\/local\/libexec\/infinite-work\/process-census ""$/m);
+});
+
+test("the skeleton's direct launcher resolves to the census wrapper its sudoers permits (INF-501)", () => {
+  const out = render(["--instance", "work"]);
+  const config = JSON.parse(readFileSync(join(out, "config.example.json"), "utf8"));
+  const census = directLauncherCensus(config.teams.commandPrefix);
+  assert.ok(census);
+  assert.equal(census.command, "/usr/bin/sudo");
+  assert.deepEqual(census.args.slice(0, 5), ["-n", "-H", "-u", "infinite-work-agent", "--"]);
+  const sudoers = readFileSync(join(out, "infinite-work.sudoers"), "utf8");
+  assert.ok(sudoers.split("\n").includes(`infinite-work-host ALL=(infinite-work-agent) NOPASSWD: ${census.wrapper} ""`));
+});
+
+test("the rendered census wrapper refuses every argument (INF-501)", () => {
+  const out = render(["--instance", "work"]);
+  for (const args of [["x"], [""], ["--census"], ["/etc"], ["a", "b"]]) {
+    const run = spawnSync("sh", [join(out, "process-census.sh"), ...args], { encoding: "utf8" });
+    assert.equal(run.status, 64, JSON.stringify(args));
+    assert.match(run.stderr, /takes no arguments/);
+  }
 });
 
 test("every deploy file with a first-instance path has a per-instance template or an explicit host-level owner", () => {

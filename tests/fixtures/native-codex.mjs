@@ -49,16 +49,27 @@ if (args[0] === "exec-server") {
   const holdFrontendReadFile = process.env.FIXTURE_HOLD_FRONTEND_READ_FILE;
   const floodDuringStartRead = process.env.FIXTURE_FLOOD_DURING_START_READ === "1";
   const startupWriteAttempt = process.env.FIXTURE_STARTUP_WRITE_ATTEMPT === "1";
+  const omitUserAgent = process.env.FIXTURE_OMIT_USER_AGENT === "1";
+  const fixtureUserAgent = process.env.FIXTURE_USER_AGENT ?? "native-fixture";
+  const fixtureCapabilities = process.env.FIXTURE_CAPABILITIES ? JSON.parse(process.env.FIXTURE_CAPABILITIES) : undefined;
+  const defaultHistoryMode = process.env.FIXTURE_DEFAULT_HISTORY_MODE ?? "legacy";
+  const requireLegacyHistory = process.env.FIXTURE_REQUIRE_LEGACY_HISTORY === "1";
+  const unsupportedPagination = process.env.FIXTURE_UNSUPPORTED_PAGINATION === "1";
+  const failThreadStartMessage = process.env.FIXTURE_FAIL_THREAD_START_MESSAGE;
+  const unmaterializedFlagFile = process.env.FIXTURE_UNMATERIALIZED_FLAG_FILE;
+  const delayEmptyFirstTurnsListMs = Number(process.env.FIXTURE_DELAY_EMPTY_FIRST_TURNS_LIST_MS ?? "0");
+  let delayedEmptyTurnsListSent = false;
   const http = createServer();
   const wss = new WebSocketServer({ noServer: true });
   const saved = stateFile && existsSync(stateFile) ? JSON.parse(readFileSync(stateFile, "utf8")) : undefined;
   const history = Array.isArray(saved?.history) ? [...saved.history] : [];
-  let threadId = saved?.threadId, activeTurn, selections = saved?.selections, activeSelections = saved?.selections, releaseHeldTurn, replayCompletedTurn;
+  const turns = Array.isArray(saved?.turns) ? [...saved.turns] : [];
+  let threadId = saved?.threadId, historyMode = saved?.historyMode, activeTurn, selections = saved?.selections, activeSelections = saved?.selections, releaseHeldTurn, replayCompletedTurn;
   let discoveredInstructions, startupWriteBlocked;
   let flooded = false;
   const saveState = () => {
     if (!stateFile) return;
-    writeFileSync(stateFile, JSON.stringify({ threadId, history, selections }));
+    writeFileSync(stateFile, JSON.stringify({ threadId, historyMode, history, turns, selections }));
   };
   const environments = new Map();
   const execute = (environmentId, method, params) => new Promise((resolve, reject) => {
@@ -74,9 +85,42 @@ if (args[0] === "exec-server") {
   });
   const foreignId = randomUUID();
   const broadcast = message => { for (const client of wss.clients) if (client.readyState === WebSocket.OPEN) client.send(JSON.stringify(message)); };
-  const thread = (includeEnvironments = true) => ({
+  const isUnmaterialized = () => Boolean(unmaterializedFlagFile && existsSync(unmaterializedFlagFile));
+  const paginate = (entries, params, defaultSort, kind) => {
+    const dir = params?.sortDirection === "asc" || params?.sortDirection === "desc" ? params.sortDirection : defaultSort;
+    const ordered = dir === "desc" ? [...entries].reverse() : [...entries];
+    let start = 0;
+    if (params?.cursor !== undefined && params?.cursor !== null) {
+      if (typeof params.cursor !== "string") return { error: "Invalid cursor" };
+      const match = params.cursor.match(new RegExp(`^${kind}:${dir}:(\\d+)(?::.+)?$`));
+      if (!match) return { error: `Invalid ${kind} cursor for sortDirection ${dir}` };
+      start = Number(match[1]);
+    }
+    const limit = typeof params?.limit === "number" && params.limit > 0 ? params.limit : ordered.length;
+    const data = ordered.slice(start, start + limit);
+    return {
+      data,
+      nextCursor: start + data.length < ordered.length ? `${kind}:${dir}:${start + data.length}` : null,
+      backwardsCursor: data.length > 0 ? `${kind}:${dir === "desc" ? "asc" : "desc"}:${ordered.length - 1 - start}` : null,
+    };
+  };
+  const formatTurn = (entry, itemsView) => ({
+    id: entry.id,
+    text: entry.text,
+    status: entry.status,
+    ...(entry.error ? { error: entry.error } : {}),
+    items: itemsView === "notLoaded" ? [] : itemsView === "full" ? entry.items : entry.items.slice(0, 1),
+  });
+  const thread = (includeEnvironments = true, includeTurns = true) => ({
     id: threadId,
-    turns: history.map(text => ({ text })),
+    ...(historyMode === "paginated"
+      ? {
+          historyMode: "paginated",
+          turns: includeTurns
+            ? turns.map(entry => ({ id: entry.id, text: entry.text, status: entry.status, ...(entry.error ? { error: entry.error } : {}) }))
+            : [],
+        }
+      : { turns: includeTurns ? history.map(text => ({ text })) : [] }),
     ...(includeEnvironments && selections ? { environments: selections, cwd: selections[0].cwd } : {}),
     ...(discoveredInstructions !== undefined ? { discoveredInstructions } : {}),
     ...(startupWriteBlocked !== undefined ? { startupWriteBlocked } : {}),
@@ -95,7 +139,14 @@ if (args[0] === "exec-server") {
         const { method, params, id } = message;
         if (method) appendFileSync("provider-requests.jsonl", JSON.stringify({ method, params }) + "\n");
         const reply = result => client.send(JSON.stringify({ id, result }));
-        if (method === "initialize") { clientName = params?.clientInfo?.name; reply({ userAgent: "native-fixture" }); }
+        const replyError = (code, reason) => client.send(JSON.stringify({ id, error: { code, message: reason } }));
+        if (method === "initialize") {
+          clientName = params?.clientInfo?.name;
+          reply({
+            ...(!omitUserAgent ? { userAgent: fixtureUserAgent } : {}),
+            ...(fixtureCapabilities !== undefined ? { capabilities: fixtureCapabilities } : {}),
+          });
+        }
         else if (method === "server/diagnostics") reply({ executionEnvironmentUpdates: 1 });
         else if (method === "environment/add") {
           environments.set(params.environmentId, params); reply({});
@@ -109,7 +160,22 @@ if (args[0] === "exec-server") {
         }
         else if (method === "environment/info") reply(await execute(params.environmentId, "environment/info"));
         else if (method === "thread/start") {
-          threadId = randomUUID(); selections = params.environments; activeSelections = params.environments;
+          if (failThreadStartMessage) {
+            replyError(-32000, failThreadStartMessage);
+            return;
+          }
+          if (unsupportedPagination && params?.historyMode !== "legacy") {
+            replyError(-32600, "paginated threads require thread/turns/list and thread/items/list support");
+            return;
+          }
+          if (requireLegacyHistory && params?.historyMode !== "legacy") {
+            replyError(-32602, "Server requires historyMode: legacy");
+            return;
+          }
+          threadId = randomUUID();
+          historyMode = params?.historyMode ?? defaultHistoryMode;
+          selections = params?.environments;
+          activeSelections = params?.environments;
           if (selections?.length && process.env.FIXTURE_STARTUP_DISCOVERY === "1") {
             const env = selections[0];
             const instructionsPath = join(env.cwd, "AGENTS.md");
@@ -128,7 +194,7 @@ if (args[0] === "exec-server") {
             }
           }
           saveState();
-          const startThread = thread(!omitStartEnvironments);
+          const startThread = thread(!omitStartEnvironments, false);
           reply({ thread: startThread }); broadcast({ method: "thread/started", params: { thread: startThread } });
         }
         else if (method === "thread/settings/update") { if (params.environments) selections = params.environments; saveState(); reply({}); }
@@ -142,8 +208,17 @@ if (args[0] === "exec-server") {
           else { if (params.environments) activeSelections = params.environments; reply({ status: "applied" }); }
         }
         else if (method === "thread/read" || method === "thread/resume") {
+          if (method === "thread/read" && params?.includeTurns === true && isUnmaterialized()) {
+            replyError(-32600, "includeTurns is unavailable before first user message");
+            return;
+          }
           const omitReadNow = omitReadEnvironments || Boolean(omitReadFlagFile && existsSync(omitReadFlagFile));
           const includeEnvs = method === "thread/read" ? !omitReadNow : (!omitStartEnvironments && !omitResumeEnvironments);
+          const includeTurns = historyMode !== "paginated"
+            ? (method === "thread/read" ? params?.includeTurns !== false : true)
+            : method === "thread/read"
+              ? params?.includeTurns === true
+              : params?.excludeTurns !== true;
           if (method === "thread/read" && clientName === "infinite_execution" && floodDuringStartRead && !flooded) {
             flooded = true;
             const big = "x".repeat(15 * 1024 * 1024);
@@ -161,7 +236,7 @@ if (args[0] === "exec-server") {
             }
           }
           if (method === "thread/read" && clientName !== "infinite_execution" && holdFrontendReadFile && existsSync(holdFrontendReadFile)) {
-            const snapshot = thread(includeEnvs);
+            const snapshot = thread(includeEnvs, includeTurns);
             const waitRelease = () => {
               if (!existsSync(holdFrontendReadFile)) {
                 reply({ thread: snapshot, pid: process.pid });
@@ -181,16 +256,76 @@ if (args[0] === "exec-server") {
               discoveredInstructions = file?.contents ?? "";
             }
           }
-          reply({ thread: thread(includeEnvs), pid: process.pid });
+          const allItems = turns.flatMap(entry => entry.items);
+          const resumeMeta = method === "thread/resume" && historyMode === "paginated"
+            ? {
+                turnsBackwardsCursor: turns.length > 0 ? `turns:desc:0:${turns.at(-1).id}` : null,
+                itemsBackwardsCursor: allItems.length > 0 ? `items:desc:0:${allItems.at(-1).id}` : null,
+                ...(params?.initialTurnsPage
+                  ? { initialTurnsPage: paginate(turns.map(entry => formatTurn(entry, params.initialTurnsPage.itemsView)), params.initialTurnsPage, "desc", "turns") }
+                  : {}),
+              }
+            : {};
+          reply({ thread: thread(includeEnvs, includeTurns), pid: process.pid, ...resumeMeta });
+        }
+        else if (method === "thread/turns/list") {
+          if (!threadId || params?.threadId !== threadId) { replyError(-32600, "Unknown threadId"); return; }
+          if (isUnmaterialized()) { replyError(-32600, `thread ${threadId} is not materialized yet; thread/turns/list is unavailable before first user message`); return; }
+          if (delayEmptyFirstTurnsListMs > 0 && !delayedEmptyTurnsListSent) {
+            delayedEmptyTurnsListSent = true;
+            setTimeout(() => reply({ data: [], nextCursor: null, backwardsCursor: null }), delayEmptyFirstTurnsListMs);
+            return;
+          }
+          const page = paginate(turns.map(entry => formatTurn(entry, params?.itemsView)), params, "desc", "turns");
+          if ("error" in page) { replyError(-32602, page.error); return; }
+          reply(page);
+        }
+        else if (method === "thread/items/list") {
+          if (!threadId || params?.threadId !== threadId) { replyError(-32600, "Unknown threadId"); return; }
+          if (isUnmaterialized()) { replyError(-32600, `thread ${threadId} is not materialized yet; thread/items/list is unavailable before first user message`); return; }
+          const selected = typeof params?.turnId === "string" ? turns.filter(entry => entry.id === params.turnId) : turns;
+          const entries = selected.flatMap(entry => entry.items.map(item => ({ turnId: entry.id, item })));
+          const page = paginate(entries, params, "asc", "items");
+          if ("error" in page) { replyError(-32602, page.error); return; }
+          reply(page);
+        }
+        else if (method === "thread/items/read") {
+          if (!threadId || params?.threadId !== threadId) { replyError(-32600, "Unknown threadId"); return; }
+          const target = turns.find(entry => entry.id === params?.turnId);
+          const wanted = Array.isArray(params?.itemIds) ? new Set(params.itemIds) : new Set();
+          reply({ items: target ? target.items.filter(item => wanted.has(item.id)) : [] });
+        }
+        else if (method === "thread/timeline/list") {
+          if (!threadId || params?.threadId !== threadId) { replyError(-32600, "Unknown threadId"); return; }
+          const entries = turns.flatMap(entry => entry.items.map(item => ({ turnId: entry.id, item })));
+          const page = paginate(entries, params, "asc", "timeline");
+          if ("error" in page) { replyError(-32602, page.error); return; }
+          reply({ data: page.data, nextCursor: page.nextCursor });
         }
         else if (method === "thread/list") reply({ data: [thread(), { id: foreignId }], nextCursor: "next" });
         else if (method === "thread/loaded/list") reply({ data: [threadId, foreignId] });
         else if (method === "plugin/list") reply({ catalog: "a".repeat(13 * 1024 * 1024) });
         else if (method === "turn/start") {
-          const text = params.input.map(item => item.text ?? "").join(""); history.push(text); saveState();
-          const turnId = randomUUID(); activeTurn = turnId; activeSelections = params.environments ?? selections;
+          const text = params.input.map(item => item.text ?? "").join("");
+          const turnId = randomUUID();
+          history.push(text);
+          const turnEntry = {
+            id: turnId,
+            text,
+            status: "inProgress",
+            items: [
+              { id: `${turnId}:user`, type: "userMessage", text },
+              { id: `${turnId}:agent`, type: "agentMessage", text: `reply:${text}` },
+            ],
+          };
+          turns.push(turnEntry);
+          saveState();
+          activeTurn = turnId; activeSelections = params.environments ?? selections;
           const complete = (status = "completed", error) => {
             if (activeTurn === turnId) activeTurn = undefined;
+            turnEntry.status = status;
+            if (error) turnEntry.error = error;
+            saveState();
             broadcast({ method: "turn/completed", params: { threadId, turn: { id: turnId, status, ...(error ? { error } : {}) } } });
           };
           reply({ turn: { id: turnId, status: "inProgress" } });
@@ -208,6 +343,7 @@ if (args[0] === "exec-server") {
               complete();
             } catch { complete("failed"); }
           }
+          if (text === "complete") complete();
           if (text === "usage-limit") complete("failed", { codexErrorInfo: "usageLimitExceeded" });
           if (text === "rate-limit-transient") complete("failed", { codexErrorInfo: "rateLimitExceeded" });
           if (text === "work") setTimeout(() => { writeFileSync("work-complete", "done"); complete(); }, 1200);

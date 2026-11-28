@@ -3,7 +3,6 @@ import type { EvidenceDb, EvidenceTx } from "./evidence/types.js";
 import { configRef, trialProfileKey } from "./eval-trial-rules.js";
 import { REPORT_KEEP_DAYS, type JobTrialRow } from "./eval-trial-store.js";
 import { VOID_ENDINGS, type PromptOrigin, type ReplayPrior, type TrialConfiguration } from "./eval-types.js";
-import type { Config } from "./types.js";
 
 export const PRIOR_KEEP_DAYS = REPORT_KEEP_DAYS, PRIORS_MAX = 500;
 export const PRIORS_SQL = "SELECT * FROM eval_priors WHERE project_ref = ? ORDER BY generated_at DESC, prior_id LIMIT 500";
@@ -11,7 +10,7 @@ export const PRIORS_SQL = "SELECT * FROM eval_priors WHERE project_ref = ? ORDER
 const DAY_MS = 86_400_000;
 const OTHER_AREA = "other";
 const BUILT_IN_AREAS = ["mixed", "root"] as const;
-type Project = Config["projects"][number];
+type PriorProject = { id: string; team?: { features?: { areas?: readonly { id: string }[] } } };
 
 export type PriorTask = { areaRef: string | null; kind: string | null; promptOrigin: PromptOrigin | null };
 export type PriorCell = {
@@ -74,7 +73,7 @@ export function writePriors(tx: EvidenceTx, input: { jobId: string; projectId: s
   return written;
 }
 
-export function readPriors(db: EvidenceDb, project: Project): ReplayPrior[] {
+export function readPriors(db: EvidenceDb, project: PriorProject): ReplayPrior[] {
   const names = areaNames(db, project);
   return db.all<PriorRow>(PRIORS_SQL, db.index("project", project.id)).map(row => ({
     projectId: project.id,
@@ -95,7 +94,7 @@ export function readPriors(db: EvidenceDb, project: Project): ReplayPrior[] {
   }));
 }
 
-export function areaNames(db: EvidenceDb, project: Project): Map<string, string> {
+export function areaNames(db: EvidenceDb, project: PriorProject): Map<string, string> {
   const names = new Map<string, string>();
   for (const area of project.team?.features?.areas ?? []) names.set(db.index("area", area.id), area.id);
   for (const builtIn of BUILT_IN_AREAS) names.set(db.index("area", builtIn), builtIn);

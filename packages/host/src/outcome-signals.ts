@@ -237,7 +237,8 @@ function withdrawSignal(
   }
   if (stored === undefined) throw new SignalRequestError("signal-not-found", "The signal does not exist.");
   const payload = stored.payload;
-  if (stored.author !== "owner" || stored.kind !== input.kind || (payload.kind !== "linked-fix" && payload.kind !== "exclusion")) {
+  const hostClaim = stored.author === "host" && stored.authority === "claim" && stored.kind === "linked-fix";
+  if ((stored.author !== "owner" && !hostClaim) || stored.kind !== input.kind || (payload.kind !== "linked-fix" && payload.kind !== "exclusion")) {
     throw new SignalRequestError("signal-not-withdrawable", "The signal cannot be withdrawn.");
   }
   if (stored.state === "withdrawn") return { signal: stored, repeated: true };

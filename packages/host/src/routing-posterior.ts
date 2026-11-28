@@ -1,10 +1,11 @@
+import type { ReplayPrior } from "./eval-types.js";
 import { rowUse } from "./outcome-cells.js";
 import type { Beta, LevelName, LevelRecord, ProfilePosterior, RoutingEvidenceRow, RoutingPoint } from "./routing-types.js";
 
-export const HALF_LIFE_DAYS = 30, MAX_AGE_DAYS = 180, LEVEL_STRENGTH = 20, EARLIER_MASS = 10, MIN_COST_ROWS = 5;
+export const HALF_LIFE_DAYS = 30, MAX_AGE_DAYS = 180, LEVEL_STRENGTH = 20, EARLIER_MASS = 10, REPLAY_PRIOR_MASS = 4, MIN_COST_ROWS = 5;
 export const CHOSEN_WEIGHT = 0.5;
 
-export type RoutingTarget = { projectRef: string; areaRef: string; kind: string | null; featureVersion: number; featureMapRef: string; point: RoutingPoint };
+export type RoutingTarget = { projectRef: string; areaRef: string; kind: string | null; featureVersion: number; featureMapRef: string; point: RoutingPoint; projectId?: string; area?: string };
 export type CurrentConfig = { epoch: number; promptVersion: string };
 export type Observation = { reward?: { r: number; w: number }; rescue?: { x: 0 | 1; w: number } };
 export type ObservedCost = { listUsd: number | null; level: LevelName | "none"; rows: number };
@@ -95,6 +96,49 @@ function chain(tally: Tally): LevelRecord[] {
   return records;
 }
 
+function applyReplayPriors(
+  reward: Tally,
+  replayPriors: readonly ReplayPrior[],
+  target: RoutingTarget,
+  now: string,
+): number {
+  if (target.point !== "start" || replayPriors.length === 0) return 0;
+  const replay = {
+    project: { success: 0, failure: 0, rows: 0 },
+    cell: { success: 0, failure: 0, rows: 0 },
+  };
+  const targetArea = target.area ?? target.areaRef;
+  const ordered = [...replayPriors].sort((left, right) => {
+    const a = `${left.jobId}\u0000${left.area}\u0000${left.kind ?? ""}\u0000${left.promptOrigin}\u0000${left.profileEpoch}\u0000${left.promptVersion}\u0000${left.generatedAt}\u0000${left.profileId}`;
+    const b = `${right.jobId}\u0000${right.area}\u0000${right.kind ?? ""}\u0000${right.promptOrigin}\u0000${right.profileEpoch}\u0000${right.promptVersion}\u0000${right.generatedAt}\u0000${right.profileId}`;
+    return a < b ? -1 : a > b ? 1 : 0;
+  });
+  for (const prior of ordered) {
+    if (prior.role !== "implementer") continue;
+    if (target.projectId !== undefined && prior.projectId !== target.projectId) continue;
+    if (prior.trials <= 0 || prior.resolved < 0 || prior.resolved > prior.trials) continue;
+    const age = ageDays(prior.generatedAt, now);
+    if (!Number.isFinite(age) || age > MAX_AGE_DAYS) continue;
+    const decay = 0.5 ** (age / HALF_LIFE_DAYS);
+    const level = prior.area === targetArea && prior.kind === target.kind ? "cell" : "project";
+    replay[level].success += decay * prior.resolved;
+    replay[level].failure += decay * (prior.trials - prior.resolved);
+    replay[level].rows += prior.trials;
+  }
+  let addedRows = 0;
+  for (const level of ["project", "cell"] as const) {
+    const bucket = replay[level];
+    const mass = bucket.success + bucket.failure;
+    if (mass <= 0) continue;
+    const scale = mass > REPLAY_PRIOR_MASS ? REPLAY_PRIOR_MASS / mass : 1;
+    reward[level].earlier.success += scale * bucket.success;
+    reward[level].earlier.failure += scale * bucket.failure;
+    reward[level].earlier.rows += bucket.rows;
+    addedRows += bucket.rows;
+  }
+  return addedRows;
+}
+
 export function posterior(
   rows: readonly RoutingEvidenceRow[],
   target: RoutingTarget,
@@ -102,6 +146,7 @@ export function posterior(
   now: string,
   chosenWeight: number = CHOSEN_WEIGHT,
   routerChosen?: ReadonlySet<string>,
+  replayPriors?: readonly ReplayPrior[],
 ): ProfilePosterior {
   const reward = emptyTally(), rescue = emptyTally();
   const counts = { production: 0, duel: 0 };
@@ -136,6 +181,7 @@ export function posterior(
       sums.rows++;
     }
   }
+  if (replayPriors !== undefined) earlierRows += applyReplayPriors(reward, replayPriors, target, now);
   const rewardRecords = chain(reward), rescueRecords = chain(rescue);
   const level: LevelName | "none" = reward.cell.observed.rows > 0 ? "cell"
     : reward.project.observed.rows > 0 ? "project"

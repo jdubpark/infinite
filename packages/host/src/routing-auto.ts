@@ -1,6 +1,8 @@
-import { promptVersion, type ObjectivePrompt } from "./config-identity.js";
+import { profileIdentityKey, promptVersion, type ObjectivePrompt } from "./config-identity.js";
 import type { UsageConfig } from "./config.js";
 import { CONFIGURATIONS_MODULE, epochAt } from "./configuration-store.js";
+import { readPriors } from "./eval-priors.js";
+import { EVAL_TRIALS_MODULE } from "./eval-trial-store.js";
 import type { EvidenceStore } from "./evidence/store.js";
 import type { EvidenceDb } from "./evidence/types.js";
 import { OUTCOMES_MODULE, selectRoutingEvidence } from "./outcome-store.js";
@@ -18,7 +20,7 @@ import {
   readProjectState, releaseStalePending, ROUTING_MODULE, shareWindow,
 } from "./routing-store.js";
 import { taskFeatures, type FeatureMap, type TaskFeatures } from "./task-features.js";
-import type { CostsBasis, DecisionRow, ExploreGuards, ProviderHeadroom, RoutingKnobs, RoutingPayload } from "./routing-types.js";
+import type { Basis, CostsBasis, DecisionRow, ExploreGuards, ProviderHeadroom, RoutingKnobs, RoutingPayload } from "./routing-types.js";
 import type { TeamModelProfile, TeamRun, TeamTask } from "./team-types.js";
 import type { Provider } from "./types.js";
 
@@ -39,6 +41,7 @@ export type RouterStart = {
   prices?: UsageConfig["prices"];
   headrooms?: ReadonlyMap<Provider, ProviderHeadroom>;
   headroomCache?: ProviderHeadroomCache;
+  evalPriorsReady?: boolean;
 };
 
 export type AutoFailure = "unavailable" | "budget" | "tooLarge" | "write" | "failed";
@@ -92,6 +95,10 @@ function guardsAt(db: EvidenceDb, run: TeamRun, knobs: RoutingKnobs, now: string
   };
 }
 
+function hasEvalPriorsTable(db: EvidenceDb): boolean {
+  return db.get<{ name: string }>("SELECT name FROM sqlite_master WHERE type='table' AND name='eval_priors'") !== undefined;
+}
+
 export function evaluateImplementer(db: EvidenceDb, input: RouterStart, frame: StartFrame, keys: { taskKey: string; key: string },
   now: string, auto: boolean, at: { point: "start" | "escalation"; named: string | null }): Evaluated | undefined {
   const { run, task } = input;
@@ -106,6 +113,8 @@ export function evaluateImplementer(db: EvidenceDb, input: RouterStart, frame: S
     featureVersion: features.featureVersion,
     featureMapRef: db.index("feature-map", features.featureMap),
     point: at.point,
+    projectId: run.projectId,
+    area: features.area,
   };
   const since = new Date(Date.parse(now) - MAX_AGE_DAYS * DAY_MS).toISOString();
   const useCostHeadroom = routing.algorithmVersion >= COST_HEADROOM_ALGORITHM_VERSION;
@@ -114,6 +123,9 @@ export function evaluateImplementer(db: EvidenceDb, input: RouterStart, frame: S
     : input.headrooms ? overlayLimitedHeadrooms(providers, input.headrooms, input.limited)
     : input.headroomCache ? input.headroomCache.read(db, providers, input.limited, input.limitHistory ?? [], input.prices, now)
     : readProviderHeadrooms(db, providers, input.limited, input.limitHistory ?? [], input.prices, now);
+  const projectPriors = at.point === "start" && input.evalPriorsReady !== false && hasEvalPriorsTable(db)
+    ? readPriors(db, { id: run.projectId, team: input.featureMap ? { features: input.featureMap } : undefined })
+    : undefined;
   const scored = new Map<string, Scored>();
   const current: { identity: string; epoch: number; promptVersion: string }[] = [];
   let observedCount = 0;
@@ -122,13 +134,14 @@ export function evaluateImplementer(db: EvidenceDb, input: RouterStart, frame: S
     const found: CurrentConfig = { epoch: epochAt(db, identity, now), promptVersion: version };
     const rows = selectRoutingEvidence(db, identityOf(profile), at.point, since);
     const applied = appliedOutcomeIds(db, identity, since, at.point);
+    const profilePriors = projectPriors?.filter(prior => profileIdentityKey(prior.profile) === identity);
     const cost = useCostHeadroom
       ? expectedCost(profile, observedCost(rows, target, found.epoch, now).listUsd)
       : { costUsd: tierCost(profile), basis: "tier-default" as const };
     if (cost.basis === "observed") observedCount++;
     else defaultCount++;
     scored.set(identity, {
-      profile, identity, posterior: posterior(rows, target, found, now, CHOSEN_WEIGHT, applied),
+      profile, identity, posterior: posterior(rows, target, found, now, CHOSEN_WEIGHT, applied, profilePriors),
       costUsd: cost.costUsd,
       ...(useCostHeadroom ? { costBasis: cost.basis, headroom: headrooms?.get(profile.provider) } : {}),
     });
@@ -209,6 +222,7 @@ export function decideAutoStart(store: EvidenceStore, input: RouterStart, now: (
   try {
     const modules = store.status().modules;
     if (REQUIRED_MODULES.some(name => modules[name] !== "ready")) return fallback("unavailable");
+    const evalPriorsReady = modules[EVAL_TRIALS_MODULE] === "ready";
     const frame = startFrame(input);
     const at = now();
     const started = clock();
@@ -217,7 +231,7 @@ export function decideAutoStart(store: EvidenceStore, input: RouterStart, now: (
       const key = decisionKey(run.id, run.revision, taskKey, "start", 1);
       const existing = readDecision(db, key);
       if (existing !== undefined) return { existing };
-      return evaluateStart(db, input, frame, { taskKey, key }, at, true);
+      return evaluateStart(db, { ...input, evalPriorsReady }, frame, { taskKey, key }, at, true);
     });
     if (decided === undefined) return fallback("failed");
     if ("existing" in decided) return { profile: profileNamed(run, decided.existing.chosenProfileId), by: "router" };
@@ -228,13 +242,45 @@ export function decideAutoStart(store: EvidenceStore, input: RouterStart, now: (
     payload.elapsedMs = Math.round(elapsed);
     if (Buffer.byteLength(JSON.stringify(payload), "utf8") > PAYLOAD_LIMIT_BYTES) return fallback("tooLarge");
 
-    const holder: { stored?: DecisionRow } = {};
+    const holder: { stored?: DecisionRow; tooLarge?: boolean } = {};
+    let finalRow = row;
     const written = store.tryWrite(tx => {
       releaseStalePending(tx, run.projectId, at);
-      if (!insertDecision(tx, row, payload)) holder.stored = readDecision(tx, row.key);
+      let nextRow = row;
+      let nextPayload = payload;
+      if (row.explore && run.routing !== undefined) {
+        const currentGuards: ExploreGuards = {
+          ...(payload.guards ?? guardsAt(tx, run, run.routing.knobs, at)),
+          pausedAt: readProjectState(tx, run.projectId).explorePausedAt,
+          share: shareWindow(tx, run.projectId, run.routing.knobs.exploreWindow, at),
+        };
+        const guarded = guardExploration(
+          { basis: row.basis as Basis, chosen: row.chosenProfileId, greedy: row.greedyProfileId, explore: true, candidates: payload.candidates },
+          currentGuards,
+          run.routing.knobs,
+        );
+        nextPayload = { ...payload, guards: currentGuards };
+        if (!guarded.explore) {
+          const greedyCandidate = payload.candidates.find(candidate => candidate.profileId === guarded.chosen)!;
+          nextRow = {
+            ...row,
+            basis: guarded.basis,
+            chosenProfileId: guarded.chosen,
+            chosenIdentity: greedyCandidate.identity,
+            explore: false,
+          };
+        }
+      }
+      if (Buffer.byteLength(JSON.stringify(nextPayload), "utf8") > PAYLOAD_LIMIT_BYTES) {
+        holder.tooLarge = true;
+        return;
+      }
+      if (insertDecision(tx, nextRow, nextPayload)) finalRow = nextRow;
+      else holder.stored = readDecision(tx, row.key);
     });
+    if (holder.tooLarge) return fallback("tooLarge");
     if (!written) return fallback("write");
-    return { profile: profileNamed(run, (holder.stored ?? row).chosenProfileId), by: "router" };
+    return { profile: profileNamed(run, (holder.stored ?? finalRow).chosenProfileId), by: "router" };
   } catch {
     return fallback("failed");
   }

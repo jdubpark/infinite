@@ -50,8 +50,8 @@ import { registerVerdicts, sweepExpiredVerdicts } from "./verdict-store.js";
 import { RoutingRecorder } from "./routing-recorder.js";
 import { registerRouting, sweepExpiredDecisions } from "./routing-store.js";
 import { ownerSignal, SignalRequestError, type OwnerSignalInput } from "./outcome-signals.js";
-import { COMMIT_ID, HOLD_DAYS_DEFAULT } from "./outcome-hold.js";
-import { BaseScanner } from "./outcome-scan.js";
+import { recordHindsightFromScan } from "./hindsight-signal.js";
+import { COMMIT_ID, HOLD_DAYS_DEFAULT } from "./outcome-hold.js"; import { BaseScanner } from "./outcome-scan.js";
 import { profileKeyOf } from "./config-identity.js";
 import { lineupProfiles } from "./team-types.js";
 import { Blackboard } from "./evidence/blackboard.js";
@@ -268,7 +268,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
   baseScanner = new BaseScanner({
     store: evidence, mirrorPath: id => projectSource.mirrorPath(id), prefix: config.teams?.commandPrefix, holdDays: () => config.teams?.outcomes?.holdDays ?? HOLD_DAYS_DEFAULT,
     onApplied: scan => {
-      signals.recordScan(scan);
+      signals.recordScan(scan); try { recordHindsightFromScan(evidence, scan); } catch {}
       lateReceipts();
     },
   });

@@ -190,10 +190,15 @@ export class TrialPump {
   private costOf(sessionId: string, endedAt: string, at: string): SessionCost | "none" | "wait" | undefined {
     const lookup = this.options.cost;
     if (lookup === undefined) return undefined;
+    const elapsed = Date.parse(at) - Date.parse(endedAt);
+    const ready = !Number.isFinite(elapsed) || elapsed >= TRIAL_COST_WAIT_MS;
     try {
-      return lookup(sessionId) ?? "none";
+      const found = lookup(sessionId);
+      if (found === undefined) return "none";
+      if (!found.complete && !ready) return "wait";
+      return found;
     } catch {
-      return Date.parse(at) - Date.parse(endedAt) >= TRIAL_COST_WAIT_MS ? "none" : "wait";
+      return ready ? "none" : "wait";
     }
   }
 

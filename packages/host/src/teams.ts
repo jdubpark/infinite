@@ -75,12 +75,11 @@ import { autonomyStartEvent, intentCheckPin, startMode, verdictPin } from "./eva
 import { capacityCeiling } from "./team-planning.js";
 import { assertReviewedDelivery, automaticMergeReviewReason, deliveryReviewLineageAtBase, inheritDeliveryReviewLineage, type DeliveryReviewApproval, type DeliveryReviewLineage } from "./delivery-review.js";
 import { projectMissionChild, type MissionProgressChild } from "./mission-progress.js";
-export { applyTeamBriefTitle } from "./team-planning.js";
+export { applyTeamBriefTitle } from "./team-planning.js"; export { TeamError } from "./team-workspace.js"; export { changeIndex } from "./team-changes.js";
 import { TeamVerdicts, type VerdictState } from "./team-verdicts.js";
 import type { DeliveryFact } from "./verdict-types.js";
-export { TeamError } from "./team-workspace.js";
 import { recommendationOutcome } from "./question-recommendation.js";
-export { changeIndex } from "./team-changes.js";
+import { plannerMemoryForRun, type PlannerMemoryOption } from "./memory/planner-context.js";
 
 type Mutation = { requestId: string; revision: number; text: string };
 export type VerificationMutation = TeamVerificationReconcile;
@@ -101,8 +100,8 @@ export type TeamServiceOptions = {
   volumeUsage?: (path: string) => Promise<VolumeUsage>;
   events?: EventOutbox;
   entries?: Blackboard;
-  capture?: CaptureSink;
-  delivery?: (runId: string, head: string, since: string) => DeliveryFact | undefined; replayLaunchGate?: ReplayLaunchGate;
+  capture?: CaptureSink; replayLaunchGate?: ReplayLaunchGate; memory?: PlannerMemoryOption;
+  delivery?: (runId: string, head: string, since: string) => DeliveryFact | undefined;
 };
 export type RetentionState = { status: TeamRun["status"]; statusAt: string; integratedAt: Record<string, string>; removalErrors: Record<string, string[]>; retryAt?: Record<string, string>;
   evidenceHeldAt?: string };
@@ -2465,10 +2464,10 @@ export class TeamService {
     const modelProfile = selected ? structuredClone(selected) : undefined;
     const provider = modelProfile?.provider ?? run.provider;
     const configuredProject = this.config.projects.find(project => project.id === run.projectId)?.team;
-    const permissionRecoveryHistory = this.permissionRecoveryHistory(run);
-    let built = carried === undefined ? teamPromptSpec(run, role, task, undefined, provider, modelProfile, configuredProject, permissionRecoveryHistory, this.publishHeadsEnabled()) : refreshBuiltPrompt(carried, { provider, profile: modelProfile, role, entryTools: entryToolsFor(run, role) });
+    const permissionRecoveryHistory = this.permissionRecoveryHistory(run), advisoryMemory = role === "project-manager" ? plannerMemoryForRun(this.options?.memory, run) : undefined;
+    let built = carried === undefined ? teamPromptSpec(run, role, task, undefined, provider, modelProfile, configuredProject, permissionRecoveryHistory, this.publishHeadsEnabled(), advisoryMemory) : refreshBuiltPrompt(carried, { provider, profile: modelProfile, role, entryTools: entryToolsFor(run, role) });
     if (role !== "permission-coordinator" && Buffer.byteLength(built.prompt) > 80 * 1024)
-      built = teamPromptSpec(run, role, task, carried?.prompt, provider, modelProfile, configuredProject, permissionRecoveryHistory, this.publishHeadsEnabled());
+      built = teamPromptSpec(run, role, task, carried?.prompt, provider, modelProfile, configuredProject, permissionRecoveryHistory, this.publishHeadsEnabled(), advisoryMemory);
     if (Buffer.byteLength(built.prompt) > 80 * 1024) throw new TeamError(409, "team-prompt-too-large", "The accumulated team requirements exceed the prompt limit. Start a new team with consolidated requirements.");
     setMemberPromptSections(this.records.get(run.id), memberId, built.promptSections, built.prompt);
     return { runId: run.id, memberId, revision: run.revision, role, ...(role === "project-manager" && !run.establishChecks && !run.verification ? { verificationRefused: true as const } : {}), ...(entryToolsFor(run, role) ? { entryTools: true as const } : {}), ...(hostProfilesFor(run, role, modelProfile?.id) ? { hostProfiles: true as const } : {}), provider, ...(modelProfile ? { modelProfile } : {}), ...(taskId ? { taskId } : {}), ...(limit && !switched ? { pendingLimit: true } : {}), sessionId: randomUUID(), title: `${role}: ${taskId ?? run.title}`.slice(0, 100), status: "queued", cwd, baseCommit, prompt: built.prompt, ...(carried?.prompt ? { contextFeedback: carried.prompt } : {}), cursor: 0, stopRequestId: randomUUID() };
@@ -2609,7 +2608,7 @@ export class TeamService {
     if (feedback) {
       member.contextFeedback = feedback;
       setStoredMemberPrompt(promptDraft, member, teamPromptSpec(run, role, task, feedback, member.provider ?? run.provider, member.modelProfile,
-        this.config.projects.find(project => project.id === run.projectId)?.team, this.permissionRecoveryHistory(run), this.publishHeadsEnabled()));
+        this.config.projects.find(project => project.id === run.projectId)?.team, this.permissionRecoveryHistory(run), this.publishHeadsEnabled(), role === "project-manager" ? plannerMemoryForRun(this.options?.memory, run) : undefined));
     }
     if (role !== "permission-coordinator") run.status = activeStageForRole(role);
     let failure: string | undefined;
@@ -2717,7 +2716,7 @@ export class TeamService {
       const intentContext = member.role === "intent-checker" ? this.intentChecks.context(stored, member) : member.role === "evaluator" ? this.verdicts.context(stored, member) : member.role === "judge" ? this.replays.judgeContext(stored, member) : undefined; if (intentContext === null) { if (undoSwitch()) this.save(stored); return; }
       const launchSeq = this.options?.entries?.launchMark(stored.run.id);
       const digest = intentContext ? undefined : this.options?.entries?.memberDigest(stored.run, member, launchSeq);
-      const contextBytes = await writeTeamContext(member.cwd, { ...(intentContext ?? teamContext(stored.run, member.contextFeedback, configuredProject, member.role, this.permissionRecoveryHistory(stored.run))), ...(digest ? { entries: digest } : {}), ...(member.role === "judge" ? {} : { assignment: assignment(member, true) }), memberBaseCommit: member.baseCommit, scratchDirectory: member.scratchDirectory }, this.prefixFor(run));
+      const contextBytes = await writeTeamContext(member.cwd, { ...(intentContext ?? teamContext(stored.run, member.contextFeedback, configuredProject, member.role, this.permissionRecoveryHistory(stored.run), member.role === "project-manager" ? plannerMemoryForRun(this.options?.memory, stored.run) : undefined)), ...(digest ? { entries: digest } : {}), ...(member.role === "judge" ? {} : { assignment: assignment(member, true) }), memberBaseCommit: member.baseCommit, scratchDirectory: member.scratchDirectory }, this.prefixFor(run));
       this.options?.entries?.recordLaunch(stored.run, member, { launchSeq, promptBytes: Buffer.byteLength(member.prompt, "utf8"), contextBytes, digestBytes: digest ? Buffer.byteLength(canonicalJson(digest), "utf8") : 0 });
     }
     if (this.fuse && !this.hasLaunch(member) && this.fuseWait(stored, this.fuse.admit(workLaunch({ launchId: member.sessionId, projectId: stored.run.projectId,

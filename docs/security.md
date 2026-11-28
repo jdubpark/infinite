@@ -21,7 +21,11 @@ encrypted state and journal. A Goal records approved paths, execution limits,
 and requested model profiles. The host validates task ownership and integrated
 changes against that scope. Public lifecycle and steering requests for a
 goal-owned Team must go through its Goal; decision answers require its current
-active cycle. Outcomes require an explicit owner/controller assessment after
+active cycle, and `POST /api/teams/:id/cancel` is also admitted for a stopped
+goal's leftover `blocked` or `paused` run once no queued control, pending
+extension, or deadline-extendable cycle remains (routed through
+`GoalService.cancelReleasedRun` under the `goalId -> teamId` lock order).
+Outcomes require an explicit owner/controller assessment after
 work stops. These controls do not establish product success or contain every
 possible provider tool effect.
 
@@ -197,7 +201,9 @@ OpenCode's native HTTP gateway has the same owner/control boundary. Every reques
 
 Codex `--laptop` execution additionally requires a single-tenant host, a paired owner bearer, and a separate random per-session executor capability. The worker receives only the capability hash through private bootstrap; public session records omit the secret. The detached laptop service receives credentials through private IPC and opens an outbound connection. The actual exec-server binds to loopback with its own bearer; neither the model nor the local native interface receives the owner key. Origin-bearing browser connections cannot attach. Channels and buffers are bounded. The service polls pairing/session status and stops on confirmed revocation or exit.
 
-The selected cwd and roots describe Codex's workspace, not a filesystem isolation boundary. Laptop shell tools retain the selected provider sandbox and the local account's authority. Closing the tunnel or cleaning up the supervisor does not establish containment of arbitrary tool descendants. Automatic handoff requires a verified prepared tree, a settled recorded executor boundary and qualified provider selection. An unresolved operation pauses. Publication epochs reject late local updates; they do not revoke arbitrary detached descendants or external effects. A failed connection never authorizes replay or a provider approval. Captures record stable reads over an observation span, not an atomic database or filesystem snapshot. Returning files go into a new recovery directory without overwriting the laptop copy.
+Codex execution environment placements persist in AES-256-GCM sealed `codex-environments.sealed` (`packages/host/src/codex-environment-store.ts`, mode `0600`, ≤2 MiB verified before atomic write), and tool dispatch runs through the loopback `CodexToolFence` WebSocket proxy (`packages/host/src/codex-environment-fence.ts`). The fence rejects Origin-bearing upgrades, requires per-endpoint random proxy bearer tokens, and blocks non-probe tool RPCs unless the executor has completed validated registration and matches a verified placement generation. During `thread/start` and `thread/resume` startup discovery, the fence admits only read-only `fs/getMetadata` and `fs/readFile` paths contained within verified workspace roots (enforcing symlink containment for local roots) while blocking writes, command execution, and root escapes. Queued pre-handshake frames carry the authorization generation and are revoked across reselections, and provider restarts restore saved threads through `thread/resume` plus `thread/read` placement confirmation in `native-codex.ts` and `worker.ts`, failing closed on drift or unreadable state.
+
+The selected cwd and roots describe Codex's workspace, not a filesystem isolation boundary. Laptop shell tools retain the selected provider sandbox and the local account's authority. Closing the tunnel, fencing tool dispatch, or cleaning up the supervisor does not establish containment of arbitrary already-spawned tool descendants. Automatic handoff requires a verified prepared tree, a settled recorded executor boundary and qualified provider selection. An unresolved operation pauses. Publication epochs reject late local updates; they do not revoke arbitrary detached descendants or external effects. A failed connection never authorizes replay or a provider approval. Captures record stable reads over an observation span, not an atomic database or filesystem snapshot. Returning files go into a new recovery directory without overwriting the laptop copy.
 
 Selected-root files, content-addressed blobs and materialized checkpoints are plaintext runtime data with private permissions; keep them on encrypted storage. The selected roots include ignored files and repository metadata, including any credentials stored inside that scope. Source transfer does not copy the entire home. The owner-only workspace export endpoint returns verified checkpoint data; controller/viewer keys and browser-origin requests cannot use it. A separate execution identity needs the dedicated shared data directory in the Ubuntu template, while receipts, blobs, keys and control sockets stay private.
 
@@ -252,7 +258,7 @@ Each service below runs on loopback, so the grader can open a connection to it. 
 | Relay | `127.0.0.1:4790` | The relay registration key of the runner. Started with `--proxy-socket`, as [the public relay](../deploy/ubuntu/public-relay.md) installs it, the port refuses relay clients, and only `/health` answers without the key. |
 | Egress socket | The same port as the egress proxy | The same as the egress proxy. systemd holds the port while the proxy is down. |
 
-A second instance runs its own listeners on its own ports, with its own credentials. See [instances](../deploy/ubuntu/instances.md).
+A second instance runs its own listeners on its own ports, with its own credentials; `deploy/ubuntu/verify-instance-boundaries.py` checks account isolation across declared roots and optional `retiredPaths` (locked-down `root`-owned `0700`/`0600` caches inaccessible to every owning and peer account). See [instances](../deploy/ubuntu/instances.md).
 
 ### What stays with the owner
 

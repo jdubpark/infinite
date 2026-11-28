@@ -73,4 +73,6 @@ most every 2 seconds. A held launch carries a reason that starts with
 A second instance is a second host process on the same machine, with its own
 names, state, and Slack app. The commissioning steps (names, accounts and
 directories, rendered service templates, the sudoers check, the relay entry, and
-the acceptance checks) are in [`deploy/ubuntu/instances.md`](../deploy/ubuntu/instances.md).
+the acceptance checks, including `deploy/ubuntu/verify-instance-boundaries.py`
+across declared roots and optional `retiredPaths` locked down to `root`-only
+`0700`/`0600` modes) are in [`deploy/ubuntu/instances.md`](../deploy/ubuntu/instances.md).

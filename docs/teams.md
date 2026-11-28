@@ -1208,7 +1208,7 @@ One trial runs host-wide at a time. Validation and trials share the grader, one 
 | `eval-failed` | A step of the trial's source in the eval account failed. |
 | `bundle-missing` | The project's source bundle could not be read. |
 
-A trial whose source cannot be built keeps its attempt and is tried again, and the job's `waiting` names the cause. The tenth failure in a row for one slot ends that trial `void-host` and the job skips the task, so the next task runs; the counted causes are `grader-failed`, `eval-failed`, `bundle-missing` and `storage`. Three voids in a row still pause the job with `trial-voids`, as before, so a cause that is not the task's stops the job after three tasks. `mirror` and `halt` only wait and are never counted, however long they last. A trial ended this way counts toward `trialsPerDay`. A paused job's `waiting` is empty, so the cause is not shown after the pause. A shorter outage uses no attempt. The count is per job and in memory, so a host restart starts it again.
+A trial whose source cannot be built keeps its attempt and is tried again, and the job's `waiting` names the cause. The tenth failure in a row for one slot ends that trial `void-host` and the job skips the task, so the next task runs; the counted causes are `grader-failed`, `eval-failed`, `bundle-missing` and `storage`. Three voids in a row still pause the job with `trial-voids`, as before, so a cause that is not the task's stops the job after three tasks. `mirror`, `halt`, `spend-fuse`, `provider-limit`, `provider-budget`, `budget-unmeasurable`, and `daily-cap` only wait and are never counted, however long they last. A trial ended this way counts toward `trialsPerDay`. A paused job's `waiting` is empty, so the cause is not shown after the pause. A shorter outage uses no attempt. The count is per job and in memory, so a host restart starts it again.
 
 The reasons that stop a job are `trial-voids` (three voids in a row), `eval-processes-alive` (a process of the eval account survived `stop`, and the job is blocked until the owner resumes it), and `configuration-changed`, with the validate job's reasons.
 
@@ -1223,11 +1223,11 @@ Nothing in this change is installed. Until the owner installs each part, the sta
 - **Grader version 1:** the summary shows `grader ready (version 1: no trials)`, and a baseline job waits `grader`. Validation runs as before.
 - **A provider wrapper refused:** the replay launch fails, and the trial ends `void-host`. Three such trials pause the job `trial-voids`.
 
-The owner chooses these. The defaults are the ones this slice builds: the windows of a job (none, so any hour); `trialsPerDay` (off; the recommended first value is 6); the hosts in `_eval` and `_eval-setup` (none by default); the files of the home template; and the fallback estimate, which waits for the standing budget.
+The owner chooses these. The defaults are the ones this slice builds: the windows of a job (none, so any hour); `providerBudgets` and host `usage.budgets` (off by default); optional `trialsPerDay` (off; secondary safety cap); the hosts in `_eval` and `_eval-setup` (none by default); the files of the home template; and the fallback estimate, which waits for the standing budget.
 
 #### Summary and status
 
-The summary and `infinite eval status PROJECT` add three things. The eval identity line is `eval identity STATE`; for `unavailable` it adds `(not probed)` when the host never probed, or `(last probe STATE, TIME)` when the last probe aged out. The trial line is `trials today N of CAP`, or `trials off` without a cap. The grader line shows `grader ready (version 1: no trials)` when the grader's version is below 2. A baseline job prints `tasks R of P (skipped S) · trials started N of P, graded N, resolved N, ended N, void N`.
+The summary and `infinite eval status PROJECT` add three things. The eval identity line is `eval identity STATE`; for `unavailable` it adds `(not probed)` when the host never probed, or `(last probe STATE, TIME)` when the last probe aged out. The trial lines print `trials off` when neither `trialsPerDay` nor any provider USD budget is configured; otherwise `trials today N` (or `trials today N of CAP` when `trialsPerDay` is set), followed by one `budget PROVIDER (SOURCE/PERIOD): SPENT of $LIMIT · STATE` line per configured project or host budget constraint. The grader line shows `grader ready (version 1: no trials)` when the grader's version is below 2. A baseline job prints `tasks R of P (skipped S) · trials started N of P, graded N, resolved N, ended N, void N`.
 
 When the project has `team.eval`, the summary adds the task count of each set (`tasks.bySet`, with `dev` and `holdout`), and its groups gain `holdout` and `exposed` counts. The status prints `sets dev N · holdout M`, and its groups line ends `holdout H, exposed X`. A project without `team.eval` has no set counts. A compare or confirm job prints the baseline line with `reused N` added, `resolved hidden` until its report is ready, and `report pending` or `report ready` once it has finished.
 
@@ -1244,7 +1244,7 @@ These arrive in later steps of the delivery order:
 
 A `compare` job runs two to four configurations over the same tasks of the dev set, and its report gives, for each pair, the difference in resolved tasks with an interval and a p-value. It names no winner. A `confirm` job runs one pair of configurations once over the holdout set, to check a result that the dev set suggested. Both are trial jobs: they use the trials above, with their gates, their eval account, and their one trial at a time.
 
-The comparison adds no setting and installs nothing. It needs `trialsPerDay` and the installs of [Eval trials](#eval-trials), and a project without `team.eval` behaves as before. Only the owner creates a job. The owner, a controller, and a viewer read reports and priors. A relay device reads neither.
+The comparison adds no setting and installs nothing. It needs `providerBudgets` (or host `usage.budgets`, or the optional `trialsPerDay` safety cap) and the installs of [Eval trials](#eval-trials), and a project without `team.eval` behaves as before. Only the owner creates a job. The owner, a controller, and a viewer read reports and priors. A relay device reads neither.
 
 #### The two sets
 
@@ -1488,7 +1488,7 @@ The state needs 30 counted pairs, so a request for exactly 30 fails on its first
 | 409 | `judge-launch-missing` | The judge's provider has no `eval.member.agents` entry. |
 | 409 | `calibration-active` | Another calibration is running. At most one runs. |
 | 409 | `request-conflict` | The `requestId` was used for a different request. |
-| 409 | `eval-config-incomplete` | A named project has no `team.eval` block. |
+| 409 | `eval-config-incomplete` | A named project has no `team.eval` block, or lacks a covering provider budget (`providerBudgets` or host `usage.budgets` for the judge's provider) and has no `trialsPerDay`. |
 | 409 | `too-few-pairs` | The projects hold fewer than 30 usable pairs for this request. |
 | 404 | `unknown-calibration` | No calibration has this ID (cancel). |
 | 503 | `evidence-unavailable` | The evidence store or the judge module is not ready. |
@@ -1543,16 +1543,18 @@ A judgement starts only when all of these hold, in this order:
 
 | Gate | Wait |
 |---|---|
-| The project is not halted. | `halt` |
+| The project is not halted (including fuse halt check). | `halt` |
 | The host load is not held. | `host-load` |
 | The eval identity is `ready`, and the judge's provider has an `eval.member.agents` entry. | `eval-identity` |
 | The grader is `ready`. | `grader` |
 | No trial is live. | `another-job` |
 | No judgement is live or preparing. | `another-judgement` |
+| The host or project spend fuse is clear and measurable. | `spend-fuse` |
 | The judge's provider has no active limit. | `provider-limit` |
+| Any configured project (`providerBudgets`) or host (`usage.budgets`) USD budget for the judge's provider has headroom and complete measured spend. | `provider-budget` or `budget-unmeasurable` |
 | At least four host session slots are free. | `session-slots` |
 
-The calibration job also checks its expiry and its pins first. A calibration has no daily cap: `trialsPerDay` counts trials only.
+The calibration job also checks its expiry and its pins first. A calibration has no daily trial-count cap: `trialsPerDay` counts trials only.
 
 **One live session.** The eval identity runs one session at a time, shared by trials and judgements. When a trial job and a running calibration are both open, they take turns: after a trial starts, the next start is a judgement, and the reverse. A judgement never starts while a trial is live. After each judgement the pump stops the account's processes, cleans the source, and resets the home before the next start.
 
@@ -1560,7 +1562,7 @@ The calibration job also checks its expiry and its pins first. A calibration has
 
 #### Spend
 
-The owner's request is the budget. One calibration starts at most `2 x pairs x 3` judge sessions (two orderings, at most three attempts each), each at most `judgeMinutes` long. The default of 36 pairs allows 216 sessions. Judge sessions do not count against a project's `trialsPerDay`, and a trial does not count against a calibration. The duel cap of the duels design needs the learning budget, which does not exist yet.
+Judge calibrations enforce the same fail-closed provider USD spend budgets (`providerBudgets` and host `usage.budgets`), spend fuse (`FuseService`), and `ProviderLimits` gates as eval trials (`eval-budget.ts`). In addition, one calibration starts at most `2 x pairs x 3` judge sessions (two orderings, at most three attempts each), each at most `judgeMinutes` long; the default of 36 pairs allows 216 sessions. Judge sessions do not count against a project's `trialsPerDay`, and a trial does not count against a calibration. The duel cap of the duels design waits for the standing learning budget.
 
 The hourly sweep reads each judge session's tokens and cost from the usage ledger, records them on the judgement row, and then removes the session, about an hour after it ended. A lookup that fails is retried until 24 hours after the judgement ended. The close of a judgement reads no cost. A session the ledger has no usage for is recorded as `none`, never zero. The view's cost sums only what the sweep has recorded, so it is a floor, and it is low until the sweep has run. The sweep also expires a calibration whose expiry has passed. It deletes judgement rows and then calibration rows created more than 365 days ago.
 
@@ -1576,7 +1578,7 @@ The list returns `{ calibrations: [...] }`, newest first, at most 20. A start an
 
 A view holds `calibrationId`, `profileId`, `profileEpoch`, `promptVersion`, `status` (`running`, `completed`, `cancelled`, or `expired`), `reason`, `state`, `pairs` (`planned`, `counted`, `correct`, and the pair count of each project), `accuracy`, `lowerBound`, `swapAgreement`, `judgeMinutes`, `cost` (`tokens` and `spentUsd`), `createdAt`, `expiresAt`, `completedAt`, `validUntil`, `inForce`, and `waiting`. While a calibration runs, `counted` and `correct` are 0 and its figures are null, because the host writes them when the calibration ends. A view never holds a task, a trial, a patch, a rubric, model text, or the judge's summary.
 
-**The wait reason.** `waiting` names the gate that holds the next judgement of a running calibration. It is `null` on a calibration that is not running, and when no gate is known. It holds one of the eight gate names in the table above, `mirror` (the project has no mirror head or no GitHub base branch), `start-up` (the start-up cannot yet stop, clean, and probe the eval account), or a cause of a failed source build: `grader-failed`, `grader-processes-alive`, `eval-failed`, `eval-processes-alive`, `bundle-missing`, `storage`, or `halt` for a halted project. The host keeps the reason in memory, so it is empty after a restart, and on a new calibration, until the next step. While a trial holds the eval account the host asks for no judgement, and the reason is `another-job`. The command line prints it as `waiting on REASON`.
+**The wait reason.** `waiting` names the gate that holds the next judgement of a running calibration. It is `null` on a calibration that is not running, and when no gate is known. It holds one of the gate names in the table above (`halt`, `host-load`, `eval-identity`, `grader`, `another-job`, `another-judgement`, `spend-fuse`, `provider-limit`, `provider-budget`, `budget-unmeasurable`, `session-slots`), `mirror` (the project has no mirror head or no GitHub base branch), `start-up` (the start-up cannot yet stop, clean, and probe the eval account), or a cause of a failed source build: `grader-failed`, `grader-processes-alive`, `eval-failed`, `eval-processes-alive`, `bundle-missing`, or `storage`. Wait-only causes (`halt`, `mirror`, `spend-fuse`, `provider-limit`, `provider-budget`, `budget-unmeasurable`) do not count toward the 10-release `void-host` threshold. The host keeps the reason in memory, so it is empty after a restart, and on a new calibration, until the next step. While a trial holds the eval account the host asks for no judgement, and the reason is `another-job`. The command line prints it as `waiting on REASON`.
 
 **A host failure uses no attempt.** When the project has no mirror head, or the source build ends on an environment cause, no judge session has started. The host deletes the judgement row, the ordering keeps its attempt, and the calibration waits. The same judgement runs again once the cause clears, or the calibration expires. After ten failures in a row for one judgement, the tenth ends the attempt `void-host`, so a cause that belongs to one pair cannot hold the calibration. A project that is gone from the configuration, or whose eval settings are incomplete, ends the attempt at once. A failure after the source exists, and a row left in flight by a restart, still end the attempt `void-host`.
 
@@ -2789,7 +2791,7 @@ into tracked configuration examples, screenshots, or repository reports.
 
 ## Usage and budgets
 
-The sealed host ledger records measured OpenCode token usage. Configure a `usage` block to expose the Cost view, account mapping, and budgets. The dated built-in catalog prices DeepSeek and Meta models; custom prices can override it. The ledger records Claude Code and Codex tokens for sessions whose hooks stream a transcript. Each figure states its coverage. Those records are not priced yet, so they count as unpriced steps. The web client, API, and CLI read the same ledger. `infinite usage repairs [--project ID] [--days N] [--json]` (`GET /api/usage/repair-loops`) summarizes baseline repair-loop latency, priced token/USD medians (excluding unmeasured loops rather than zeroing them), and cold-replacement/failed-resume denominators.
+The sealed host ledger records measured OpenCode token usage. Configure a `usage` block to expose the Cost view, account mapping, and budgets. The dated built-in catalog prices DeepSeek and Meta models; custom prices can override it. The ledger records Claude Code and Codex tokens for sessions whose hooks stream a transcript. Each figure states its coverage. Those records are not priced yet, so they count as unpriced steps. The web client, API, and CLI read the same ledger. `infinite usage repairs [--project ID] [--days N] [--json]` (`GET /api/usage/repair-loops`) summarizes baseline repair-loop latency, priced token/USD medians (excluding unmeasured loops rather than zeroing them), and cold-replacement/failed-resume denominators. `infinite usage interrupted [--project ID] [--days N] [--json]` (`GET /api/usage/interrupted-tasks`) mounts ahead of the `/api/usage` ledger availability gate via `registerInterruptedTaskMetricsRoute`, reads a lightweight `teams.interruptedTaskRuns(filter)` projection instead of cloning full `understandingRecords()`, and depends only on `EvidenceStore` availability (`503 evidence-unavailable`).
 
 ```json
 {
@@ -2817,7 +2819,7 @@ The sealed host ledger records measured OpenCode token usage. Configure a `usage
 
 Every total carries an unpriced count. Clients mark incomplete priced totals with `≥` and do not turn missing usage or price into a zero-cost claim.
 
-Budgets are informational. The host shows spent against budget and marks `over budget`, but it never pauses, refuses, or hides a team, goal, or session because of spend.
+For interactive sessions, production teams, and goals, host `usage.budgets` are informational: the host shows spent against budget and marks `over budget`, without pausing, refusing, or hiding production work because of spend. For replay eval trials and judge calibrations, host `usage.budgets` (alongside project `eval.providerBudgets`) are enforced fail-closed; see [Eval trials](#eval-trials) and [Judge calibration](#judge-calibration).
 
 OpenCode team members and OpenCode sessions started from the local UI report usage. Grok and OpenCode in a native terminal stay unmeasured, so their sessions, and team members that use them, show `Unmeasured`. Unmeasured work is counted separately and is never added to a total as zero.
 
@@ -3758,7 +3760,7 @@ infinite routing status PROJECT [--json]
 infinite routing explain RUN_ID TASK_ID [--json]
 ```
 
-`status` shows the mode and its source, the value and the contributor setting, whether start is covered, how often the router matched the coordinator over the last 30 days, the shadow period (it ends after 14 days and 50 decisions, whichever is later), and each profile's posterior at each recorded area and at the new-task line. Intervals are 90% normal approximations. A count of zero is shown as "no decision had a coordinator pick", never as a rate. A cost that is a tier default is labelled as one. `explain` lists one task's start decisions, with the candidates each one considered.
+`status` shows the mode and its source, the value and the contributor setting, whether start is covered, how often the router matched the coordinator over the last 30 days, the shadow period (it ends after 14 days and 50 decisions, whichever is later), observed list USD costs vs tier defaults (`costs.basis` on `RoutingStatus` and `costBasis` per profile/candidate), modelled provider limit headroom (`Provider headroom: ...` from `routing-headroom.ts`), and each profile's posterior at each recorded area and at the new-task line. Intervals are 90% normal approximations. A count of zero is shown as "no decision had a coordinator pick", never as a rate. A cost that is a tier default is labelled as one. `explain` lists one task's start decisions, with the candidates each one considered (including `costUsd` and any nonzero `pressure`).
 
 With owner criteria on (`project.team.objective.prompts: "on"`), status reads the evidence as the start of a goal cycle with a pinned record digest would, with the digest in the prompt version. In such a project, the rows of a standalone run, and of a goal cycle whose digest was skipped, count as earlier evidence. A recorded decision keeps the prompt version its own start used.
 
@@ -3814,9 +3816,10 @@ A start explores (picks a profile other than the greedy one) only when all of th
 - exploration is not paused for the project;
 - the run has at least `minSpareAttempts` spare attempts (default 4);
 - the share of exploratory starts over the project's last `exploreWindow` starts, counting pending and applied rows, stays within `maxExploreShare` (default 0.2) with the new start included;
-- the task's risk is not `elevated`.
+- the task's risk is not `elevated`;
+- the chosen candidate does not have a known modelled provider headroom estimate `h` below `0.2` (when `h` is known and `< 0.2`, exploration is blocked as `greedy-headroom`; providers with insufficient limit history have unknown headroom and remain eligible for exploration).
 
-Pending rows that are not released within 7 days are released. Headroom is not applied.
+Pending rows that are not released within 7 days are released. Cost and headroom terms use observed complete `listUsd` persisted on outcome rows (pooled hierarchically `cell -> project -> tenant` with at least 5 complete-cost attempts and 30-day half-life decay, falling back to `TIER_COSTS` defaults) and `ProviderLimits` 30-day usage-limit history combined with `usage_records` over 5-hour short and 7-day long trailing windows (`routing-headroom.ts`, falling back to token counts when any record in a window is unpriced), applying linear `pressure` below `h = 0.5`.
 
 ```sh
 infinite routing pause-explore PROJECT
@@ -3864,7 +3867,7 @@ Otherwise the text is today's, and names the pool. No member is told a candidate
 **What the router picks.** Neither point draws a sample or reads an exploration guard.
 
 - An escalation takes the candidate with the highest greedy utility. An elevated-risk task uses the mean minus one posterior deviation, as the design's Part 5 says. The basis is `greedy-point`. It is `single-candidate` when one candidate is left, and `default-all-limited` when every candidate is limited, which takes the first candidate.
-- A scout takes the candidate with the lowest tier cost, and ties go to lineup order. A limited candidate is passed over unless every candidate is limited. The basis is `greedy-point`, `single-candidate`, or `default-all-limited`. A scout candidate is never `strong`, so every candidate has the light cost, and in practice the first candidate in lineup order that is not limited is chosen.
+- A scout takes the candidate with the lowest observed list USD cost when available, falling back to tier cost, and ties go to lineup order. A limited candidate is passed over unless every candidate is limited. The basis is `greedy-point`, `single-candidate`, or `default-all-limited`. A scout candidate is never `strong`, so when no observed list cost applies every candidate shares the light tier cost and the first non-limited candidate in lineup order is chosen.
 
 A router pick and a fallback pick pass rules 1 and 2, and are never the escalated member's own profile. In a covered run that is not revoked, a profile a member names does not choose, but it must still be in its pool and pass rule 1. Otherwise the run blocks when the host takes the report, with `invalid-escalation` for an escalation or `invalid-agent-profile` for a scout batch, as an out-of-pool name does today. The router's pick replaces a named profile that passes. When the router cannot choose, the named profile is the fallback if it is a candidate: it passes rules 1 and 2 and, for a scout, is not `strong`. In an uncovered or revoked run, a named profile is used as before and keeps rule 1 only. When the chosen profile's provider is limited at launch, the member starts on that profile's limit fallback, as every launch does. That fallback passes rules 1 and 2 but can be the escalated member's own profile, and the decision row is then released.
 

@@ -10,7 +10,8 @@ On laptop loss, the worker allows five seconds for an idle relay to reconnect. T
 
 ```mermaid
 flowchart LR
-  Conversation[Persistent cloud conversation] --> Laptop[Laptop tools]
+  Conversation[Persistent cloud conversation] --> Fence[Verified placement and tool fence]
+  Fence --> Laptop[Laptop tools]
   Laptop --> Capture[Incremental background checkpoint]
   Capture --> Prepared[Verified prepared cloud tree]
   Prepared --> Cloud[Cloud tools after outage]
@@ -33,7 +34,7 @@ A checkpoint records a **capture span**, not an atomic filesystem snapshot. Stab
 
 The API, web and phone distinguish tool location from conversation-host location. Session execution state reports connecting, online, preparing or paused, checkpoint age, readiness and a concrete blocker. `cloudReady` means a verified prepared tree covers the recorded executor boundary and the backend supports selection. It does not certify every package, external service or platform capability.
 
-Dispatch and results are journaled before forwarding. Any meaningful executor operation advances the revision. A later cloud checkpoint must cover that revision before handoff. New dispatch is held during loss and selection; a fresh environment ID prevents reuse of laptop connection metadata. Live-turn selection and sticky future-turn selection are both acknowledged, and the loaded thread selection is read back before releasing a held not-executed result.
+Dispatch and results are journaled before forwarding. Any meaningful executor operation advances the revision. A later cloud checkpoint must cover that revision before handoff. Execution environment placements persist in AES-256-GCM sealed `codex-environments.sealed` (`packages/host/src/codex-environment-store.ts`, `0600`, ≤2 MiB verified before atomic write), and tool dispatch runs through the loopback `CodexToolFence` proxy (`packages/host/src/codex-environment-fence.ts`). New dispatch is held during loss, selection, or restart until placement is verified; a fresh environment ID prevents reuse of laptop connection metadata, and queued pre-handshake frames carry their authorization generation so reselections revoke stale frames. During `thread/start` and `thread/resume` startup discovery, the fence admits only read-only `fs/getMetadata` and `fs/readFile` reads contained within verified workspace roots (blocking writes, exec, and root escapes). Live-turn selection and sticky future-turn selection are both acknowledged, and the loaded thread selection is read back (`thread/read` when omitted on `thread/start`) before releasing a held not-executed result. On provider restarts, `native-codex.ts` and `worker.ts` restore saved threads via `thread/resume` and re-verify placement against `codex-environments.sealed`, failing closed on drift or unreadable state.
 
 An uncertain command stays paused even if some output or side effects were observed. Killing a parent process does not prove its descendants stopped. Publication epochs prevent late laptop checkpoints and responses from replacing cloud state; they are not a revocable sandbox for arbitrary descendants or external effects. Detached local work may still affect the preserved laptop copy. Independent human edits are also preserved there. No automatic command replay, permission approval or reverse takeover is performed.
 
@@ -62,7 +63,7 @@ This builds and qualifies an alternate app-server with its code-mode helper befo
 
 Both transfer endpoints require a paired owner. Executor attachment additionally requires a per-session capability. Capabilities stay out of model context and native frontend arguments. Checkpoint files and source data are plaintext in private runtime directories and need encrypted host storage; journals remain application-encrypted. All files within the selected roots are transferred, including any credentials stored there. The single-tenant trust boundary does not provide confidentiality from its owner or administrator.
 
-Worker and provider process restart recovery, automatic dependency provisioning, arbitrary descendant containment, atomic database snapshots, and automatic merge/application are not implemented. API restart preserves the detached worker. Shared pool chunks are automatically reclaimed after superseded checkpoints and deleted sessions pass their safety grace window; legacy store-local chunks and mutable workspace copies still require operator-managed retention.
+Worker-process and host-reboot recovery, automatic dependency provisioning, arbitrary descendant containment, atomic database snapshots, and automatic merge/application are not implemented. API restart preserves the detached worker, and Codex provider-process restarts restore saved threads through `thread/resume` with fail-closed placement verification against `codex-environments.sealed` (except when the backend exits during environment selection or exceeds five restart attempts, in which case the backend shuts down instead). Shared pool chunks are automatically reclaimed after superseded checkpoints and deleted sessions pass their safety grace window; legacy store-local chunks and mutable workspace copies still require operator-managed retention.
 
 ## Verification
 

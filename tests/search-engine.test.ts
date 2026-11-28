@@ -493,6 +493,36 @@ test("no challenger starts when every free worker slot has a ready task, and the
   assert.deepEqual(drive.last, [{ kind: "stop-operations" }, release("exhausted", "no-challenger")]);
 });
 
+test("widening past deadline abandons with deadline ahead of no-challenger without widening or tripping the brake, while arming under together stays armed (Part 4 rules 1, 3, 9, Part 7)", () => {
+  const tightArming = armed({ start: "together" }, { deadline: at(5 + 164) });
+  assert.equal(tightArming.search.state, "armed");
+  assert.deepEqual(tightArming.last, [], "failing condition 12 at arming under together keeps the search armed");
+
+  const drive = armed();
+  drive.deliver(10, CHAMPION);
+  assert.equal(drive.search.holdUntil, at(10 + 165));
+  drive.at(30, { kind: "gated", memberId: CHAMPION, outcome: "fail", ms: 1000 }, { deadline: at(10 + 164), widened: history(1, 9) });
+  assert.deepEqual([drive.search.state, drive.search.endReason], ["abandoned", "deadline"]);
+  assert.equal(drive.search.widened, undefined);
+  assert.deepEqual(drive.last, [{ kind: "stop-operations" }, release("abandoned", "deadline")]);
+  assert.ok(!kinds(drive.last).includes("widened"));
+  assert.ok(!kinds(drive.last).includes("pause"));
+
+  const overlap = armed();
+  overlap.deliver(10, CHAMPION);
+  overlap.at(30, { kind: "gated", memberId: CHAMPION, outcome: "fail", ms: 1000 }, { deadline: at(10 + 164), spareWorkerSlots: 0, widened: history(1, 9) });
+  assert.deepEqual([overlap.search.state, overlap.search.endReason], ["abandoned", "deadline"], "condition 12 takes precedence over conditions 9 to 11");
+  assert.deepEqual(overlap.last, [{ kind: "stop-operations" }, release("abandoned", "deadline")]);
+
+  const pending = armed({ start: "together" });
+  pending.deliver(10, CHAMPION);
+  pending.at(30, { kind: "gated", memberId: CHAMPION, outcome: "fail", ms: 1000 }, { deadline: at(10 + 164), widened: history(1, 9) });
+  assert.deepEqual([pending.search.state, pending.search.endReason], ["abandoned", "deadline"], "a pending arming launch does not suppress deadline abandonment");
+  assert.deepEqual(pending.last, [{ kind: "stop-operations" }, release("abandoned", "deadline"), cancel(1)]);
+  pending.at(31, receipt(1, ["m-c1", "p-gpt"]), { deadline: at(10 + 164), widened: history(1, 9) });
+  assert.deepEqual(pending.last, [stop("host", "m-c1"), counted("none"), { kind: "pause" }], "a late receipt naming a started challenger still stops it and counts once for the brake");
+});
+
 test("the brake: an end that leaves 10 widened searches with 1 rescue emits the pause; only the owner's pause state refuses admission (acceptance 17)", () => {
   assert.deepEqual(admit(facts({ project: { paused: true } })), { admitted: false, condition: 6 }, "a pause with no widened search");
   assert.deepEqual(admit(facts({ project: { paused: true } }, { mode: "measure" })), { admitted: false, condition: 6 });

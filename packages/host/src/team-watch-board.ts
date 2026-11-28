@@ -408,16 +408,58 @@ export async function askForBrief(api: WatchApi, team: any, rows: TeamBriefRow[]
   }
 }
 
-async function fetchAllEntries(api: WatchApi, teamId: string, signal: AbortSignal): Promise<EntryHead[]> {
-  const collected = new Map<string, EntryHead>();
-  let since = 0;
-  for (let hops = 0; hops < 6; hops += 1) {
-    const page = await api.json<EntryPage>(`/teams/${teamId}/entries?limit=100${since > 0 ? `&since=${since}` : ""}`, undefined, signal);
-    for (const entry of page.entries) collected.set(entry.entryId, entry);
-    if (!page.more || page.cursor <= since) break;
-    since = page.cursor;
+const BOARD_PAGE_LIMIT = 100;
+const MAX_SYNC_PAGES = 100;
+const MAX_RETAINED_BOARD_ENTRIES = 600;
+const BOARD_TAIL_REVALIDATE_ENTRIES = 100;
+const BOARD_REVALIDATE_EVERY_TICKS = 5;
+
+export type BoardEntryCache = {
+  entries: EntryHead[];
+  cursor: number;
+  ticks: number;
+};
+
+const isValidBoardCursor = (value: unknown): value is number =>
+  typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+
+export async function syncBoardEntryCache(
+  api: WatchApi,
+  teamId: string,
+  cache: BoardEntryCache,
+  signal: AbortSignal,
+): Promise<BoardEntryCache> {
+  const merged = new Map<string, EntryHead>();
+  for (const entry of cache.entries) merged.set(entry.entryId, entry);
+  const startCursor = cache.cursor;
+  let nextSince = startCursor;
+  let finalCursor = startCursor;
+  let hasMore = false;
+  for (let hops = 0; hops < MAX_SYNC_PAGES && !signal.aborted; hops += 1) {
+    const query = nextSince > 0 ? `&since=${nextSince}` : "";
+    const page = await api.json<EntryPage>(`/teams/${teamId}/entries?limit=${BOARD_PAGE_LIMIT}${query}`, undefined, signal);
+    const pageEntries = Array.isArray(page?.entries) ? page.entries : [];
+    for (const entry of pageEntries) merged.set(entry.entryId, entry);
+    const validCursor = isValidBoardCursor(page?.cursor);
+    if (validCursor && page.cursor > finalCursor) finalCursor = page.cursor;
+    hasMore = Boolean(page?.more);
+    if (!hasMore || pageEntries.length === 0 || !validCursor || page.cursor <= nextSince) break;
+    nextSince = page.cursor;
   }
-  return [...collected.values()].sort((a, b) => a.seq - b.seq);
+  const nextTicks = cache.ticks + 1;
+  if (startCursor > 0 && !hasMore && nextTicks % BOARD_REVALIDATE_EVERY_TICKS === 0) {
+    const tail = [...merged.values()].sort((a, b) => a.seq - b.seq).slice(-BOARD_TAIL_REVALIDATE_ENTRIES);
+    if (tail.some(entry => entry.seq <= startCursor)) {
+      const refreshSince = Math.max(0, tail[0]!.seq - 1);
+      const query = refreshSince > 0 ? `&since=${refreshSince}` : "";
+      const refreshed = await api.json<EntryPage>(`/teams/${teamId}/entries?limit=${BOARD_PAGE_LIMIT}${query}`, undefined, signal);
+      const refreshedEntries = Array.isArray(refreshed?.entries) ? refreshed.entries : [];
+      for (const entry of refreshedEntries) merged.set(entry.entryId, entry);
+      if (isValidBoardCursor(refreshed?.cursor) && refreshed.cursor > finalCursor) finalCursor = refreshed.cursor;
+    }
+  }
+  const entries = [...merged.values()].sort((a, b) => a.seq - b.seq).slice(-MAX_RETAINED_BOARD_ENTRIES);
+  return { entries, cursor: finalCursor, ticks: nextTicks };
 }
 
 export async function runTeamWatch({
@@ -428,9 +470,10 @@ export async function runTeamWatch({
 }: {
   subcommand: "status" | "watch";
   id: string | undefined;
-  options: { json: boolean; logs: boolean; board: boolean };
+  options: { json: boolean; logs: boolean; board: boolean; pollIntervalMs?: number; onOut?: (chunk: string) => void };
   api: WatchApi;
 }): Promise<boolean> {
+  const writeOut = options.onOut ?? ((chunk: string) => { process.stdout.write(chunk); });
   const abort = new AbortController(), stop = () => abort.abort();
   const { json, logs, board } = options;
   const tty = subcommand === "watch" && Boolean(process.stdout.isTTY) && !json;
@@ -447,6 +490,7 @@ export async function runTeamWatch({
   let status = "";
   let briefRows: TeamBriefRow[] = [];
   let boardState = createTeamBoardState();
+  let boardCache: BoardEntryCache = { entries: [], cursor: 0, ticks: 0 };
   let boardEntries: EntryHead[] = [];
   const detailCache = new Map<string, TeamBoardDetail>();
   let lastTeam: any = null;
@@ -458,7 +502,7 @@ export async function runTeamWatch({
     const screen = teamWatchScreen(card, { rows: process.stdout.rows || 24, columns: process.stdout.columns || 80, offset, color: !process.env.NO_COLOR, status: notice || status });
     offset = screen.offset;
     page = screen.page;
-    process.stdout.write(screen.frame);
+    writeOut(screen.frame);
   };
   const scrolls: Partial<Record<TeamWatchCommand, () => number>> = {
     up: () => offset - 1, down: () => offset + 1, pageUp: () => offset - page, pageDown: () => offset + page,
@@ -470,7 +514,7 @@ export async function runTeamWatch({
     if (subcommand !== "watch") console.log(`${process.stdout.isTTY ? wrapText(output, process.stdout.columns || 80).join("\n") : output}\n`);
     else if (!tty) {
       const frame = teamWatchFrame(previous, output, false);
-      if (frame) process.stdout.write(frame);
+      if (frame) writeOut(frame);
       previous = output;
     } else {
       const key = `${mode}/${mode === "logs" ? memberId : ""}`;
@@ -516,7 +560,7 @@ export async function runTeamWatch({
   };
   process.once("SIGINT", stop);
   if (tty) {
-    process.stdout.write("\x1b[?1049h\x1b[?25l");
+    writeOut("\x1b[?1049h\x1b[?25l");
     process.stdout.on("resize", paint);
   }
   if (interactive) {
@@ -558,7 +602,8 @@ export async function runTeamWatch({
           }
           if (subcommand === "status" && logs) await printTeamLogs(api, team, abort.signal);
           else if (mode === "board") {
-            boardEntries = await fetchAllEntries(api, String(team.id), abort.signal);
+            boardCache = await syncBoardEntryCache(api, String(team.id), boardCache, abort.signal);
+            boardEntries = boardCache.entries;
             if (pending) continue;
             const synced = syncBoardEntries(boardState, boardEntries);
             boardState = synced.state;
@@ -568,6 +613,17 @@ export async function runTeamWatch({
               detail = detailCache.get(synced.selected.entryId) ?? null;
               if (!detail) {
                 detail = await api.json<TeamBoardDetail>(`/teams/${team.id}/entries/${synced.selected.entryId}`, undefined, abort.signal);
+                detailCache.set(synced.selected.entryId, detail);
+                if (detailCache.size > 100) {
+                  const oldest = detailCache.keys().next().value;
+                  if (oldest !== undefined) detailCache.delete(oldest);
+                }
+              } else if (
+                detail.head.state !== synced.selected.state ||
+                detail.head.supersedes !== synced.selected.supersedes ||
+                detail.head.summary !== synced.selected.summary
+              ) {
+                detail = { ...detail, head: synced.selected };
                 detailCache.set(synced.selected.entryId, detail);
               }
             }
@@ -603,7 +659,7 @@ export async function runTeamWatch({
       if (subcommand !== "watch") break;
       if (wake.signal.aborted) wake = new AbortController();
       else {
-        try { await delay(2000, undefined, { signal: AbortSignal.any([abort.signal, wake.signal]) }); }
+        try { await delay(options.pollIntervalMs ?? 2000, undefined, { signal: AbortSignal.any([abort.signal, wake.signal]) }); }
         catch { if (abort.signal.aborted) break; }
         if (wake.signal.aborted) wake = new AbortController();
       }
@@ -617,7 +673,7 @@ export async function runTeamWatch({
     }
     if (tty) {
       process.stdout.off("resize", paint);
-      process.stdout.write("\x1b[?25h\x1b[?1049l");
+      writeOut("\x1b[?25h\x1b[?1049l");
     }
     process.off("SIGINT", stop);
   }

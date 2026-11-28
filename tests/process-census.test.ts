@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { once } from "node:events";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
-import { WITNESS_LIMIT, directoryCensus, excuseEarlier, extendWitness, newWitness, operationCensus, processStart, readProcessTable, recordCommand, statusRunsAs, witnessFindings,
+import { WITNESS_LIMIT, directLauncherCensus, directoryCensus, excuseEarlier, extendWitness, newWitness, operationCensus, processStart, readProcessTable, recordCommand, statusRunsAs, witnessFindings,
   type CensusFinding, type EarlierProcesses, type ProcessRow, type ProcessTable, type ProcessWitness } from "../packages/host/src/process-census.js";
 
 const censusFile = fileURLToPath(new URL("../packages/host/src/process-census.ts", import.meta.url));
@@ -294,6 +294,44 @@ test("a non-sudo prefix is unsupported and a sudo prefix without its wrapper can
       { command: "/usr/bin/sudo", args: ["-n", "--", "/nonexistent-census-test/provider"] });
     assert.deepEqual(missing, { ok: false, problem: "census wrapper missing" });
     assert.equal((await directoryCensus("relative/path")).ok, false);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("a direct team-command launcher runs the census wrapper beside it through sudo as the instance's agent (INF-501)", () => {
+  assert.deepEqual(directLauncherCensus({ command: "/usr/local/libexec/infinite-work/team-command", args: [] }), {
+    command: "/usr/bin/sudo",
+    args: ["-n", "-H", "-u", "infinite-work-agent", "--", "/usr/local/libexec/infinite-work/process-census"],
+    wrapper: "/usr/local/libexec/infinite-work/process-census",
+  });
+  assert.deepEqual(directLauncherCensus({ command: "/usr/local/libexec/infinite/team-command", args: [] })?.args.slice(0, 4), ["-n", "-H", "-u", "infinite-agent"]);
+});
+
+test("a launcher shape the census does not know stays unsupported (INF-501)", () => {
+  const shapes: [string, string[]][] = [
+    ["/usr/local/libexec/infinite-work/team-command", ["--census"]],
+    ["/usr/local/libexec/infinite-work/team-command", [""]],
+    ["/usr/local/libexec/infinite-work/other-command", []],
+    ["/usr/local/libexec/infinite-work/../infinite-x/team-command", []],
+    ["/usr/local/libexec/infinite-work/sub/team-command", []],
+    ["/usr/local/libexec/infinite-Work/team-command", []],
+    ["/usr/local/libexec/infinite-work-extra-name-too-long-here/team-command", []],
+    ["/usr/local/libexec/other/team-command", []],
+    ["/tmp/libexec/infinite-work/team-command", []],
+    ["team-command", []],
+    ["/usr/local/libexec/infinite-work/team-command ", []],
+  ];
+  for (const [command, args] of shapes) assert.equal(directLauncherCensus({ command, args }), undefined, JSON.stringify([command, args]));
+});
+
+test("the census looks for the wrapper beside a direct launcher instead of refusing the prefix (INF-501)", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "census-"));
+  try {
+    assert.deepEqual(await operationCensus(newWitness(), directory, { command: "/usr/local/libexec/infinite-census-test/team-command", args: [] }),
+      { ok: false, problem: "census wrapper missing" });
+    assert.deepEqual(await operationCensus(newWitness(), directory, { command: "/usr/local/libexec/infinite-census-test/team-command", args: ["x"] }),
+      { ok: false, problem: "prefix-unsupported" });
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }

@@ -59,7 +59,7 @@ export function GoalDetail({ connection, id }: { connection: Connection; id: str
   if (!goal) return <View style={[s.fill, s.overlayRoot]}>{header}<FloatingNotice position="top" offset={58} message={poll.stale ? "Can't reach this machine." : null} actions={poll.stale ? <Button compact title="Refresh" secondary onPress={poll.refresh} /> : null} /><View style={s.empty}><ActivityIndicator /><Text style={t.note}>{poll.loading ? "Loading goal…" : "The goal could not be loaded. Check the machine and try again."}</Text></View></View>;
 
   const controls = goalControls(goal, me?.role, fresh, poll.data?.receivedAt);
-  const expired = Date.parse(goal.deadlineAt) <= (poll.data?.receivedAt ?? 0);
+  const expired = !goal.standing && Date.parse(goal.deadlineAt) <= (poll.data?.receivedAt ?? 0);
   const locked = request.busy || Boolean(request.pending);
   const decisions = activeTeam ? openDecisions(activeTeam) : [];
   const previous = goal.cycles.filter(cycle => cycle.teamId !== goal.activeTeamId);
@@ -81,9 +81,9 @@ export function GoalDetail({ connection, id }: { connection: Connection; id: str
         <View style={s.metaRow}>
           <Chip kind={goalKind(goal).kind} fraction={goalKind(goal).fraction} label={GOAL_LABELS[goal.status]} accessibilityLabel={`State: ${GOAL_LABELS[goal.status]}`}
             tone={goalKind(goal).kind === "attention" || goalKind(goal).kind === "paused" ? "attention" : goalKind(goal).kind === "blocked" ? "error" : undefined} />
-          <Chip icon={<ProgressBar done={goal.cycles.length} total={goal.maxRuns} width={30} />} label={`${goal.cycles.length}/${goal.maxRuns} cycles`} />
+          <Chip {...(goal.maxRuns !== undefined ? { icon: <ProgressBar done={goal.cycles.length} total={goal.maxRuns} width={30} /> } : {})} label={goal.maxRuns !== undefined ? `${goal.cycles.length}/${goal.maxRuns} cycles` : `${goal.cycles.length} cycles · standing`} />
           <Chip label={`${goal.memberCount}/${goal.maxMembers} agents`} />
-          <Chip label={`Due ${shortDate(goal.deadlineAt)}`} />
+          <Chip label={goal.standing ? `Every ${goal.standing.cadenceMinutes}m` : `Due ${shortDate(goal.deadlineAt)}`} />
           <LinearChip tracking={goal.linear} fresh={fresh} />
           <Chip label={`Rev ${goal.revision}`} accessibilityLabel={`Revision ${goal.revision}`} />
         </View>
@@ -123,9 +123,9 @@ export function GoalDetail({ connection, id }: { connection: Connection; id: str
       </Section>
 
       <Section title="Work limits">
-        <Text style={t.body}>{goal.cycles.length}/{goal.maxRuns} cycles · {goal.memberCount}/{goal.maxMembers} agents · Workers {goal.activeTeamId ? workerStatus(activeTeam ?? { parallelism: goal.parallelism }) : "Agent-managed"}</Text>
+        <Text style={t.body}>{goal.maxRuns !== undefined ? `${goal.cycles.length}/${goal.maxRuns} cycles` : `${goal.cycles.length} cycles (standing)`} · {goal.memberCount}/{goal.maxMembers} agents · Workers {goal.activeTeamId ? workerStatus(activeTeam ?? { parallelism: goal.parallelism }) : "Agent-managed"}</Text>
         <Text style={t.note}>The PM and coordinator adjust workers as work changes.</Text>
-        <Text style={t.note}>Deadline {shortDate(goal.deadlineAt)}: {goal.maxMinutes} minutes from creation. Pausing does not extend it.</Text>
+        <Text style={t.note}>{goal.standing ? `Standing goal · repeats every ${goal.standing.cadenceMinutes} minutes.` : `Deadline ${shortDate(goal.deadlineAt)}: ${goal.maxMinutes} minutes from creation. Pausing does not extend it.`}</Text>
       </Section>
 
       <Section title="Reported numbers">

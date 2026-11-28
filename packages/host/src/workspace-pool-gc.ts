@@ -339,36 +339,54 @@ async function discoverRegisteredScopes(
       throw error;
     }
     if (!isPrivateDirectoryStats(info)) throw new Error("Workspace scope must be a private owner-controlled directory");
-    liveSet.add(await realpath(parsed.directory));
+    try {
+      liveSet.add(await realpath(parsed.directory));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT" || (error as NodeJS.ErrnoException).code === "ENOTDIR") {
+        deadScopeFiles.push({ file, directory: parsed.directory });
+        continue;
+      }
+      throw error;
+    }
   }
   return { liveScopes: [...liveSet], deadScopeFiles };
 }
 
 async function markScopeRefs(scope: string, liveHashes: Set<string>, signal?: AbortSignal): Promise<void> {
   const refsDir = join(scope, "refs");
+  let shards: string[];
   try {
     await verifyPrivateDirectory(refsDir);
+    shards = await readdir(refsDir);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") return;
     throw error;
   }
-  const shards = await readdir(refsDir);
   for (const shardName of shards) {
     signal?.throwIfAborted();
     if (!SHARD.test(shardName)) continue;
     const shardDir = join(refsDir, shardName);
+    let dir;
     try {
       await verifyPrivateDirectory(shardDir);
+      dir = await opendir(shardDir);
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "ENOENT" || code === "ENOTDIR") continue;
       throw error;
     }
-    const dir = await opendir(shardDir);
-    for await (const entry of dir) {
-      signal?.throwIfAborted();
-      if (HASH.test(entry.name) && entry.name.startsWith(shardName)) {
-        liveHashes.add(entry.name);
+    try {
+      for await (const entry of dir) {
+        signal?.throwIfAborted();
+        if (HASH.test(entry.name) && entry.name.startsWith(shardName)) {
+          liveHashes.add(entry.name);
+        }
       }
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "ENOENT" || code === "ENOTDIR") continue;
+      throw error;
     }
   }
 }

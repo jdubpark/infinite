@@ -41,7 +41,10 @@ export function Lifecycle({ connection, session, role, online, control, refresh 
       const settled = lifecycles.complete(key, request.requestId, request.action === "resume" && result.id ? { id: result.id } : undefined, request.action === "stop" ? "End requested. Refreshing the session state." : "");
       if (settled && mounted.current && request.action === "resume" && result.id) router.replace({ pathname: "/session/[id]", params: { id: result.id, machine: connectionKey(connection) } });
       if (mounted.current) refresh();
-    } catch (error) { lifecycles.fail(key, request.requestId, `${(error as Error).message} Check the session state before retrying. Retry keeps the same request ID.`); }
+    } catch (error) {
+      const refused = error instanceof ApiError && error.status >= 400 && error.status < 500 && (error.status !== 409 || Boolean(error.code));
+      lifecycles.fail(key, request.requestId, refused ? (error as Error).message : `${(error as Error).message} Check the session state before retrying. Retry keeps the same request ID.`, refused);
+    }
     finally { inFlight.current.delete(request.requestId); if (mounted.current) setSendingId(current => current === request.requestId ? undefined : current); }
   }
   async function archive(archived: boolean) {

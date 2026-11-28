@@ -74,7 +74,10 @@ export function createRelayServer(options: RelayOptions) {
     if (!client) return;
     clients.delete(id); client.socket.terminate();
     const host = hosts.get(client.machineId);
-    if (notify && host && !sendHost(host, { type: "close", id })) host.terminate();
+    if (!notify || !host) return;
+    const text = JSON.stringify({ type: "close", id } satisfies RelayEnvelope);
+    if (host.readyState !== WebSocket.OPEN || host.bufferedAmount + Buffer.byteLength(text) > MAX_BUFFERED_BYTES) host.terminate();
+    else host.send(text, error => { if (error) host.terminate(); });
   }
   function heartbeat(socket: WebSocket) {
     let alive = true;

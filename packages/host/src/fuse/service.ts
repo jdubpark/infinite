@@ -457,7 +457,7 @@ export class FuseService implements FuseGate {
       launches,
       trips: [...merged.trips, ...closedHeld],
     }, now);
-    if (changed || file === undefined) writeBaseline(this.file, this.key, next);
+    if ((changed || file === undefined) && !writeBaseline(this.file, this.key, next)) this.writeFailedAt = now;
     this.authoritative = true;
     this.unmeasurableId = undefined;
     this.adopt(next);

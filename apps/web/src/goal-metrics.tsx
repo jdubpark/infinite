@@ -39,11 +39,12 @@ function Omitted({ metrics }: { metrics: GoalMetricsView }) {
   return parts.length ? <p className="quiet goal-metric-omitted">{parts.join(" · ")}</p> : null;
 }
 
-export function GoalMetricsPanel({ metrics, error, cycles }: { metrics: GoalMetricsView | null; error: string; cycles: number[] }) {
+export function GoalMetricsPanel({ metrics, error, remoteUnavailable = false, cycles }: { metrics: GoalMetricsView | null; error: string; remoteUnavailable?: boolean; cycles: number[] }) {
   return <section className="team-section goal-metrics">
     <div className="team-section-heading"><h2>Reported numbers</h2></div>
-    {error && <p className="quiet goal-metric-error" role="status">Reported numbers could not be loaded. {error}</p>}
-    {!metrics && !error && <p className="quiet" role="status">Loading reported numbers…</p>}
+    {remoteUnavailable && <p className="quiet" role="status">Reported numbers are unavailable over remote access.</p>}
+    {!remoteUnavailable && error && <p className="quiet goal-metric-error" role="status">Reported numbers could not be loaded. {error}</p>}
+    {!remoteUnavailable && !metrics && !error && <p className="quiet" role="status">Loading reported numbers…</p>}
     {metrics && (metrics.series.length === 0
       ? <p className="quiet">No check has reported a number yet. A check reports one by printing <code>infinite-metric NAME VALUE</code>.</p>
       : <>

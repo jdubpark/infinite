@@ -159,11 +159,11 @@ export function GoalList({ connection, me, goals, now }: { connection: Connectio
               </View>
               <View style={s.line}>
                 <Text style={[s.state, (kind === "attention" || kind === "paused") && s.attentionText, kind === "blocked" && s.errorText]} numberOfLines={1}>{GOAL_LABELS[goal.status]}</Text>
-                <ProgressBar done={goal.cycles.length} total={goal.maxRuns} width={40} />
-                <Text style={s.meta}>{goal.cycles.length}/{goal.maxRuns} cycles</Text>
+                {goal.maxRuns !== undefined ? <ProgressBar done={goal.cycles.length} total={goal.maxRuns} width={40} /> : null}
+                <Text style={s.meta}>{goal.maxRuns !== undefined ? `${goal.cycles.length}/${goal.maxRuns} cycles` : `${goal.cycles.length} cycles · standing`}</Text>
               </View>
               {alert ? <Text style={s.alert} numberOfLines={1}>{alert}</Text>
-                : <Text style={s.meta} numberOfLines={1}>{[project(goal.projectId), goal.linear?.issue?.identifier, `due ${shortDate(goal.deadlineAt)}`].filter(Boolean).join(" · ")}</Text>}
+                : <Text style={s.meta} numberOfLines={1}>{[project(goal.projectId), goal.linear?.issue?.identifier, goal.standing ? `every ${goal.standing.cadenceMinutes}m` : `due ${shortDate(goal.deadlineAt)}`].filter(Boolean).join(" · ")}</Text>}
             </View>
           </Pressable>;
         })}

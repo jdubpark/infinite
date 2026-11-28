@@ -1,6 +1,7 @@
 import { useMemo, useRef, useState } from "react";
 import { ApiError, useApi, type Api } from "../api";
 import { useLiveRefresh } from "../live-refresh";
+import { useMachineId } from "../machines";
 import { contextRequests, nextBatch, SESSION_BATCH } from "./graph-model";
 import type { CodeMap, SessionTouches, SwarmModel, TeamTouches } from "./types";
 
@@ -14,14 +15,15 @@ const unavailablePaths = new Set<string>();
 
 type Request = { key: string; path: string };
 
-async function fetchEach<T>(api: Api, requests: Request[]): Promise<{ results: Map<string, T>; settled: Map<string, boolean> }> {
+async function fetchEach<T>(api: Api, machineId: string, requests: Request[]): Promise<{ results: Map<string, T>; settled: Map<string, boolean> }> {
   const results = new Map<string, T>();
   const settled = new Map<string, boolean>();
   await Promise.all(requests.map(async ({ key, path }) => {
-    if (unavailablePaths.has(path)) return;
+    const cacheKey = `${machineId}:${path}`;
+    if (unavailablePaths.has(cacheKey)) return;
     try { results.set(key, await api<T>(path)); settled.set(path, true); }
     catch (error) {
-      if (error instanceof ApiError && error.status === 404) { unavailablePaths.add(path); settled.set(path, true); }
+      if (error instanceof ApiError && error.status === 404) { unavailablePaths.add(cacheKey); settled.set(path, true); }
       else settled.set(path, false);
     }
   }));
@@ -49,6 +51,7 @@ export function useSwarmContext(model: SwarmModel, enabled: boolean): {
   failing: boolean;
 } {
   const api = useApi();
+  const machineId = useMachineId();
   const plan = contextRequests(model);
   const [maps, setMaps] = useState<Record<string, CodeMap>>({});
   const [teamTouches, setTeamTouches] = useState<Record<string, TeamTouches>>({});
@@ -64,14 +67,14 @@ export function useSwarmContext(model: SwarmModel, enabled: boolean): {
   const sessionKey = enabled && plan.sessions.length ? `sessions:${plan.sessions.join(",")}` : undefined;
 
   useLiveRefresh(async current => {
-    const { results, settled } = await fetchEach<CodeMap>(api, plan.projects.map(id => ({ key: id, path: mapPath(id) })));
+    const { results, settled } = await fetchEach<CodeMap>(api, machineId, plan.projects.map(id => ({ key: id, path: mapPath(id) })));
     if (!current()) return;
     setMaps(previous => settle(plan.projects, results, previous));
     setFailed(previous => mark(previous, settled));
   }, MAP_INTERVAL, projectKey);
 
   useLiveRefresh(async current => {
-    const { results, settled } = await fetchEach<TeamTouches>(api, plan.teams.map(id => ({ key: id, path: teamPath(id) })));
+    const { results, settled } = await fetchEach<TeamTouches>(api, machineId, plan.teams.map(id => ({ key: id, path: teamPath(id) })));
     if (!current()) return;
     setTeamTouches(previous => settle(plan.teams, results, previous));
     setFailed(previous => mark(previous, settled));
@@ -80,7 +83,7 @@ export function useSwarmContext(model: SwarmModel, enabled: boolean): {
   useLiveRefresh(async current => {
     const { batch, offset } = nextBatch(plan.sessions, sessionOffset.current, SESSION_BATCH);
     sessionOffset.current = offset;
-    const { results, settled } = await fetchEach<SessionTouches>(api, batch.map(id => ({ key: id, path: sessionPath(id) })));
+    const { results, settled } = await fetchEach<SessionTouches>(api, machineId, batch.map(id => ({ key: id, path: sessionPath(id) })));
     if (!current()) return;
     setSessionTouches(previous => settle(plan.sessions, results, previous));
     setFailed(previous => mark(previous, settled));

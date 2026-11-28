@@ -18,14 +18,17 @@ export function installNotificationHandler() {
 async function redirect(n: Notifications.Notification) {
   const data = n.request.content.data;
   const url = data?.url;
-  const [, kind, id] = typeof url === "string" ? url.match(/^\/(session|team|goal)\/([a-f0-9-]{36})(?:\?.*)?$/i) ?? [] : [];
-  if (!kind || !id) return;
+  if (typeof url !== "string") return;
+  const [, kind, id] = url.match(/^\/(session|team|goal)\/([a-f0-9-]{36})(?:\?.*)?$/i) ?? [];
+  const topLevel = !kind && /^\/(teams|machine)(?:\?.*)?$/i.test(url);
+  if ((!kind || !id) && !topLevel) return;
   const saved = await loadConnections();
   const machineId = typeof data?.machineId === "string" ? data.machineId : undefined;
   const connection = machineId ? saved.profiles.find(profile => profile.id === machineId || profile.machineId === machineId || profile.relay?.machineId === machineId) : saved.profiles.length === 1 ? saved.profiles[0] : undefined;
   if (!connection) { router.push("/"); return; }
-  const pathname = kind.toLowerCase() === "team" ? "/team/[id]" : kind.toLowerCase() === "goal" ? "/goal/[id]" : "/session/[id]";
-  router.push({ pathname, params: { id, machine: connectionKey(connection) } });
+  if (topLevel) { router.push({ pathname: "/(tabs)", params: { machine: connectionKey(connection) } }); return; }
+  const pathname = kind!.toLowerCase() === "team" ? "/team/[id]" : kind!.toLowerCase() === "goal" ? "/goal/[id]" : "/session/[id]";
+  router.push({ pathname, params: { id: id!, machine: connectionKey(connection) } });
 }
 
 export function useNotificationRouting() {

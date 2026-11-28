@@ -269,8 +269,9 @@ export class TeamPermissionAgent {
     this.host.assertRunPath(stored, sessionRoot);
     const prefix = this.host.prefixFor(run);
     const scratch = member.scratchDirectory ? [member.scratchDirectory] : [];
+    const signal = this.agentController(runId).signal;
     const workspace = async () => {
-      const changedPaths = await memberChangedPaths(sessionRoot, member.baseCommit, prefix);
+      const changedPaths = await memberChangedPaths(sessionRoot, member.baseCommit, prefix, signal);
       return { changedPaths, evidence: collectPermissionEvidence({ prompt, cwd: sessionRoot, changedPaths, approvedScratchRoots: scratch }) };
     };
     const task = memberTaskOf(run, member.taskId);
@@ -287,7 +288,7 @@ export class TeamPermissionAgent {
       ...(member.role === "delivery" ? { roleCheck: async () => {
         const current = this.host.record(runId);
         this.host.assertDelivery(current);
-        await assertMemberReadOnly(sessionRoot, current.run.headCommit!, prefix);
+        await assertMemberReadOnly(sessionRoot, current.run.headCommit!, prefix, signal);
       } } : {}),
       workspace,
       task: () => { const current = this.host.record(runId).run; return teamPermissionTask(current, memberTaskOf(current, member.taskId)); },
@@ -297,11 +298,11 @@ export class TeamPermissionAgent {
           const limitations = ["The requested paths are malformed or outside the member's workspace; nothing was collected."];
           return { files: [], limitations, digest: permissionEvidenceDigest({ files: [], limitations }) };
         }
-        const changedPaths = await memberChangedPaths(sessionRoot, member.baseCommit, prefix);
+        const changedPaths = await memberChangedPaths(sessionRoot, member.baseCommit, prefix, signal);
         return collectPermissionEvidence({ prompt, cwd: sessionRoot, changedPaths, approvedScratchRoots: scratch, requestedPaths: normalized });
       },
       delivering: (deliveryId, active) => this.trackAgentDelivery(runId, sessionId, deliveryId, active),
-      signal: this.agentController(runId).signal,
+      signal,
     });
     return { request, handled: await delivery.handle(target) };
   }

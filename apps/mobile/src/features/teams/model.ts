@@ -144,10 +144,11 @@ export function canContinueBlockedTeam(team: TeamListItem, role: DeviceRole | un
 export type GoalStatus = "running" | "needs-input" | "paused" | "blocked" | "ready-for-review" | "no-opportunity" | "limit-reached" | "cancelled" | "achieved";
 export type GoalResult = "achieved" | "not-achieved" | "inconclusive";
 export type GoalCycle = { teamId: string; cycle: number; goalRevision: number; status: string; startedAt: string; finishedAt?: string; branch?: string; headCommit?: string; brief?: TeamBrief; reason?: string; memberCount: number };
+export type GoalStanding = { shape: "objective"; cadenceMinutes: number };
 export type ProductGoal = {
   id: string; projectId: string; title: string; objective: string; successCriteria: string;
   nonGoals: string[]; allowedPaths: string[]; evidence: string[];
-  maxRuns: number; maxMinutes: number; maxMembers: number; parallelism: number;
+  maxRuns?: number; standing?: GoalStanding; maxMinutes: number; maxMembers: number; parallelism: number;
   revision: number; status: GoalStatus; reason?: string; createdAt: string; updatedAt: string; deadlineAt: string;
   lineup: TeamLineup; linear?: LinearTracking; activeTeamId?: string; cycles: GoalCycle[]; memberCount: number;
   steering: { text: string; revision: number; at: string }[]; events: { at: string; text: string }[];
@@ -343,7 +344,7 @@ export function goalControls(goal: ProductGoal, role: DeviceRole | undefined, fr
   return {
     steer: acts && ["running", "needs-input"].includes(goal.status),
     pause: owns && ["running", "needs-input"].includes(goal.status),
-    resume: owns && goal.status === "paused" && now < Date.parse(goal.deadlineAt),
+    resume: owns && goal.status === "paused" && (Boolean(goal.standing) || now < Date.parse(goal.deadlineAt)),
     cancel: owns,
     outcome: acts && goalStopped(goal),
   };

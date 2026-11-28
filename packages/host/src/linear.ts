@@ -78,8 +78,11 @@ function serverSkew(response: Response) {
 }
 
 export class LinearFailure extends Error {
-  constructor(readonly retryAfterMs = 0) { super("Linear could not confirm synchronization. Check the connection and host credential; execution is waiting."); }
+  constructor(readonly retryAfterMs = 0, readonly retryAt?: number) { super("Linear could not confirm synchronization. Check the connection and host credential; execution is waiting."); }
 }
+
+const retryDeadline = (error: unknown, now: number) => error instanceof LinearFailure
+  ? error.retryAt ?? (error.retryAfterMs > 0 ? now + error.retryAfterMs : 0) : 0;
 
 export class LinearService {
   private readonly records = new Map<string, Stored>();
@@ -303,7 +306,8 @@ export class LinearService {
   private failure(stored: Stored, error: unknown) {
     if (this.closed) return;
     stored.failures++; stored.error = new LinearFailure().message;
-    stored.retryAt = Date.now() + Math.max(Math.min(30000, 1000 * 2 ** Math.min(stored.failures - 1, 5)), error instanceof LinearFailure ? error.retryAfterMs : 0);
+    const now = Date.now();
+    stored.retryAt = Math.max(now + Math.min(30000, 1000 * 2 ** Math.min(stored.failures - 1, 5)), retryDeadline(error, now));
     this.save(stored);
   }
   private success(stored: Stored) {
@@ -396,7 +400,8 @@ export class LinearService {
           if (this.closed) return;
           stored.retitleFailures = (stored.retitleFailures ?? 0) + 1;
           const backoff = Math.min(30 * 60000, 30000 * 2 ** Math.min(stored.retitleFailures - 1, 6));
-          stored.retitleRetryAt = Date.now() + Math.max(backoff, error instanceof LinearFailure ? error.retryAfterMs : 0); this.save(stored);
+          const now = Date.now();
+          stored.retitleRetryAt = Math.max(now + backoff, retryDeadline(error, now)); this.save(stored);
         }
       }
       try {
@@ -412,13 +417,13 @@ export class LinearService {
         try { await this.applyLabel(stored, intent, version); }
         catch (error) {
           if (this.closed) return;
-          const retryAt = error instanceof LinearFailure && error.retryAfterMs > 0 ? Date.now() + error.retryAfterMs : 0;
+          const now = Date.now(), retryAt = retryDeadline(error, now);
           const providerDeferred = retryAt > (stored.labelProviderRetryAt ?? 0);
           if (providerDeferred) stored.labelProviderRetryAt = retryAt;
           if (stored.label !== intent || (stored.labelVersion ?? 0) !== version) { if (providerDeferred) this.save(stored); continue; }
           stored.labelFailures = (stored.labelFailures ?? 0) + 1;
           const backoff = Math.min(30 * 60000, 30000 * 2 ** Math.min(stored.labelFailures - 1, 6));
-          stored.labelRetryAt = Date.now() + Math.max(backoff, error instanceof LinearFailure ? error.retryAfterMs : 0); this.save(stored);
+          stored.labelRetryAt = Math.max(now + backoff, retryAt); this.save(stored);
         }
       }
     }
@@ -545,7 +550,8 @@ export class LinearService {
   }
   private async graphql(operationName: string, query: string, variables: unknown, shared = true, delivery?: { sent: boolean; answered: boolean }): Promise<Record<string, unknown>> {
     if (this.closed) throw new LinearFailure();
-    if (Date.now() < this.retryUntil) throw new LinearFailure(this.retryUntil - Date.now());
+    const remaining = this.retryUntil - Date.now();
+    if (remaining > 0) throw new LinearFailure(remaining, this.retryUntil);
     const api = this.config.linear;
     if (!api) throw new LinearFailure();
     const url = new URL(api.endpoint ?? endpoint);
@@ -580,9 +586,11 @@ export class LinearService {
         if (limited) {
           this.limitStreak++;
           const wait = this.limitDelay(response, seen);
-          if (shared) { this.retryUntil = Math.max(this.retryUntil, Date.now() + wait.delay); this.recovering = true; }
-          this.limited(operationName, response, wait, shared);
-          throw new LinearFailure(wait.delay);
+          const now = Date.now(), retryAt = now + wait.delay;
+          const deadline = shared ? Math.max(this.retryUntil, retryAt) : retryAt;
+          if (shared) { this.retryUntil = deadline; this.recovering = true; }
+          this.limited(operationName, response, wait, shared, deadline);
+          throw new LinearFailure(wait.delay, deadline);
         }
         this.answered(admission.probe);
         throw new LinearFailure();
@@ -595,7 +603,8 @@ export class LinearService {
   private async admit(shared: boolean): Promise<{ probe: boolean; release: () => void }> {
     for (;;) {
       if (this.closed) throw new LinearFailure();
-      if (Date.now() < this.retryUntil) throw new LinearFailure(this.retryUntil - Date.now());
+      const remaining = this.retryUntil - Date.now();
+      if (remaining > 0) throw new LinearFailure(remaining, this.retryUntil);
       if (!this.recovering) return { probe: false, release: () => {} };
       if (!shared) throw new LinearFailure(fallbackPauseMs);
       if (!this.probe) {
@@ -648,14 +657,14 @@ export class LinearService {
         : this.limits?.endpoint ? { endpoint: this.limits.endpoint } : {}) };
     return { requests, complexity, endpoint, cost };
   }
-  private limited(operation: string, response: Response, { delay, basis, retryAfterSeconds }: RateLimitWait, shared: boolean) {
+  private limited(operation: string, response: Response, { delay, basis, retryAfterSeconds }: RateLimitWait, shared: boolean, retryAt: number) {
     this.lastLimit = { at: new Date().toISOString(), operation, httpStatus: response.status,
       ...(retryAfterSeconds !== undefined ? { retryAfterSeconds } : {}), waitSeconds: Math.ceil(delay / 1000), basis, shared };
     if (Date.now() - this.limitLoggedAt < 60000) return;
     this.limitLoggedAt = Date.now();
     const limit = (label: string, value?: LinearLimitView) => value ? `${label} ${value.remaining ?? "?"}/${value.limit ?? "?"} left, resets ${value.resetAt ?? "unknown"}` : `${label} not reported`;
     const sent = this.lastHour();
-    console.warn(`Linear rate limit on ${operation} (HTTP ${response.status}): ${shared ? "the host's Linear requests pause" : "this optional request backs off"} until ${at(Date.now() + delay)}. `
+    console.warn(`Linear rate limit on ${operation} (HTTP ${response.status}): ${shared ? "the host's Linear requests pause" : "this optional request backs off"} until ${at(retryAt)}. `
       + `${limit("Requests", this.limits?.requests)}; ${limit("complexity", this.limits?.complexity)}${this.limits?.endpoint ? `; ${limit(`endpoint ${this.limits.endpoint.name ?? "limit"}`, this.limits.endpoint)}` : ""}. `
       + `This host sent ${sent.requests} requests (${sent.complexity} complexity points reported) in the last hour.`);
   }

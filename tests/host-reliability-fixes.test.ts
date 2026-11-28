@@ -122,6 +122,7 @@ test("TeamService.launch() skips manager.list() when blocked by workerCapacityFu
     f.state.attention.lastActivityAt = freshAt;
     f.run.status = "implementing";
     f.run.parallelism = 1;
+    f.run.parallelismCeiling = 1;
     const queuedMembers: TeamMember[] = [];
     const tasks: TeamTask[] = [
       { id: "task-0", title: "Task 0", instructions: "Do 0", paths: ["a.txt"], dependsOn: [], revision: 1, status: "running", memberId: runningMember.memberId },
@@ -165,22 +166,23 @@ test("TeamService.launch() skips manager.list() when blocked by workerCapacityFu
 
     await internals.step(stored);
     assert.equal(listCalls, 0);
-    assert.ok(queuedMembers.every(member => member.pendingCapacity === true));
+    assert.ok(stored.run.members.slice(1).every(member => member.pendingCapacity === true));
 
-    runningMember.status = "stopped";
-    f.run.parallelism = 8;
+    stored.run.members[0]!.status = "stopped";
+    stored.run.parallelism = 8;
+    stored.run.parallelismCeiling = 8;
     internals.limits.observe({
       provider: "demo",
       limit: "usage",
       detectedAt: new Date().toISOString(),
       resetsAt: new Date(Date.now() + 60 * 60_000).toISOString(),
-      sessionId: runningMember.sessionId,
+      sessionId: stored.run.members[0]!.sessionId,
       runId: f.run.id,
       confidence: "corroborated",
     });
     await internals.step(stored);
     assert.equal(listCalls, 0);
-    assert.ok(queuedMembers.every(member => member.pendingLimit === true));
+    assert.ok(stored.run.members.slice(1).every(member => member.pendingLimit === true));
   } finally {
     f.close();
   }
@@ -350,12 +352,16 @@ test("reported member under active control lease does not flap run.reason or ham
     const internals = teams as unknown as {
       records: Map<string, { run: TeamRun }>;
       step(stored: unknown): Promise<void>;
-      save(stored: unknown): void;
+      activity: { commit(...args: unknown[]): boolean };
     };
     const stored = internals.records.get(f.run.id)!;
-    let saves = 0;
-    const origSave = internals.save.bind(teams);
-    internals.save = (value: unknown) => { saves++; return origSave(value); };
+    let writes = 0;
+    const origCommit = internals.activity.commit.bind(internals.activity);
+    internals.activity.commit = (...args: unknown[]) => {
+      const wrote = origCommit(...args);
+      if (wrote) writes++;
+      return wrote;
+    };
 
     const reasons: (string | undefined)[] = [];
     for (let i = 0; i < 3; i++) {
@@ -365,7 +371,7 @@ test("reported member under active control lease does not flap run.reason or ham
     assert.equal(stops, 0);
     assert.deepEqual(reasons, [STOP_REFUSED_REASON, STOP_REFUSED_REASON, STOP_REFUSED_REASON]);
     assert.equal(teams.get(f.run.id).members[0]!.status, "unavailable");
-    assert.equal(saves, 1);
+    assert.equal(writes, 1);
 
     f.state.control = null;
     await internals.step(stored);
@@ -402,15 +408,19 @@ test("non-control TeamStopRefused respects retry backoff across ticks while pres
     const internals = teams as unknown as {
       records: Map<string, { run: TeamRun }>;
       step(stored: unknown): Promise<void>;
-      save(stored: unknown): void;
+      activity: { commit(...args: unknown[]): boolean };
     };
     const stored = internals.records.get(f.run.id)!;
-    let saves = 0;
-    const origSave = internals.save.bind(teams);
-    internals.save = (value: unknown) => { saves++; return origSave(value); };
+    let writes = 0;
+    const origCommit = internals.activity.commit.bind(internals.activity);
+    internals.activity.commit = (...args: unknown[]) => {
+      const wrote = origCommit(...args);
+      if (wrote) writes++;
+      return wrote;
+    };
 
     await internals.step(stored);
-    const savesAfterFirstTick = saves;
+    const writesAfterFirstTick = writes;
     assert.equal(stops, 1);
     assert.equal(teams.get(f.run.id).reason, STOP_REFUSED_REASON);
     assert.equal(teams.get(f.run.id).members[0]!.status, "unavailable");
@@ -420,7 +430,7 @@ test("non-control TeamStopRefused respects retry backoff across ticks while pres
     nowMs += 500;
     await internals.step(stored);
     assert.equal(stops, 1);
-    assert.equal(saves, savesAfterFirstTick);
+    assert.equal(writes, writesAfterFirstTick);
     assert.equal(teams.get(f.run.id).reason, STOP_REFUSED_REASON);
 
     nowMs += 31_000;

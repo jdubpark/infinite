@@ -6,6 +6,7 @@ import type { AutonomyMode } from "./autonomy.js";
 import { VERDICT_LIMITS, type RunAssessment } from "./verdict-types.js";
 import { ID_RE, SHARED_INPUT_LIMITS, isScopedPath } from "./schema-primitives.js";
 import { signalKinds, type PendingWake } from "./signals/types.js";
+import type { GoalDigest } from "./goal-digest.js";
 
 export { isScopedPath };
 const scopedPath = z.string().trim().min(1).max(SHARED_INPUT_LIMITS.pathChars).refine(isScopedPath, "Use a repository-relative file or folder, or . for the whole project");
@@ -13,7 +14,7 @@ export const defaultMaxRuns = 3;
 export const goalStandingSchema = z.object({
   shape: z.literal("objective"),
   cadenceMinutes: z.number().int().min(30).max(10080).default(1440),
-  wakeOn: z.array(z.enum(signalKinds)).min(1).max(4).refine(kinds => new Set(kinds).size === kinds.length, "List each signal kind once").optional(),
+  wakeOn: z.array(z.enum(signalKinds)).min(1).max(signalKinds.length).refine(kinds => new Set(kinds).size === kinds.length, "List each signal kind once").optional(),
 }).strict();
 export type GoalStanding = z.infer<typeof goalStandingSchema>;
 export const createGoalSchema = z.object({
@@ -241,4 +242,5 @@ export interface ProductGoal extends Omit<CreateGoal, "requestId"> {
   steering: { text: string; revision: number; at: string }[];
   events: { at: string; text: string }[];
   outcomes: { result: "achieved" | "not-achieved" | "inconclusive"; summary: string; evidence: string; at: string; revision: number; verdictId?: string }[];
+  digest?: GoalDigest;
 }

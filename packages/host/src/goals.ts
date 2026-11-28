@@ -10,7 +10,8 @@ import { goalActionSchema, goalExtendSchema, goalOutcomeSchema, goalParallelismS
 import { SHARED_INPUT_LIMITS } from "./schema-primitives.js";
 import type { Config } from "./types.js";
 import { DEFAULT_TEAM_RETENTION, hostClosedBlockedReason, type CreateTeam, type TeamGoalContext, type TeamView } from "./team-types.js";
-import { addRollups, emptyRollup, type StoredRollup, type UsageRollup } from "./team-usage.js";
+import { addRollups, type StoredRollup, type UsageRollup } from "./team-usage.js";
+import { advanceGoalDigest, formatPreviousWork, snapshotRollup } from "./goal-cycle-digest.js";
 import type { LinearService } from "./linear.js";
 import type { LinearTrackingView } from "./linear-types.js";
 import { applyFuseReason } from "./fuse/rules.js";
@@ -62,14 +63,6 @@ const correctionEvent = (version: number) => `The owner corrected the objective 
 const launchRetryMs = 60_000;
 const ceilingOf = (goal: ProductGoal) => goal.ceilingAt ?? new Date(Date.parse(goal.createdAt) + (goal.maxTotalMinutes ?? goal.maxMinutes) * 60000).toISOString();
 const cycleUsageSnapshot = (usage: UsageRollup) => ({ ...usage.total, ...usage });
-function snapshotRollup(cycle: GoalCycle): StoredRollup {
-  const snapshot = cycle.usage;
-  if (snapshot?.total && snapshot.byProfile && snapshot.byProvider && Number.isInteger(snapshot.unmeasuredMembers))
-    return { total: snapshot.total, byProfile: snapshot.byProfile, byProvider: snapshot.byProvider, unmeasuredMembers: snapshot.unmeasuredMembers };
-  const rollup = emptyRollup(cycle.memberCount);
-  if (snapshot) rollup.total = { cost: snapshot.cost, tokens: snapshot.tokens, messages: snapshot.messages, pricing: { ...snapshot.pricing, catalog: snapshot.pricing.catalog ?? 0 } };
-  return rollup;
-}
 
 export class GoalService {
   private readonly records = new Map<string, Stored>();
@@ -720,6 +713,8 @@ export class GoalService {
           goal.activeTeamId = undefined;
           if (goal.standing) this.settleCycle(stored, cycle);
           else if (["running", "needs-input"].includes(goal.status)) {
+            const nextDigest = advanceGoalDigest(goal, cycle);
+            if (nextDigest) goal.digest = nextDigest;
             const deadlineStopped = goal.stopReason === "deadline" || goal.deadlineContinuation === true;
             const extendedDeadline = deadlineStopped && goal.deadlineContinuation === true && Date.now() < Date.parse(goal.deadlineAt);
             const reason = cycle.reason ?? "The active team stopped before producing a reviewed result.";
@@ -747,6 +742,8 @@ export class GoalService {
         if (goal.standing) { if (!goal.activeTeamId) this.settleCycle(stored, goal.cycles.find(value => value.teamId === team!.id)!, team); }
         else if (["running", "needs-input"].includes(goal.status) && !classified) {
           stored.endedAs = { teamId: team.id, status: team.status, headCommit: team.headCommit };
+          const endedCycle = goal.cycles.find(value => value.teamId === team!.id);
+          if (endedCycle) { const nextDigest = advanceGoalDigest(goal, endedCycle, team); if (nextDigest) goal.digest = nextDigest; }
           if (team.status === "blocked" || team.status === "cancelled") {
             const deadlineStopped = team.stopReason === "deadline" || goal.stopReason === "deadline" || goal.deadlineContinuation === true;
             if (deadlineStopped) { goal.stopReason = "deadline"; goal.deadlineContinuation = true; }
@@ -831,7 +828,7 @@ export class GoalService {
     const sourceIssue = goal.linear?.issue;
     const context: TeamGoalContext = { id: goal.id, revision: goal.revision, cycle, successCriteria: goal.successCriteria, nonGoals: goal.nonGoals, allowedPaths: goal.allowedPaths, evidence: goal.evidence,
       ...(sourceIssue ? { sourceIssue: { id: sourceIssue.id, identifier: sourceIssue.identifier, url: sourceIssue.url, title: sourceIssue.title, description: sourceIssue.description } } : {}),
-      previousWork: goal.cycles.filter(isReviewed).slice(-maxPreviousWork).map(value => `${value.brief?.title ?? `Feature ${value.cycle}`}: ${value.brief?.expectedOutcome ?? "Reviewed change"}`.slice(0, 2000)),
+      previousWork: formatPreviousWork(goal),
       deadlineAt: goal.deadlineAt, maxMembers, ...(parent ? { parentRunId: parent.teamId } : {}),
       extendMinutes: goal.extendMinutes ?? 0, ceilingAt: ceilingOf(goal), ...(pinned && "digest" in pinned ? { record: pinned.digest } : {}), ...criteriaRowsFor(stored, project) };
     const wake = goal.standing && useWake ? goal.pendingWake : undefined;
@@ -936,6 +933,8 @@ export class GoalService {
     cycle.class = classifyCycle({ status: cycle.status, stopReason: team?.stopReason, blockCode: team?.blockCode, deadlineStop: cycle.deadlineStop, ownerStop,
       fuseOpen: !ownerStop && this.fuse?.check({ projectId: goal.projectId }).state === "open" });
     cycle.settledAt = now();
+    const nextDigest = advanceGoalDigest(goal, cycle, team);
+    if (nextDigest) goal.digest = nextDigest;
     this.event(stored, `Cycle ${cycle.cycle} settled as ${cycle.class}.`);
     const unresolved = team && unresolvedOperation(team, this.teams.hasDeliveryAttempt(team.id));
     if (unresolved) {

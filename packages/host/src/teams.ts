@@ -52,7 +52,10 @@ import { LEGACY_READ_ONLY_ROLE_CHANGED_FILES_REASON, TeamError, assertMemberRead
 import { assertTeamworkPath } from "./repo-enrollment.js";
 import { CommandFence, HALT_CENSUS_MS, commandStopReasons, stopFenceLifted, stopFenced, type OwnerStatement, type TakenCensus } from "./team-command-fence.js";
 import { HOST_LOAD_REASON_PREFIX, LaunchHeldError } from "./host-load.js";
-import { permissionEvidenceHash } from "./team-permissions.js";
+import { permissionEvidenceHash, selectPermissionRecoveryHistory } from "./team-permissions.js";
+import { TeamReadPool, readStepToScout, type ReadPoolAdmitInput, type ReadStepFinding, type ReadStepSpec } from "./team-read-pool.js";
+import { TeamSearchRuntime } from "./team-search-runtime.js";
+import { createTeamSearchHost } from "./team-search-host.js";
 import { storageShortfall, volumeUsage, type VolumeUsage } from "./storage.js";
 import type { PermissionAgentServices } from "./permission-agent-types.js";
 import { activeMember, activeTeamRun, assignment, automaticRecoveryLimit, boundedRecoveryText, commitId, coordinatorPermissionPrompt, deliveredAtRevision, digest, filesystemEntryExists, livePermissionRecoveryStatuses, permissionCoordinatorDecision, permissionRequestCount, recoveriesUsed, teamRunDirectory, terminalPermissionCoordinator, timestamp } from "./team-kernel.js";
@@ -63,7 +66,7 @@ import { TeamPublisher, type PublisherHost } from "./team-publisher.js";
 import { applyLaunchHoldReason, commitProviderLimitSwitch, evaluateLaunchAdmission, evaluateLaunchAdmissionAsync, expireQueuedPermissionReview, isBenignFenceError, isBenignOutboxError, isBenignSourceRefreshError, isBenignStopError, isDeferredWorkerMember, limitFallbackEligibility, resolveLaunchHoldReason, retargetForFallback, TeamDiagnostics, TrackedTaskSet, type TeamDiagnosticsSnapshot } from "./team-diagnostics.js";
 import { TeamReviewFeedback, type ReviewFeedbackHost } from "./team-review-feedback.js";
 import type { ReviewIntake } from "./review-feedback.js";
-import { TeamRecovery, automaticOperationRecoveryCodes, genericOperationFailureReason, interruptedOperationReason, recoverableOperationFailure, recoverableUnattributedResult, type RecoveryHost } from "./team-recovery.js";
+import { TeamRecovery, automaticOperationRecoveryCodes, completedChecks, genericOperationFailureReason, interruptedOperationReason, obsoletePermissionResult, recoverableOperationFailure, recoverableUnattributedResult, roleAcceptsReport, validVerificationRecovery, type RecoveryHost } from "./team-recovery.js";
 import { TeamConsumer, agentQuestionReason, checkTimeoutReason, invalidNoChangeReason, repairLimitReason, type ConsumerHost } from "./team-consumer.js";
 export { checkTimeoutReason };
 export { repeatedCheckFailureReason } from "./team-consumer.js";
@@ -147,7 +150,7 @@ export type Stored = {
   ratings?: Record<string, { fingerprint: string; result: TeamTask["ownerRating"] }>;
   ledgerReplaces?: Record<string, { memberId: string; cause: ReplacementCause }>;
   objectiveRecord?: unknown; objectiveNotice?: ObjectiveUnavailable; intentCheck?: IntentCheckState; register?: RegisterState;
-  verdict?: VerdictState; reviewIntake?: ReviewIntake; memberPromptSections?: Record<string, StoredMemberPromptSections>;
+  verdict?: VerdictState; reviewIntake?: ReviewIntake; memberPromptSections?: Record<string, StoredMemberPromptSections>; readFindings?: Record<string, ReadStepFinding>; readSpecs?: Record<string, Record<string, ReadStepSpec>>;
 };
 const receiptDigest = <T extends object>(value: T & { source?: SteeringSource | string; by?: string }) => {
   const { source, by, ...body } = value;
@@ -171,43 +174,8 @@ const promptTooLargeReason = "The accumulated team requirements exceed the promp
 const missingAgentReportReason = "An agent exited without a valid structured report. Its task is unresolved.";
 const wrongAgentReportReason = "An agent's report does not match its assigned role.";
 const automaticRecoveryCodes = new Set(["agent-blocked", "agent-question", "missing-agent-report", "invalid-no-change", "wrong-agent-report"]);
-function roleAcceptsReport(role: TeamMember["role"], kind: NonNullable<TeamMember["report"]>["kind"]) {
-  const expected: Record<TeamMember["role"], string[]> = {
-    "permission-coordinator": ["permission-decision"], "project-manager": ["plan", "explore", "no-change"], scout: ["findings"],
-    implementer: ["result", "escalate"], integrator: ["result"], reviewer: ["review"], delivery: ["delivery", "delivery-repair", "delivery-reconciliation", "pull-request"], "intent-checker": ["intent-check"], evaluator: ["verdict"], judge: ["judgement"],
-  };
-  return kind === "question" || kind === "blocked" || expected[role].includes(kind);
-}
 const recoverableContinueCodes = new Set(["repair-limit", "team-prompt-too-large", "repeated-check-failure", "agent-blocked", "missing-agent-report"]);
 const verificationRecoveryReason = "A read-only verification command changed its workspace. Inspect the check evidence before resuming from the recorded integration commit.";
-function completedChecks(stored: Stored, revision: number) {
-  const checks = stored.run.checks.filter(check => check.revision === revision);
-  return checks.length > 0 && checks.every(check => (check.status === "passed" || check.status === "failed") && Boolean(check.finishedAt));
-}
-function validVerificationRecovery(stored: Stored) {
-  const { run, pending, verificationRecovery } = stored;
-  const head = run.headCommit;
-  return Boolean(pending && verificationRecovery && run.status === "blocked" && pending.kind === "check" &&
-    pending.id === verificationRecovery.pendingId && verificationRecovery.pendingKind === "check" &&
-    pending.revision === run.revision && verificationRecovery.revision === run.revision &&
-    head && commitId.test(head) && verificationRecovery.headCommit === head && stored.checkHead !== head &&
-    !stored.deliveryAttempt && !run.deliveryReceipt && !run.stopReason && completedChecks(stored, run.revision) &&
-    (verificationRecovery.failure === "legacy-completed-check" || verificationRecovery.failure === "setup-changed-files" || verificationRecovery.failure === "verification-changed-files"));
-}
-function obsoletePermissionResult(stored: Stored, pending: PendingOperation) {
-  const { run } = stored;
-  if (run.status === "paused" || run.status === "cancelled" || stored.halt === "pause" || stored.halt === "cancel" || pending.kind !== "result" || pending.revision !== run.revision) return undefined;
-  const reported = run.members.filter(member => member.revision === pending.revision && member.report && roleAcceptsReport(member.role, member.report.kind));
-  const candidates = reported.filter(member => {
-    const report = member.report;
-    return member.role === "permission-coordinator" &&
-      (!pending.source || pending.source.memberId === member.memberId) && report?.kind === "permission-decision" &&
-      Boolean(run.permissionDecisions?.some(decision => decision.coordinatorMemberId === member.memberId &&
-        (decision.coordinatorSessionId === member.sessionId || decision.coordinatorSessionId === undefined) && decision.id === report.decisionId &&
-        decision.revision === member.revision && terminalPermissionCoordinator(run, member)));
-  });
-  return candidates.length === 1 && (pending.source || reported.length === 1) ? candidates[0] : undefined;
-}
 
 export function blockedTeamCanResume(input: {
   status: string;
@@ -283,7 +251,14 @@ export class TeamService {
   private readonly intentChecks = new TeamIntent({ prepare: (s, r, f, o, p) => this.prepareMember(s as Stored, r, undefined, f, o, p), consume: (s, m) => this.consume(s as Stored, m), operation: (s, p, c, m) => this.operation(s as Stored, "result", p, c, m), save: s => this.save(s as Stored), event: (s, t) => this.event(s as Stored, t), block: (s, e, m) => this.block(s as Stored, e, m), project: run => this.config.projects.find(project => project.id === run.projectId), limited: () => this.limits.limited(this.currentDate()), prefix: () => this.config.teams?.commandPrefix });
   private readonly objectiveTests = new TeamRegister({ holder: id => this.records.get(id), configured: run => this.config.projects.find(project => project.id === run.projectId)?.team?.checks ?? [], workspace: s => { try { this.assertRunPath(s as Stored, s.run.workspace); return s.run.workspace; } catch { return undefined; } }, enqueue: (runId, work) => this.enqueue(runId, work), save: s => this.save(s as Stored), event: (s, text) => this.event(s as Stored, text), prefix: () => this.config.teams?.commandPrefix, now: timestamp });
   readonly verdicts = new TeamVerdicts({ holder: id => this.records.get(id), prepare: (s, o, p, f) => this.prepareMember(s as Stored, "evaluator", undefined, undefined, o, p, f), consume: (s, m) => this.consume(s as Stored, m), operation: (s, p, c, m) => this.operation(s as Stored, "result", p, c, m), save: s => this.save(s as Stored), delivery: (runId, head, since) => this.options?.delivery?.(runId, head, since), event: (s, t) => this.event(s as Stored, t), emit: (s, d) => this.emitWith(s as Stored, "verdict.recorded", [d.verdictId], { revision: s.verdict?.revision ?? s.run.revision }, () => d), configured: run => this.config.projects.find(project => project.id === run.projectId)?.team?.checks ?? [], limited: () => this.limits.limited(this.currentDate()), prefix: () => this.config.teams?.commandPrefix, register: this.objectiveTests, now: timestamp, uuid: randomUUID });
-  private readonly stopBackoff = new StopRefusalBackoff(); private reconciledAt = 0;
+  readonly readPool = new TeamReadPool();
+  readonly searchRuntime = ((service: TeamService) => new TeamSearchRuntime(createTeamSearchHost({ get config() { return service.config; }, get manager() { return service.manager; }, get closed() { return service.closed; }, nowMs: () => service.options?.now?.() ?? Date.now(), currentDate: () => service.currentDate(), limited: () => service.limits.limited(service.currentDate()), requiredChecks: run => service.requiredChecks(run), prefixFor: run => service.prefixFor(run),
+    freeSessionSlots: () => { const max = service.config.maxSessions ?? 4, live = service.reconciledAt > 0 ? service.activeSessionCount : [...service.records.values()].reduce((n, r) => n + r.run.members.filter(m => m.revision === r.run.revision && (m.status === "running" || m.status === "queued")).length, 0); return Number.isFinite(max) ? Math.max(0, max - live) : 0; },
+    activeWorkerCount: run => run.members.filter(m => holdsWorkerSlot(m, run.revision)).length, enqueue: (id, fn) => service.enqueue(id, fn), save: h => service.save(h as Stored), event: (h, t) => service.event(h as Stored, t), block: (h, e, m) => service.block(h as Stored, e, m), stopped: m => service.stopped(m), assertRunPath: (h, p) => service.assertRunPath(h as Stored, p), isPending: h => Boolean((h as Stored).pending), isHalted: h => Boolean((h as Stored).halt || ["paused", "cancelled", "blocked"].includes(h.run.status)),
+    isExploratoryStart: (r, t) => Boolean(service.router?.isExploratoryStart(r, t)), operation: (h, k, p, c, m, w) => service.operation(h as Stored, k, p, c, m, w),
+    pauseRun: (h, reason) => { const s = h as Stored; s.run.status = "paused"; s.halt = "pause"; s.run.reason = reason; service.event(s, `${reason} (${timestamp()})`); service.commands.get(s.run.id)?.abort(); void service.invalidatePermissionDecisions(s, "The team was paused by the search safety brake.").catch(() => {}); service.save(s); },
+    newMember: (r, role, cwd, base, tid, pi, prof) => service.newMember(r, role, cwd, base, tid, pi as BuiltPrompt | undefined, prof), recordIntegrated: (h, m, task, data) => service.consumer.applyTaskIntegration(h as Stored, m, task, data), onReleaseResult: (h, m) => service.consume(h as Stored, m), runtime: () => service.searchRuntime })))(this);
+  private readonly stopBackoff = new StopRefusalBackoff(); private reconciledAt = 0; private activeSessionCount = 0;
   constructor(private readonly config: Config, private readonly key: Buffer, private readonly manager: Manager, private readonly startInProject: StartInProject, private readonly linear?: LinearService, private readonly titler?: Pick<Readings, "requestTitle">, private readonly options?: TeamServiceOptions) {
     this.directory = join(config.stateDir, "teams");
     this.limits = new ProviderLimits(join(config.stateDir, "provider-limits.sealed"), key);
@@ -453,7 +428,7 @@ export class TeamService {
   useEvidence(store: EvidenceStore) { this.evidence = store; }
   useRouter(router: RoutingRecorder) { this.router = router; }
   useFuse(fuse: FuseGate) { this.fuse = fuse; }
-  useGoalRecords(port: GoalRecordPort) { this.intentChecks.goals = port; this.objectiveTests.goals = port; this.verdicts.goals = port; this.verdicts.restore(this.records.values()); }
+  useGoalRecords(port: GoalRecordPort) { this.intentChecks.goals = port; this.objectiveTests.goals = port; this.verdicts.goals = port; this.searchRuntime.goals = port; this.verdicts.restore(this.records.values()); }
   private fuseWait(stored: Stored, result: FuseCheck | FuseAdmission): boolean {
     const keeps = memberStateReasons.has(stored.run.reason ?? "");
     const fuse = applyFuseReason(keeps ? {} : stored.run, result);
@@ -545,20 +520,7 @@ export class TeamService {
     return true;
   }
   private permissionRecoveryHistory(run: TeamRun): TeamPermissionRecoveryView[] {
-    const steps = (run.permissionRecovery?.steps ?? []).slice(-10);
-    const relevantActions = new Set(steps.map(step => step.action.toLowerCase()));
-    const stopWords = new Set(["about", "after", "before", "could", "from", "into", "needs", "permission", "prompt", "request", "same", "that", "this", "with"]);
-    const tokens = (value: string) => new Set((value.toLowerCase().match(/[a-z0-9][a-z0-9-]{3,}/g) ?? []).filter(word => !stopWords.has(word)));
-    const causes = [run.reason, run.recovery?.source.reason, ...steps.map(step => step.cause)].filter((value): value is string => Boolean(value));
-    const currentTokens = new Set(causes.flatMap(cause => [...tokens(cause)]));
-    if (!relevantActions.size && !currentTokens.size) return [];
-    return [...this.records.values()].filter(item => item.run.id !== run.id && item.run.projectId === run.projectId)
-      .flatMap(item => (item.run.permissionRecovery?.outcomes ?? []).map(({ requestId: _requestId, ...outcome }) => outcome))
-      .filter(outcome => relevantActions.has(outcome.action.toLowerCase()) || [...tokens(outcome.cause)].filter(token => currentTokens.has(token)).length >= 3)
-      .sort((a, b) => b.at.localeCompare(a.at)).slice(0, 5).map(outcome => ({
-        ...outcome, cause: boundedRecoveryText(outcome.cause), action: boundedRecoveryText(outcome.action),
-        decision: boundedRecoveryText(outcome.decision), consequence: boundedRecoveryText(outcome.consequence),
-      }));
+    return selectPermissionRecoveryHistory(run, this.records.values(), boundedRecoveryText);
   }
   private trackingHold(stored: Stored, tracking: TeamRun["linear"]) {
     const run = stored.run;
@@ -707,11 +669,15 @@ export class TeamService {
     if (!this.options?.events) return;
     (stored.ledgerReplaces ??= {})[next.memberId] = { memberId: previous.memberId, cause };
   }
-  private memberStopped(stored: Stored, member: TeamMember, reason: MemberStopReason, detail?: MemberStopDetail): void { this.stopBackoff.clear(member.memberId); clearStopRefusedReason(stored.run, member);
-    if (member.role === "permission-coordinator") return;
+  private memberStopped(stored: Stored, member: TeamMember, reason: MemberStopReason, detail?: MemberStopDetail): boolean { this.stopBackoff.clear(member.memberId); clearStopRefusedReason(stored.run, member);
+    const handled = member.role === "implementer"
+      ? this.searchRuntime.onMemberLeft(stored, member, reason === "stall" ? "stall" : reason === "limit" ? "limit" : reason === "no-report" ? "no-report" : "conflict")
+      : false;
+    if (member.role === "permission-coordinator") return handled;
     this.emitWith(stored, "member.stopped", [member.memberId],
       { memberId: member.memberId, taskId: member.taskId, revision: member.revision },
       () => ({ role: member.role, reason, ...(detail ? { detail } : {}), reported: Boolean(member.report) }));
+    return handled;
   }
   private flushOutbox(stored: Stored, afterGap = false): boolean {
     const events = this.options?.events;
@@ -1223,6 +1189,7 @@ export class TeamService {
       const objectiveNote = runObjectiveNote(stored, steerRunObjective(stored, body.requestId, timestamp())); if (objectiveNote) this.event(stored, objectiveNote);
       this.emit(stored, "run.revision-advanced", [stored.run.revision], {}, { cause: "steer", fromRevision: stored.run.revision - 1, baseChanged: false });
       stored.run.status = "planning"; stored.halt = "steer"; stored.run.reason = "Stopping earlier members before planning the updated request."; stored.run.blockCode = undefined;
+      if (stored.run.searches?.length) this.searchRuntime.onHalt(stored, "steer");
       stored.run.tasks = []; stored.run.review = undefined; stored.run.round = 0; stored.checkHead = undefined;
       stored.run.brief = undefined; stored.run.noChange = undefined;
       if (stored.run.discovery && !stored.run.discovery.completedAt) stored.run.discovery.completedAt = timestamp();
@@ -1483,7 +1450,7 @@ export class TeamService {
       if (action === "resume") this.fence.check(stored, taken);
       const verificationRecovery = action === "resume" && validVerificationRecovery(stored) ? stored.verificationRecovery : undefined;
       if (action === "resume") { const refusal = this.resumeRefusal(stored, verificationRecovery); if (refusal) throw refusal; }
-      if (action === "resume" && verificationRecovery) return this.resumeVerificationRecovery(stored, body, verificationRecovery);
+      if (action === "resume" && verificationRecovery) { this.searchRuntime.clearPausedBrake(run.projectId); return this.resumeVerificationRecovery(stored, body, verificationRecovery); }
       const inPlace = heldWaiting(stored), inPlaceWaited = inPlace && this.heldStatus(run) === "needs-input";
       const receipt = this.admit(stored, action, body);
       if (!receipt) return this.view(stored);
@@ -1517,6 +1484,7 @@ export class TeamService {
   }
   private async resumeRun(stored: Stored, inPlace = false, record?: () => void) {
     const run = stored.run;
+    this.searchRuntime.clearPausedBrake(run.projectId);
     if (!inPlace) await this.invalidatePermissionDecisions(stored, "A resume started before the permission request could be answered.");
     record?.();
     if (inPlace) { run.status = this.heldStatus(run); run.reason = undefined; return; }
@@ -1537,6 +1505,7 @@ export class TeamService {
     run.reason = reason;
     if (line) this.event(stored, line);
     if (action === "cancel") this.intentChecks.release(stored, "cancelled");
+    if (run.searches?.length) this.searchRuntime.onHalt(stored, action);
     await this.invalidatePermissionDecisions(stored, `The team was ${action === "pause" ? "paused" : "cancelled"} before the permission request could be answered.`);
     this.commands.get(run.id)?.abort();
   }
@@ -1690,6 +1659,7 @@ export class TeamService {
             this.reconciledAt = Date.now();
             const rows = await this.manager.list().catch(() => undefined);
             if (rows) {
+              this.activeSessionCount = rows.filter(session => session.status === "running" || session.status === "starting").length;
               await this.usage?.tick(rows).catch(() => {});
               await this.limits.reconcile(this.manager, rows.filter(row => !isEvalSession(row)), this.currentDate()).catch(() => {});
             } else this.usage?.markReconciliationFailed();
@@ -1709,7 +1679,7 @@ export class TeamService {
     this.timer = setInterval(tick, 500); this.timer.unref(); tick();
     void this.reviewFeedback.start(listener => this.options?.source?.onTick?.(listener) ?? (() => {}));
   }
-  async close(): Promise<void> { const reviewFeedback = this.reviewFeedback.close(); this.closed = true; this.running = false; if (this.timer) clearInterval(this.timer); for (const timer of this.sampleTimers) clearTimeout(timer); this.sampleTimers.clear(); for (const controller of this.commands.values()) controller.abort(); for (const controller of this.publicationControllers.values()) controller.abort(); for (const controller of this.memberWorkSaveControllers.values()) controller.abort(); for (const controller of this.agentControllers.values()) controller.abort(); this.objectiveTests.close(); this.removeAgentSource?.(); while (this.activeTicks.size > 0) await Promise.allSettled([...this.activeTicks]); await Promise.allSettled([reviewFeedback, this.queues.drain()]); }
+  async close(): Promise<void> { const reviewFeedback = this.reviewFeedback.close(); this.closed = true; this.running = false; if (this.timer) clearInterval(this.timer); for (const timer of this.sampleTimers) clearTimeout(timer); this.sampleTimers.clear(); for (const controller of this.commands.values()) controller.abort(); for (const controller of this.publicationControllers.values()) controller.abort(); for (const controller of this.memberWorkSaveControllers.values()) controller.abort(); for (const controller of this.agentControllers.values()) controller.abort(); this.searchRuntime.close(); this.objectiveTests.close(); this.removeAgentSource?.(); while (this.activeTicks.size > 0) await Promise.allSettled([...this.activeTicks]); await Promise.allSettled([reviewFeedback, this.queues.drain()]); }
   async idle() {
     await this.diag.idle.drain({
       reviewFeedback: () => this.reviewFeedback.settled(),
@@ -1976,6 +1946,7 @@ export class TeamService {
     this.commands.get(stored.run.id)?.abort();
     void this.invalidatePermissionDecisions(stored, "The team became blocked before the permission request could be answered.").catch(error => console.warn("Team permission invalidation failed while blocking the run.", error));
     if (!["paused", "cancelled"].includes(stored.run.status)) { stored.run.status = "blocked"; stored.halt = "block"; }
+    if (run.searches?.length) this.searchRuntime.onHalt(stored, "block");
     if (run.deliveryRecovery && run.deliveryRecovery.status !== "complete") {
       run.deliveryRecovery.status = "exhausted";
       if (run.recovery) run.recovery.status = "exhausted";
@@ -2161,6 +2132,7 @@ export class TeamService {
         if (run.reason !== reason) { run.reason = reason; this.save(stored); }
       }
       if (stored.pending) return;
+      if (run.searches?.length) this.searchRuntime.onTick(stored);
       this.assertRunPath(stored, run.workspace);
       for (const member of run.members.filter(item => item.revision === run.revision && activeMember(item))) {
         if (member.status === "queued") {
@@ -2246,7 +2218,8 @@ export class TeamService {
                 this.event(stored, "The permission coordinator exited without a decision; the provider request remains with the user."); this.save(stored); continue;
               }
               member.status = "stopped";
-              this.memberStopped(stored, member, "no-report");
+              if (this.memberStopped(stored, member, "no-report")) { this.save(stored); continue; }
+              if (member.role === "scout" && this.readPool.failMemberStep(stored, member.memberId, "Scout exited without a report.")) { this.event(stored, `${member.title} exited without a report; its read step was marked failed.`); this.save(stored); continue; }
               if (this.intentChecks.failed(stored, member) || this.verdicts.failed(stored, member)) return;
               this.block(stored, new TeamError(409, "missing-agent-report", "An agent exited without a valid structured report. Its task is unresolved."), member); return;
             }
@@ -2317,6 +2290,11 @@ export class TeamService {
           this.save(stored); return;
         }
       }
+      const readyRead = this.readPool.nextReadySteps(stored)[0];
+      if (readyRead && run.members.filter(member => holdsWorkerSlot(member, run.revision)).length < run.parallelism) {
+        this.prepareMember(stored, "scout", readStepToScout(readyRead), undefined, member => this.readPool.markStarted(stored, readyRead.requestId, readyRead.step.id, member.memberId));
+        return;
+      }
       if (run.members.some(member => member.revision === run.revision && activeMember(member) && member.role !== "implementer" && member.role !== "permission-coordinator")) return;
       if (run.members.some(member => member.revision === run.revision && member.status === "waiting" && member.role !== "implementer" && member.role !== "permission-coordinator")) { run.status = "needs-input"; this.save(stored); return; }
       const reconciledBaseline = run.deliveryRecovery?.status === "replanning" && run.deliveryRecovery.revision === run.revision &&
@@ -2324,7 +2302,7 @@ export class TeamService {
       if (!run.tasks.length && !reconciledBaseline) {
         if (this.intentChecks.step(stored) || this.verdicts.step(stored) || this.replays.judgeStep(stored)) return;
         if (run.members.some(member => member.revision === run.revision && member.role === "project-manager" && member.status === "waiting")) { run.status = "needs-input"; this.save(stored); return; }
-        this.prepareMember(stored, "project-manager"); return;
+        this.prepareMember(stored, "project-manager", undefined, this.readPool.formatFindingsFeedback(stored)); return;
       }
       const pendingTasks = run.tasks.filter(task => task.status === "pending");
       const activeCount = run.members.filter(member => member.revision === run.revision && activeMember(member) && member.role !== "permission-coordinator").length;
@@ -2449,7 +2427,7 @@ export class TeamService {
   private newMember(run: TeamRun, role: TeamMember["role"], cwd: string, baseCommit: string, taskId?: string, promptInput?: string | BuiltPrompt, pinnedProfile?: TeamModelProfile, planMemberId?: string): TeamMember {
     this.assertBudget(run, true);
     const memberId = randomUUID();
-    const task = role === "scout" ? run.discovery?.tasks.find(task => task.id === taskId) : run.tasks.find(task => task.id === taskId);
+    const task = role === "scout" ? (run.discovery?.tasks.find(task => task.id === taskId) ?? (taskId ? this.readPool.findScoutTask(this.records.get(run.id) ?? run, taskId) : undefined)) : run.tasks.find(task => task.id === taskId);
     let selected = pinnedProfile ?? this.memberProfile(run, role, task);
     const now = this.currentDate(), targetProvider = selected?.provider ?? run.provider;
     const limit = this.limits.active(now).find(item => item.provider === targetProvider);
@@ -2520,13 +2498,15 @@ export class TeamService {
     if (member.report) { this.save(stored); return; }
     if (page.more || member.cursor < exited.seq) { member.status = "unavailable"; this.save(stored); return; }
     if (limit) { member.stalledAt = undefined; if (member.stoppedReason?.startsWith("No activity for ")) member.stoppedReason = undefined; await this.switchLimitedMember(stored, member, limit); return; }
-    this.memberStopped(stored, member, "stall");
+    if (this.memberStopped(stored, member, "stall")) { this.save(stored); return; }
     if (this.intentChecks.failed(stored, member) || this.verdicts.failed(stored, member)) return;
+    const poolMatch = member.role === "scout" ? this.readPool.findMemberStep(run, member.memberId) : undefined;
     const decision = this.evalStall(stored, member, attentionState, true, "replace", activePrompt);
+    if (decision.action === "block" && poolMatch && decision.code === "member-stalled" && this.readPool.failMemberStep(stored, member.memberId, decision.message)) { this.event(stored, `${member.title} stalled twice; read step ${poolMatch.step.id} was marked failed.`); this.save(stored); return; }
     if (decision.action === "block") { if (decision.code === "goal-deadline" && (run.goal || run.handoff)) run.stopReason = "deadline"; if (decision.code === "team-attempt-limit" && (run.goal || run.handoff)) run.stopReason = "member-limit"; return this.block(stored, new TeamError(409, decision.code, decision.message)); }
     if (decision.action !== "replace") { if (decision.action !== "wait") this.save(stored); return; }
     const task = member.role === "implementer" ? run.tasks.find(item => item.id === member.taskId && item.memberId === member.memberId) : undefined;
-    const scout = member.role === "scout" ? run.discovery?.tasks.find(item => item.id === member.taskId && item.memberId === member.memberId) : undefined;
+    const scout = member.role === "scout" ? (run.discovery?.tasks.find(item => item.id === member.taskId && item.memberId === member.memberId) ?? (member.taskId ? this.readPool.findScoutTask(stored, member.taskId) : undefined)) : undefined;
     const prefix = this.config.teams?.commandPrefix, editing = decision.editing, note = `The previous ${member.role} stalled with no activity for ${minutes} minutes before reporting. Its workspace was preserved. ${editing ? "Its partial edits are present in this working copy and have passed the host's path-scope check. Inspect them before continuing." : "Its working copy was checked unchanged; complete the same assignment."}`;
     this.operation(stored, "result", signal => editing ? assertMemberScope(member.cwd, member.baseCommit, task ? task.paths : run.goal?.allowedPaths, prefix, signal) : assertMemberReadOnly(member.cwd, member.baseCommit, prefix, signal), () => {
       if (run.members.some(item => item !== member && item.stalledSourceMemberId === member.memberId)) return;
@@ -2534,6 +2514,7 @@ export class TeamService {
       next.stalledSourceMemberId = member.memberId; next.contextFeedback = [member.contextFeedback ?? member.prompt, note].filter(Boolean).join("\n\n");
       if (task) { task.memberId = next.memberId; task.status = "running"; }
       if (scout) scout.memberId = next.memberId;
+      if (poolMatch) this.readPool.markStarted(stored, poolMatch.request.id, poolMatch.step.id, next.memberId);
       run.members.push(next); this.linkReplacement(stored, next, member, "stall");
       this.event(stored, `${member.title} stalled with no activity for ${minutes} minutes; its workspace was preserved and a replacement continues the assignment.`);
     });
@@ -2558,11 +2539,12 @@ export class TeamService {
       this.save(stored);
       return;
     }
-    this.memberStopped(stored, member, "limit");
+    if (this.memberStopped(stored, member, "limit")) { this.save(stored); return; }
     if (this.intentChecks.failed(stored, member) || this.verdicts.failed(stored, member)) return;
     if (member.role === "delivery" && stored.deliveryAttempt) {
       this.block(stored, new TeamError(409, "delivery-reconciliation-required", "The delivery provider stopped at a limit. Inspect the remote branch and PR before replacing a possibly completed publication.")); return;
     }
+    const poolMatch = member.role === "scout" ? this.readPool.findMemberStep(run, member.memberId) : undefined;
     const from = member.modelProfile, selected = from && run.lineup ? switchFallback(run.lineup, from.id, provider, this.limits.limited(this.currentDate()), limitFallbackEligibility(run, member.role, stored.intentCheck?.planMemberId)) : undefined;
     const fallback = selected;
     if (!from || !fallback) {
@@ -2571,7 +2553,7 @@ export class TeamService {
     }
     const task = member.role === "implementer" ? run.tasks.find(item => item.id === member.taskId && item.memberId === member.memberId) : undefined;
     if (member.role === "implementer" && !task) throw new TeamError(409, "invalid-task", "The implementer has no current task assignment.");
-    const scout = member.role === "scout" ? run.discovery?.tasks.find(item => item.id === member.taskId && item.memberId === member.memberId) : undefined;
+    const scout = member.role === "scout" ? (run.discovery?.tasks.find(item => item.id === member.taskId && item.memberId === member.memberId) ?? (member.taskId ? this.readPool.findScoutTask(stored, member.taskId) : undefined)) : undefined;
     const prefix = this.config.teams?.commandPrefix, editing = member.role === "implementer" || member.role === "integrator";
     const note = editing ? `The previous ${member.role} stopped at a ${name} ${kind}. Its partial edits are present in this working copy and have passed the host's path-scope check. Inspect them before continuing.`
       : `The previous ${member.role} stopped at a ${name} ${kind} before reporting. Its working copy was checked unchanged; complete the same assignment.`;
@@ -2585,6 +2567,7 @@ export class TeamService {
         task.memberId = next.memberId; task.status = "running";
       }
       if (scout) scout.memberId = next.memberId;
+      if (poolMatch) this.readPool.markStarted(stored, poolMatch.request.id, poolMatch.step.id, next.memberId);
       if (member.role === "permission-coordinator") {
         const decision = run.permissionDecisions?.find(item => item.coordinatorMemberId === member.memberId);
         if (decision && decision.status === "reviewing") decision.coordinatorMemberId = next.memberId;
@@ -2597,11 +2580,11 @@ export class TeamService {
       this.event(stored, `${from.label} hit a ${name} ${kind}${resets ? ` (resets ${resets})` : ""}; ${task?.title ?? member.title} continues on ${fallback.label}${editing ? " with partial work preserved" : ""}.`);
     });
   }
-  private prepareMember(stored: Stored, role: TeamMember["role"], task?: TeamTask | TeamScout, feedback?: string, onPrepared?: (member: TeamMember) => void, prebuilt?: { prompt: string; promptSections?: TeamPromptSection[]; profile: TeamModelProfile }, onFailed?: () => void) {
+  private prepareMember(stored: Stored, role: TeamMember["role"], task?: TeamTask | TeamScout, feedback?: string, onPrepared?: (member: TeamMember) => void, prebuilt?: { prompt: string; promptSections?: TeamPromptSection[]; profile: TeamModelProfile }, onFailed?: () => void, pinnedProfile?: TeamModelProfile) {
     if (this.publicationGate(stored, role)) return;
     const run = stored.run, routed = task && run.routing && this.router && (role === "implementer" || role === "scout") ? this.routerInput(run) : undefined;
     const start = routed && role === "implementer" ? { ...routed, run, task: task as TeamTask } : undefined, scout = routed && role === "scout" ? { run, scout: task as TeamScout, limited: routed.limited, featureMap: routed.featureMap } : undefined;
-    const member = this.newMember(run, role, "", run.headCommit!, task?.id, prebuilt, prebuilt?.profile ?? (start && autoPinned(run) ? this.router!.applyStart(start) : scout ? this.router!.routeScout(scout) : undefined), stored.intentCheck?.planMemberId); const promptDraft = takeMemberPromptStore(stored, member);
+    const member = this.newMember(run, role, "", run.headCommit!, task?.id, prebuilt, prebuilt?.profile ?? pinnedProfile ?? (start && autoPinned(run) ? this.router!.applyStart(start) : scout ? this.router!.routeScout(scout) : undefined), stored.intentCheck?.planMemberId); const promptDraft = takeMemberPromptStore(stored, member);
     if (role === "project-manager" && run.goal?.record) member.goalCriteriaPlan = { objectiveVersion: run.goal.record.version };
     if (start) this.router!.recordStart(start);
     const continuationHead = role === "project-manager" && stored.continuationHead?.revision === run.revision
@@ -2650,6 +2633,7 @@ export class TeamService {
       member.cwd = cwd; run.members.push(member); commitMemberPromptStore(stored, promptDraft, member);
       if (task) { task.status = "running"; task.memberId = member.memberId; }
       onPrepared?.(member);
+      if (role === "implementer" && task) this.searchRuntime.admitTaskSearch(stored, member, task as TeamTask);
       this.event(stored, `${member.title} queued in an isolated working copy.`);
     });
   }
@@ -2778,6 +2762,9 @@ export class TeamService {
     run.parallelism = limit;
     this.event(stored, `The project manager set the worker limit from ${previous} to ${limit} (capacity ceiling ${ceiling}).`);
   }
+  admitReadRequest(id: string, input: Omit<ReadPoolAdmitInput, "requestId"> & { requestId?: string }) {
+    return this.enqueue(id, () => { const stored = this.record(id); const res = this.readPool.admit(stored, { ...input, requestId: input.requestId ?? randomUUID() }); if (res.ok) this.save(stored); return res; });
+  }
   private consumerHost(): ConsumerHost {
     const service = this;
     return {
@@ -2790,6 +2777,7 @@ export class TeamService {
       block: (stored, error, sourceMember) => service.block(stored, error, sourceMember),
       get options() { return service.options; }, get diag() { return service.diag; }, get router() { return service.router; },
       get replays() { return service.replays; }, get intentChecks() { return service.intentChecks; }, get verdicts() { return service.verdicts; },
+      get readPool() { return service.readPool; }, get searchRuntime() { return service.searchRuntime; },
       get startInProject() { return service.startInProject; },
       consumePermissionCoordinator: (stored, member) => service.consumePermissionCoordinator(stored, member),
       prefixFor: run => service.prefixFor(run),
@@ -2797,9 +2785,10 @@ export class TeamService {
       emit: (stored, kind, keyParts, ids, data) => service.emit(stored, kind, keyParts, ids, data),
       emitWith: (stored, kind, keyParts, ids, build) => service.emitWith(stored, kind, keyParts, ids, build),
       routerInput: run => service.routerInput(run),
+      limitedProviders: () => service.limits.limited(service.currentDate()),
       newMember: (run, role, cwd, baseCommit, taskId, promptInput, pinnedProfile) => service.newMember(run, role, cwd, baseCommit, taskId, promptInput, pinnedProfile),
       linkReplacement: (stored, next, previous, cause) => service.linkReplacement(stored, next, previous, cause),
-      prepareMember: (stored, role, task, feedback, onPrepared) => service.prepareMember(stored, role, task, feedback, onPrepared),
+      prepareMember: (stored, role, task, feedback, onPrepared, pinnedProfile) => service.prepareMember(stored, role, task, feedback, onPrepared, undefined, undefined, pinnedProfile),
       assertDelivery: stored => service.assertDelivery(stored),
       queueDeliveryRetryAfterEvidence: (stored, member, report) => service.queueDeliveryRetryAfterEvidence(stored, member, report),
       memberProfile: (run, role, task) => service.memberProfile(run, role, task),

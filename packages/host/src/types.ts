@@ -332,6 +332,7 @@ export interface Config {
     outcomes?: { holdDays?: number; retentionDays?: number };
     blackboard?: { tools?: boolean };
     memberTraces?: import("./member-traces.js").MemberTraceSettings;
+    warmRepair?: boolean;
   };
   machine?: { id: string; label: string };
   permissionAgent?: import("./permission-agent-config.js").PermissionAgentConfig;

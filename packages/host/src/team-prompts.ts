@@ -160,6 +160,8 @@ function withoutPrivateSettings<T extends object>(project: T): T {
   delete copy.mainCheck;
   delete copy.routing;
   delete copy.objective;
+  delete copy.warmRepair;
+  delete copy.search;
   return copy as T;
 }
 export const UNREPORTED_ROLES: ReadonlySet<TeamMember["role"]> = new Set(["permission-coordinator", "evaluator", "judge"]);

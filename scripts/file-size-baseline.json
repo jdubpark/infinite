@@ -18,7 +18,7 @@
     "tests/evidence-outbox.test.ts": 1017,
     "tests/evidence-store.test.ts": 1247,
     "tests/goals.test.ts": 1059,
-    "tests/halt.test.ts": 1209,
+    "tests/halt.test.ts": 1211,
     "tests/intake-slack.test.ts": 1647,
     "tests/intake.test.ts": 1624,
     "tests/missions.test.ts": 2576,

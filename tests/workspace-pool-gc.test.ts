@@ -315,6 +315,15 @@ test("external lease revocation mid-capture fails closed with SharedPoolLeaseLos
     assert.equal(existsSync(lostLease.path), false, "release still unlinks owned lease file after lease loss");
     rmSync(join(f.sharedPoolDirectory, "gc.lease"), { force: true });
 
+    const unknownSweepLease = await acquireSharedPoolLease(f.sharedPoolDirectory, "write", { scope: scope.directory, leaseTtlMs: 4_000, now: () => clock });
+    writeFileSync(join(f.sharedPoolDirectory, "gc.lease"), JSON.stringify({
+      version: 1, id: randomUUID(), pid: process.pid, phase: "sweep", sweepState: "future-state",
+      startedAt: clock, updatedAt: clock, expiresAt: clock + 60_000,
+    }), { mode: 0o600 });
+    await assert.rejects(unknownSweepLease.assertHeld(), error => error instanceof SharedPoolLeaseLostError);
+    await unknownSweepLease.release();
+    rmSync(join(f.sharedPoolDirectory, "gc.lease"), { force: true });
+
     const overlapLease = await acquireSharedPoolLease(f.sharedPoolDirectory, "write", { scope: scope.directory, leaseTtlMs: 4_000, now: () => clock });
     clock += 2_000;
     let enteredRefreshRename!: () => void;
@@ -341,6 +350,63 @@ test("external lease revocation mid-capture fails closed with SharedPoolLeaseLos
   } finally {
     fsp.rename = originalRename;
     syncBuiltinESMExports();
+    f.close();
+  }
+});
+
+test("an admitted writer keeps its lease while GC closes admission for a sweep", { timeout: 30000 }, async () => {
+  const f = fixture();
+  const fsp = createRequire(import.meta.url)("node:fs/promises") as typeof import("node:fs/promises");
+  const originalRename = fsp.rename;
+  let lease: Awaited<ReturnType<typeof acquireSharedPoolLease>> | undefined;
+  let injected = false;
+  try {
+    const deadScope = f.target("dead-scope"), writerScope = f.target("writer-scope");
+    const deadBytes = Buffer.from(`closing-barrier-dead-${randomUUID()}`), deadHash = sha(deadBytes);
+    await putWorkspaceBlob(deadScope, deadHash, deadBytes.toString("base64"));
+    const baseNow = Date.now();
+    await pruneScopeRefs({ scopeDirectory: deadScope.directory, keepHashes: new Set(), graceMs: 0, now: () => baseNow + 60_000 });
+    ageFile(poolObject(f.sharedPoolDirectory, deadHash), 30 * 60 * 1000, baseNow);
+
+    fsp.rename = (async (...args: Parameters<typeof fsp.rename>) => {
+      if (!injected && String(args[1]).endsWith("/gc.lease")) {
+        const record = JSON.parse(readFileSync(String(args[0]), "utf8")) as { phase?: string };
+        if (record.phase === "sweep") {
+          injected = true;
+          // Admit a real writer after GC has chosen to close admission but
+          // before that barrier is published. The ensuing assertion checks
+          // whether this handoff revoked a lease GC must drain first.
+          const admittedLease = await acquireSharedPoolLease(f.sharedPoolDirectory, "write", { scope: writerScope.directory });
+          lease = admittedLease;
+          const result = await originalRename(...args);
+          await admittedLease.assertHeld();
+          return result;
+        }
+      }
+      return originalRename(...args);
+    }) as typeof fsp.rename;
+    syncBuiltinESMExports();
+
+    const deferred = await collectSharedPool({ sharedPoolDirectory: f.sharedPoolDirectory, graceMs: 10 * 60 * 1000, now: () => baseNow });
+    assert.equal(injected, true);
+    assert.equal(deferred.status, "deferred-active-lease");
+    assert.equal(deferred.activeLeases, 1);
+    assert.equal(deferred.removedBlobs, 0);
+    assert.equal(existsSync(poolObject(f.sharedPoolDirectory, deadHash)), true);
+    const heldLease = lease;
+    assert.ok(heldLease);
+    await heldLease.assertHeld();
+    await heldLease.release();
+    lease = undefined;
+    fsp.rename = originalRename;
+    syncBuiltinESMExports();
+    const finish = await collectSharedPool({ sharedPoolDirectory: f.sharedPoolDirectory, graceMs: 10 * 60 * 1000, now: () => baseNow });
+    assert.equal(finish.status, "completed");
+    assert.equal(existsSync(poolObject(f.sharedPoolDirectory, deadHash)), false);
+  } finally {
+    fsp.rename = originalRename;
+    syncBuiltinESMExports();
+    await lease?.release();
     f.close();
   }
 });

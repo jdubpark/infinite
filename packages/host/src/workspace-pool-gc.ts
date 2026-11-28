@@ -525,14 +525,23 @@ export async function collectSharedPool(options: CollectSharedPoolOptions): Prom
     }
 
     const enterSweepWindow = async () => {
-      if (!(await updateGcLease(sharedRoot, gcId, lease.startedAt, "sweep", sweepLeaseTtlMs, now))) {
+      // Close admission first, then inspect leases admitted while the phase was
+      // mark. Existing holders remain valid during this phase.
+      if (!(await updateGcLease(sharedRoot, gcId, lease.startedAt, "sweep", sweepLeaseTtlMs, now, "closing"))) {
         return { ok: false as const, status: "skipped-gc-active" as const };
       }
       const postBarrierLeases = await scanPoolLeases(sharedRoot, now(), { cleanupExpired: true });
       baseResult.removedExpiredLeases += postBarrierLeases.removedExpired;
       if (postBarrierLeases.active > 0) {
         baseResult.activeLeases = postBarrierLeases.active;
+        // Defer this sweep. finally releases the closing barrier; admitted
+        // holders remain valid until then, while new admissions stay blocked.
         return { ok: false as const, status: "deferred-active-lease" as const };
+      }
+      // Publish the ordinary v1 sweep record only after the closing scan is
+      // empty. This preserves the old fail-closed meaning for active sweeps.
+      if (!(await updateGcLease(sharedRoot, gcId, lease.startedAt, "sweep", sweepLeaseTtlMs, now))) {
+        return { ok: false as const, status: "skipped-gc-active" as const };
       }
       try {
         const freshScopes = await discoverRegisteredScopes(sharedRoot, explicitScopes);

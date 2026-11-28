@@ -54,6 +54,8 @@ export interface PoolGcLeaseRecord {
   bootId?: string;
   processStart?: string;
   phase: "mark" | "sweep";
+  /** A closing sweep blocks new admissions while existing leases are drained. */
+  sweepState?: "closing";
   startedAt: number;
   updatedAt: number;
   expiresAt: number;
@@ -311,6 +313,7 @@ function parseGcLease(value: unknown): PoolGcLeaseRecord | undefined {
     ...(value.bootId !== undefined ? { bootId: value.bootId } : {}),
     ...(value.processStart !== undefined ? { processStart: value.processStart } : {}),
     phase: value.phase,
+    ...(value.phase === "sweep" && value.sweepState === "closing" ? { sweepState: "closing" as const } : {}),
     startedAt: value.startedAt,
     updatedAt: value.updatedAt,
     expiresAt: value.expiresAt,
@@ -471,7 +474,7 @@ export async function acquireSharedPoolLease(
       throw new SharedPoolLeaseLostError();
     }
     const gc = await readGcLease(sharedRoot);
-    if (gc.record && gc.record.phase === "sweep" && await isLeaseLive(gc.record, now())) {
+    if (gc.record && gc.record.phase === "sweep" && gc.record.sweepState !== "closing" && await isLeaseLive(gc.record, now())) {
       lost = true;
       activeInProcessLeases.delete(id);
       throw new SharedPoolLeaseLostError("Workspace shared pool entered sweep while operation lease was lost");
@@ -679,6 +682,7 @@ export async function updateGcLease(
   phase: "mark" | "sweep",
   ttlMs: number,
   now: () => number,
+  sweepState?: "closing",
 ): Promise<boolean> {
   const existing = await readGcLease(sharedRoot);
   if (existing.record?.id !== gcId) return false;
@@ -692,6 +696,7 @@ export async function updateGcLease(
     ...(hostBoot !== "unsupported" ? { bootId: hostBoot } : {}),
     ...(procStart !== undefined ? { processStart: procStart } : {}),
     phase,
+    ...(phase === "sweep" && sweepState !== undefined ? { sweepState } : {}),
     startedAt,
     updatedAt: current,
     expiresAt: current + ttlMs,

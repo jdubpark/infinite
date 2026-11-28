@@ -105,7 +105,6 @@ export function DecisionQueueScreen({ connection }: { connection: Connection }) 
               {active.terminalOnly ? <>
                 <Text style={s.question} selectable>{active.prompt.title}</Text>
                 {active.prompt.detail ? <Text style={t.mono} selectable>{active.prompt.detail}</Text> : null}
-                <Button compact secondary glyph="terminal" title="Open session" onPress={() => openSession(active.origin.id)} />
               </> : <QueueSessionAnswer key={active.key} connection={connection} decision={active} permitted={permitted} online={feed.online}
                 onClosed={() => settle(active.key)} onSending={setSessionSending} onOpenSession={() => openSession(active.origin.id)} />}
               <Button compact secondary title="Open session" onPress={() => openSession(active.origin.id)} />

@@ -210,7 +210,11 @@ permits, and without it the instance's sudo sessions report
 `finalDrain: "skipped"`. Install the rendered `process-census.sh` the same way as
 `/usr/local/libexec/infinite-NAME/process-census`, owned `root:root` with mode
 `0755`; the rendered sudoers permits it, and without it the instance cannot
-check for processes left by an earlier API process.
+check for processes left by an earlier API process. The same wrapper serves the skeleton's direct
+`team-command` launcher: the host runs it with
+`/usr/bin/sudo -n -H -u infinite-NAME-agent` beside the launcher, so the
+launcher needs no census entry and no change. Without the wrapper, a stopped
+check under the launcher waits for `infinite team processes-ended RUN_ID`.
 
 The rendered sudoers also permits the instance's `jevcode` and
 `repository-graph` wrappers under `/usr/local/libexec/infinite-NAME/`. Each

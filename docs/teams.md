@@ -3082,6 +3082,9 @@ outlives the anchor, so it also reaches a process left in the group after the
 anchor exited. So a process that ignores SIGTERM still ends about five seconds
 after the stop, unless it moved to a process group or session of its own. Other
 prefixed commands, such as Git and workspace removal, run without the anchor.
+Under a prefix, the fence's first census after a stop retries, once a second for
+up to 8 s, while the census still sees the anchor's group ending, and records
+only the last result.
 Without a prefix there is no anchor: the group SIGKILL already ends every
 process in the group. A command whose stop comes
 before its start, for example while it waits for its turn to start, is never

@@ -2,6 +2,7 @@
   "name": "infinite",
   "version": "0.1.0",
   "private": true,
+  "packageManager": "npm@10.9.8",
   "type": "module",
   "workspaces": [
     "packages/*",
@@ -10,18 +11,18 @@
   "scripts": {
     "prepare:codex": "node scripts/build-codex-handoff.mjs",
     "postinstall": "npm run build -w @infinite/attention && npm run build -w @infinite/remote",
-    "build": "npm run build -w @infinite/attention && npm run build -w @infinite/remote && npm run build -w @infinite/host && npm run build -w @infinite/web",
-    "typecheck": "npm run typecheck --workspaces --if-present && tsc -p tsconfig.type-tests.json && tsc -p tsconfig.mcp-exact.json",
-    "test": "npm run build -w @infinite/attention && npm run build -w @infinite/remote && node scripts/run-tests.mjs",
-    "dev": "tsx packages/host/src/cli.ts dev",
+    "build": "sh scripts/cloud-npm.sh 'npm run build -w @infinite/attention && npm run build -w @infinite/remote && npm run build -w @infinite/host && npm run build -w @infinite/web'",
+    "typecheck": "sh scripts/cloud-npm.sh 'npm run typecheck --workspaces --if-present && tsc -p tsconfig.type-tests.json && tsc -p tsconfig.mcp-exact.json'",
+    "test": "sh scripts/cloud-npm.sh 'npm run build -w @infinite/attention && npm run build -w @infinite/remote && node scripts/run-tests.mjs'",
+    "dev": "sh scripts/cloud-npm.sh 'tsx packages/host/src/cli.ts dev'",
     "host": "node packages/host/dist/cli.js",
-    "web": "npm run dev -w @infinite/web",
-    "check:size": "node scripts/check-file-size.mjs",
-    "check:comments": "node scripts/check-comments.mjs",
-    "check": "npm run check:size && npm run check:comments && npm run typecheck && npm test && npm run build",
-    "desktop:build": "node scripts/build-macos.mjs",
+    "web": "sh scripts/cloud-npm.sh 'npm run dev -w @infinite/web'",
+    "check:size": "sh scripts/cloud-npm.sh 'node scripts/check-file-size.mjs'",
+    "check:comments": "sh scripts/cloud-npm.sh 'node scripts/check-comments.mjs'",
+    "check": "sh scripts/cloud-npm.sh 'npm run check:size && npm run check:comments && npm run typecheck && npm test && npm run build'",
+    "desktop:build": "sh scripts/cloud-npm.sh 'node scripts/build-macos.mjs'",
     "desktop:install": "node scripts/build-macos.mjs --install",
-    "desktop:test": "tsx scripts/test-macos-integration.ts"
+    "desktop:test": "sh scripts/cloud-npm.sh 'tsx scripts/test-macos-integration.ts'"
   },
   "devDependencies": {
     "@playwright/test": "^1.56.0",

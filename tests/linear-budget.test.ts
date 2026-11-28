@@ -93,7 +93,10 @@ test("a finished item keeps its confirmation for client reads; live items and a 
 
 test("rate-limit headers reach the bridge status; a limited read pauses with its reason and retry time", { timeout: 60000 }, async t => {
   const b = await bridge();
-  const warnings = t.mock.method(console, "warn", () => undefined);
+  let advanceWarningClock = true;
+  const warnings = t.mock.method(console, "warn", () => {
+    if (advanceWarningClock) { advanceWarningClock = false; t.mock.timers.tick(2100); }
+  });
   try {
     const hour = Date.now() + 3600000;
     b.linear.responseHeaders({ "x-ratelimit-requests-limit": "2500", "x-ratelimit-requests-remaining": "2400", "x-ratelimit-requests-reset": String(hour),
@@ -121,6 +124,7 @@ test("rate-limit headers reach the bridge status; a limited read pauses with its
     };
     let previous: string | undefined;
     const started = Date.now();
+    t.mock.timers.enable({ apis: ["Date"], now: started });
     let view: LinearTrackingView = await limit({ "retry-after": "120", "x-ratelimit-complexity-remaining": "2990000", "x-ratelimit-complexity-reset": String(started + 55 * 60000) });
     assert.ok(Math.abs(Date.parse(view.retryAt!) - (started + 120000)) < 5000, view.retryAt);
     assert.ok(["error", "pending"].includes(view.status));
@@ -134,7 +138,6 @@ test("rate-limit headers reach the bridge status; a limited read pauses with its
     assert.match(line, /This host sent \d+ requests \(\d+ complexity points reported\) in the last hour\.$/);
     assert.ok(!line.includes(b.linear.apiKey));
 
-    t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
     t.mock.timers.tick(125000);
     previous = view.retryAt;
     let now = Date.now();

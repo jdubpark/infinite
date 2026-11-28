@@ -421,7 +421,10 @@ test("an older poll result cannot replace a newer ineligible row", async () => {
 
 test("501 failed turn readings stay suppressed after the display LRU would have evicted entries", async () => {
   let calls = 0;
-  const failing = { systemOne: async () => { calls++; throw new Error("provider unavailable"); } } as unknown as JevTransport;
+  const failing = { systemOne: async () => {
+    calls++;
+    throw new Error("provider unavailable");
+  } } as unknown as JevTransport;
   const f = setup({ transport: failing });
   const rows: ReadingRow[] = Array.from({ length: 501 }, (_, index) => {
     const id = `session-${index}`;
@@ -436,12 +439,12 @@ test("501 failed turn readings stay suppressed after the display LRU would have 
       const batch = rows.slice(offset, offset + 25);
       f.readings.merge(batch);
       const expected = offset + batch.length;
-      await eventually(() => calls === expected);
-      await new Promise(resolve => setTimeout(resolve, 0));
+      await new Promise<void>(resolve => setImmediate(resolve));
+      assert.equal(calls, expected, "every eligible reading reaches the provider before the batch settles");
     }
     f.manager.list = async () => rows;
     await f.readings.tick();
-    await new Promise(resolve => setTimeout(resolve, 30));
+    await new Promise<void>(resolve => setImmediate(resolve));
     assert.equal(calls, 501, "a full scan does not retry failures merely because the display cache is bounded");
 
     f.manager.list = async () => rows.slice(0, 1);
@@ -470,8 +473,11 @@ test("many eligible rows keep pending Jev work within the 50-job cap", () => {
 test("pending work coalesces to the newest hash and rechecks the gate before send", async () => {
   const calls: any[] = [];
   const releases: Array<(value: any) => void> = [];
+  let resolveThirdCall!: () => void;
+  const thirdCallStarted = new Promise<void>(resolve => { resolveThirdCall = resolve; });
   const transport = { systemOne: (request: any) => {
     calls.push(request);
+    if (calls.length === 3) resolveThirdCall();
     return new Promise(resolve => releases.push(resolve));
   } } as unknown as JevTransport;
   const f = setup({ transport });
@@ -495,10 +501,15 @@ test("pending work coalesces to the newest hash and rechecks the gate before sen
       waiting: { type: "noul", noul: 0.1 },
     } };
     releases.forEach(release => release(answer));
-    await eventually(() => calls.length === 3);
+    await thirdCallStarted;
+    assert.equal(calls.length, 3, "the coalesced pending slot starts exactly one provider call");
     assert.equal(calls[2].state.lastSentence, "New queued sentence.", "the pending slot sends only its newest hash");
     assert.equal(calls.some(request => request.state.lastSentence === "Gate held sentence."), false, "a message that no longer passes the turn-finished gate is skipped before send");
     releases.slice(2).forEach(release => release(answer));
+    await new Promise<void>(resolve => setImmediate(resolve));
+    const completed = f.readings.merge([target("coalesced", now(newerMessage))])[0]!;
+    assert.equal(completed.reading?.now?.text, candidateSentences(newerMessage)[0], "the newest reading completes through the normal merge path");
+    assert.equal(calls.length, 3, "settling the newest reading does not send the gated job as a fourth provider call");
   } finally { f.dispose(); }
 });
 

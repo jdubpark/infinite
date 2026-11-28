@@ -995,14 +995,14 @@ test("in a shared thread, a second event for the same message and a redelivered 
     const first = mention("Q2 yes");
     await send(first, "Ev-first");
     await until(() => sh.get(b!), mission => mission.decisions[0].answer === "yes", 20000);
-    const posts = s.texts().length;
+    await waitFor(async () => s.texts(), texts => texts.includes("Received your answer to Q2."), 20000);
+    const posts = s.texts();
     await send(mention("status", { ts: first.ts }), "Ev-edited");
     await send(mention("Q1 skip"), "Ev-first");
-    await delay(500);
-    assert.equal(s.texts().length, posts, "Neither duplicate gets a reply");
+    assert.deepEqual(s.texts(), posts, "Neither duplicate gets a reply");
     assert.equal(sh.get(a).decisions[0].answer, undefined, "Neither duplicate reaches the other request");
-    assert.equal(s.store.get(ISSUE)!.inbound.length, 0);
-    assert.equal(s.store.get(SECOND)!.inbound.length, 1);
+    assert.equal(s.store.get(ISSUE)!.inbound.length, 0, "The older request receives no duplicate entry");
+    assert.equal(s.store.get(SECOND)!.inbound.length, 1, "The accepted event remains the only entry");
   } finally { await close(); }
 });
 

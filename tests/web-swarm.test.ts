@@ -1,19 +1,17 @@
 import { after, before, describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
 import { chromium, type Browser, type Page } from "playwright";
 import { LONG_TOOL } from "./fixtures/web-swarm-data";
 
 const executablePath = process.env.PLAYWRIGHT_CHROMIUM_PATH || chromium.executablePath();
-const skip = existsSync(executablePath) ? false : "Chromium for Playwright is not installed; run `npx playwright install chromium`";
 const harness = fileURLToPath(new URL("./fixtures/web-swarm-harness.tsx", import.meta.url));
 const ORIGIN = "http://127.0.0.1/swarm";
 
 type Control = { requests: string[]; view(view: "lanes" | "wall" | "graph"): void; poll(variant: { shuffleUpdated?: boolean; flipState?: boolean; idle?: boolean; longTool?: boolean }): void };
 
-describe("web swarm view", { skip }, () => {
+describe("web swarm view", () => {
   let browser: Browser;
   let script = "", styles = "";
   before(async () => {

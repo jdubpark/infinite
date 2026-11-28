@@ -324,6 +324,7 @@ test("automatic brief uses the latest transcript after a delayed provider flush 
 
     await host.fetchApi("/sessions", "owner", { requestId: blockerId, provider: "demo", projectId: "rehearsal", title: "Queue gate", prompt: "hold queue" });
     blockerSummary = host.fetchApi(`/sessions/${blockerId}/summary`, "viewer");
+    void blockerSummary.catch(() => {});
     await waitFor(async () => existsSync(gateEntered), entered => entered, 20000);
 
     const id = randomUUID();

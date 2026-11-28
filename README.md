@@ -80,9 +80,9 @@ verification/  Formal finite-state safety models (Understanding refresh fence) +
 
 ## Quickstart
 
-### Run a local development host
+### Run a development host on a cloud runner
 
-Requires Node.js 22.14+ and npm, plus native build tools for `node-pty` (C++/Python build tools on Linux; Xcode Command Line Tools on macOS).
+Use a standing checkout on an owner-operated cloud server with the repository's pinned Node and npm versions and native build tools for `node-pty`. Open the browser on that server or forward its loopback port over SSH.
 
 ```sh
 npm ci
@@ -184,9 +184,89 @@ Keep private EAS and Firebase identifiers out of tracked files (`apps/mobile/.lo
 
 ---
 
+## Cloud verification
+
+From a workstation, enroll an SSH alias for an owner-operated test VM. Verify its SSH host key through the owner's trusted channel first. Linked worktrees share enrollment. The workstation needs Git, Python 3.9+ and OpenSSH. Provision each Linux runner with Python 3.10+, the tools and platform in `scripts/cloud-check/linux-runner.json`, the Node version in `.nvmrc`, the npm version in `package.json`'s `packageManager` field, and the native build dependencies. The job checks the distribution, architecture, Git, Docker engine, Compose, Node and npm before installing dependencies.
+
+```sh
+python3 scripts/cloud-check.py --enroll VERIFY_LINUX
+npm run check
+python3 scripts/cloud-check.py -- node --import tsx --test tests/chat.test.ts
+```
+
+Process retirement tests need their own Linux process table. The normal `npm test` command runs failed-operation, leftover-process and main-check suites in disposable, digest-pinned containers on the enrolled guest. The team check-stop suite runs in a private PID and mount namespace on the Linux guest, preserving the enrolled user and real nested `sudo` cases. To run one group, use `infinite-check -- node scripts/run-tests.mjs` with `--team-operation-failure`, `--team-check-stop`, `--team-leftovers` or `--main-check-real`.
+
+Each run transfers the current Git revision, staged and unstaged edits, deletions, and eligible nonignored untracked files into a disposable cloud checkout. Git history stops at the captured commit. Ignored inputs, credentials, Git remotes and unrelated refs stay outside the snapshot. The runner installs dependencies with `npm ci` from that checkout's lockfile. The receipt identifies the source snapshot, lockfile, platform, tool versions, and exit status. Concurrent calls use separate directories. Keep commands that share build output, a service, or a browser session in a single invocation.
+
+Run `python3 scripts/install-cloud-check.py` once to install `infinite-check` for older worktrees as well. Run it again when upgrading the launcher. `infinite-check -- COMMAND ARG...` snapshots the calling worktree, including when invoked from a subdirectory. A checkout that predates both toolchain pins uses the installed launcher's pins.
+
+The first eligible alias is the default. Enroll additional owned boxes with the same launcher command. Use `--runner` to select a box by capability or run independent checks on different boxes. Docker jobs use a Linux runner with Docker installed. The launcher contains test services using a Linux user systemd service or a child subreaper. Xcode and iOS simulator checks require a separately provisioned owner-operated Mac environment.
+
+Each job gets a unique `COMPOSE_PROJECT_NAME`. Use `docker run --rm` for disposable containers and label any other job-owned Docker resources with `io.infinite.check="$INFINITE_CHECK_RUN_ID"`. The runner cleans resources bearing that label or the job's Compose project label on its local Docker socket.
+
+```sh
+python3 scripts/cloud-check.py --runner VERIFY_BROWSER -- npm test
+```
+
+Provision Chromium with the lockfile's Playwright CLI on each browser runner. After `npm ci`, run `PLAYWRIGHT_BROWSERS_PATH="$HOME/.cache/infinite-cloud-check/playwright" ./node_modules/.bin/playwright install chromium`. Linux images also need Playwright's system dependencies.
+
+For a standing runner checkout, administrators can create the root-owned file `/etc/infinite-cloud-runner` after provisioning it. The installed Infinite systemd host also qualifies. Normal npm tests on a standing runner use a fresh snapshot. Builds and dev servers started there directly can retain their output. A missing enrollment, unavailable runner, or toolchain mismatch stops workstation dispatch.
+
+### Docker-backed projects
+
+From a project you want to test, enroll its owned SSH runners once. Linked worktrees share the enrollment. Independent clones inside the workspace inherit it when their `origin` URL matches exactly. For a managed workspace, explicitly enroll an independent clone located outside its configured roots to bind its Git directory as well. A project without an origin can enroll its own Git directory from within its workspace.
+
+```sh
+infinite-check --enroll VERIFY_LINUX --enroll VERIFY_LINUX_2
+infinite-check --project-command -- make test
+```
+
+`--project-command` runs the project's existing command in the verified cloud checkout. It works for projects that use Docker builds, Compose, Testcontainers, or their own dependency installer. The project controls those dependencies. Invoking the whole command on the runner gives Docker bind mounts the same files that the test driver sees.
+
+For a repeatable Compose suite, commit the test service and a project-root `.infinite/check.json`. For example, this recipe runs the default command of the `test` service.
+
+```json
+{
+  "version": 1,
+  "composeFile": "compose.test.yaml",
+  "service": "test",
+  "platform": "linux/amd64"
+}
+```
+
+Give each service the declared platform and an image pinned by digest. Mount project inputs from the checkout, and use job-scoped networks and volumes. The runner checks the resolved Compose configuration and records the image identities. Keep expected results and test data under version control. A suite that depends on a clock, random input, or an external service needs a controlled input or an assertion that accounts for its variability.
+
+```sh
+infinite-check
+infinite-check --also-on VERIFY_LINUX_2
+infinite-check --require-tip origin main --also-on VERIFY_LINUX_2
+```
+
+The second command sends one captured checkout to both enrolled runners. A pinned Compose replay requires both tests to pass and compares the platform, kernel, toolchain, resolved image identities and the SHA-256 of the test service's exact standard output. Give the test service deterministic output when using this comparison. In `--project-command` mode the receipt covers the source, runner profile and exit status. The project controls dependency and output equivalence in that mode.
+
+The third command also checks the live branch tip before and after execution. Staged, unstaged and eligible untracked changes still participate. A successful snapshot must still match the calling worktree at the end. A change to the source or tests during a run makes its result stale. Each completed dispatch prints the path to its private JSON receipt under the owning workspace's state directory.
+
+Infinite's normal tests include a fresh non-Node repository that starts a real digest-pinned container, reads the current working files through a bind mount and checks a deliberate failing assertion. To repeat just that qualification on an enrolled Infinite guest, run `infinite-check --runner VERIFY_LINUX -- node --import tsx --test --test-name-pattern 'fresh non-Node project' tests/cloud-check.test.ts` from the Infinite checkout. Qualify each application's own suite from its own repository.
+
+A cloud controller can also run the declared check for an enrolled branch or pull request and publish a status on its exact commit. It can recover current heads over outbound HTTPS while the workstation is asleep. A required check uses the receipt from the owning workspace. [Cloud revision controller](docs/cloud-revision-controller.md)
+
+### Isolating workspaces that contain several repositories
+
+Provision a dedicated VM, Docker engine, disk, SSH identity and package caches for each workspace. Keep private networks and other workspaces' guests inaccessible from that VM. On each VM create a regular root-owned `/etc/infinite-check-workspace` file containing the workspace ID, writable only by root. The workstation requires confirmation of that ID over the authenticated SSH connection before sending any checkout bytes. A paired run checks that the guests and Docker engines have distinct identities. Where the test network requires an HTTP egress proxy, put its credential-free endpoint in a root-owned `/etc/infinite-check-proxy` file. The worker configures package clients and Docker builds within the disposable job home.
+
+Under the operator's private `$XDG_CONFIG_HOME/infinite/cloud-check/workspaces.d` directory (the default base is `$HOME/.config`), create one `WORKSPACE_ID.json` per workspace. Set directory permissions to 0700 and files to 0600. Each file declares `roots` (absolute canonical directories), `originHashes` (SHA-256 of each exact Git origin URL, without a trailing newline) and `runners` (ordered SSH aliases). Assign every root, origin and alias to a single workspace. Linked worktrees retain their Git common directory's scope. Enroll new repositories from their owning workspace. A conflicting guest, an unknown repository under a managed root, or a cross-workspace runner selection stops dispatch.
+
+Invoke the launcher inside the repository being checked. Workspace context stores and sibling checkouts stay outside the snapshot. A test with another repository as an input needs that dependency pinned and available within its own test environment. Keep the workstation's default Docker context disconnected so an unqualified Docker command cannot send a build context to a different workspace.
+
+If a repository tracks a distributed environment template such as `.env.development-example`, review the template before approving it. In the operator's global Git config, add `<content SHA-256> <repository-relative path>` under `infiniteProject.<origin SHA-256>.envExample`. Only those exact bytes are accepted from the commit, index and working file. Keep credentials and machine-specific environment files outside source control.
+
+For a tracked, credential-free `.npmrc`, use the same digest and path format under `infiniteProject.<origin SHA-256>.npmConfig`. Review package settings in each new version before updating its approved digest.
+
+---
+
 ## Checks, Quality Ratchets and Verification
 
-Run checks from the repository root (when working on Infinite checkouts from a workstation with an enrolled verification runner, dispatch through the cloud runner rather than running builds or tests locally):
+From the checkout, these npm scripts dispatch verification to an enrolled cloud runner.
 
 ```sh
 npm run check                          # check:size + check:comments + typecheck + test + build
@@ -200,8 +280,8 @@ npm run export:ios -w @infinite/mobile
 
 1. **`npm run check:size`** (`scripts/check-file-size.mjs`): 1,000-line cap on new source files; downward-only baseline across 24 grandfathered files.
 2. **`npm run check:comments`** (`scripts/check-comments.mjs`): zero-comment policy across `.ts/.tsx/.js/.mjs/.swift/.py/.sh/.c/.h/.kt/.css/.service/.timer/.socket` (`scripts/comments-baseline.json` is at `0`).
-3. **`npm run typecheck`**: TypeScript strict check across all workspaces plus `tsconfig.type-tests.json` (`@ts-expect-error` state-machine and wire-contract tests).
-4. **`npm test`** (`scripts/run-tests.mjs`): discovers every top-level `tests/*.test.ts` file, running parallelizable suites concurrently (default concurrency 4; override with `--concurrency=` or `INFINITE_TEST_CONCURRENCY=1` on small runners) followed by contention-sensitive suites listed in `serialFiles` sequentially, covering 12-PTY live API-restart continuity, vault/SQLite crypto, OS-boundary eval/grader launchers, Playwright browser smoke, and seeded crash/fault/differential simulators.
+3. **`npm run typecheck`** runs a strict TypeScript check across all workspaces plus `tsconfig.mcp-exact.json` and `tsconfig.type-tests.json` (`@ts-expect-error` state-machine and wire-contract tests).
+4. **`npm test`** discovers every top-level `tests/*.test.ts` file in the captured checkout. `scripts/run-tests.mjs` runs the failed-operation suite first, four files concurrently by default, then serial CLI tests and the isolated main-check suite. Set `INFINITE_TEST_CONCURRENCY=1` on small runners or pass `--concurrency=N` directly to the test runner. The suite covers 12-PTY live API-restart continuity, vault and SQLite encryption, eval and grader process isolation, Playwright browser smoke, and seeded crash and differential simulations.
 5. **`npm run build`**: sequential build of `@infinite/attention -> @infinite/remote -> @infinite/host -> @infinite/web`.
 
 End-to-end browser verification against a disposable host uses `.agents/skills/verify-infinite/scripts/drive.mjs session --instance DIR`.

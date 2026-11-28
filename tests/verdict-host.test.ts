@@ -20,6 +20,7 @@ import { EvidenceStore, evidenceDatabasePath } from "../packages/host/src/eviden
 import { isFuseReason } from "../packages/host/src/fuse/rules.js";
 import { FuseService } from "../packages/host/src/fuse/service.js";
 import { commandDigest } from "../packages/host/src/objective-input.js";
+import { definitionDigest } from "../packages/host/src/objective-receipts.js";
 import { VERDICT_OPS } from "../packages/host/src/objective-record.js";
 import { recordDigest, type Criterion, type ObjectiveRecord } from "../packages/host/src/objective-types.js";
 import { sealRecord } from "../packages/host/src/objective-write.js";
@@ -844,6 +845,7 @@ test("recovery fences an artifact criterion whose threshold was raised between i
     pending: false,
     receipts: [{
       handle: `receipt:${f.holder.run.id}:1:c1`, kind: "artifact", subject: "criterion", id: "c1",
+      digest: definitionDigest(initialRecord.criteria.find(item => item.id === "c1")!),
       commit: f.holder.run.headCommit!, outcome: "pass", at: AT, detail: { kind: "artifact", read: "read", total: 5 },
     }],
   });

@@ -1,12 +1,10 @@
 import { after, before, describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
 import { chromium, type Browser, type Page } from "playwright";
 
 const executablePath = process.env.PLAYWRIGHT_CHROMIUM_PATH || chromium.executablePath();
-const skip = existsSync(executablePath) ? false : "Chromium for Playwright is not installed; run `npx playwright install chromium`";
 const harness = fileURLToPath(new URL("./fixtures/web-polling-harness.tsx", import.meta.url));
 const controlHarness = fileURLToPath(new URL("./fixtures/web-control-harness.tsx", import.meta.url));
 const ORIGIN = "http://127.0.0.1/polling";
@@ -16,7 +14,7 @@ type ControlProbe = {
   hostHeld: { id: string; expiresAt: number } | null; releaseRequests: number; claim: () => void; teardown: () => void;
 };
 
-describe("web conversation polling", { skip }, () => {
+describe("web conversation polling", () => {
   let browser: Browser;
   let script: string, controlScript: string;
   const bundle = async (entry: string) => (await build({ entryPoints: [entry], bundle: true, write: false, format: "iife", jsx: "automatic", logLevel: "silent", define: { "process.env.NODE_ENV": '"production"' } })).outputFiles[0].text;

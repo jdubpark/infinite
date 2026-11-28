@@ -525,7 +525,7 @@ export async function collectSharedPool(options: CollectSharedPoolOptions): Prom
     }
 
     const enterSweepWindow = async () => {
-      if (!(await updateGcLease(sharedRoot, gcId, lease.startedAt, "sweep", sweepLeaseTtlMs, now))) {
+      if (!(await updateGcLease(sharedRoot, gcId, lease.startedAt, "sweep", sweepLeaseTtlMs, now, "closing"))) {
         return { ok: false as const, status: "skipped-gc-active" as const };
       }
       const postBarrierLeases = await scanPoolLeases(sharedRoot, now(), { cleanupExpired: true });
@@ -533,6 +533,9 @@ export async function collectSharedPool(options: CollectSharedPoolOptions): Prom
       if (postBarrierLeases.active > 0) {
         baseResult.activeLeases = postBarrierLeases.active;
         return { ok: false as const, status: "deferred-active-lease" as const };
+      }
+      if (!(await updateGcLease(sharedRoot, gcId, lease.startedAt, "sweep", sweepLeaseTtlMs, now))) {
+        return { ok: false as const, status: "skipped-gc-active" as const };
       }
       try {
         const freshScopes = await discoverRegisteredScopes(sharedRoot, explicitScopes);

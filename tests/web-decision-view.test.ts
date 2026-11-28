@@ -1,12 +1,10 @@
 import { after, before, describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
 import { chromium, type Browser, type Page } from "playwright";
 
 const executablePath = process.env.PLAYWRIGHT_CHROMIUM_PATH || chromium.executablePath();
-const skip = existsSync(executablePath) ? false : "Chromium for Playwright is not installed; run `npx playwright install chromium`";
 const harness = fileURLToPath(new URL("./fixtures/web-decision-view-harness.tsx", import.meta.url));
 const ORIGIN = "http://127.0.0.1";
 const TEAM = "22222222-2222-4222-8222-222222222222", SESSION = "11111111-1111-4111-8111-111111111111";
@@ -32,7 +30,7 @@ const destructivePrompt = {
 };
 const sessionRow = { id: SESSION, title: "Fix the upload test", provider: "claude", projectId: "demo", status: "running", createdAt: since, seq: 1, contextVersion: 1, backend: "infinite", capabilities: { terminalSnapshot: 1 } };
 
-describe("web decision queue view", { skip }, () => {
+describe("web decision queue view", () => {
   let browser: Browser;
   let script: string;
   before(async () => {

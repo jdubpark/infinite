@@ -1,0 +1,18 @@
+[Unit]
+Description=Find current revisions for enrolled cloud checks
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=infinite-check-controller
+Group=infinite-check-controller
+Environment=HOME=/var/lib/infinite-check-controller
+Environment=XDG_STATE_HOME=/var/lib/infinite-check-controller/state
+ExecStart=/usr/bin/python3 /usr/local/libexec/cloud-revision/observe.py --config /etc/infinite/cloud-revision/enrollment.json
+StateDirectory=infinite-check-controller infinite-revision
+StateDirectoryMode=0700
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+NoNewPrivileges=true

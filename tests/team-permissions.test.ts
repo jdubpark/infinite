@@ -6,7 +6,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameS
 import { join, relative, sep } from "node:path";
 import type { Prompt } from "@infinite/attention";
 import { claimControl, waitFor } from "./helpers.js";
-import { fixture, git, limitLineup } from "./team-fixture.js";
+import { addInspectableCheckPackage, fixture, git, limitLineup } from "./team-fixture.js";
 import { DEFAULT_PERMISSION_LIMIT, DEFAULT_PERMISSION_SCOPE, LEGACY_DEFAULT_PERMISSION_SCOPES, currentPermissions, type TeamLineup, type TeamPermissionDecision } from "../packages/host/src/team-types.js";
 import { isCollapsedPermissionPrompt, permissionEvidenceHash, refusedBeforeSend } from "../packages/host/src/team-permissions.js";
 import { permissionEvidenceDigest } from "../packages/host/src/team-permission-evidence.js";
@@ -20,15 +20,6 @@ const permissionLineup: TeamLineup = {
   ...limitLineup,
   coordinator: { ...limitLineup.coordinator, id: "claude-coordinator", label: "Claude coordinator", provider: "claude", model: "claude-opus-5-5", effort: "xhigh", tier: "strong" },
 };
-
-function addInspectableCheckPackage(f: Awaited<ReturnType<typeof fixture>>) {
-  const source = f.host.config.projects.find(project => project.id === "rehearsal")!.path;
-  const packageManifest = `${JSON.stringify({ scripts: { check: "node check.mjs" } }, null, 2)}\n`;
-  writeFileSync(join(source, "package.json"), packageManifest);
-  git(source, "add", "package.json");
-  git(source, "-c", "user.name=Example Developer", "-c", "user.email=dev@example.invalid", "commit", "-m", "Add inspectable check script");
-  return { packageManifest, checkSource: readFileSync(join(source, "check.mjs"), "utf8") };
-}
 
 test("a saved default policy follows the current default; an owner-written scope or lowered limit is kept", () => {
   for (const scope of LEGACY_DEFAULT_PERMISSION_SCOPES) {
@@ -795,7 +786,12 @@ test("an owner answer supersedes a late permission report when the obsolete revi
     const priorReviewer = stored.run.members.find((member: any) => member.memberId === decision.coordinatorMemberId)!;
     const sibling = stored.run.members.find((member: any) => member.revision === stored.run.revision && member.role === "implementer" && member.report?.kind === "result");
     assert.ok(sibling, "the legacy intent overlaps a reported implementation sibling");
+    const observedLateReviewer = lateReport.members.find(member => member.memberId === coordinator.memberId)!;
+    assert.equal(observedLateReviewer.memberId, decision.coordinatorMemberId);
+    assert.equal(observedLateReviewer.report?.kind, "permission-decision");
+    assert.ok(observedLateReviewer.report, "the held reviewer report is available for the legacy fixture");
     priorReviewer.status = "unavailable";
+    priorReviewer.report = observedLateReviewer.report;
     stored.run.status = "blocked";
     stored.run.reason = "A team operation failed. Its workspaces and recorded evidence were preserved for inspection.";
     stored.run.blockCode = undefined;
@@ -829,6 +825,8 @@ test("an owner answer supersedes a late permission report when the obsolete revi
     assert.equal(recovered.permissionDecisions?.[0]?.receipt, undefined, "the retained reviewer report is never treated as an owner answer");
     assert.equal(recovered.members.find(member => member.memberId === coordinator.memberId)?.status, "unavailable");
     assert.equal(recovered.members.find(member => member.memberId === coordinator.memberId)?.report?.kind, "permission-decision");
+    assert.deepEqual(recovered.members.find(member => member.memberId === coordinator.memberId)?.report, observedLateReviewer.report,
+      "recovery preserves the held permission report in the legacy fixture");
     assert.equal(recovered.members.find(member => member.memberId === sibling.memberId)?.report?.kind, "result", "the sibling implementation report remains evidence");
     assert.ok(recovered.members.some(member => member.role === "project-manager" && member.revision > finished.revision), "PM diagnosis is scheduled in the same run");
   } finally {

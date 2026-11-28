@@ -529,7 +529,7 @@ test("a halt holds a run whose answer queued a replacement that has not launched
   try {
     await teams.answer(waiting.id, waiting.decisionId, { requestId: randomUUID(), revision: 1, text: "Change a.txt" });
     await step(teams, waiting.id);
-    assert.equal(teams.get(waiting.id).status, "planning");
+    assert.equal(teams.get(waiting.id).status, "planning", "the answered question returns the run to planning");
     assert.deepEqual(teams.get(waiting.id).members.map(member => member.status), ["stopped", "queued"]);
     assert.equal(f.launches.length, 0);
 
@@ -542,7 +542,7 @@ test("a halt holds a run whose answer queued a replacement that has not launched
     assert.ok(teams.get(waiting.id).events.some(event => event.text.startsWith("Team paused before its queued member started:") && event.text.endsWith("The answer is kept; the member starts after the release.")), "the pause line says the member had not started");
 
     await halt.release(fixtureScope, { requestId: randomUUID() }, owner);
-    assert.equal(teams.get(waiting.id).status, "planning", "the release resumes the run at the replacement's stage");
+    assert.equal(teams.get(waiting.id).status, "planning", "the release restores the stage of the queued planner");
     assert.equal(teams.get(waiting.id).revision, 1, "without a fresh plan");
     assert.ok(teams.get(waiting.id).events.some(event => event.text === "Team resumed with its queued member: the owner released the halt."), "the resume line says the queued member continues");
     await step(teams, waiting.id);

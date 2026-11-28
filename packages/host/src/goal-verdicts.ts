@@ -60,8 +60,15 @@ export function applyLateVerdict(goal: ProductGoal, cycle: GoalCycle, team: Pick
 }
 
 export function withdrawProvisional(goal: ProductGoal, cycle: GoalCycle): void {
-  if (cycle.assessment === undefined || cycle.assessment.result === "met" || goal.cycles.at(-1) !== cycle) return;
+  if (cycle.assessment?.result === "met" || goal.cycles.at(-1) !== cycle) return;
   if (goal.status === "ready-for-review" && goal.stopReason === "provisional-met" && goal.reason === PROVISIONAL_REASON) goal.reason = PROVISIONAL_WITHDRAWN_REASON;
+}
+
+export function refreshCycleVerdict(goal: ProductGoal, cycle: GoalCycle, team: Pick<TeamView, "revision" | "assessment">): boolean {
+  const late = lateVerdict(goal, cycle, team) !== undefined;
+  Object.assign(cycle, cycleVerdict(goal, cycle, team));
+  withdrawProvisional(goal, cycle);
+  return late;
 }
 
 export function holdReasonChange(goal: ProductGoal, holds: boolean): "hold" | "release" | undefined {

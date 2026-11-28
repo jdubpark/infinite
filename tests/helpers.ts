@@ -10,6 +10,8 @@ import { readRecordedSocketPath, workerCall, type SocketTarget } from "../packag
 import { unseal } from "../packages/host/src/vault.js";
 import type { Config, Role, ControlLease } from "../packages/host/src/types.js";
 
+const HOST_STARTUP_TIMEOUT_MS = 45_000;
+
 export const waitFor = async <T>(
   fn: () => Promise<T>,
   accepts: (value: T) => boolean,
@@ -94,9 +96,10 @@ export interface Host {
   stop: () => Promise<void>;
 }
 
-export function apiClient(origin: string, tokens: Record<Role, string>): Host["fetchApi"] {
+export function apiClient(origin: string, tokens: Record<Role, string>, signal?: AbortSignal): Host["fetchApi"] {
   return async (path, role = "owner", body, headers = {}, method) => {
     const response = await fetch(origin + "/api" + path, {
+      signal,
       method: method ?? (body ? "POST" : "GET"),
       headers: {
         connection: "close",
@@ -212,24 +215,33 @@ export async function startHost(options: { agents?: Config["agents"]; config?: P
     api.stderr!.on("data", (chunk) => {
       diagnostics += chunk;
     });
-    const answer = async () => {
-      let status = 0;
-      try {
-        status = (await fetchApi("/me")).status;
-      } catch {
-        status = 0;
-      }
-      if (status === 200) return 200;
-      if (api.exitCode !== null || api.signalCode !== null) {
-        await Promise.race([stderrDone, new Promise((resolveTimeout) => setTimeout(resolveTimeout, 1000))]);
-        throw new Error(diagnostics || `Host exited before listening (${api.signalCode ?? api.exitCode})`);
-      }
-      return status;
+    const step = options.startStepMs ?? HOST_STARTUP_TIMEOUT_MS;
+    const lock = join(config.runDir, "server.lock");
+    const exited = new AbortController();
+    const abortProbe = () => exited.abort();
+    api.once("exit", abortProbe);
+    const loaded = () => {
+      try { return readFileSync(lock, "utf8") === String(api.pid); } catch { return false; }
     };
-    const lock = join(config.runDir, "server.lock"), step = options.startStepMs ?? 45000;
-    const loaded = () => { try { return readFileSync(lock, "utf8") === String(api.pid); } catch { return false; } };
-    await waitFor(async () => loaded() || await answer() === 200, (ready) => ready, step);
-    await waitFor(answer, (status) => status === 200, step);
+    const waitForPhase = (acceptLock: boolean) => {
+      const signal = AbortSignal.any([exited.signal, AbortSignal.timeout(step)]);
+      const probe = apiClient(listenerOrigin, tokens, signal);
+      return waitFor(async () => {
+        if (acceptLock && loaded()) return true;
+        const response = await probe("/me").catch(() => undefined);
+        if (api.exitCode !== null || api.signalCode !== null) {
+          await Promise.race([stderrDone, new Promise((resolveTimeout) => setTimeout(resolveTimeout, 1000))]);
+          throw new Error(diagnostics || `Host exited before listening (${api.signalCode ?? api.exitCode})`);
+        }
+        return response?.status === 200;
+      }, Boolean, step);
+    };
+    try {
+      await waitForPhase(true);
+      await waitForPhase(false);
+    } finally {
+      api.off("exit", abortProbe);
+    }
   };
   const stop = async () => {
     const floor = new Promise((resolve) => setTimeout(resolve, 1700));

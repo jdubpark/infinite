@@ -1,9 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
 import { randomBytes, randomUUID } from "node:crypto";
+import { createInterface } from "node:readline";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { IntakeSlackSurface } from "../packages/host/src/intake-slack.js";
 import { IntakeStore } from "../packages/host/src/intake-store.js";
 import { SlackClient } from "../packages/host/src/slack-client.js";
@@ -22,6 +25,29 @@ const OTHER: IntakeThread = { channelId: "C0000000001", threadTs: "1700000000.00
 const { scope: TEST_SCOPE } = slackAudienceFixture();
 const NOW = new Date().toISOString();
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+test("closing while organization scope is pending leaves no retry timers keeping the process alive", { timeout: 60000 }, async () => {
+  const child = spawn(process.execPath, ["--import", import.meta.resolve("tsx"), resolve("tests/fixtures/intake-slack-close-lifecycle.mjs")], {
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stderr = "";
+  child.stderr?.setEncoding("utf8").on("data", chunk => { stderr += chunk; });
+  const lines = createInterface({ input: child.stdout! });
+  let released = false;
+  let timeout = setTimeout(() => child.kill("SIGKILL"), 30000);
+  lines.on("line", line => {
+    if (line !== "SCOPE_RELEASED") return;
+    released = true;
+    clearTimeout(timeout);
+    timeout = setTimeout(() => child.kill("SIGKILL"), 5000);
+  });
+  const exited = once(child, "close");
+  const [code, signal] = await exited;
+  clearTimeout(timeout);
+  lines.close();
+  assert.ok(released, `shutdown scenario did not reach its release marker (signal=${signal ?? "none"}): ${stderr}`);
+  assert.equal(code, 0, `closed intake process should exit naturally (signal=${signal ?? "none"}): ${stderr}`);
+});
 
 function record(issueId: string, state: "queued" | "started", extra: Record<string, unknown> = {}): IntakeRecord {
   const base = {

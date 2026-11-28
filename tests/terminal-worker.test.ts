@@ -152,27 +152,31 @@ test("worker snapshots restore a bounded rendered prefix and contiguous live del
   } finally { terminals.forEach(terminal => terminal.dispose()); await worker.stop(); }
 });
 
-test("worker snapshots preserve titles and refuse unhandled OSC or extended SGR state across resets", { timeout: 35_000 }, async () => {
-  const unsupported = [
-    ...["4:3", "4:2", "21", "4;58;2;11;22;33"].map(code => ({ kind: "sgr", code })),
-    ...["8", "4", "10", "11"].map(code => ({ kind: "osc", code })),
-  ];
-  await settleAll(unsupported.map(async ({ kind, code }) => {
-    const worker = await fixture();
-    try {
-      await worker.command(`${kind} ${code}`);
-      await waitFor(async () => worker.output(), output => output.includes(`${kind.toUpperCase()} DONE ${code}`));
-      await assert.rejects(worker.call({ op: "snapshot" }), { code: "snapshot-unavailable" }, `${kind.toUpperCase()} ${code} state cannot be restored by the cell serializer`);
-      await worker.command("reset");
-      await waitFor(async () => worker.output(), output => output.includes("RESET DONE"));
-      await assert.rejects(worker.call({ op: "snapshot" }), { code: "snapshot-unavailable" }, "unsupported styling keeps the worker on full replay");
-    } finally { await worker.stop(); }
-  }));
+const unsupportedSnapshotStates = [
+  ...["4:3", "4:2", "21", "4;58;2;11;22;33"].map(code => ({ kind: "sgr", code })),
+  ...["8", "4", "10", "11"].map(code => ({ kind: "osc", code })),
+];
+
+for (const { kind, code } of unsupportedSnapshotStates) test(`worker snapshots refuse ${kind.toUpperCase()} ${code} state across resets`, { timeout: 35_000 }, async () => {
+  const worker = await fixture();
+  try {
+    await worker.command(`${kind} ${code}`);
+    await waitFor(async () => worker.output(), output => output.includes(`${kind.toUpperCase()} DONE ${code}`));
+    await assert.rejects(worker.call({ op: "snapshot" }), { code: "snapshot-unavailable" }, `${kind.toUpperCase()} ${code} state cannot be restored by the cell serializer`);
+    await worker.command("reset");
+    await waitFor(async () => worker.output(), output => output.includes("RESET DONE"));
+    await assert.rejects(worker.call({ op: "snapshot" }), { code: "snapshot-unavailable" }, "unsupported styling keeps the worker on full replay");
+  } finally { await worker.stop(); }
+});
+
+test("worker snapshots preserve titles and icons after supported RGB styling", { timeout: 35_000 }, async () => {
   const worker = await fixture();
   const restored = new headless.Terminal({ cols: 120, rows: 32, allowProposedApi: true });
   let title = "";
   restored.onTitleChange(value => { title = value; });
   try {
+    await worker.command("reset");
+    await waitFor(async () => worker.output(), output => output.includes("RESET DONE"));
     await worker.command("sgr 38;2;21;58;59;48:2::58:21:59");
     await waitFor(async () => worker.output(), output => output.includes("SGR DONE 38;2;21;58;59;48:2::58:21:59"));
     await worker.command("title");

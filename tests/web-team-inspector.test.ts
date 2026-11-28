@@ -265,4 +265,32 @@ describe("web team inspector repair trace", { skip: skipBrowser }, () => {
       await page.close();
     }
   });
+
+  test("periodic revalidation syncs withdrawn entry state in both list and selected detail without full reload", async () => {
+    const page = await browser.newPage({ viewport: { width: 1360, height: 900 } });
+    try {
+      await page.clock.install();
+      await page.route(`${ORIGIN}*`, route => route.fulfill({ contentType: "text/html", body: '<div id="root"></div>' }));
+      await page.goto(`${ORIGIN}#/teams/${TEAM_ID}/entries/${ENTRY_IDS.checkPass}`);
+      await page.addStyleTag({ content: `html,body{margin:0;height:100%}${styles}` });
+      await page.addScriptTag({ content: script });
+      await page.waitForSelector(".ti-entry-detail");
+      await page.getByRole("button", { name: "Withdraw entry" }).waitFor();
+
+      await page.evaluate(entryId => {
+        (window as unknown as { inspector: { withdrawn: Set<string> } }).inspector.withdrawn.add(entryId);
+      }, ENTRY_IDS.checkPass);
+
+      for (let tick = 0; tick < 10; tick += 1) {
+        await page.clock.runFor(2050);
+      }
+
+      await page.waitForSelector(".ti-entry-row.is-withdrawn");
+      const detailText = await page.locator(".ti-entry-detail").textContent();
+      assert.match(detailText ?? "", /withdrawn/);
+      assert.equal(await page.getByRole("button", { name: "Withdraw entry" }).count(), 0);
+    } finally {
+      await page.close();
+    }
+  });
 });

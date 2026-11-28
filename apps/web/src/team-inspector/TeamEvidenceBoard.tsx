@@ -211,6 +211,8 @@ export function TeamEvidenceBoard({
   const [withdrawError, setWithdrawError] = useState("");
   const listRef = useRef<HTMLDivElement>(null);
   const cursorRef = useRef(0);
+  const revalidateCursorRef = useRef(0);
+  const feedTickRef = useRef(0);
   const moreRef = useRef(false);
   const followRef = useRef(follow);
   const feedEpochRef = useRef(0);
@@ -222,6 +224,8 @@ export function TeamEvidenceBoard({
   useEffect(() => {
     feedEpochRef.current += 1;
     cursorRef.current = 0;
+    revalidateCursorRef.current = 0;
+    feedTickRef.current = 0;
     moreRef.current = false;
     ownSelectionRef.current = null;
     setEntries([]);
@@ -262,6 +266,33 @@ export function TeamEvidenceBoard({
       setEntries(previous => accumulated.reduce((acc, nextPage) => mergeEntryPage(acc, nextPage), previous));
       setMore(hasMore);
       setListError("");
+      feedTickRef.current += 1;
+      if (startSince > 0 && feedTickRef.current % 10 === 0) {
+        if (revalidateCursorRef.current < cursorRef.current) {
+          const sweepSince = revalidateCursorRef.current;
+          const sweepPath = `/teams/${teamId}/entries?limit=50${sweepSince > 0 ? `&since=${sweepSince}` : ""}`;
+          const swept = await api<TeamEntryPage>(sweepPath);
+          if (!isCurrent()) return;
+          revalidateCursorRef.current = swept.cursor > sweepSince && swept.more && swept.cursor < cursorRef.current
+            ? swept.cursor
+            : 0;
+          setEntries(previous => mergeEntryPage(previous, swept));
+          const byId = new Map(swept.entries.map(entry => [entry.entryId, entry]));
+          setDetail(previous => {
+            if (!previous) return previous;
+            const updated = byId.get(previous.head.entryId);
+            if (!updated) return previous;
+            if (
+              updated.state === previous.head.state &&
+              updated.supersedes === previous.head.supersedes &&
+              updated.summary === previous.head.summary
+            ) return previous;
+            return { ...previous, head: updated };
+          });
+        } else {
+          revalidateCursorRef.current = 0;
+        }
+      }
     } catch (error) {
       if (isCurrent()) setListError((error as Error).message);
       throw error;

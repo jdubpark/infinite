@@ -59,6 +59,7 @@ function allowedPath(method: RemoteMethod, path: string): boolean {
   if (method === "GET" && raw.length === 4 && raw[1] === "permissions" && raw[2] === "decisions" && DECISION_ID.test(decoded[3])) return true;
   if (method === "POST" && rawPathname === "/api/permissions/marks") return true;
   if (method === "GET" && rawPathname === "/api/halt") return true;
+  if (method === "GET" && rawPathname === "/api/fuse") return true;
   if (method === "GET" && ["/api/usage", "/api/usage/daily", "/api/usage/models", "/api/usage/projects", "/api/usage/repair-loops", "/api/usage/interrupted-tasks"].includes(rawPathname)) return true;
   if (method === "GET" && raw.length === 4 && raw[1] === "usage" && raw[2] === "projects" && PROJECT_ID.test(decoded[3])) return true;
   if (method === "POST" && rawPathname === "/api/usage/balances/refresh") return true;

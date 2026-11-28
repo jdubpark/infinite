@@ -40,6 +40,7 @@ import type { OutcomeRollup } from "./outcome-rollup.js";
 import { LEGACY_BATCH_MAX, parseLegacyFile, type LegacyLineOutcome } from "./outcome-legacy.js";
 import type { LegacyImportResult } from "./outcome-import.js";
 import { handleUsageInterruptedCommand, handleUsageRepairsCommand } from "./repair-metrics-cli.js";
+import { formatFuseLines } from "./fuse/format.js";
 
 type Me = { role: string; capabilities?: { workspaceMirror?: number; mirrorForget?: number }; machine?: { label?: string }; nativeUi?: string[]; execution?: { laptop: boolean; cloudHandoff: boolean }; terminal?: { stream: boolean; raw: boolean; duplex?: boolean; snapshot?: boolean; control?: boolean }; projects: { id: string; name: string }[] };
 const providers = new Set(["claude", "codex", "grok", "opencode"]);
@@ -711,17 +712,7 @@ export function evidenceStatusLines(status: import("./evidence/types.js").Eviden
 }
 
 export function fuseLines(view: import("./fuse/service.js").FuseView): string[] {
-  const line = (name: string, scope: import("./fuse/service.js").FuseScopeView) => {
-    if (scope.state === "closed") return `${name}: closed, ${Number(scope.hour.launches)} of ${Number(scope.hour.limit)} launches in the last hour`;
-    const cause = scope.trip?.cause === "unmeasurable" ? "launch record unreadable, it closes once it can be read"
-      : scope.trip?.ownerClose ? "launch rate, the owner must close it" : "launch rate, it closes on its own";
-    return `${name}: open (${clean(cause)})`;
-  };
-  return [
-    line("Host", view.host),
-    ...view.projects.map(project => line(`Project ${clean(String(project.projectId))}`, project)),
-    ...(view.writeFailedAt ? [`The host could not record a launch at ${clean(String(view.writeFailedAt))}. New team launches wait until it can.`] : []),
-  ];
+  return formatFuseLines(view, clean);
 }
 
 export type FuseCommand = { action: "view" } | { action: "close"; scope: { scope: "host" } | { scope: "project"; projectId: string } };

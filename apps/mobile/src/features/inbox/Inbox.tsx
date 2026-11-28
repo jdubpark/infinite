@@ -19,6 +19,7 @@ import { GlassButton, GroupHeader, LiveStatus, Segmented, Sheet, SheetRow } from
 import { Glyph, StatusIcon } from "../../components/Icon";
 import { FloatingNotice } from "../../components/FloatingNotice";
 import { HaltBanner } from "../halt/HaltBanner";
+import { FuseBanner } from "../halt/FuseBanner";
 import { age, SESSION_KIND, SESSION_LABELS, type StatusKind } from "../../status";
 import { theme } from "../../theme";
 import { goalGroup, pendingApprovals, ROLE_NAMES, teamGroup, type ProductGoal, type TeamListItem } from "../teams/model";
@@ -126,7 +127,8 @@ export function Inbox({
       <ScrollView contentContainerStyle={s.list} keyboardShouldPersistTaps="handled"
         refreshControl={<RefreshControl refreshing={refreshing || runs.refreshing} onRefresh={refreshAll} tintColor={theme.colors.forest} colors={[theme.colors.forest]} />}>
         <Text style={s.title} accessibilityRole="header">{shown === "teams" ? "Teams" : shown === "goals" ? "Goals" : "Sessions"}</Text>
-        <HaltBanner connection={connection} place="screen" names={id => data?.me.projects?.find(project => project.id === id)?.name} style={s.halt} />
+        <HaltBanner connection={connection} place="screen" role={data?.me.role} online={online} names={id => data?.me.projects?.find(project => project.id === id)?.name} style={s.halt} />
+        <FuseBanner connection={connection} role={data?.me.role} online={online} names={id => data?.me.projects?.find(project => project.id === id)?.name} style={s.halt} />
         {shown === "teams" && data ? <TeamList connection={connection} me={data.me} teams={teams} sessions={all} now={now} />
           : shown === "goals" && data ? <GoalList connection={connection} me={data.me} goals={goals} now={now} /> : <>
             {all.length > 4 || query ? <View style={s.search}>

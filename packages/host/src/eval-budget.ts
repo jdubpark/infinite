@@ -8,7 +8,7 @@ import {
   type TrialBudgetConstraint,
 } from "./eval-config.js";
 import type { EvalProviderBudgetStatus } from "./eval-types.js";
-import type { FuseCheck, FuseGate } from "./fuse/types.js";
+import type { FuseCause, FuseCheck, FuseGate } from "./fuse/types.js";
 import type { Provider } from "./types.js";
 import { periodEnd, periodStart, type ProviderSpendSnapshot, type ProviderSpendUnmeasurableReason } from "./usage.js";
 
@@ -40,7 +40,7 @@ export type ProviderBudgetVerdict =
 export type FuseVerdict =
   | { state: "clear" }
   | { state: "halted" }
-  | { state: "open"; cause: "launch-rate" | "unmeasurable" | "unavailable" };
+  | { state: "open"; cause: FuseCause | "unavailable" };
 
 function roundMicroUsd(usd: number): number {
   return Math.round(usd * MICRO_USD) / MICRO_USD;

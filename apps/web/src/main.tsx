@@ -46,7 +46,8 @@ import { CostPage, CostPicker } from "./cost";
 import { PermissionDetail, PermissionOverview, PermissionPicker, clearPermissionRequests, decisionLogAvailable } from "./permissions";
 import { SwarmView } from "./swarm/SwarmView";
 import { haltNotice, type HaltPlace, type HaltView } from "./halt";
-import { HaltBanner } from "./halt-banner";
+import { HaltBanner, type HaltReleaseScope } from "./halt-banner";
+import { FuseBanner, isRemoteDenied, useFuse, type FuseCloseScope } from "./fuse-banner";
 import { useDecisionQueueFeed } from "./decision-queue-feed";
 import { clearDecisionQueueRequests, DecisionQueueView } from "./decision-queue";
 import "./style.css";
@@ -83,6 +84,10 @@ function App() {
   const [attempt, setAttempt] = useState(0);
   const [busy, setBusy] = useState(false);
   const [swarmFocus, setSwarmFocus] = useState(false);
+  const [haltBusy, setHaltBusy] = useState(false);
+  const [haltError, setHaltError] = useState("");
+  const [fuseBusy, setFuseBusy] = useState(false);
+  const [fuseError, setFuseError] = useState("");
   useEffect(() => {
     let current = true;
     setBootstrapError(false);
@@ -113,7 +118,43 @@ function App() {
     const view = await api<HaltView>("/halt");
     if (current()) setHalt(view);
   }, 1800, me);
+  const fuseFeed = useFuse(api, me ? `${machines.active.id}:${me.role}` : null);
   const decisionFeed = useDecisionQueueFeed(api, me ? `${machines.active.id}:${me.role}` : null, route.decisions ? 1800 : 10000);
+  const identityKey = me ? `${machines.active.id}:${me.role}` : "";
+  const haltOpen = Boolean(halt && (!halt.readable || halt.host || halt.projects.length > 0));
+  const fuseOpen = Boolean(fuseFeed.view && (fuseFeed.view.host.state === "open" || fuseFeed.view.projects.some(project => project.state === "open") || fuseFeed.view.writeFailedAt));
+  useEffect(() => {
+    setHaltError("");
+  }, [identityKey, haltOpen]);
+  useEffect(() => {
+    setFuseError("");
+  }, [identityKey, fuseOpen]);
+  async function releaseHalt(scope: HaltReleaseScope) {
+    setHaltBusy(true);
+    setHaltError("");
+    try {
+      await api("/halt/release", { requestId: crypto.randomUUID(), ...scope });
+      await haltFeed.refresh();
+    } catch (error) {
+      if (isRemoteDenied(error)) setHaltError("Releasing a halt is unavailable over remote access. Run it on the host or CLI (infinite halt off).");
+      else setHaltError((error as Error).message || "Could not release halt.");
+    } finally {
+      setHaltBusy(false);
+    }
+  }
+  async function closeFuse(scope: FuseCloseScope) {
+    setFuseBusy(true);
+    setFuseError("");
+    try {
+      await api("/fuse/close", scope);
+      await fuseFeed.refresh();
+    } catch (error) {
+      if (isRemoteDenied(error)) setFuseError("Closing the spend fuse is unavailable over remote access. Run it on the host or CLI (infinite fuse close).");
+      else setFuseError((error as Error).message || "Could not close spend fuse.");
+    } finally {
+      setFuseBusy(false);
+    }
+  }
   const connected = host.fresh;
   const lastSeen = host.seen;
   const decisionCount = decisionFeed.failed || decisionFeed.stale ? 0 : decisionFeed.queue?.decisions.length ?? 0;
@@ -301,7 +342,7 @@ function App() {
             </strong>
           </div>
           <div className="refresh-status">
-          <button className="text-button" onClick={() => { host.refresh(); haltFeed.refresh(); decisionFeed.refresh(); if (me.teams) teamFeed.refresh(); if (me.goals) goalFeed.refresh(); }} disabled={host.refreshing} aria-busy={host.refreshing}>
+          <button className="text-button" onClick={() => { host.refresh(); haltFeed.refresh(); fuseFeed.refresh(); decisionFeed.refresh(); if (me.teams) teamFeed.refresh(); if (me.goals) goalFeed.refresh(); }} disabled={host.refreshing} aria-busy={host.refreshing}>
             <RefreshCw className={host.refreshing ? "is-refreshing" : ""} size={14} /> Refresh
           </button>
           <span className={`connection ${connected ? "" : "offline"}`}>
@@ -315,7 +356,8 @@ function App() {
             {host.seen ? "This device is offline or the host is unreachable. Showing the last received state. Work may still be running; controls are disabled until a fresh connection arrives." : "Can’t reach the host. Sessions haven’t loaded; controls are disabled until a fresh connection arrives."}
           </div>
         )}
-        {!route.missionId && <HaltBanner className="halt-main" notice={haltNotice(halt, haltPlace)} name={projectName} owner={me.role === "owner"} />}
+        {!route.missionId && <HaltBanner className="halt-main" notice={haltNotice(halt, haltPlace)} name={projectName} owner={me.role === "owner"} online={connected} onRelease={releaseHalt} busy={haltBusy} error={haltError} />}
+        <FuseBanner className="halt-main" view={fuseFeed.view} projectId={screenProject} name={projectName} owner={me.role === "owner"} online={connected} remoteDenied={fuseFeed.remoteDenied} onClose={closeFuse} busy={fuseBusy} error={fuseError} />
         {route.missionId ? <MissionPage key={route.missionId} id={route.missionId} me={me} connected={connected} openTeam={route.navigateTeam} halt={halt} /> : route.decisions ? <DecisionQueueView key={machines.active.id} queue={decisionFeed.queue} readAt={decisionFeed.readAt} current={decisionFeed.current} stale={decisionFeed.stale} failed={decisionFeed.failed} failureSince={decisionFeed.failureSince} unavailable={decisionFeed.unavailable} role={me.role} promptAnswers={me.capabilities?.answer !== false} projects={me.projects} refresh={decisionFeed.refresh} confirmAnswered={decisionFeed.confirmAnswered} navigateSession={route.navigate} answer={async (decision, request) => { await postDecisionAnswer(api, decision.answerPath, request); }} /> : route.swarm ? swarm : permissionsShown ? (route.decisionId ? <PermissionDetail key={route.decisionId} id={route.decisionId} me={me} openSession={route.navigate} onSelect={route.navigatePermissions} /> : <PermissionOverview onSelect={route.navigatePermissions} />) : route.cost ? <CostPage me={me} view={route.costView} projectId={route.costProjectId} navigate={route.navigateCost} /> : route.creatingGoal ? <GoalCreate me={me} connected={connected} done={id => { goalFeed.refresh(); route.navigateGoal(id); }} /> : route.goalId ? <GoalDetail key={route.goalId} id={route.goalId} me={me} connected={connected} teams={teams} teamsStale={teamFeed.stale} refreshGoals={goalFeed.refresh} openTeam={route.navigateTeam} /> : route.goals ? <GoalList goals={goals} me={me} fresh={goalFeed.fresh} stale={goalFeed.stale} loading={Boolean(me.goals) && !goalFeed.seen && !goalFeed.failed} failed={goalFeed.failed} seen={goalFeed.seen} onCreate={route.createGoal} onSelect={route.navigateGoal} /> : route.creatingTeam ? <TeamCreate me={me} connected={connected} done={id => { teamFeed.refresh(); route.navigateTeam(id); }} /> : route.teamId ? <TeamDetail key={route.teamId} id={route.teamId} me={me} connected={connected} sessions={sessions} refreshTeams={teamFeed.refresh} openSession={route.navigate} /> : route.teams ? <TeamList teams={teams} me={me} fresh={teamFeed.fresh} stale={teamFeed.stale} loading={Boolean(me.teams) && !teamFeed.seen && !teamFeed.failed} failed={teamFeed.failed} seen={teamFeed.seen} onCreate={route.createTeam} onSelect={route.navigateTeam} refresh={teamFeed.refresh} openCost={() => route.navigateCost()} /> : creating ? (
           <Create
             me={me}

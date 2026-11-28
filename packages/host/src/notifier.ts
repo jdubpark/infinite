@@ -215,8 +215,14 @@ export class Notifier {
     try { return this.fuse.interrupts(); } catch { return []; }
   }
   private fuseMessage(item: FuseInterrupt, to: string) {
-    const cause = item.cause === "unmeasurable" ? "its launch record cannot be read"
-      : item.cause === "write-failed" ? "it cannot record a launch" : "it reached its launch limit for the last hour";
+    const period = item.window === "day" ? "daily" : item.window === "week" ? "weekly" : "hourly";
+    const cause = item.cause === "unmeasurable"
+      ? item.window === "day" || item.window === "week" ? `its ${period} spend cannot be measured` : "its launch record cannot be read"
+      : item.cause === "write-failed" ? "it cannot record a launch"
+      : item.cause === "tokens" ? `it reached its ${period} token limit`
+      : item.cause === "list-usd" ? `it reached its ${period} list-price spend limit`
+      : item.cause === "spent-usd" ? `it reached its ${period} metered spend limit`
+      : "it reached its launch limit for the last hour";
     const closing = item.cause === "unmeasurable" ? "It closes once the record can be read."
       : item.cause === "write-failed" ? "Launches resume once the host can write its state again."
       : item.ownerClose ? "It stays open until you close it." : "It closes on its own as launches leave the last hour.";

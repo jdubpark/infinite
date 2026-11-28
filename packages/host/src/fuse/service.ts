@@ -5,7 +5,8 @@ import type { EvidenceStore } from "../evidence/store.js";
 import type { EvidenceModule, EvidenceTx } from "../evidence/types.js";
 import type { Config } from "../types.js";
 import { BASELINE_FILE, type FuseBaseline, mergeBaselines, pruneBaseline, readBaseline, writeBaseline } from "./baseline.js";
-import { DEFAULT_LAUNCHES_PER_HOUR, EXEMPT_ROLES, HOUR_MS, fuseCheck, projectLimit, rollingCount, scopeState, utcDay } from "./rules.js";
+import { DEFAULT_LAUNCHES_PER_HOUR, EXEMPT_ROLES, HOUR_MS, projectLimit, rollingCount, scopeState, utcDay } from "./rules.js";
+import { checkSpendScope, evaluateSpendScope, hasSpendCeilings, spendLimitsOf } from "./spend.js";
 import type {
   FuseAdmission,
   FuseCause,
@@ -14,7 +15,11 @@ import type {
   FuseLaunch,
   FuseLaunchRecord,
   FuseLimits,
+  FuseOpen,
+  FusePeriodReading,
   FuseScope,
+  FuseSpendLimits,
+  FuseSpendReader,
   FuseTripRecord,
   FuseWindow,
   LaunchRole,
@@ -25,6 +30,7 @@ export type FuseServiceOptions = {
   key: Buffer;
   store: EvidenceStore;
   sessionExists(sessionId: string): boolean;
+  spend?: FuseSpendReader;
   now?: () => number;
 };
 
@@ -32,6 +38,8 @@ export type FuseScopeView = {
   state: "open" | "closed";
   trip?: { tripId?: string; cause: FuseCause; window?: FuseWindow; openedAt?: string; ownerClose: boolean };
   hour: { launches: number; limit: number };
+  day?: FusePeriodReading;
+  week?: FusePeriodReading;
 };
 
 export type FuseView = {
@@ -47,11 +55,22 @@ export type FuseInterrupt = {
   projectId?: string;
   label: string;
   cause: FuseCause | "write-failed";
+  window?: FuseWindow;
   ownerClose: boolean;
   openedAt: string;
 };
 
 const WRITE_FAILED_ID = "write-failed";
+const SPEND_UNMEASURABLE_PREFIX = "spend-unmeasurable:";
+const CLOSABLE_CAUSES = new Set<FuseCause>(["launch-rate", "tokens", "list-usd", "spent-usd"]);
+
+function spendScopeKey(scope: FuseScope, projectId?: string): string {
+  return scope === "host" ? "host" : `project:${projectId!}`;
+}
+
+function spendUnmeasurableTripId(scope: FuseScope, projectId?: string): string {
+  return `${SPEND_UNMEASURABLE_PREFIX}${spendScopeKey(scope, projectId)}`;
+}
 
 const MODULE = "fuse";
 const TICK_MS = 60_000;
@@ -138,7 +157,9 @@ export class FuseService implements FuseGate {
   private readonly now: () => number;
   private readonly file: string;
   private readonly limits: FuseLimits;
+  private readonly spendLimits: ReturnType<typeof spendLimitsOf>;
   private readonly config: Config;
+  private readonly spend?: FuseSpendReader;
   private readonly sessionExistsOf: (sessionId: string) => boolean;
   private launches = new Map<string, FuseLaunchRecord>();
   private trips = new Map<string, FuseTripRecord>();
@@ -148,6 +169,8 @@ export class FuseService implements FuseGate {
   private timer: ReturnType<typeof setInterval> | undefined;
   private writeFailedAt: number | undefined;
   private writeFailureAnnouncedDay: string | undefined;
+  private spendUnmeasurable = new Map<string, { scope: FuseScope; projectId?: string; window: "day" | "week"; openedAt: number }>();
+  private spendUnmeasurableAnnouncedDay = new Map<string, string>();
   private readonly admissions = new Map<string, { prior?: FuseLaunchRecord; opened: string[] }>();
 
   constructor(options: FuseServiceOptions) {
@@ -157,7 +180,9 @@ export class FuseService implements FuseGate {
     this.now = options.now ?? Date.now;
     this.file = join(config.stateDir, BASELINE_FILE);
     this.limits = limitsOf(config.autonomy?.fuse);
+    this.spendLimits = spendLimitsOf(config.autonomy?.fuse);
     this.config = options.config;
+    this.spend = options.spend;
     this.sessionExistsOf = (sessionId) => {
       try {
         return options.sessionExists(sessionId);
@@ -171,7 +196,7 @@ export class FuseService implements FuseGate {
 
   check(input: { projectId: string; role?: LaunchRole }): FuseCheck {
     if (input.role !== undefined && EXEMPT_ROLES.has(input.role)) return { state: "closed", exempt: true };
-    return fuseCheck([...this.launches.values()], [...this.trips.values()], input.projectId, this.limits, this.now());
+    return this.checkAll([...this.launches.values()], [...this.trips.values()], input.projectId, this.now());
   }
 
   admit(launch: FuseLaunch): FuseAdmission {
@@ -183,17 +208,17 @@ export class FuseService implements FuseGate {
     const now = this.now();
     const launches = [...this.launches.values()];
     const trips = [...this.trips.values()];
-    const check = fuseCheck(launches, trips, projectId, this.limits, now);
+    const check = this.checkAll(launches, trips, projectId, now);
     if (check.state === "open") {
-      if (!this.authoritative || check.tripId !== undefined) return { ok: false, launchId, open: check };
+      if (!this.authoritative || check.tripId !== undefined || check.cause === "unmeasurable") return { ok: false, launchId, open: check };
       const seq = this.seq + 1;
       const tripBase = {
         tripId: randomUUID(),
-        cause: "launch-rate" as const,
-        window: "hour" as const,
+        cause: check.cause,
+        window: check.window ?? ("hour" as const),
         openedAt: now,
         ownerClose: check.ownerClose,
-        launches: rollingCount(launches, trips, check.scope, check.projectId, now),
+        ...(check.cause === "launch-rate" ? { launches: rollingCount(launches, trips, check.scope, check.projectId, now) } : {}),
         seq,
       };
       const trip: FuseTripRecord = check.scope === "host"
@@ -267,13 +292,14 @@ export class FuseService implements FuseGate {
     const now = this.now();
     const seq = this.seq + 1;
     const closing: FuseTripRecord[] = [...this.trips.values()]
-      .filter(trip => trip.closedAt === undefined && trip.cause === "launch-rate" && trip.scope === scope && (scope === "host" || trip.projectId === projectId))
+      .filter(trip => trip.closedAt === undefined && CLOSABLE_CAUSES.has(trip.cause) && trip.scope === scope && (scope === "host" || trip.projectId === projectId))
       .map((trip): FuseTripRecord => ({ ...trip, closedAt: now, closedBy: "owner", seq }));
-    if (closing.length === 0) {
-      const launches = [...this.launches.values()], trips = [...this.trips.values()];
-      const limit = input.scope === "host" ? this.limits.host : projectLimit(this.limits, input.projectId);
-      const state = scopeState(launches, trips, scope, projectId, limit, now);
-      if (state.state !== "open" || state.cause !== "launch-rate") return "not-open";
+    const closingMap = new Map(closing.map(trip => [trip.tripId, trip]));
+    const workingTrips = [...this.trips.values()].map(trip => closingMap.get(trip.tripId) ?? trip);
+    const launches = [...this.launches.values()];
+    const limit = input.scope === "host" ? this.limits.host : projectLimit(this.limits, input.projectId);
+    const rateState = scopeState(launches, workingTrips, scope, projectId, limit, now);
+    if (rateState.state === "open" && rateState.cause === "launch-rate") {
       const closedBase = {
         tripId: randomUUID(),
         cause: "launch-rate" as const,
@@ -281,14 +307,39 @@ export class FuseService implements FuseGate {
         openedAt: now,
         closedAt: now,
         closedBy: "owner" as const,
-        ownerClose: state.ownerClose,
-        launches: rollingCount(launches, trips, scope, projectId, now),
+        ownerClose: rateState.ownerClose,
+        launches: rollingCount(launches, workingTrips, scope, projectId, now),
         seq,
       };
-      closing.push(input.scope === "host"
+      const record: FuseTripRecord = input.scope === "host"
         ? { ...closedBase, scope: "host" }
-        : { ...closedBase, scope: "project", projectId: input.projectId });
+        : { ...closedBase, scope: "project", projectId: input.projectId };
+      closing.push(record);
+      workingTrips.push(record);
     }
+    const spendLimits = this.scopeSpendLimits(scope, projectId);
+    if (hasSpendCeilings(spendLimits)) {
+      for (let pass = 0; pass < 2; pass++) {
+        const spendState = checkSpendScope(workingTrips, scope, projectId, spendLimits, this.spend, now);
+        if (spendState.state !== "open" || spendState.cause === "unmeasurable") break;
+        const closedBase = {
+          tripId: randomUUID(),
+          cause: spendState.cause,
+          window: spendState.window ?? ("day" as const),
+          openedAt: now,
+          closedAt: now,
+          closedBy: "owner" as const,
+          ownerClose: true,
+          seq,
+        };
+        const record: FuseTripRecord = input.scope === "host"
+          ? { ...closedBase, scope: "host" }
+          : { ...closedBase, scope: "project", projectId: input.projectId };
+        closing.push(record);
+        workingTrips.push(record);
+      }
+    }
+    if (closing.length === 0) return "not-open";
     const moved = [...this.launches.values()]
       .filter(launch => launch.admittedAt > now && (scope === "host" || launch.projectId === projectId))
       .map((launch): FuseLaunchRecord => ({ ...launch, admittedAt: now, seq }));
@@ -310,6 +361,10 @@ export class FuseService implements FuseGate {
     };
   }
 
+  private scopeLabel(scope: FuseScope, projectId?: string): string {
+    return scope === "host" ? "the host" : plainLabel(this.config.projects.find(project => project.id === projectId)?.name ?? projectId ?? "");
+  }
+
   interrupts(): FuseInterrupt[] {
     const now = this.now();
     const today = utcDay(now);
@@ -322,21 +377,48 @@ export class FuseService implements FuseGate {
         tripId: trip.tripId,
         scope: trip.scope,
         ...(trip.scope === "project" ? { projectId: trip.projectId } : {}),
-        label: trip.scope === "host" ? "the host" : plainLabel(this.config.projects.find(project => project.id === trip.projectId)?.name ?? trip.projectId),
+        label: this.scopeLabel(trip.scope, trip.projectId),
         cause: trip.cause,
+        ...(trip.window === undefined ? {} : { window: trip.window }),
         ownerClose: trip.ownerClose,
         openedAt: new Date(trip.openedAt).toISOString(),
       }));
     if (this.writeFailedAt !== undefined && this.writeFailureAnnouncedDay !== today) {
       due.push({ tripId: WRITE_FAILED_ID, scope: "host", label: "the host", cause: "write-failed", ownerClose: false, openedAt: new Date(this.writeFailedAt).toISOString() });
     }
+    if (this.writeFailedAt === undefined) {
+      for (const [key, entry] of this.spendUnmeasurable) {
+        if (this.spendUnmeasurableAnnouncedDay.get(key) === today) continue;
+        const hasOpen = trips.some(
+          trip => trip.closedAt === undefined && trip.scope === entry.scope && (entry.scope === "host" || trip.projectId === entry.projectId),
+        );
+        if (hasOpen) continue;
+        due.push({
+          tripId: spendUnmeasurableTripId(entry.scope, entry.projectId),
+          scope: entry.scope,
+          ...(entry.projectId === undefined ? {} : { projectId: entry.projectId }),
+          label: this.scopeLabel(entry.scope, entry.projectId),
+          cause: "unmeasurable",
+          window: entry.window,
+          ownerClose: false,
+          openedAt: new Date(entry.openedAt).toISOString(),
+        });
+      }
+    }
     return due;
   }
 
   markAnnounced(tripIds: readonly string[]): void {
     const now = this.now();
+    const today = utcDay(now);
     const ids = new Set(tripIds);
-    if (ids.delete(WRITE_FAILED_ID)) this.writeFailureAnnouncedDay = utcDay(now);
+    if (ids.delete(WRITE_FAILED_ID)) this.writeFailureAnnouncedDay = today;
+    for (const id of [...ids]) {
+      if (id.startsWith(SPEND_UNMEASURABLE_PREFIX)) {
+        this.spendUnmeasurableAnnouncedDay.set(id.slice(SPEND_UNMEASURABLE_PREFIX.length), today);
+        ids.delete(id);
+      }
+    }
     const targets = [...this.trips.values()].filter(trip => ids.has(trip.tripId) && trip.announcedAt === undefined);
     if (targets.length === 0) return;
     if (!this.authoritative) {
@@ -351,12 +433,14 @@ export class FuseService implements FuseGate {
   tick(): boolean {
     if (!this.authoritative) this.load();
     else if (this.writeFailedAt !== undefined) this.persist(this.seq + 1, [], []);
+    if (this.authoritative) this.evaluateSpend();
     this.prune();
     return this.authoritative;
   }
 
   start(): void {
     if (this.timer !== undefined) return;
+    this.tick();
     this.timer = setInterval(() => this.tick(), TICK_MS);
     this.timer.unref();
   }
@@ -583,10 +667,112 @@ export class FuseService implements FuseGate {
     });
   }
 
+  private scopeSpendLimits(scope: FuseScope, projectId: string | undefined): FuseSpendLimits {
+    return scope === "host" ? this.spendLimits.host : this.spendLimits.project(projectId!);
+  }
+
+  private checkScopeState(
+    launches: readonly FuseLaunchRecord[],
+    trips: readonly FuseTripRecord[],
+    scope: FuseScope,
+    projectId: string | undefined,
+    limit: number,
+    now: number,
+  ): FuseOpen | { state: "closed" } {
+    const rateState = scopeState(launches, trips, scope, projectId, limit, now);
+    if (rateState.state === "open") return rateState;
+    const spendLimits = this.scopeSpendLimits(scope, projectId);
+    if (!hasSpendCeilings(spendLimits)) return rateState;
+    return checkSpendScope(trips, scope, projectId, spendLimits, this.spend, now);
+  }
+
+  private checkAll(
+    launches: readonly FuseLaunchRecord[],
+    trips: readonly FuseTripRecord[],
+    projectId: string,
+    now: number,
+  ): FuseOpen | { state: "closed" } {
+    const host = this.checkScopeState(launches, trips, "host", undefined, this.limits.host, now);
+    if (host.state === "open") return host;
+    return this.checkScopeState(launches, trips, "project", projectId, projectLimit(this.limits, projectId), now);
+  }
+
+  private evaluateSpend(): void {
+    if (!this.authoritative) return;
+    const now = this.now();
+    const scopes: [FuseScope, string | undefined][] = [
+      ["host", undefined],
+      ...this.config.projects.map((project): [FuseScope, string] => ["project", project.id]),
+    ];
+    const working = [...this.trips.values()];
+    const opened: FuseTripRecord[] = [];
+    const seq = this.seq + 1;
+    for (const [scope, projectId] of scopes) {
+      const limits = this.scopeSpendLimits(scope, projectId);
+      const key = spendScopeKey(scope, projectId);
+      if (!hasSpendCeilings(limits)) {
+        this.spendUnmeasurable.delete(key);
+        continue;
+      }
+      const state = checkSpendScope(working, scope, projectId, limits, this.spend, now);
+      if (state.state === "closed") {
+        this.spendUnmeasurable.delete(key);
+        continue;
+      }
+      const hasOpenScopeTrip = working.some(
+        trip => trip.closedAt === undefined && trip.scope === scope && (scope === "host" || trip.projectId === projectId),
+      );
+      if (state.cause === "unmeasurable") {
+        if (!hasOpenScopeTrip && this.writeFailedAt === undefined) {
+          const prior = this.spendUnmeasurable.get(key);
+          this.spendUnmeasurable.set(key, {
+            scope,
+            ...(projectId === undefined ? {} : { projectId }),
+            window: state.window === "week" ? "week" : "day",
+            openedAt: prior?.openedAt ?? now,
+          });
+        } else {
+          this.spendUnmeasurable.delete(key);
+        }
+        continue;
+      }
+      this.spendUnmeasurable.delete(key);
+      const hasOpenCauseTrip = working.some(
+        trip =>
+          trip.closedAt === undefined &&
+          trip.scope === scope &&
+          (scope === "host" || trip.projectId === projectId) &&
+          trip.cause === state.cause,
+      );
+      if (!hasOpenCauseTrip) {
+        const tripBase = {
+          tripId: randomUUID(),
+          cause: state.cause,
+          window: state.window ?? ("day" as const),
+          openedAt: now,
+          ownerClose: true,
+          seq,
+        };
+        const trip: FuseTripRecord = scope === "host"
+          ? { ...tripBase, scope: "host" }
+          : { ...tripBase, scope: "project", projectId: projectId! };
+        working.push(trip);
+        opened.push(trip);
+      }
+    }
+    if (opened.length > 0) this.persist(seq, [], opened);
+  }
+
   private scopeView(launches: FuseLaunchRecord[], trips: FuseTripRecord[], scope: FuseScope, projectId: string | undefined, limit: number, now: number): FuseScopeView {
     const hour = { launches: rollingCount(launches, trips, scope, projectId, now), limit };
-    const state = scopeState(launches, trips, scope, projectId, limit, now);
-    if (state.state === "closed") return { state: "closed", hour };
+    const rateState = scopeState(launches, trips, scope, projectId, limit, now);
+    const spendLimits = this.scopeSpendLimits(scope, projectId);
+    const spend = hasSpendCeilings(spendLimits)
+      ? evaluateSpendScope(trips, scope, projectId, spendLimits, this.spend, now)
+      : undefined;
+    const state = rateState.state === "open" ? rateState : (spend?.state ?? rateState);
+    const periods = spend?.readings ?? {};
+    if (state.state === "closed") return { state: "closed", hour, ...periods };
     const trip = state.tripId === undefined ? undefined : trips.find(item => item.tripId === state.tripId);
     return {
       state: "open",
@@ -598,6 +784,7 @@ export class FuseService implements FuseGate {
         ownerClose: state.ownerClose,
       },
       hour,
+      ...periods,
     };
   }
 }

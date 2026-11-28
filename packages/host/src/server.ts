@@ -35,7 +35,7 @@ import { inspectHybridSessions } from "./workspace-pool-gc.js";
 import { UsageService } from "./usage-service.js";
 import { EvidenceStore, evidenceDatabasePath } from "./evidence/store.js";
 import { EventOutbox } from "./evidence/outbox.js";
-import { FuseService } from "./fuse/service.js";
+import { FuseService } from "./fuse/service.js"; import { createFuseSpendReader } from "./fuse/usage-reader.js";
 import { MAX_SIGNAL_PAGE, MAX_SIGNAL_TEXT_LENGTH, SignalService } from "./signals/service.js";
 import { HaltService } from "./halt/service.js";
 import type { HaltTarget } from "./halt/rules.js";
@@ -274,7 +274,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
   });
   outbox.registerProjector(outcomeProjector(evidence, { prices: config.usage?.prices }));
   const evalHost: EvalHost = new EvalHost({ config, store: evidence, source: projectSource, hostLoad: manager.hostLoad, halt: () => halt, runs: () => teams.understandingRecords(), teams: () => teams, sessions: manager, cost: sessionId => sessionCostOf(usage.session(sessionId)), usage: () => usage, fuse: () => gate });
-  const fuse = new FuseService({ config, key, store: evidence, sessionExists: id => {
+  const fuse = new FuseService({ config, key, store: evidence, spend: createFuseSpendReader(() => usage), sessionExists: id => {
     try { manager.meta(id); return true; } catch (error) { return (error as NodeJS.ErrnoException).code !== "ENOENT"; }
   } });
   const blackboard = new Blackboard(evidence);

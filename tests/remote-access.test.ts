@@ -359,6 +359,9 @@ test("remote access rejects wrong keys, revoked keys, privileged paths and exces
       await assert.rejects(client.request(path, { method, body: method === "GET" ? undefined : {} }), (error: RemoteError) => error.status === 403 && error.code === "remote-endpoint-denied");
     assert.deepEqual(await client.request("/decision-queue"), { count: 22, method: "GET", path: "/api/decision-queue" });
     await assert.rejects(client.request("/decision-queue", { method: "POST", body: {} }), (error: RemoteError) => error.status === 403 && error.code === "remote-endpoint-denied");
+    assert.deepEqual(await client.request("/fuse"), { count: 23, method: "GET", path: "/api/fuse" });
+    for (const [method, path] of [["POST", "/fuse/close"], ["GET", "/fuse/close"]] as const)
+      await assert.rejects(client.request(path, { method, body: method === "GET" ? undefined : { scope: "host" } }), (error: RemoteError) => error.status === 403 && error.code === "remote-endpoint-denied");
     runner.oversized();
     await assert.rejects(client.request("/me"), (error: RemoteError) => error.status === 413 && error.code === "response-too-large");
     const beforeRevoke = runner.requests.length;

@@ -8,6 +8,7 @@ import {
   type Pricing, type ProviderSpendSnapshot, type UsagePeriod, type UsageRecord, type UsageTokens, type UsageTotals,
 } from "./usage.js";
 import { usagePlanSchema, type AccountView, type Balance, type BriefingUsage, type Money, type TaskUsage, type UsageResolvers } from "./usage-api.js";
+import type { FuseSpendSample } from "./fuse/types.js";
 import { EvidenceError } from "./evidence/types.js";
 import type { EvidenceStore } from "./evidence/store.js";
 import type { EvidenceTx } from "./evidence/types.js";
@@ -766,5 +767,75 @@ export class UsageService {
     return { period: { start: monthStart.toISOString(), end: end.toISOString() }, providers,
       month: { start: monthStart.toISOString(), end: end.toISOString(), spent: this.money(inRange(monthStart, new Date(now.getTime() + 1))), previous: this.money(inRange(previousStart, monthStart)), plansUsd: accounts.filter(account => account.kind === "subscription").reduce((sum, account) => sum + (account.planUsd ?? 0), 0), unmeasuredSessions,
         partialSessions: data.sessions.filter(session => partial(session) && Date.parse(session.lastActiveAt ?? session.createdAt) >= monthStart.getTime() && Date.parse(session.lastActiveAt ?? session.createdAt) < end.getTime()).length }, accounts };
+  }
+
+  spendWindow(input: { scope: "host" | "project"; projectId?: string; sinceMs: number; now: number }): FuseSpendSample {
+    if (!this.available()) return { tokens: 0, listUsd: 0, spentUsd: 0, unmeasuredSessions: 0, available: false };
+    let data: Snapshot;
+    try { data = this.snapshot(); } catch { return { tokens: 0, listUsd: 0, spentUsd: 0, unmeasuredSessions: 0, available: false }; }
+    const { scope, projectId, sinceMs, now } = input;
+    if (sinceMs > now) return { tokens: 0, listUsd: 0, spentUsd: 0, unmeasuredSessions: 0, available: true };
+    const sessions = data.sessions.filter(s => scope === "host" || s.projectId === projectId);
+    const briefings = data.briefings.filter(b => scope === "host" || b.projectId === projectId);
+    let tokens = 0, listUsd = 0, spentUsd = 0;
+    let unmeasuredSessions = 0, unmeasuredListSessions = 0, unmeasuredSpentSessions = 0;
+    const add = (record: UsageRecord): { listUnknown: boolean; spentUnknown: boolean } | undefined => {
+      const at = Date.parse(record.completedAt);
+      if (at < sinceMs || at > now) return undefined;
+      const t = record.tokens;
+      tokens += t.input + t.output + t.reasoning + t.cacheRead + t.cacheWrite;
+      const listed = listPriceUsage(record, this.config.usage?.prices);
+      listUsd += listed.cost;
+      const spent = this.price(record);
+      spentUsd += spent.cost;
+      return {
+        listUnknown: listed.pricing === "unknown",
+        spentUnknown: record.provider === "opencode" && spent.pricing === "unknown",
+      };
+    };
+    const seen = new Set<string>();
+    for (const s of sessions) {
+      seen.add(s.sessionId);
+      const records = data.bySession.get(s.sessionId);
+      if (!sessionOverlaps(s, records, sinceMs, now + 1)) continue;
+      const sessionUnmeasured = !measured(s) || partial(s) || this.ingestionGaps.has(s.sessionId);
+      if (sessionUnmeasured) unmeasuredSessions++;
+      if (!measured(s) || !records) continue;
+      let unpricedList = false, unpricedSpent = false;
+      for (const record of records) {
+        const res = add(record);
+        if (!res) continue;
+        if (res.listUnknown) unpricedList = true;
+        if (res.spentUnknown) unpricedSpent = true;
+      }
+      if (!sessionUnmeasured) {
+        if (unpricedList) unmeasuredListSessions++;
+        if (unpricedSpent) unmeasuredSpentSessions++;
+      }
+    }
+    for (const [sessionId, gap] of this.ingestionGaps) {
+      if ((scope === "host" || gap.projectId === projectId) && !seen.has(sessionId)) unmeasuredSessions++;
+    }
+    for (const briefing of briefings) {
+      const at = Date.parse(briefing.at);
+      if (at < sinceMs || at > now) continue;
+      if (!briefing.record) {
+        unmeasuredSessions++;
+        continue;
+      }
+      const res = add(briefing.record);
+      if (res?.listUnknown) unmeasuredListSessions++;
+      if (res?.spentUnknown) unmeasuredSpentSessions++;
+    }
+    const roundUsd = (value: number) => Math.round(value * 1_000_000) / 1_000_000;
+    return {
+      tokens,
+      listUsd: roundUsd(listUsd),
+      spentUsd: roundUsd(spentUsd),
+      unmeasuredSessions,
+      ...(unmeasuredListSessions > 0 ? { unmeasuredListSessions } : {}),
+      ...(unmeasuredSpentSessions > 0 ? { unmeasuredSpentSessions } : {}),
+      available: true,
+    };
   }
 }

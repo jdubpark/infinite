@@ -26,16 +26,7 @@ import { HALT_PAUSED_TEAM, KEPT_PAUSED, LEFT_AS_IS, LEFT_PAUSED, STILL_HALTED, i
 import { missionDecisionQueueCandidates } from "./decision-queue.js";
 import { projectMissionSource } from "./mission-progress.js";
 import { MissionReview, type MissionReviewRecord, type ReviewDirection, type ReviewForwardOp } from "./mission-review.js";
-import {
-  CoordinatorContextReadTracker,
-  readSessionPromptContext, sameRealPath,
-  reconcileDeliveredUnapplied,
-  returnConsumedMessages,
-  selectCoordinatorContinuation,
-  settleCoordinatorReport,
-  settleUnappliedConsumed,
-  type DeliveredUnappliedBatch,
-} from "./mission-coordinator.js";
+import { CoordinatorContextReadTracker, readSessionPromptContext, sameRealPath, reconcileDeliveredUnapplied, returnConsumedMessages, selectCoordinatorContinuation, settleCoordinatorReport, settleUnappliedConsumed, type DeliveredUnappliedBatch } from "./mission-coordinator.js";
 
 export type ProjectGroupLookup = { get(id: string): ProjectGroup };
 
@@ -1046,7 +1037,11 @@ export class MissionService {
     if (attempt.status === "running") {
       this.readReport(stored, attempt);
       if (attempt.status === "running" && !attempt.stopping && !attempt.missedReport && live.has(mission.status)) {
-        const state = await this.manager.state(attempt.sessionId);
+        let state = await this.manager.state(attempt.sessionId);
+        if (state.status === "unavailable") {
+          const dead = await this.manager.confirmDeadTeamSession?.(attempt.sessionId, this.assignment(stored, attempt), state);
+          if (dead) state = dead;
+        }
         if (attempt.continuation && state.nativeSession?.id === attempt.continuation.nativeSessionId) attempt.nativeConfirmed = true;
         const quiet = state.attention.state !== "needs-you" &&
           Date.now() - Date.parse(state.attention.lastActivityAt ?? attempt.startedAt ?? now()) > (this.config.teams?.stallMinutes ?? 30) * 60000;

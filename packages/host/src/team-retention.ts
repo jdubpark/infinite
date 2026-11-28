@@ -5,7 +5,7 @@ import type { EvidenceStore } from "./evidence/store.js";
 import { runEventKey, runSummaryCounts } from "./run-events.js";
 import { hostGithubGrantEnvironment } from "./github-grants.js";
 import { ensureDefaultTeamRoot, ensureHostDirectory, publishTeamHead, removeMemberWorkspace, removeTeamWorkspace, snapshotMemberWork, TeamError } from "./team-workspace.js";
-import { activeMember, digest, filesystemEntryExists, type TeamKernel, teamRunDirectory } from "./team-kernel.js";
+import { activeMember, assignment, digest, filesystemEntryExists, type TeamKernel, teamRunDirectory } from "./team-kernel.js";
 import type { EntryIngestQueue } from "./team-entry-ingest.js";
 import { intakeEndedByRemoval } from "./review-feedback.js";
 import type { RetentionState, Stored, TeamServiceOptions } from "./teams.js";
@@ -393,8 +393,15 @@ export class TeamRetention {
       if (member.status === "stopped") continue;
       try { this.host.manager.meta(member.sessionId); }
       catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; }
-      try { if ((await this.host.manager.state(member.sessionId)).status !== "exited") return false; }
+      let state;
+      try { state = await this.host.manager.state(member.sessionId); }
       catch { continue; }
+      if (state.status !== "exited") {
+        let dead;
+        try { dead = await this.host.manager.confirmDeadTeamSession?.(member.sessionId, assignment(member), state); }
+        catch { return false; }
+        if (!dead || dead.status !== "exited") return false;
+      }
       if (stored.halt === "cancel" && activeMember(member)) return false;
     }
     return true;

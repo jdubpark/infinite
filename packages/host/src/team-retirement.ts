@@ -1,8 +1,14 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash, randomUUID } from "node:crypto";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import { applyLifecycle } from "@infinite/attention";
+import { removeWorkerSockets, workerCall, type SocketTarget } from "./ipc.js";
 import { TeamError, teamCommand } from "./team-workspace.js";
 import type { TeamCommand } from "./team-types.js";
+import type { WorkerState } from "./types.js";
+import { unseal, writeSealed } from "./vault.js";
 
 const execute = promisify(execFile);
 
@@ -183,4 +189,70 @@ export async function stopRuntimeTree(known: RuntimeProcess[], workerPid: number
 
 export function runtimeIdentity(sessionId: string, assignment: unknown, runtimeId: string | null, worker: RuntimeProcess, pid: number | null, pty?: RuntimeProcess): string {
   return createHash("sha256").update(JSON.stringify({ sessionId, assignment, runtimeId, workerPid: worker.pid, worker: worker.born, pid, pidBorn: pty?.born ?? null })).digest("hex");
+}
+
+export async function confirmDeadTeamRuntime(options: {
+  stateDir: string;
+  key: Buffer;
+  socketTarget: SocketTarget;
+  sessionId: string;
+  state: WorkerState;
+  inventory?: () => Promise<RuntimeProcess[]>;
+  probeAlive?: () => Promise<boolean>;
+}): Promise<WorkerState | undefined> {
+  const { stateDir, key, socketTarget, sessionId, state } = options;
+  if ((state.status !== "unavailable" && state.status !== "recording-error") || state.control) return undefined;
+  const now = new Date().toISOString();
+  const retirementFile = join(stateDir, "sessions", sessionId, "retirement.sealed");
+  if (existsSync(retirementFile)) {
+    try {
+      const record = unseal<{ state?: unknown; sessionId?: unknown }>(key, `${sessionId}:retirement`, readFileSync(retirementFile, "utf8"));
+      if (record.state === "retired" && record.sessionId === sessionId) {
+        return {
+          ...state,
+          status: "exited",
+          control: null,
+          outputTailIncomplete: true,
+          attention: applyLifecycle(state.attention, "exited", now),
+        };
+      }
+    } catch {}
+    return undefined;
+  }
+  const statusFile = join(stateDir, "sessions", sessionId, "status.sealed");
+  let sealed: WorkerState;
+  try { sealed = unseal<WorkerState>(key, `${sessionId}:status`, readFileSync(statusFile, "utf8")); }
+  catch { return undefined; }
+  if (sealed.control || !sealed.workerPid || !Number.isSafeInteger(sealed.workerPid) || sealed.workerPid <= 1) return undefined;
+  if (state.status === "recording-error") {
+    let alive = true;
+    try {
+      alive = options.probeAlive
+        ? await options.probeAlive()
+        : (await workerCall(socketTarget, sessionId, { op: "state" }, 1500), true);
+    } catch { alive = false; }
+    if (alive) return undefined;
+  }
+  let rows: RuntimeProcess[];
+  try { rows = await (options.inventory ?? inventoryRuntimeProcesses)(); }
+  catch { return undefined; }
+  const watched = new Set<number>([sealed.workerPid]);
+  for (const pid of [sealed.pid, state.pid]) {
+    if (typeof pid === "number" && Number.isSafeInteger(pid) && pid > 1) watched.add(pid);
+  }
+  if (descendants(rows, watched).some(live)) return undefined;
+  try { removeWorkerSockets(socketTarget, sessionId, sealed.socketPath); } catch {}
+  if (sealed.status === "exited") return sealed;
+  const exitedState: WorkerState = {
+    ...sealed,
+    status: "exited",
+    control: null,
+    outputTailIncomplete: true,
+    attention: applyLifecycle(sealed.attention ?? state.attention, "exited", now),
+  };
+  if (sealed.status !== "recording-error" && state.status !== "recording-error") {
+    try { writeSealed(statusFile, key, `${sessionId}:status`, exitedState); }
+    catch { return undefined; }
+  }
+  return exitedState;
 }

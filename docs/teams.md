@@ -3362,7 +3362,16 @@ model when a requested selection is unavailable.
 
 Claude launches receive `--model` and `--effort`; Codex receives `--model` and
 `-c model_reasoning_effort=...`; OpenCode launches in headless `run` mode with
-`--model` and optional `--variant`. These are requested settings, not evidence
+`--model` and optional `--variant`.
+On OpenCode 2 the host launches `run --standalone` with the variant inside the
+model string (`provider/model#variant`) and no `--variant`. Version 2 has no
+`--pure`, so the argument is dropped and plugins from the agent account's
+OpenCode configuration load into members; a plugin one member writes reaches
+later members. The host reads the version by running `opencode --version` as
+the agent account (5 s timeout, 4 KiB of output), caches it for 10 s, and reads
+it again when the executable changes. An unreadable version is retried at the
+next launch and uses the OpenCode 1 form meanwhile. Local native OpenCode
+sessions need version 1 and are refused on version 2. These are requested settings, not evidence
 of the backend model that served a turn. Provider account access and
 organization restrictions still apply. A provider failure leaves the assignment
 unresolved. The configuration example does not establish model availability on

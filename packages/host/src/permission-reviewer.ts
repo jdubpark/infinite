@@ -347,11 +347,12 @@ export function createCliTurnLauncher(options: CliTurnLauncherOptions): Permissi
       };
       if (await held()) return { ok: false, failure: "held" };
       if (turn.signal?.aborted) return { ok: false, failure: "aborted" };
+      const major = turn.profile.provider === "opencode" ? (await readOpenCodeVersion(launch)).major : 1;
+      if (major === 2) return { ok: false, failure: "unsupported" };
       const cwd = mkdtempSync(join(options.workRoot ?? tmpdir(), "infinite-permission-turn-"));
       try {
         chmodSync(cwd, 0o755);
         const env = { ...(options.env ?? reviewerEnvironment()) };
-        const major = turn.profile.provider === "opencode" ? (await readOpenCodeVersion(launch)).major : 1;
         if (turn.profile.provider === "opencode" && !(await openCodeToolsOff(launch, major, { ...env, ...OPENCODE_ENV }, cwd))) return { ok: false, failure: "tools-offered" };
         if (await held()) return { ok: false, failure: "held" };
         const startedAt = now().toISOString();

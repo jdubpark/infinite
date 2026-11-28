@@ -8,7 +8,7 @@ import { join, resolve } from "node:path";
 import { teamModelLaunch } from "../packages/host/src/launch.js";
 import { readOpenCodeVersion } from "../packages/host/src/opencode-version.js";
 import { nestedToolsFromRunLine, toolFromRunLine, usageFromRunLine } from "../packages/host/src/opencode-usage.js";
-import { createCliTurnLauncher, openCodeAgentsDenyEverything, openCodeParser, openCodeReviewerConfig, reviewerEnvironment, type PermissionTurn } from "../packages/host/src/permission-reviewer.js";
+import { createCliTurnLauncher, openCodeAgentsDenyEverything, openCodeParser, openCodeReviewerArgs, openCodeReviewerConfig, reviewerEnvironment, type PermissionTurn } from "../packages/host/src/permission-reviewer.js";
 import type { TeamModelProfile } from "../packages/host/src/team-types.js";
 import { startHost } from "./helpers.js";
 
@@ -86,45 +86,28 @@ test("a version 2 member launch drops the version 1 plugin switch in every spell
 
 const strong = (extra: Partial<TeamModelProfile> = {}): TeamModelProfile => ({ id: "strong-deepseek", label: "Strong DeepSeek", provider: "opencode", model: "deepseek/deepseek-pro", ...extra }) as TeamModelProfile;
 
-test("a version 2 reviewer runs standalone with every permission and the execute tool denied, and is refused if the agent offers more", { timeout: 60_000 }, async () => {
+test("an OpenCode 2 reviewer turn is refused before any run or debug process starts", { timeout: 60_000 }, async () => {
   const dir = mkdtempSync(join(tmpdir(), "opencode-reviewer-"));
   const log = join(dir, "launches.jsonl");
   try {
-    const cli = (mode: string) => {
-      const bin = join(dir, mode);
-      mkdirSync(bin, { recursive: true });
-      const command = join(bin, "opencode");
-      writeFileSync(command, `#!/bin/sh\nPERMISSION_FIXTURE_VERSION=2.3.2 PERMISSION_FIXTURE_MODE=${mode} PERMISSION_FIXTURE_LOG='${log}' exec '${process.execPath}' '${FIXTURE}' "$@"\n`, { mode: 0o755 });
-      return { command, args: [] };
-    };
-    const launcher = (mode: string) => createCliTurnLauncher({ agents: { opencode: cli(mode) }, env: reviewerEnvironment({ ...process.env }), workRoot: dir });
-    const turn = (profile: TeamModelProfile): PermissionTurn => ({ purpose: "review", tier: "strong", profile, timeoutMs: 20_000, system: "You review.", schema: {}, prompt: "Decide." });
-    const launches = () => { try { return readFileSync(log, "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line)); } catch { return []; } };
-
-    const outcome = await launcher("decide").run(turn(strong({ variant: "high" })));
-    assert.ok(outcome.ok);
-    const [verify, run] = launches();
-    assert.deepEqual(verify.argv, ["debug", "agents", "--standalone"]);
-    assert.deepEqual(run.argv.slice(0, 9), ["run", "--standalone", "--format", "json", "--agent", "infinite-permission-review", "--model", "deepseek/deepseek-pro#high", "--"]);
-    assert.ok(!run.argv.includes("--pure") && !run.argv.includes("--variant"));
-    const config = JSON.parse(run.openCodeConfig);
-    assert.equal(config.agent, undefined);
-    assert.equal(config.autoupdate, undefined);
-    const agent = config.agents["infinite-permission-review"];
-    assert.equal(agent.system, "You review.");
-    assert.equal(agent.tools, undefined);
-    assert.equal(agent.permission, undefined);
-    assert.ok(agent.permissions.length > 0 && agent.permissions.every((rule: { resource: string; effect: string }) => rule.resource === "*" && rule.effect === "deny"));
-    assert.ok(agent.permissions.some((rule: { action: string }) => rule.action === "execute"));
-    assert.ok(agent.permissions.some((rule: { action: string }) => rule.action === "*"));
-
-    const count = launches().length;
-    const offered = await launcher("tools-on").run(turn(strong()));
-    assert.equal(offered.ok ? "ok" : offered.failure, "tools-offered");
-    assert.deepEqual(launches().slice(count).map(entry => entry.argv[0]), ["debug"], "the run never started");
+    const command = join(dir, "opencode");
+    writeFileSync(command, `#!/bin/sh\nPERMISSION_FIXTURE_VERSION=2.3.2 PERMISSION_FIXTURE_LOG='${log}' exec '${process.execPath}' '${FIXTURE}' "$@"\n`, { mode: 0o755 });
+    const launcher = createCliTurnLauncher({ agents: { opencode: { command, args: [] } }, env: reviewerEnvironment({ ...process.env }), workRoot: dir });
+    const turn: PermissionTurn = { purpose: "review", tier: "strong", profile: strong({ variant: "high" }), timeoutMs: 20_000, system: "You review.", schema: {}, prompt: "Decide." };
+    assert.deepEqual(await launcher.run(turn), { ok: false, failure: "unsupported" });
+    assert.throws(() => readFileSync(log), "the fake opencode was never invoked for run or debug");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("the version 2 reviewer builders deny every permission and the execute tool", () => {
+  const config = JSON.parse(openCodeReviewerConfig("You review.", 2));
+  const agent = config.agents["infinite-permission-review"];
+  assert.equal(agent.system, "You review.");
+  assert.ok(agent.permissions.every((rule: { resource: string; effect: string }) => rule.resource === "*" && rule.effect === "deny"));
+  assert.ok(agent.permissions.some((rule: { action: string }) => rule.action === "execute"));
+  assert.deepEqual(openCodeReviewerArgs({ profile: strong({ variant: "high" }), prompt: "p" }, 2).slice(0, 2), ["run", "--standalone"]);
 });
 
 test("the version 2 reviewer check accepts only an agent whose last matching rule denies every tool and execute", () => {

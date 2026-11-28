@@ -235,12 +235,13 @@ export function connectRemoteAccess(server: Server, config: Config): () => void 
       if (eventStreams.size >= MAX_EVENTS_STREAMS) {
         reply({ type: "response", id: command.id, status: 429, body: { error: "Too many open event streams", code: "busy" } }); return;
       }
-      const address = server.address();
-      if (!address || typeof address === "string") throw new Error("Runner is not listening");
       const controller = new AbortController(), stream = { controller, buffered: 0 };
       eventStreams.set(command.id, stream);
       const query = new URLSearchParams({ topics: command.topics.join(","), after: String(command.after) });
+      let opened = false;
       try {
+        const address = server.address();
+        if (!address || typeof address === "string") throw new Error("Runner is not listening");
         const response = await fetch(`http://127.0.0.1:${address.port}/api/events?${query}`, {
           headers: { Authorization: `Bearer ${command.token}`, Accept: "text/event-stream" }, redirect: "error", signal: controller.signal,
         });
@@ -249,6 +250,7 @@ export function connectRemoteAccess(server: Server, config: Config): () => void 
           eventStreams.delete(command.id);
           reply({ type: "response", id: command.id, status: response.status || 502, body }); return;
         }
+        opened = true;
         reply({ type: "response", id: command.id, status: 200, body: { streamId: command.id } });
         const reader = response.body.getReader(), decoder = new TextDecoder();
         let pendingText = "";
@@ -287,7 +289,11 @@ export function connectRemoteAccess(server: Server, config: Config): () => void 
         }
         stopEvents(command.id, 1000);
       } catch {
-        if (eventStreams.has(command.id)) stopEvents(command.id, 1013);
+        if (opened) { if (eventStreams.has(command.id)) stopEvents(command.id, 1013); }
+        else {
+          eventStreams.delete(command.id);
+          reply({ type: "response", id: command.id, status: 502, body: { error: "Machine request failed. Refresh to reconnect.", code: "upstream-unavailable" } });
+        }
       }
     }
     function terminal(command: RemoteTerminalCommand) {
@@ -405,7 +411,7 @@ export function connectRemoteAccess(server: Server, config: Config): () => void 
         if (!matches || Number(request.id) <= lastId) throw new Error("Device revoked or request replayed");
         refreshIdle();
         lastId = Number(request.id);
-        if (request.type === "events-open" || request.type === "events-close") { void events(request); return; }
+        if (request.type === "events-open" || request.type === "events-close") { void events(request).catch(() => close()); return; }
         if (request.type !== "request") { terminal(request); return; }
         if (!allowedPath(request.method, request.path)) {
           reply({ type: "response", id: request.id, status: 403, body: { error: "This endpoint is unavailable through remote machine access", code: "remote-endpoint-denied" } }); return;

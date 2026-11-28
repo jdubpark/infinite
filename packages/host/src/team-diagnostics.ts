@@ -576,16 +576,15 @@ export type LaunchAdmissionResult =
   | { proceed: false; changed: boolean }
   | { proceed: true; changed: boolean; pendingSwitch?: Extract<ProviderLimitLaunchAction, { kind: "switch" }> };
 
-export function evaluateLaunchAdmission(
+function evaluateLaunchAdmissionWithDecision(
   run: TeamRun,
   member: TeamMember,
   activeLimits: readonly ProviderLimit[],
-  limitedProviders: Set<Provider>,
+  decision: ProviderLimitLaunchAction,
   sessionSlotReason: string,
   appendEvent: (text: string) => void,
-  options: { planMemberId?: string; workerCapacityFull?: boolean; hostLoadReason?: string; sessionSlotFull?: boolean; promptSections?: readonly TeamPromptSection[] } = {},
+  options: { workerCapacityFull?: boolean; hostLoadReason?: string; sessionSlotFull?: boolean } = {},
 ): LaunchAdmissionResult {
-  const decision = resolveProviderLimitLaunch(run, member, activeLimits, limitedProviders, options.planMemberId, options.promptSections);
   if (decision.kind === "defer") {
     let changed = false;
     if (!member.pendingLimit) { member.pendingLimit = true; changed = true; }
@@ -614,6 +613,39 @@ export function evaluateLaunchAdmission(
   const holdReason = resolveLaunchHoldReason(run, activeLimits, sessionSlotReason);
   if (applyLaunchHoldReason(run, holdReason, sessionSlotReason)) changed = true;
   return { proceed: true, changed, ...(decision.kind === "switch" ? { pendingSwitch: decision } : {}) };
+}
+
+export function evaluateLaunchAdmission(
+  run: TeamRun,
+  member: TeamMember,
+  activeLimits: readonly ProviderLimit[],
+  limitedProviders: Set<Provider>,
+  sessionSlotReason: string,
+  appendEvent: (text: string) => void,
+  options: { planMemberId?: string; workerCapacityFull?: boolean; hostLoadReason?: string; sessionSlotFull?: boolean; promptSections?: readonly TeamPromptSection[] } = {},
+): LaunchAdmissionResult {
+  const decision = resolveProviderLimitLaunch(run, member, activeLimits, limitedProviders, options.planMemberId, options.promptSections);
+  return evaluateLaunchAdmissionWithDecision(run, member, activeLimits, decision, sessionSlotReason, appendEvent, options);
+}
+
+export async function evaluateLaunchAdmissionAsync(
+  run: TeamRun,
+  member: TeamMember,
+  activeLimits: readonly ProviderLimit[],
+  limitedProviders: Set<Provider>,
+  sessionSlotReason: string,
+  appendEvent: (text: string) => void,
+  options: { planMemberId?: string; workerCapacityFull?: boolean; hostLoadReason?: string; checkSessionSlotFull: () => Promise<boolean>; promptSections?: readonly TeamPromptSection[] },
+): Promise<LaunchAdmissionResult> {
+  const decision = resolveProviderLimitLaunch(run, member, activeLimits, limitedProviders, options.planMemberId, options.promptSections);
+  const sessionSlotFull = decision.kind !== "defer" && !options.workerCapacityFull && !options.hostLoadReason
+    ? await options.checkSessionSlotFull()
+    : false;
+  return evaluateLaunchAdmissionWithDecision(run, member, activeLimits, decision, sessionSlotReason, appendEvent, {
+    workerCapacityFull: options.workerCapacityFull,
+    hostLoadReason: options.hostLoadReason,
+    sessionSlotFull,
+  });
 }
 
 export function commitProviderLimitSwitch(

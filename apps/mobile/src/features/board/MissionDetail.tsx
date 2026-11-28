@@ -37,11 +37,14 @@ export function MissionDetail({ connection, id }: { connection: Connection; id: 
   const [extendOpen, setExtendOpen] = useState(false);
   const mission = poll.data ? newer(recorded, poll.data.mission) : recorded;
   const request = useRunRequest<Mission>(connection, `${machine}/mission/${id}`, {
-    accepted: result => {
+    accepted: (result, sent) => {
       setRecordedState(previous => ({
         id,
         mission: newer(previous?.id === id ? previous.mission : null, result),
       }));
+      if (sent.path === `/missions/${id}/steer`) {
+        setDirection(current => current.trim() === String(sent.fields.text ?? "") ? "" : current);
+      }
       poll.refresh();
     },
     refused: poll.refresh,
@@ -166,7 +169,7 @@ export function MissionDetail({ connection, id }: { connection: Connection; id: 
       <SteerBox value={direction} onChange={setDirection} placeholder="Steer the coordinator…"
         enabled={controls.steer && !locked} busy={request.busy}
         note={me.role !== "owner" ? "View only." : mission.status === "paused" ? "Resume to steer." : !controls.steer ? "This mission cannot be steered in its current state." : undefined}
-        onSend={() => { const text = direction.trim(); if (text) { send("steer", "Direction", { text }); setDirection(""); } }} />
+        onSend={() => { const text = direction.trim(); if (text) send("steer", "Direction", { text }); }} />
     </View> : null}
     {me?.role === "owner" ? <RequestStatus request={request} bottom={dockHeight + 10} canRetry={fresh} /> : null}
     <FloatingNotice position="top" offset={58} message={poll.stale ? "Offline · last received state. Controls paused." : null} />

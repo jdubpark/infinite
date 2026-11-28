@@ -416,18 +416,35 @@ function mentionsDirectory(text: string, directory: string, terminators: string)
   return false;
 }
 
+const DIRECT_LAUNCHER = /^\/usr\/local\/libexec\/(infinite(?:-[a-z][a-z0-9-]{0,15})?)\/team-command$/;
+const CENSUS_SUDO = "/usr/bin/sudo";
+
+export function directLauncherCensus(prefix: TeamCommand): { command: string; args: string[]; wrapper: string } | undefined {
+  if (prefix.args.length !== 0) return undefined;
+  const match = DIRECT_LAUNCHER.exec(prefix.command);
+  if (!match) return undefined;
+  const wrapper = join(dirname(prefix.command), CENSUS_WRAPPER);
+  return { command: CENSUS_SUDO, args: ["-n", "-H", "-u", `${match[1]}-agent`, "--", wrapper], wrapper };
+}
+
 async function prefixCensus(directory: string, prefix: TeamCommand): Promise<CensusResult> {
+  const direct = directLauncherCensus(prefix);
+  if (direct) return wrapperCensus(direct.command, direct.args, direct.wrapper, directory);
   if (!/(^|\/)sudo$/.test(prefix.command)) return { ok: false, problem: "prefix-unsupported" };
   const shape = sudoShape(prefix.args);
   if (!shape.ok || !isAbsolute(shape.executable)) return { ok: false, problem: "prefix-unsupported" };
   const wrapper = join(dirname(shape.executable), CENSUS_WRAPPER);
+  const options = ["-n", ...shape.options.filter(arg => arg !== "-n")];
+  return wrapperCensus(prefix.command, [...options, "--", wrapper], wrapper, directory);
+}
+
+async function wrapperCensus(command: string, args: string[], wrapper: string, directory: string): Promise<CensusResult> {
   try {
     if (!statSync(wrapper).isFile()) return { ok: false, problem: "census wrapper missing" };
   } catch {
     return { ok: false, problem: "census wrapper missing" };
   }
-  const options = ["-n", ...shape.options.filter(arg => arg !== "-n")];
-  return runWrapper(prefix.command, [...options, "--", wrapper], directory);
+  return runWrapper(command, args, directory);
 }
 
 function runWrapper(command: string, args: string[], directory: string): Promise<CensusResult> {

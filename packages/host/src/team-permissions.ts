@@ -137,3 +137,24 @@ const ANSWER_REFUSALS = new Set(["prompt-changed", "unsupported", "invalid-optio
 export function refusedBeforeSend(error: unknown): boolean {
   return error instanceof ContentError || ANSWER_REFUSALS.has((error as WorkerError | undefined)?.code ?? "");
 }
+
+export function selectPermissionRecoveryHistory<T extends { cause: string; action: string; decision: string; consequence: string; at: string }>(
+  run: { id: string; projectId: string; reason?: string; recovery?: { source: { reason: string } }; permissionRecovery?: { steps: { action: string; cause: string }[] } },
+  records: Iterable<{ run: { id: string; projectId: string; permissionRecovery?: { outcomes: (T & { requestId: string })[] } } }>,
+  bound: (value: string) => string,
+): T[] {
+  const steps = (run.permissionRecovery?.steps ?? []).slice(-10);
+  const relevantActions = new Set(steps.map(step => step.action.toLowerCase()));
+  const stopWords = new Set(["about", "after", "before", "could", "from", "into", "needs", "permission", "prompt", "request", "same", "that", "this", "with"]);
+  const tokens = (value: string) => new Set((value.toLowerCase().match(/[a-z0-9][a-z0-9-]{3,}/g) ?? []).filter(word => !stopWords.has(word)));
+  const causes = [run.reason, run.recovery?.source.reason, ...steps.map(step => step.cause)].filter((value): value is string => Boolean(value));
+  const currentTokens = new Set(causes.flatMap(cause => [...tokens(cause)]));
+  if (!relevantActions.size && !currentTokens.size) return [];
+  return [...records].filter(item => item.run.id !== run.id && item.run.projectId === run.projectId)
+    .flatMap(item => (item.run.permissionRecovery?.outcomes ?? []).map(({ requestId: _requestId, ...outcome }) => outcome as unknown as T))
+    .filter(outcome => relevantActions.has(outcome.action.toLowerCase()) || [...tokens(outcome.cause)].filter(token => currentTokens.has(token)).length >= 3)
+    .sort((a, b) => b.at.localeCompare(a.at)).slice(0, 5).map(outcome => ({
+      ...outcome, cause: bound(outcome.cause), action: bound(outcome.action),
+      decision: bound(outcome.decision), consequence: bound(outcome.consequence),
+    }));
+}

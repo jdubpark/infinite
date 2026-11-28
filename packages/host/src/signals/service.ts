@@ -64,10 +64,14 @@ const SIGNALS_EVIDENCE_MODULE: EvidenceModule = {
 
 type Sealed =
   | { projectId: string; kind: "owner"; key: string; text: string }
-  | { projectId: string; kind: CommitSignalKind; key: string; runId?: string; commit?: string };
+  | { projectId: string; kind: "ci-failure"; key: string; runId?: string; commit?: string; workflow?: string; checkName?: string; branch?: string }
+  | { projectId: string; kind: Exclude<CommitSignalKind, "ci-failure">; key: string; runId?: string; commit?: string };
 type Row = { seq: number; signal_id: string; kind: string; at: string; sealed: string };
 
-export type SignalInput = { projectId: string; kind: SignalKind; key: string; runId?: string; commit?: string; text?: string };
+export type SignalInput = { projectId: string; kind: SignalKind; key: string; runId?: string; commit?: string; text?: string; workflow?: string; checkName?: string; branch?: string };
+
+const MAX_CI_FIELD_LENGTH = 200;
+const CI_FIELD = /^[^\x00-\x1f\x7f-\x9f]+$/;
 
 export type SignalFailure = "invalid" | "unavailable" | "gone" | "full";
 export type RecordResult =
@@ -224,21 +228,44 @@ export function outsideCommit(scan: Pick<AppliedScan, "continuous" | "commits" |
   return scan.commits.slice(from).some(commit => !attributed.has(commit.id));
 }
 
+function validCiField(value: string | undefined): string | undefined | null {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (trimmed.length === 0 || trimmed.length > MAX_CI_FIELD_LENGTH || !CI_FIELD.test(trimmed)) return null;
+  return trimmed;
+}
+
 function checkInput(input: SignalInput): Sealed | undefined {
   if (!input || typeof input !== "object") return undefined;
-  const { projectId, kind, key, runId, commit, text } = input;
+  const { projectId, kind, key, runId, commit, text, workflow, checkName, branch } = input;
   const baseValid = typeof projectId === "string" && PROJECT_ID.test(projectId)
     && typeof kind === "string" && KINDS.has(kind)
     && typeof key === "string" && key.length <= MAX_SIGNAL_KEY_LENGTH && KEY.test(key);
   if (!baseValid) return undefined;
   if (kind === "owner") {
-    if (runId !== undefined || commit !== undefined) return undefined;
+    if (runId !== undefined || commit !== undefined || workflow !== undefined || checkName !== undefined || branch !== undefined) return undefined;
     if (typeof text !== "string" || text.trim().length === 0 || text.length > MAX_SIGNAL_TEXT_LENGTH) return undefined;
     return { projectId, kind: "owner", key, text };
   }
   if (text !== undefined) return undefined;
   if (runId !== undefined && (typeof runId !== "string" || !RUN_ID.test(runId))) return undefined;
   if (commit !== undefined && (typeof commit !== "string" || !COMMIT.test(commit))) return undefined;
+  if (kind === "ci-failure") {
+    const cleanWorkflow = validCiField(workflow);
+    const cleanCheckName = validCiField(checkName);
+    const cleanBranch = validCiField(branch);
+    if (cleanWorkflow === null || cleanCheckName === null || cleanBranch === null) return undefined;
+    return {
+      projectId, kind: "ci-failure", key,
+      ...(runId === undefined ? {} : { runId }),
+      ...(commit === undefined ? {} : { commit }),
+      ...(cleanWorkflow === undefined ? {} : { workflow: cleanWorkflow }),
+      ...(cleanCheckName === undefined ? {} : { checkName: cleanCheckName }),
+      ...(cleanBranch === undefined ? {} : { branch: cleanBranch }),
+    };
+  }
+  if (workflow !== undefined || checkName !== undefined || branch !== undefined) return undefined;
   return {
     projectId, kind, key,
     ...(runId === undefined ? {} : { runId }),
@@ -311,6 +338,16 @@ function openSignal(db: EvidenceDb, row: Row, projectId: string): ProjectSignal 
 function toSignal(seq: number, id: string, at: string, sealed: Sealed): ProjectSignal {
   if (sealed.kind === "owner") {
     return { seq, id, projectId: sealed.projectId, kind: "owner", key: sealed.key, at, text: sealed.text };
+  }
+  if (sealed.kind === "ci-failure") {
+    return {
+      seq, id, projectId: sealed.projectId, kind: "ci-failure", key: sealed.key, at,
+      ...(sealed.runId === undefined ? {} : { runId: sealed.runId }),
+      ...(sealed.commit === undefined ? {} : { commit: sealed.commit }),
+      ...(sealed.workflow === undefined ? {} : { workflow: sealed.workflow }),
+      ...(sealed.checkName === undefined ? {} : { checkName: sealed.checkName }),
+      ...(sealed.branch === undefined ? {} : { branch: sealed.branch }),
+    };
   }
   return {
     seq, id, projectId: sealed.projectId, kind: sealed.kind, key: sealed.key, at,

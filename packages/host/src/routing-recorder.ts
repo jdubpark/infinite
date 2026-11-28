@@ -98,6 +98,15 @@ export class RoutingRecorder {
     return pin;
   }
 
+  isExploratoryStart(run: TeamRun, task: TeamTask): boolean {
+    if (run.routing?.mode !== "auto" || task.routing?.by !== "router") return false;
+    try {
+      return this.store.read(db => readDecision(db, decisionKey(run.id, run.revision, db.index("task", task.id), "start", 1))?.explore === true);
+    } catch {
+      return false;
+    }
+  }
+
   recordStart(input: RouterStart): void {
     try {
       this.record(input);

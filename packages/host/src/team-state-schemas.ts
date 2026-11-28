@@ -10,6 +10,8 @@ import { teamCommandSchema, type TeamCommand } from "./schema-primitives.js";
 
 export { TEAM_ROLE_VALUES, type TeamRole } from "./team-role.js";
 export { teamCommandSchema, type TeamCommand };
+export { searchStateSchema, teamSearchSchema } from "./search-engine.js";
+export { readsStateSchema, readPhaseEventSchema } from "./read-phases.js";
 
 const nonNegInt = z.number().int().min(0);
 const usageTokensSchema = z.object({

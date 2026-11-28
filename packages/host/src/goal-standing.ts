@@ -60,6 +60,14 @@ function wakeLine(signal: PendingWake["signals"][number]): string | undefined {
   if (signal.kind === "revert") return commit ? `- revert of commit ${commit} on the base branch` : "- a revert on the base branch";
   if (signal.kind === "external-commit") return commit ? `- commit ${commit} landed on the base branch outside this host's runs` : "- a commit landed on the base branch outside this host's runs";
   if (signal.kind === "delivery-landed") return commit ? `- delivered commit ${commit} landed on the base branch` : "- a delivered change landed on the base branch";
+  if (signal.kind === "ci-failure") {
+    const name = signal.checkName ?? signal.workflow ?? "CI check";
+    const workflow = signal.workflow && signal.workflow !== name ? ` (${signal.workflow})` : "";
+    const branch = signal.branch ? ` on ${signal.branch}` : "";
+    const atCommit = commit ? ` at commit ${commit}` : "";
+    const times = signal.count && signal.count > 1 ? ` (${signal.count} events)` : "";
+    return `- ${name}${workflow} failed${branch}${atCommit}${times}`;
+  }
   return undefined;
 }
 

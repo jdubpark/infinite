@@ -32,6 +32,41 @@ export type RecoveryHost = Pick<TeamKernel, "commands" | "config" | "save" | "ev
   publicationGate(stored: Stored, role: TeamMember["role"]): boolean;
 };
 
+export function roleAcceptsReport(role: TeamMember["role"], kind: NonNullable<TeamMember["report"]>["kind"]) {
+  const expected: Record<TeamMember["role"], string[]> = {
+    "permission-coordinator": ["permission-decision"], "project-manager": ["plan", "explore", "no-change"], scout: ["findings"],
+    implementer: ["result", "escalate"], integrator: ["result"], reviewer: ["review"], delivery: ["delivery", "delivery-repair", "delivery-reconciliation", "pull-request"], "intent-checker": ["intent-check"], evaluator: ["verdict"], judge: ["judgement"],
+  };
+  return kind === "question" || kind === "blocked" || expected[role].includes(kind);
+}
+export function completedChecks(stored: Stored, revision: number) {
+  const checks = stored.run.checks.filter(check => check.revision === revision);
+  return checks.length > 0 && checks.every(check => (check.status === "passed" || check.status === "failed") && Boolean(check.finishedAt));
+}
+export function validVerificationRecovery(stored: Stored) {
+  const { run, pending, verificationRecovery } = stored;
+  const head = run.headCommit;
+  return Boolean(pending && verificationRecovery && run.status === "blocked" && pending.kind === "check" &&
+    pending.id === verificationRecovery.pendingId && verificationRecovery.pendingKind === "check" &&
+    pending.revision === run.revision && verificationRecovery.revision === run.revision &&
+    head && commitId.test(head) && verificationRecovery.headCommit === head && stored.checkHead !== head &&
+    !stored.deliveryAttempt && !run.deliveryReceipt && !run.stopReason && completedChecks(stored, run.revision) &&
+    (verificationRecovery.failure === "legacy-completed-check" || verificationRecovery.failure === "setup-changed-files" || verificationRecovery.failure === "verification-changed-files"));
+}
+export function obsoletePermissionResult(stored: Stored, pending: PendingOperation) {
+  const { run } = stored;
+  if (run.status === "paused" || run.status === "cancelled" || stored.halt === "pause" || stored.halt === "cancel" || pending.kind !== "result" || pending.revision !== run.revision) return undefined;
+  const reported = run.members.filter(member => member.revision === pending.revision && member.report && roleAcceptsReport(member.role, member.report.kind));
+  const candidates = reported.filter(member => {
+    const report = member.report;
+    return member.role === "permission-coordinator" &&
+      (!pending.source || pending.source.memberId === member.memberId) && report?.kind === "permission-decision" &&
+      Boolean(run.permissionDecisions?.some(decision => decision.coordinatorMemberId === member.memberId &&
+        (decision.coordinatorSessionId === member.sessionId || decision.coordinatorSessionId === undefined) && decision.id === report.decisionId &&
+        decision.revision === member.revision && terminalPermissionCoordinator(run, member)));
+  });
+  return candidates.length === 1 && (pending.source || reported.length === 1) ? candidates[0] : undefined;
+}
 export type DeliveryReconciliationReport = Extract<TeamReport, { kind: "delivery-reconciliation" }>;
 export function deliveryInspectionHash(report: DeliveryReconciliationReport) {
   return digest({ headCommit: report.headCommit, repository: report.repository, branch: report.branch,

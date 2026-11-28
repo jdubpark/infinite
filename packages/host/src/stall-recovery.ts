@@ -148,6 +148,7 @@ export interface StallRecoveryInput {
     | "members"
     | "tasks"
     | "discovery"
+    | "reads"
     | "decisions"
     | "permissionDecisions"
     | "permissionRecovery"
@@ -205,12 +206,24 @@ export function evaluateStallRecovery(input: StallRecoveryInput): StallRecoveryD
     }
   }
   if (member.role === "scout") {
-    if (!run.discovery || run.discovery.revision !== run.revision || run.discovery.completedAt) {
-      return { action: "none", guard: "current-assignment", reason: "discovery-inactive" };
-    }
-    const scout = run.discovery.tasks.find(item => item.id === member.taskId && item.memberId === member.memberId);
-    if (!scout || scout.status === "complete") {
-      return { action: "none", guard: "current-assignment", reason: "not-current-scout-member" };
+    const inReadPool = Boolean(
+      run.reads?.requests.some(
+        req =>
+          req.revision === run.revision &&
+          req.status === "running" &&
+          req.phases.some(
+            ph => ph.status === "started" && ph.steps.some(st => st.status === "running" && st.memberIds.includes(member.memberId)),
+          ),
+      ),
+    );
+    if (!inReadPool) {
+      if (!run.discovery || run.discovery.revision !== run.revision || run.discovery.completedAt) {
+        return { action: "none", guard: "current-assignment", reason: "discovery-inactive" };
+      }
+      const scout = run.discovery.tasks.find(item => item.id === member.taskId && item.memberId === member.memberId);
+      if (!scout || scout.status === "complete") {
+        return { action: "none", guard: "current-assignment", reason: "not-current-scout-member" };
+      }
     }
   }
   const superseded = run.members.slice(memberIndex + 1).some(

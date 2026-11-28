@@ -14,7 +14,7 @@ const routineGoalSchema = z.object(goalFields).extend({
   path: ["maxTotalMinutes"], message: "The total time ceiling cannot be shorter than the time limit.",
 });
 
-const wakeOnSchema = z.array(z.enum(signalKinds)).min(1).max(4)
+const wakeOnSchema = z.array(z.enum(signalKinds)).min(1).max(signalKinds.length)
   .refine(kinds => new Set(kinds).size === kinds.length, "Each signal kind may appear once.");
 
 export const createRoutineSchema = z.object({

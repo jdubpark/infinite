@@ -18,7 +18,7 @@ import {
   ownedPathSchema,
 } from "./schema-primitives.js";
 import { questionRecommendationSchema, refineQuestion, requiredQuestionRecommendationSchema } from "./question-recommendation.js";
-import type { RoutingKnobs, TeamRunRouting } from "./routing-types.js";
+import type { RoutingKnobs, RoutingPoint, TeamRunRouting } from "./routing-types.js";
 import type { Prompt, AnswerResult } from "@infinite/attention";
 import type { Receipt, Provider } from "./types.js";
 import type { LinearTrackingView } from "./linear-types.js";
@@ -26,6 +26,8 @@ import type { UsageTotals } from "./usage.js";
 import type { UsageRollup } from "./team-usage.js";
 import type { ProviderLimit } from "./provider-limits.js";
 import type { AutonomyMode } from "./autonomy.js";
+import { teamSearchSchema, type SearchState, type TeamSearch } from "./search-engine.js";
+import type { ReadsState } from "./read-phases.js";
 import {
   commitHashSchema,
   deliveryReconciliationReportSchema,
@@ -203,6 +205,8 @@ export const teamProjectSchema = z.object({
   routing: teamRoutingSchema.optional(),
   objective: z.strictObject({ prompts: z.enum(["on", "off"]).optional(), intentCheck: z.enum(["on", "off"]).optional(), register: z.enum(["on", "off"]).optional(), evaluator: z.enum(["on", "off"]).optional() }).optional(),
   mainCheck: z.strictObject({ minutes: z.number().int().min(1).max(240).optional() }).optional(),
+  warmRepair: z.boolean().optional(),
+  search: teamSearchSchema.optional(),
 }).strict().superRefine((project, context) => {
   if (project.establishChecks ? project.checks.length > 0 : project.checks.length === 0)
     context.addIssue({ code: "custom", path: ["checks"], message: "Configure required checks, or explicitly authorize the team to establish them with an empty checks array." });
@@ -356,9 +360,11 @@ export function escalationCandidates(lineup: TeamLineup, knobs: Pick<RoutingKnob
 export function scoutCandidates(lineup: TeamLineup, knobs: Pick<RoutingKnobs, "allowContributor">): TeamModelProfile[] {
   return lineup.implementers.filter(profile => profile.tier !== "strong" && fixedRuleFailure(lineup, knobs, profile) === undefined);
 }
-export function coversPoint(run: Pick<TeamRun, "routing" | "lineup">, point: "escalation" | "scout", ownProfileId?: string): boolean {
+export function coversPoint(run: Pick<TeamRun, "routing" | "lineup">, point: RoutingPoint, ownProfileId?: string): boolean {
   const { routing, lineup } = run;
-  if (!lineup || !routing || routing.mode !== "auto" || routing.algorithmVersion < POINTS_ALGORITHM_VERSION || !routing.knobs.points.includes(point)) return false;
+  if (!lineup || !routing || routing.mode !== "auto" || !routing.knobs.points.includes(point)) return false;
+  if (point === "start") return lineup.implementers.some(profile => fixedRuleFailure(lineup, routing.knobs, profile) === undefined);
+  if (routing.algorithmVersion < POINTS_ALGORITHM_VERSION) return false;
   return point === "scout" ? scoutCandidates(lineup, routing.knobs).length > 0 : escalationCandidates(lineup, routing.knobs, ownProfileId).length > 0;
 }
 export function hostSelects(run: Pick<TeamRun, "routing" | "routingRevokedAt" | "lineup">, point: "escalation" | "scout", ownProfileId?: string): boolean {
@@ -680,6 +686,8 @@ export interface TeamRun {
   intentCheck?: "on" | "off";
   register?: "on";
   verdicts?: "on";
+  searches?: SearchState[];
+  reads?: ReadsState;
   assessment?: RunAssessment;
   permissions?: TeamPermissions;
   permissionsRevokedAt?: string;

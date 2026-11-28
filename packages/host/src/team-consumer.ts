@@ -24,6 +24,10 @@ import { integrationGauge } from "./outcome-gauges.js";
 import type { TeamReplay } from "./team-replay.js";
 import type { TeamIntent } from "./team-intent.js";
 import type { TeamVerdicts } from "./team-verdicts.js";
+import type { TeamReadPool } from "./team-read-pool.js";
+import type { TeamSearchRuntime } from "./team-search-runtime.js";
+import { selectWarmRepairTarget, warmRepairFeedback } from "./team-warm-repair.js";
+import type { Provider } from "./types.js";
 import type { RetentionState, Stored, TeamServiceOptions } from "./teams.js";
 
 export const checkTimeoutReason = "A configured check ran past the team check time limit (teams.checkMinutes) and was stopped. No correction round was used; the integrated work was preserved.";
@@ -40,6 +44,8 @@ export type ConsumerHost = Pick<TeamKernel, "records" | "config" | "closed" | "s
   readonly replays: Pick<TeamReplay, "consume">;
   readonly intentChecks: Pick<TeamIntent, "consume" | "hold">;
   readonly verdicts: Pick<TeamVerdicts, "consume" | "holdNoChange">;
+  readonly readPool?: TeamReadPool;
+  readonly searchRuntime?: TeamSearchRuntime;
   readonly startInProject: <T>(projectId: string, start: () => Promise<T>) => Promise<T>;
   consumePermissionCoordinator(stored: Stored, member: TeamMember): void;
   prefixFor(run: TeamRun): TeamCommand | undefined;
@@ -47,9 +53,10 @@ export type ConsumerHost = Pick<TeamKernel, "records" | "config" | "closed" | "s
   emit(stored: Stored, kind: string, keyParts: readonly (string | number)[], ids: { memberId?: string; taskId?: string; revision?: number }, data: Record<string, unknown>): void;
   emitWith(stored: Stored, kind: string, keyParts: readonly (string | number)[], ids: { memberId?: string; taskId?: string; revision?: number }, build: () => Record<string, unknown>): void;
   routerInput(run: TeamRun): Omit<RouterStart, "run" | "task">;
+  limitedProviders?(): ReadonlySet<Provider>;
   newMember(run: TeamRun, role: TeamMember["role"], cwd: string, baseCommit: string, taskId?: string, promptInput?: string | BuiltPrompt, pinnedProfile?: TeamModelProfile): TeamMember;
   linkReplacement(stored: Stored, next: TeamMember, previous: TeamMember, cause: ReplacementCause): void;
-  prepareMember(stored: Stored, role: TeamMember["role"], task?: TeamTask | TeamScout, feedback?: string, onPrepared?: (member: TeamMember) => void): void;
+  prepareMember(stored: Stored, role: TeamMember["role"], task?: TeamTask | TeamScout, feedback?: string, onPrepared?: (member: TeamMember) => void, pinnedProfile?: TeamModelProfile): void;
   assertDelivery(stored: Stored): void;
   queueDeliveryRetryAfterEvidence(stored: Stored, member: TeamMember, report: DeliveryReconciliationReport): void;
   memberProfile(run: TeamRun, role: TeamMember["role"], task?: TeamTask | TeamScout): TeamModelProfile | undefined;
@@ -62,6 +69,32 @@ export type ConsumerHost = Pick<TeamKernel, "records" | "config" | "closed" | "s
   noteLeftover(stored: Stored, result: CommandResult): Promise<void>;
 };
 
+export async function collectIntegrationData(
+  run: Pick<TeamRun, "workspace" | "baseCommit" | "headCommit">,
+  member: Pick<TeamMember, "cwd" | "baseCommit">,
+  commit: string,
+  head: string,
+  options: { hasTask: boolean; needTree?: boolean; prefix?: TeamCommand; signal?: AbortSignal; at: string },
+) {
+  const { hasTask, needTree, prefix, signal, at } = options;
+  if (!commit) return { commit, head };
+  const diff = await teamCommand({ command: "git", args: teamGitArgs(run.workspace, ["diff", "--no-ext-diff", "--no-textconv", "--numstat", "--no-renames", "-z", member.baseCommit, commit, "--"]) }, run.workspace, signal, 30000, prefix).catch(() => undefined);
+  const gitRead = (args: string[]) => teamCommand({ command: "git", args: teamGitArgs(run.workspace, args) }, run.workspace, signal, 30000, prefix)
+    .then(result => result.exitCode === 0 && !result.interrupted && !result.truncated ? result.stdout : undefined, () => undefined);
+  const nameStatus = await gitRead(["diff", "--no-ext-diff", "--no-textconv", "--name-status", "-M", "-z", run.baseCommit, head, "--"]);
+  const numstat = await gitRead(["diff", "--no-ext-diff", "--no-textconv", "--numstat", "-M", "-z", run.baseCommit, head, "--"]);
+  const taskPaths = hasTask ? await gitRead(["diff", "--no-ext-diff", "--no-textconv", "--name-only", "--no-renames", "-z", member.baseCommit, commit, "--"]) : undefined;
+  const tree = needTree ? await gitRead(["rev-parse", "--verify", `${commit}^{tree}`]) : undefined;
+  return {
+    commit,
+    head,
+    diff: diff?.exitCode === 0 ? diff.stdout : undefined,
+    changes: changeIndex(nameStatus, numstat, head, at),
+    changedPaths: taskPaths !== undefined ? changedPathList(taskPaths) : undefined,
+    tree: tree?.trim(),
+  };
+}
+
 export class TeamConsumer {
   private enrichments = 0;
   constructor(private readonly host: ConsumerHost) {}
@@ -71,8 +104,26 @@ export class TeamConsumer {
     if (member.role === "permission-coordinator") { this.host.consumePermissionCoordinator(stored, member); return; }
     if (member.role === "intent-checker") { this.host.intentChecks.consume(stored, member); return; }
     if (member.role === "evaluator") { this.host.verdicts.consume(stored, member); return; }
-    if (report.kind === "blocked") { this.host.block(stored, new TeamError(409, "agent-blocked", report.summary), member); return; }
+    if (report.kind === "blocked") {
+      if (member.role === "implementer" && this.host.searchRuntime?.onMemberLeft(stored, member, "blocked")) {
+        member.status = "stopped"; this.host.save(stored); return;
+      }
+      if (member.role === "scout" && this.host.readPool?.failMemberStep(stored, member.memberId, report.summary)) {
+        member.status = "stopped";
+        this.host.event(stored, `${member.title} reported blocked; its read step was marked failed.`);
+        this.host.save(stored); return;
+      }
+      this.host.block(stored, new TeamError(409, "agent-blocked", report.summary), member); return;
+    }
     if (report.kind === "question" && ["implementer", "scout", "integrator", "reviewer"].includes(member.role)) {
+      if (member.role === "implementer" && this.host.searchRuntime?.onMemberLeft(stored, member, "question")) {
+        member.status = "stopped"; this.host.save(stored); return;
+      }
+      if (member.role === "scout" && this.host.readPool?.failMemberStep(stored, member.memberId, report.question)) {
+        member.status = "stopped";
+        this.host.event(stored, `${member.title} requested owner input; its read step was marked failed.`);
+        this.host.save(stored); return;
+      }
       this.host.block(stored, new TeamError(409, "agent-question", agentQuestionReason(member.role, report)), member); return;
     }
     if (report.kind === "question") {
@@ -119,6 +170,16 @@ export class TeamConsumer {
       }, member); return;
     }
     if (report.kind === "findings") {
+      const poolMatch = this.host.readPool?.findMemberStep(run, member.memberId);
+      if (poolMatch && this.host.readPool) {
+        this.host.operation(stored, "result", signal => assertMemberReadOnly(member.cwd, member.baseCommit, this.host.prefixFor(run), signal), () => {
+          const items = poolMatch.step.list ? Math.min(report.evidence.length, 32) : undefined;
+          const settled = this.host.readPool!.settleStep(stored, poolMatch.request.id, poolMatch.step.id, "complete", randomUUID(), items, { summary: report.summary, evidence: report.evidence });
+          if (!settled.ok) throw new TeamError(409, "invalid-discovery", settled.message);
+          this.host.event(stored, `${member.title} returned evidence for read step ${poolMatch.step.id} without changing its working copy.`);
+          this.host.emitWith(stored, "scout.completed", [member.revision, poolMatch.step.id], { memberId: member.memberId, taskId: poolMatch.step.id, revision: member.revision }, () => ({}));
+        }, member); return;
+      }
       const scout = run.discovery?.tasks.find(task => task.id === member.taskId && task.memberId === member.memberId);
       if (!scout || run.discovery?.revision !== run.revision) throw new TeamError(409, "invalid-discovery", "The scout does not belong to the current discovery batch.");
       this.host.operation(stored, "result", signal => assertMemberReadOnly(member.cwd, member.baseCommit, this.host.prefixFor(run), signal), () => {
@@ -128,6 +189,9 @@ export class TeamConsumer {
       }, member); return;
     }
     if (report.kind === "escalate") {
+      if (this.host.searchRuntime?.onMemberLeft(stored, member, "escalate")) {
+        member.status = "stopped"; this.host.save(stored); return;
+      }
       const task = run.tasks.find(item => item.id === member.taskId && item.memberId === member.memberId);
       const named = escalationPool(run).find(item => item.id === report.agentProfileId && item.id !== member.modelProfile?.id);
       const profile = !task || task.escalation || (report.agentProfileId !== undefined && !named) || !run.routing || !this.host.router ? named
@@ -413,64 +477,94 @@ export class TeamConsumer {
     if (report.kind !== "result") throw new TeamError(409, "wrong-agent-report", "The member did not submit an implementation result.");
     const task = run.tasks.find(item => item.id === member.taskId);
     if (member.role === "implementer" && !task) throw new TeamError(409, "invalid-task", "The implementer has no current task assignment.");
+    if (member.role === "implementer" && this.host.searchRuntime?.onMemberResult(stored, member)) return;
     run.status = "integrating";
     this.host.operation(stored, "result", async signal => {
       const commit = await captureMemberResult(member.cwd, member.baseCommit, member.role === "implementer" ? task!.paths : run.goal?.allowedPaths, this.host.prefixFor(run), signal);
       const head = commit ? (run.replay ? commit : await integrateMemberResult(run.workspace, member.cwd, commit, this.host.prefixFor(run), signal)) : run.headCommit!;
-      const diff = commit ? await teamCommand({ command: "git", args: teamGitArgs(run.workspace, ["diff", "--no-ext-diff", "--no-textconv", "--numstat", "--no-renames", "-z", member.baseCommit, commit, "--"]) }, run.workspace, signal, 30000, this.host.prefixFor(run)).catch(() => undefined) : undefined;
-      const gitRead = (args: string[]) => teamCommand({ command: "git", args: teamGitArgs(run.workspace, args) }, run.workspace, signal, 30000, this.host.prefixFor(run))
-        .then(result => result.exitCode === 0 && !result.interrupted && !result.truncated ? result.stdout : undefined, () => undefined);
-      const change = commit ? {
-        nameStatus: await gitRead(["diff", "--no-ext-diff", "--no-textconv", "--name-status", "-M", "-z", run.baseCommit, head, "--"]),
-        numstat: await gitRead(["diff", "--no-ext-diff", "--no-textconv", "--numstat", "-M", "-z", run.baseCommit, head, "--"]),
-        taskPaths: task ? await gitRead(["diff", "--no-ext-diff", "--no-textconv", "--name-only", "--no-renames", "-z", member.baseCommit, commit, "--"]) : undefined,
-      } : undefined;
-      return { commit, head, diff: diff?.exitCode === 0 ? diff.stdout : undefined,
-        changes: change ? changeIndex(change.nameStatus, change.numstat, head, timestamp()) : undefined,
-        changedPaths: change?.taskPaths !== undefined ? changedPathList(change.taskPaths) : undefined };
-    }, ({ commit, head, diff, changes, changedPaths }) => {
-      const headBefore = run.headCommit;
-      stored.deliveryReviewLineage = advanceDeliveryReviewLineage(stored.deliveryReviewLineage, { headBefore: headBefore ?? "", headAfter: head,
-        contributorFamilies: commit ? workspaceContributorFamilies(run, member) : [] });
-      run.headCommit = head; stored.checkHead = undefined; run.review = undefined;
-      if (commit) { if (changes) run.changes = changes; else delete run.changes; }
-      if (member.role === "integrator" && run.deliveryRecovery?.status === "replanning" && run.deliveryRecovery.revision === run.revision)
-        run.deliveryRecovery.integratedHeadCommit = head;
-      if (task) {
-        task.status = "integrated"; task.commit = commit; task.summary = report.summary; task.limitations = recordedTaskLimitations(report); task.diffStat = diffStat(diff);
-        if (changedPaths) task.changedPaths = changedPaths; else delete task.changedPaths;
-        this.host.emitWith(stored, "task.integrated", [member.revision, task.id], { memberId: member.memberId, taskId: task.id, revision: member.revision }, () => ({
-          commit, headCommit: head, baseCommit: run.baseCommit, memberBaseCommit: member.baseCommit, diff: task.diffStat,
-          integration: integrationGauge({ tasks: run.tasks, taskId: task.id, memberBase: member.baseCommit, headBefore, changedPaths: task.changedPaths ?? (commit ? undefined : { paths: [], truncated: false }) }),
-        }));
-        if (commit && member.role === "implementer" && !run.replay) this.host.captureIntegrated(stored, member, task, commit, head);
-      }
-      if (member.role === "integrator" && run.round > 0) {
-        this.host.emitWith(stored, "repair.integrated", [member.revision, run.round], { memberId: member.memberId, revision: member.revision }, () => ({
-          round: run.round, commit, headCommit: head, baseCommit: run.baseCommit,
-        }));
-        const repaired = { revision: member.revision, memberId: member.memberId, round: run.round, base: member.baseCommit, workspace: run.workspace };
-        if (commit) this.enrich(stored, async signal => {
-          const result = await teamCommand({ command: "git", args: teamGitArgs(repaired.workspace, ["diff", "--no-ext-diff", "--no-textconv", "--name-only", "--no-renames", "-z", repaired.base, commit, "--"]) },
-            repaired.workspace, signal, 30000, this.host.prefixFor(run)).catch(() => undefined);
-          const list = result && result.exitCode === 0 && !result.interrupted ? changedPathList(result.stdout) : undefined;
-          return () => this.host.emitWith(stored, "repair.paths", [repaired.revision, repaired.round], { memberId: repaired.memberId, revision: repaired.revision }, () => ({
-            round: repaired.round, commit, ...(list && !list.truncated ? pathField(list.paths) : { pathsOmitted: true }),
-          }));
-        });
-      }
-      if (member.role === "implementer" || member.role === "integrator") this.host.retentionState(stored).integratedAt[member.memberId] = this.host.retentionNow();
-      this.host.event(stored, `${member.title} reported a result; its validated changes were integrated.`);
-      run.status = "implementing";
+      const measureSearch = Boolean(member.role === "implementer" && task && !run.replay && this.host.searchRuntime?.findOpenMemberSearch(run, member.memberId, "measure"));
+      return collectIntegrationData(run, member, commit, head, {
+        hasTask: Boolean(task),
+        needTree: measureSearch,
+        prefix: this.host.prefixFor(run),
+        signal,
+        at: timestamp(),
+      });
+    }, ({ commit, head, diff, changes, changedPaths, tree }) => {
+      this.applyTaskIntegration(stored, member, task, { commit, head, diff, changes, changedPaths, reportSummary: report.summary, report, tree });
     }, member, "integration");
+  }
+  applyTaskIntegration(
+    stored: Stored,
+    member: TeamMember,
+    task: TeamTask | undefined,
+    data: {
+      commit: string;
+      head: string;
+      diff?: string;
+      changes?: TeamRun["changes"];
+      changedPaths?: { paths: string[]; truncated: boolean };
+      reportSummary?: string;
+      report?: Extract<TeamReport, { kind: "result" }>;
+      tree?: string;
+    },
+  ) {
+    const { run } = stored, { commit, head, diff, changes, changedPaths, reportSummary, report, tree } = data;
+    const headBefore = run.headCommit;
+    stored.deliveryReviewLineage = advanceDeliveryReviewLineage(stored.deliveryReviewLineage, { headBefore: headBefore ?? "", headAfter: head,
+      contributorFamilies: commit ? workspaceContributorFamilies(run, member) : [] });
+    run.headCommit = head; stored.checkHead = undefined; run.review = undefined;
+    if (commit) { if (changes) run.changes = changes; else delete run.changes; }
+    if (member.role === "integrator" && run.deliveryRecovery?.status === "replanning" && run.deliveryRecovery.revision === run.revision)
+      run.deliveryRecovery.integratedHeadCommit = head;
+    if (task) {
+      task.memberId = member.memberId;
+      task.status = "integrated"; task.commit = commit; task.summary = reportSummary ?? (member.report?.kind === "result" ? member.report.summary : "Integrated change.");
+      task.limitations = report ? recordedTaskLimitations(report) : [];
+      task.diffStat = diffStat(diff);
+      if (changedPaths) task.changedPaths = changedPaths; else delete task.changedPaths;
+      this.host.emitWith(stored, "task.integrated", [member.revision, task.id], { memberId: member.memberId, taskId: task.id, revision: member.revision }, () => ({
+        commit, headCommit: head, baseCommit: run.baseCommit, memberBaseCommit: member.baseCommit, diff: task.diffStat,
+        integration: integrationGauge({ tasks: run.tasks, taskId: task.id, memberBase: member.baseCommit, headBefore, changedPaths: task.changedPaths ?? (commit ? undefined : { paths: [], truncated: false }) }),
+      }));
+      if (commit && member.role === "implementer" && !run.replay) this.host.captureIntegrated(stored, member, task, commit, head);
+      if (member.role === "implementer" && !run.replay) this.host.searchRuntime?.onTaskIntegrated(stored, member, task, commit, tree ?? "", !commit);
+    }
+    if (member.role === "integrator" && run.round > 0) {
+      this.host.emitWith(stored, "repair.integrated", [member.revision, run.round], { memberId: member.memberId, revision: member.revision }, () => ({
+        round: run.round, commit, headCommit: head, baseCommit: run.baseCommit,
+      }));
+      const repaired = { revision: member.revision, memberId: member.memberId, round: run.round, base: member.baseCommit, workspace: run.workspace };
+      if (commit) this.enrich(stored, async signal => {
+        const result = await teamCommand({ command: "git", args: teamGitArgs(repaired.workspace, ["diff", "--no-ext-diff", "--no-textconv", "--name-only", "--no-renames", "-z", repaired.base, commit, "--"]) },
+          repaired.workspace, signal, 30000, this.host.prefixFor(run)).catch(() => undefined);
+        const list = result && result.exitCode === 0 && !result.interrupted ? changedPathList(result.stdout) : undefined;
+        return () => this.host.emitWith(stored, "repair.paths", [repaired.revision, repaired.round], { memberId: repaired.memberId, revision: repaired.revision }, () => ({
+          round: repaired.round, commit, ...(list && !list.truncated ? pathField(list.paths) : { pathsOmitted: true }),
+        }));
+      });
+    }
+    if (member.role === "implementer" || member.role === "integrator") this.host.retentionState(stored).integratedAt[member.memberId] = this.host.retentionNow();
+    this.host.event(stored, `${member.title} reported a result; its validated changes were integrated.`);
+    run.status = "implementing";
   }
   repair(stored: Stored, feedback: string, cause: "check" | "review" | "delivery") {
     if (stored.halt || ["paused", "cancelled"].includes(stored.run.status)) return;
     if (stored.run.round >= 2) { this.host.block(stored, new TeamError(409, "repair-limit", repairLimitReason)); return; }
     stored.run.round++; stored.run.review = undefined; stored.checkHead = undefined;
     const round = stored.run.round;
-    this.host.emitWith(stored, "repair.started", [stored.run.revision, round], {}, () => ({ round, cause, headCommit: stored.run.headCommit }));
-    this.host.prepareMember(stored, "integrator", undefined, feedback);
+    const warmTarget = selectWarmRepairTarget(stored.run, cause, this.host.config, this.host.limitedProviders?.());
+    this.host.emitWith(stored, "repair.started", [stored.run.revision, round], {}, () => ({
+      round, cause, headCommit: stored.run.headCommit, ...(warmTarget ? { warmFromMemberId: warmTarget.memberId } : {}),
+    }));
+    this.host.prepareMember(
+      stored,
+      "integrator",
+      undefined,
+      warmTarget ? warmRepairFeedback(warmTarget, feedback) : feedback,
+      undefined,
+      warmTarget?.modelProfile,
+    );
   }
   requiredChecks(run: TeamRun) {
     return run.establishChecks ? run.verification?.checks : run.handoff?.project.checks ?? this.host.config.projects.find(project => project.id === run.projectId)?.team?.checks;

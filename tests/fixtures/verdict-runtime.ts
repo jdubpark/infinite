@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { canonicalJson } from "../../packages/host/src/evidence/crypto.js";
 import { commandDigest } from "../../packages/host/src/objective-input.js";
 import type { GoalRecordPort } from "../../packages/host/src/objective-intent.js";
+import { definitionDigest } from "../../packages/host/src/objective-receipts.js";
 import type { ObjectiveReceipt } from "../../packages/host/src/objective-receipts.js";
 import { objectiveError } from "../../packages/host/src/objective-record.js";
 import { recordDigest } from "../../packages/host/src/objective-types.js";
@@ -60,8 +61,9 @@ export function recordOf(runId: string, entries = 1, extra: Criterion[] = []): O
   return { ...body, digest: recordDigest(body) } as ObjectiveRecord;
 }
 
-export function receiptOf(id: string, outcome: ObjectiveReceipt["outcome"], runId = RUN, commit = HEAD): ObjectiveReceipt {
+export function receiptOf(id: string, outcome: ObjectiveReceipt["outcome"], runId = RUN, commit = HEAD, measured: Criterion | undefined = criteria().find(item => item.id === id)): ObjectiveReceipt {
   return {
+    ...(measured === undefined ? {} : { digest: definitionDigest(measured) }),
     handle: `receipt:${runId}:1:${id}`, kind: "command", subject: "criterion", id, commit, outcome, at: AT,
     detail: { kind: "command", observed: outcome === "pass" ? "passed" : "failed", round: 1 },
   };

@@ -411,7 +411,7 @@ const pinnedCriterion = (): Criterion[] => [{
 function noChangeWithParent(parentChanges: unknown, lineup: TeamLineup = SAME_FAMILY): Fixture {
   const f = noChangeFixture({ lineup }, recordOf(RUN, 1, pinnedCriterion()));
   if (parentChanges !== "gone") f.host.holders.set(PARENT, holderOf(runOf({ id: PARENT, headCommit: BASE, changes: parentChanges as never })));
-  f.world.passes.set(PARENT, { head: BASE, pending: false, receipts: [receiptOf("c6", "pass", PARENT, BASE)] });
+  f.world.passes.set(PARENT, { head: BASE, pending: false, receipts: [receiptOf("c6", "pass", PARENT, BASE, pinnedCriterion()[0])] });
   f.verdicts.holdNoChange(f.holder, memberOf(f.holder.run, "project-manager", { status: "reported" }));
   return f;
 }

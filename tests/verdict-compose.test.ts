@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { commandDigest } from "../packages/host/src/objective-input.js";
+import { definitionDigest } from "../packages/host/src/objective-receipts.js";
 import type { ObjectiveReceipt } from "../packages/host/src/objective-receipts.js";
 import { rebuildVersion } from "../packages/host/src/objective-record.js";
 import { canonicalBytes, objectiveRecordSchema, recordDigest } from "../packages/host/src/objective-types.js";
@@ -59,6 +60,7 @@ function rating(subject: string, score: number, commit: string): LogEntry {
 function receipt(id: string, outcome: ObjectiveReceipt["outcome"], commit = HEAD): ObjectiveReceipt {
   return {
     handle: `receipt:${RUN}:1:${id}`, kind: "command", subject: "criterion", id, commit, outcome, at: AT,
+    digest: definitionDigest(part9().find(item => item.id === id)!),
     detail: { kind: "command", observed: outcome === "pass" ? "passed" : outcome === "fail" ? "failed" : "absent", round: 1 },
   };
 }
@@ -103,6 +105,31 @@ test("acceptance 6: a failing receipt overrides the evaluator", () => {
   assert.equal(contradicted[0]!.target, "c4");
   assert.equal(written.version, 2);
   assert.equal(objectiveRecordSchema.safeParse(written).success, true);
+});
+
+test("a receipt is judged only against the definition it measured", () => {
+  const receipts = [receipt("c1", "pass"), receipt("c4", "pass")];
+  const edited = (id: string, change: (item: Criterion) => Criterion) => record(part9().map(item => (item.id === id ? change(item) : item)));
+  const judged = (rec: ObjectiveRecord, id: string) => find(composeVerdict(input({ record: rec, receipts })).criteria, id);
+  assert.equal(judged(record(part9()), "c1").state, "met");
+  const edits: [string, string, (item: Criterion) => Criterion][] = [
+    ["c1", "path", item => ({ ...item, check: { kind: "artifact", path: "research/other.json", count: "/entries" } })],
+    ["c1", "threshold", item => ({ ...item, threshold: { kind: "count", min: 11, max: 25 } })],
+    ["c4", "command", item => ({ ...item, check: { kind: "command", command: "f".repeat(64) } })],
+    ["c4", "pinned", item => ({ ...item, pinned: [{ path: PINNED, blob: "4".repeat(40) }] })],
+  ];
+  for (const [id, what, change] of edits) {
+    const stale = judged(edited(id, change), id);
+    assert.equal(stale.state, "inconclusive", what);
+    assert.equal(stale.reason, "receipt-stale", what);
+    assert.equal(stale.receipt, undefined, what);
+  }
+  const reworded = judged(edited("c1", item => ({ ...item, statement: "Another wording", producer: "host" })), "c1");
+  assert.equal(reworded.state, "met");
+  const undigested = receipts.map(({ digest: _digest, ...rest }) => rest);
+  const missing = find(composeVerdict(input({ receipts: undigested })).criteria, "c1");
+  assert.equal(missing.state, "inconclusive");
+  assert.equal(missing.reason, "receipt-stale");
 });
 
 test("the result follows the composition rules", () => {

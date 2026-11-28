@@ -49,7 +49,7 @@ export const verdictReportSchema = z.object({
 export type VerdictReport = z.infer<typeof verdictReportSchema>;
 
 export type VerdictReason = "no-independent-evaluator" | "evaluator-unavailable" | "record-unavailable" | "context-too-large";
-export type CriterionReason = "no-receipt" | "receipt-unknown" | "before-delivery" | "pinned-changed" | "unresolved-evidence" | "not-assessed" | "no-evaluator";
+export type CriterionReason = "no-receipt" | "receipt-unknown" | "receipt-stale" | "before-delivery" | "pinned-changed" | "unresolved-evidence" | "not-assessed" | "no-evaluator";
 export type VerdictCounts = { met: number; notMet: number; inconclusive: number; pendingOwner: number };
 
 export type RunAssessment = {

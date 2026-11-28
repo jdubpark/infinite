@@ -11,6 +11,8 @@ import { age } from "../../status";
 import { theme } from "../../theme";
 import { visibleGroups } from "../projects/model";
 import { HaltBanner } from "../halt/HaltBanner";
+import { queueEntryLabel } from "../queue/model";
+import { useDecisionCount } from "../queue/useDecisionQueue";
 import { Composer } from "./Composer";
 import { attemptLabel, boardKind, boardStatusLabel, groupBoard, subtaskProgressLabel } from "./model";
 
@@ -31,6 +33,7 @@ export function Board({ connection, machines, pushNote, onSelectMachine, onAddMa
     ]);
     return { board, groups: groups.groups, suggestions: groups.suggestions, me, at: Date.now() };
   }, 4000, [connection]);
+  const decisions = useDecisionCount(connection);
   const groups: ProjectGroup[] = poll.data?.groups ?? [];
   const suggestions: ProjectGroupSuggestion[] = poll.data?.suggestions ?? [];
   const chips = visibleGroups(groups);
@@ -56,6 +59,11 @@ export function Board({ connection, machines, pushNote, onSelectMachine, onAddMa
     <ScrollView style={s.list} contentContainerStyle={[s.content, owner && s.contentWithComposer]} keyboardShouldPersistTaps="handled"
       refreshControl={<RefreshControl refreshing={poll.refreshing} onRefresh={refresh} tintColor={theme.colors.forest} colors={[theme.colors.forest]} />}>
       <Text style={s.title} accessibilityRole="header">Board</Text>
+      {decisions.available ? <Pressable accessibilityRole="button" accessibilityLabel={queueEntryLabel(decisions.count)} onPress={() => router.push({ pathname: "/decisions", params: { machine } })}
+        style={({ pressed }) => [s.queue, pressed && s.pressed]}>
+        <Text style={[s.queueText, decisions.count ? s.attention : null]}>{queueEntryLabel(decisions.count)}</Text>
+        <Glyph name="forward" size={12} color={theme.colors.mutedInk} />
+      </Pressable> : null}
       <HaltBanner connection={connection} place="overview" names={id => poll.data?.me.projects?.find(project => project.id === id)?.name} style={s.halt} />
       <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={s.filters}>
         <Chip label="All" accessibilityLabel="All projects" selected={!projectId} onPress={() => setProjectId("")} />
@@ -133,6 +141,8 @@ const s = StyleSheet.create({
   title: { fontSize: 28, lineHeight: 34, fontWeight: "700", color: theme.colors.ink, letterSpacing: -0.6, marginTop: 4 },
   filters: { flexDirection: "row", gap: 6, paddingVertical: 12, paddingRight: 16 },
   halt: { marginTop: 10 },
+  queue: { minHeight: 44, flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginTop: 8, paddingHorizontal: 12, borderRadius: theme.radius.control, backgroundColor: theme.colors.secondarySurface },
+  queueText: { fontSize: 14, fontWeight: "600", color: theme.colors.secondaryInk },
   subtitle: { marginTop: -7, marginBottom: 2, fontSize: 12, lineHeight: 17, color: theme.colors.mutedInk },
   row: { minHeight: 72, flexDirection: "row", alignItems: "center", gap: 10, paddingVertical: 10, borderBottomWidth: StyleSheet.hairlineWidth, borderColor: theme.colors.rule },
   pressed: { backgroundColor: theme.colors.secondarySurface },

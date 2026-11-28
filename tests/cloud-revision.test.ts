@@ -74,6 +74,7 @@ test("signed push and same-repository PR heads keep exact SHA status through fai
   writeFileSync(token, "controller-only-token\n", { mode: 0o600 });
   writeFileSync(secret, "webhook-secret-value\n", { mode: 0o600 });
   const launcherCalls = join(dir, "launcher-calls");
+  const capacityOpen = join(dir, "capacity-open");
   const installed = join(dir, "installed");
   const launcher = join(installed, "scripts", "cloud-check.py");
   mkdirSync(join(installed, "scripts/cloud-check"), { recursive: true });
@@ -100,6 +101,18 @@ for directory in (root.parent.parent, root.parent, root):
 envelope = "fixture-envelope-" + head
 guest = {"base": head, "snapshot": "fixture-snapshot", "envelope": envelope, "exit": exit_code, "mode": "npm", "commandSha256": hashlib.sha256(json.dumps(${JSON.stringify(command)}, separators=(",", ":"), ensure_ascii=True).encode("ascii")).hexdigest(), "profile": ${JSON.stringify(profileValue)}, "machine": "fixture-machine", "engine": "fixture-engine"}
 receipt = {"version": 1, "workspace": "fixture-workspace", "project": ${JSON.stringify(projectHash)}, "base": head, "archive": "fixture-archive", "envelope": envelope, "requiredTip": None, "current": True, "worktreeChanges": 0, "comparison": None, "runs": [{"runner": "fixture-runner", "exit": exit_code, "receipt": guest}], "exit": exit_code}
+if Path("busy-timeout.txt").exists() and (not Path(${JSON.stringify(capacityOpen)}).exists() or Path("ambiguous-receipt.txt").exists()):
+    if Path("ambiguous-receipt.txt").exists():
+        path = root / (head + ".json")
+        path.write_text(json.dumps(receipt), encoding="utf-8")
+        path.chmod(0o600)
+    if Path("extra-output.txt").exists():
+        print("Untrusted task output", file=sys.stderr, flush=True)
+    for _ in range(2):
+        print("Dispatch to fixture-runner (archive SHA-256 " + "a" * 64 + ")", file=sys.stderr, flush=True)
+        print("Runner fixture-runner is busy; checkout not sent", file=sys.stderr, flush=True)
+    print("cloud-check: workspace runner pool remained busy until the capacity wait expired", file=sys.stderr, flush=True)
+    raise SystemExit(2)
 if Path("no-receipt.txt").exists():
     raise SystemExit(0)
 if Path("stale-receipt.txt").exists():
@@ -272,6 +285,92 @@ raise SystemExit(exit_code)
   assert.equal(accepted.some(row => row.sha === newer && row.state === "success" && row.token === "Bearer controller-rotated-token"), true);
   assert.equal(readFileSync(launcherCalls, "utf8").trim().split("\n").length, 3);
 
+  writeFileSync(join(source, "busy-timeout.txt"), "fixture marks pre-transfer capacity expiration\n");
+  git("add", "busy-timeout.txt");
+  git("commit", "-qm", "runner capacity wait");
+  const busyHead = git("rev-parse", "HEAD");
+  git("push", "-q", "origin", "HEAD:refs/heads/main");
+  assert.equal((await push(busyHead)).status, 202);
+  assert.equal((await runOnce()).status, 0);
+  const busyJobPath = join(state, "jobs", readdirSync(join(state, "jobs")).find(name => name.endsWith(".json") && JSON.parse(readFileSync(join(state, "jobs", name), "utf8")).sha === busyHead)!);
+  const busyJob = JSON.parse(readFileSync(busyJobPath, "utf8"));
+  const firstBusyOutput = readFileSync(busyJobPath.replace(/\.json$/, ".log"));
+  assert.equal(busyJob.attempts, 1);
+  assert.equal(busyJob.admissionWaits, 1);
+  assert.equal(busyJob.result, undefined);
+  assert.equal(busyJob.outputBytes, firstBusyOutput.length);
+  assert.equal(firstBusyOutput.toString(), [
+    ...Array(2).fill("Dispatch to fixture-runner (archive SHA-256 " + "a".repeat(64) + ")\nRunner fixture-runner is busy; checkout not sent\n"),
+    "cloud-check: workspace runner pool remained busy until the capacity wait expired\n",
+  ].join(""));
+  busyJob.result = "error";
+  busyJob.description = "Cloud verification could not complete";
+  busyJob.error = "RevisionError: cloud launcher returned no receipt";
+  busyJob.completedAt = 1;
+  busyJob.publishedResult = "error";
+  accepted.push({ sha: busyHead, state: "error", token: "Bearer controller-only-token" });
+  published.push({ sha: busyHead, state: "error", context: "infinite/cloud-check", token: "Bearer controller-only-token", description: busyJob.description });
+  delete busyJob.admissionWaits;
+  writeFileSync(busyJobPath, JSON.stringify(busyJob));
+  const busyLogPath = busyJobPath.replace(/\.json$/, ".log");
+  writeFileSync(busyLogPath, firstBusyOutput.subarray(0, firstBusyOutput.length - 2));
+  assert.equal((await runOnce()).status, 0);
+  assert.equal(JSON.parse(readFileSync(busyJobPath, "utf8")).result, "error");
+  writeFileSync(busyLogPath, Buffer.concat([firstBusyOutput.subarray(0, -1), Buffer.from("!")]));
+  assert.equal((await runOnce()).status, 0);
+  assert.equal(JSON.parse(readFileSync(busyJobPath, "utf8")).result, "error");
+  writeFileSync(busyLogPath, firstBusyOutput);
+  const archivedBusyLog = busyJobPath.replace(/\.json$/, ".terminal.log");
+  writeFileSync(archivedBusyLog, "corrupt archived evidence\n");
+  assert.notEqual((await runOnce()).status, 0);
+  assert.equal(JSON.parse(readFileSync(busyJobPath, "utf8")).result, "error");
+  rmSync(archivedBusyLog);
+  const pendingCountBeforeRecovery = published.filter(row => row.sha === busyHead && row.state === "pending").length;
+  assert.equal((await runOnce()).status, 0);
+  const recoveredJob = JSON.parse(readFileSync(busyJobPath, "utf8"));
+  assert.equal(recoveredJob.result, undefined);
+  assert.equal(recoveredJob.attempts, 2);
+  assert.equal(recoveredJob.admissionWaits, 2);
+  assert.equal(recoveredJob.terminalEvidence.result, "error");
+  assert.equal(recoveredJob.terminalEvidence.error, "RevisionError: cloud launcher returned no receipt");
+  assert.deepEqual(readFileSync(busyJobPath.replace(/\.json$/, ".terminal.log")), firstBusyOutput);
+  assert.equal(published.filter(row => row.sha === busyHead && row.state === "pending").length, pendingCountBeforeRecovery + 1);
+  writeFileSync(capacityOpen, "operator confirms runner capacity is available\n");
+  assert.equal((await runOnce()).status, 0);
+  const completedBusyJob = JSON.parse(readFileSync(busyJobPath, "utf8"));
+  assert.equal(completedBusyJob.result, "success");
+  assert.equal(completedBusyJob.publishedResult, "success");
+  assert.equal(published.some(row => row.sha === busyHead && row.state === "success"), true);
+  assert.equal(accepted.some(row => row.sha === busyHead && row.state === "success"), true);
+  assert.equal(readFileSync(launcherCalls, "utf8").trim().split("\n").length, 6);
+
+  rmSync(capacityOpen);
+  writeFileSync(join(source, "extra-output.txt"), "capacity text with unrelated output\n");
+  git("add", "extra-output.txt");
+  git("commit", "-qm", "extra output is not admission proof");
+  const extraOutputHead = git("rev-parse", "HEAD");
+  git("push", "-q", "origin", "HEAD:refs/heads/main");
+  assert.equal((await push(extraOutputHead)).status, 202);
+  assert.equal((await runOnce()).status, 0);
+  assert.equal(published.some(row => row.sha === extraOutputHead && row.state === "error"), true);
+
+  writeFileSync(capacityOpen, "operator confirms runner capacity is available\n");
+  writeFileSync(join(source, "ambiguous-receipt.txt"), "capacity text with a receipt present\n");
+  git("add", "ambiguous-receipt.txt");
+  git("commit", "-qm", "receipt blocks admission retry");
+  const ambiguousReceiptHead = git("rev-parse", "HEAD");
+  git("push", "-q", "origin", "HEAD:refs/heads/main");
+  assert.equal((await push(ambiguousReceiptHead)).status, 202);
+  assert.equal((await runOnce()).status, 0);
+  assert.equal(published.some(row => row.sha === ambiguousReceiptHead && row.state === "error"), true);
+
+  rmSync(join(source, "busy-timeout.txt"));
+  rmSync(join(source, "extra-output.txt"));
+  rmSync(join(source, "ambiguous-receipt.txt"));
+  git("add", "-u");
+  git("commit", "-qm", "remove runner capacity fixtures");
+  git("push", "-q", "origin", "HEAD:refs/heads/main");
+
   for (const marker of ["no-receipt.txt", "wrong-receipt.txt", "stale-receipt.txt"]) {
     if (marker === "wrong-receipt.txt") {
       rmSync(join(source, "no-receipt.txt"));
@@ -291,7 +390,7 @@ raise SystemExit(exit_code)
     assert.equal(published.some(row => row.sha === badReceiptHead && row.state === "error"), true);
     assert.equal(published.some(row => row.sha === badReceiptHead && row.state === "success"), false);
   }
-  assert.equal(readFileSync(launcherCalls, "utf8").trim().split("\n").length, 6);
+  assert.equal(readFileSync(launcherCalls, "utf8").trim().split("\n").length, 11);
 
   const foreignOrigin = { ...config, origin: join(dir, "another-project.git") };
   writeFileSync(configPath, JSON.stringify(foreignOrigin), { mode: 0o600 });

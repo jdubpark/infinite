@@ -27,6 +27,7 @@ NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}\Z", re.ASCII)
 CONTEXT = re.compile(r"[A-Za-z0-9][A-Za-z0-9_./-]{0,99}\Z", re.ASCII)
 MAX_BODY = 1_000_000
 MAX_ATTEMPTS = 2
+MAX_CAPACITY_OUTPUT = 1024 * 1024
 
 
 class RevisionError(RuntimeError):
@@ -328,6 +329,92 @@ def record_output(stream, job_path: Path, job: dict) -> bytes:
     return tail
 
 
+def has_receipt_for_sha(receipt_dir: Path, sha: str) -> bool:
+    if not receipt_dir.is_dir():
+        return False
+    for path in receipt_dir.glob("*.json"):
+        try:
+            if path.is_symlink() or not path.is_file():
+                continue
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
+        if isinstance(record, dict) and record.get("base") == sha:
+            return True
+    return False
+
+
+def confirmed_capacity_wait(job_path: Path, job: dict, config: dict) -> bool:
+    size = job.get("outputBytes")
+    digest = job.get("outputSha256")
+    command, _mode = check_argv(config)
+    command_digest = hashlib.sha256(json.dumps(command, separators=(",", ":"), ensure_ascii=True).encode("ascii")).hexdigest()
+    if (job.get("launcherExit") != 2 or job.get("runner") != config["runner"]
+            or job.get("profileSha256") != config["profileSha256"] or job.get("commandSha256") != command_digest
+            or not isinstance(job.get("sha"), str) or not SHA.fullmatch(job["sha"])
+            or has_receipt_for_sha(effective_state_home() / config["workspace"] / "cloud-check/receipts", job["sha"])
+            or type(size) is not int
+            or size < 1 or size > MAX_CAPACITY_OUTPUT
+            or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest)):
+        return False
+    log_path = job_path.with_suffix(".log")
+    try:
+        info = log_path.lstat()
+        if log_path.is_symlink() or not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077 or info.st_size != size:
+            return False
+        output = log_path.read_bytes()
+    except OSError:
+        return False
+    if len(output) != size or not hmac.compare_digest(hashlib.sha256(output).hexdigest(), digest):
+        return False
+    try:
+        lines = output.decode("ascii", "strict").splitlines(keepends=True)
+    except UnicodeDecodeError:
+        return False
+    if len(lines) < 3 or (len(lines) - 1) % 2 or len(lines) > 8193:
+        return False
+    archive_digest = None
+    dispatch = re.compile(r"Dispatch to ([A-Za-z0-9][A-Za-z0-9_.-]{0,99}) \(archive SHA-256 ([0-9a-f]{64})\)\n\Z", re.ASCII)
+    busy = re.compile(r"Runner ([A-Za-z0-9][A-Za-z0-9_.-]{0,99}) is busy; checkout not sent\n\Z", re.ASCII)
+    for index in range(0, len(lines) - 1, 2):
+        dispatch_match = dispatch.fullmatch(lines[index])
+        busy_match = busy.fullmatch(lines[index + 1])
+        if (dispatch_match is None or busy_match is None
+                or dispatch_match.group(1) != config["runner"]
+                or busy_match.group(1) != config["runner"]
+                or archive_digest is not None and dispatch_match.group(2) != archive_digest):
+            return False
+        archive_digest = dispatch_match.group(2)
+    return lines[-1] == "cloud-check: workspace runner pool remained busy until the capacity wait expired\n"
+
+
+def preserve_terminal_evidence(job_path: Path, job: dict) -> dict:
+    keys = ("result", "description", "error", "completedAt", "publishedResult", "launcherExit",
+            "outputSha256", "outputBytes", "runner", "profileSha256", "commandSha256")
+    evidence = {key: job[key] for key in keys if key in job}
+    evidence["log"] = job_path.with_suffix(".terminal.log").name
+    source = job_path.with_suffix(".log")
+    target = job_path.with_suffix(".terminal.log")
+    if source.is_file() and not target.exists():
+        with source.open("rb") as original, tempfile.NamedTemporaryFile(dir=job_path.parent, prefix=".terminal-", delete=False) as preserved:
+            shutil.copyfileobj(original, preserved)
+            preserved.flush()
+            os.fsync(preserved.fileno())
+            os.fchmod(preserved.fileno(), 0o600)
+            temporary = Path(preserved.name)
+        os.replace(temporary, target)
+    elif target.is_symlink() or target.exists() and (not target.is_file() or target.stat().st_mode & 0o077):
+        raise RevisionError("saved terminal log has unsafe permissions")
+    if (not target.is_file() or target.stat().st_size != job.get("outputBytes")
+            or not hmac.compare_digest(hashlib.sha256(target.read_bytes()).hexdigest(), job.get("outputSha256", ""))):
+        raise RevisionError("saved terminal log does not match its recorded digest")
+    return evidence
+
+
+def verification_attempts(job: dict) -> int:
+    return max(0, int(job.get("attempts", 0)) - int(job.get("admissionWaits", 0)))
+
+
 def run_job(config: dict, state: Path, job_path: Path, api: str) -> None:
     worker_lock_path = job_path.with_suffix(".worker.lock")
     queue_lock_path = job_path.with_suffix(".queue.lock")
@@ -339,13 +426,26 @@ def run_job(config: dict, state: Path, job_path: Path, api: str) -> None:
             sha = job["sha"]
             if job.get("configDigest") != config_digest(config):
                 raise RevisionError("queued event belongs to a different enrollment")
+            if (job.get("result") == "error" and job.get("publishedResult") == "error"
+                    and job.get("error") == "RevisionError: cloud launcher returned no receipt"
+                    and "receiptSha256" not in job
+                    and confirmed_capacity_wait(job_path, job, config)):
+                evidence = preserve_terminal_evidence(job_path, job)
+                publish_current(config, sha, "pending", "Cloud verification queued", api)
+                job.setdefault("terminalEvidence", evidence)
+                prior_admission_waits = int(job.get("admissionWaits", 0))
+                job["admissionWaits"] = prior_admission_waits + 1
+                for key in ("result", "description", "error", "completedAt", "publishedResult"):
+                    job.pop(key, None)
+                job["pendingPublished"] = True
+                atomic_json(job_path, job)
             if job.get("result") in {"success", "failure", "error"}:
                 if job.get("publishedResult") != job["result"]:
                     publish_current(config, sha, job["result"], job["description"], api)
                     job["publishedResult"] = job["result"]
                     atomic_json(job_path, job)
                 return
-            if int(job.get("attempts", 0)) >= MAX_ATTEMPTS:
+            if verification_attempts(job) >= MAX_ATTEMPTS:
                 job["result"] = "error"
                 job["description"] = "Cloud verification could not complete"
                 job["error"] = "retry limit reached"
@@ -364,6 +464,7 @@ def run_job(config: dict, state: Path, job_path: Path, api: str) -> None:
             job["attempts"] = int(job.get("attempts", 0)) + 1
             job["startedAt"] = int(time.time())
             atomic_json(job_path, job)
+        validated_capacity_wait = False
         try:
             if launcher_digest(Path(config["launcher"])) != config["launcherSha256"]:
                 raise RevisionError("installed launcher changed after enrollment")
@@ -385,16 +486,32 @@ def run_job(config: dict, state: Path, job_path: Path, api: str) -> None:
             job["runner"] = config["runner"]
             job["profileSha256"] = config["profileSha256"]
             job["commandSha256"] = hashlib.sha256(json.dumps(check, separators=(",", ":"), ensure_ascii=True).encode("ascii")).hexdigest()
-            record = verify_receipt(config, sha, exit_code, output_bytes, check, mode, prior_receipts)
-            job["result"] = "success" if exit_code == 0 else "failure"
-            job["description"] = "Cloud verification passed" if exit_code == 0 else "Cloud verification failed"
-            job["receiptSha256"] = hashlib.sha256(json.dumps(record, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+            if confirmed_capacity_wait(job_path, job, config):
+                validated_capacity_wait = True
+            else:
+                record = verify_receipt(config, sha, exit_code, output_bytes, check, mode, prior_receipts)
+                job["result"] = "success" if exit_code == 0 else "failure"
+                job["description"] = "Cloud verification passed" if exit_code == 0 else "Cloud verification failed"
+                job["receiptSha256"] = hashlib.sha256(json.dumps(record, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         except Exception as error:
             job["result"] = "error"
             job["runner"] = config["runner"]
             job["profileSha256"] = config["profileSha256"]
             job["description"] = "Cloud verification could not complete"
             job["error"] = f"{type(error).__name__}: {str(error)[:500]}"
+        if validated_capacity_wait:
+            job["admissionWaits"] = int(job.get("admissionWaits", 0)) + 1
+            job["lastAdmissionWaitAt"] = int(time.time())
+            for key in ("result", "description", "error", "completedAt", "publishedResult"):
+                job.pop(key, None)
+            with queue_lock_path.open("a+b") as queue_lock:
+                fcntl.flock(queue_lock, fcntl.LOCK_EX)
+                current = json.loads(job_path.read_text(encoding="utf-8"))
+                for key, value in job.items():
+                    if key != "deliveries":
+                        current[key] = value
+                atomic_json(job_path, current)
+            return
         job["completedAt"] = int(time.time())
         with queue_lock_path.open("a+b") as queue_lock:
             fcntl.flock(queue_lock, fcntl.LOCK_EX)
@@ -435,7 +552,7 @@ def receive(config: dict, state: Path, body: bytes, headers: dict[str, str], api
             if current is None:
                 check, _mode = check_argv(config)
                 command_hash = hashlib.sha256(json.dumps(check, separators=(",", ":"), ensure_ascii=True).encode("ascii")).hexdigest()
-                current = {**accepted, "attempts": 0, "runner": config["runner"], "profileSha256": config["profileSha256"], "commandSha256": command_hash, "deliveries": [delivery_record]}
+                current = {**accepted, "attempts": 0, "admissionWaits": 0, "runner": config["runner"], "profileSha256": config["profileSha256"], "commandSha256": command_hash, "deliveries": [delivery_record]}
             elif not any(item.get("delivery") == delivery for item in current.get("deliveries", [])):
                 current.setdefault("deliveries", []).append(delivery_record)
             atomic_json(queue, current)

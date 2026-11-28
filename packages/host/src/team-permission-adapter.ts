@@ -85,6 +85,7 @@ export type TeamTargetDeps = {
   roleCheck?(): Promise<void>;
   task?(): { title: string; text: string } | undefined;
   workspace(): Promise<TeamWorkspaceEvidence>;
+  initialWorkspace?: TeamWorkspaceEvidence;
   collect?(paths: string[]): Promise<PermissionEvidence>;
   delivering?(deliveryId: string, active: boolean): void;
   signal?: AbortSignal;
@@ -103,6 +104,7 @@ export function teamPermissionTarget(request: PermissionRequest, deps: TeamTarge
   const current = () => deps.runCheck() === undefined && !deps.signal?.aborted;
   let requested: { paths: string[]; digest: string } | undefined;
   let delivering: string | undefined;
+  let unusedInitialWorkspace = deps.initialWorkspace;
 
   const target: PermissionInteractiveTarget = {
     request,
@@ -113,6 +115,8 @@ export function teamPermissionTarget(request: PermissionRequest, deps: TeamTarge
       return evidence;
     } } : {}),
     async check() {
+      const initialWorkspace = unusedInitialWorkspace;
+      unusedInitialWorkspace = undefined;
       const run = deps.runCheck();
       if (run) return fail(run.stale, run.reason);
       if (deps.signal?.aborted) return fail(false, "The run's permission authority ended while the request was decided.");
@@ -125,7 +129,8 @@ export function teamPermissionTarget(request: PermissionRequest, deps: TeamTarge
         catch { return fail(false, "The delivery policy, reviewed head, or required checks are no longer current."); }
       }
       try {
-        if (!workspaceMatches(await deps.workspace())) return fail(true, "The inspected command sources or changed paths changed.");
+        const workspace = initialWorkspace ?? await deps.workspace();
+        if (!workspaceMatches(workspace)) return fail(true, "The inspected command sources or changed paths changed.");
       } catch { return fail(true, "The member's changed files could not be listed."); }
       if (requested && deps.collect) {
         try {

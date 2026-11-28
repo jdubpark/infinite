@@ -2617,7 +2617,7 @@ export class TeamService {
       this.assertRunPath(stored, run.workspace);
       if (continuationHead) await assertMemberReadOnly(run.workspace, continuationHead.headCommit, this.config.teams?.commandPrefix, signal, "integration");
       let cwd: string;
-      try { cwd = run.replay ? run.workspace : await prepareMemberWorkspace(run.workspace, member.memberId, member.baseCommit, this.config.teams?.commandPrefix, signal); }
+      try { cwd = run.replay ? run.workspace : await prepareMemberWorkspace(run.workspace, member.memberId, member.baseCommit, this.config.teams?.commandPrefix, signal, { readOnly: !["implementer", "integrator", "delivery"].includes(role) }); }
       catch (error) { if (!onFailed || signal.aborted || (error instanceof TeamError && error.code === "team-root-unsafe")) throw error; failure = error instanceof TeamError ? error.code : "workspace-operation-failed"; return undefined; }
       this.assertRunPath(stored, cwd);
       if (continuationHead) await assertMemberReadOnly(run.workspace, continuationHead.headCommit, this.config.teams?.commandPrefix, signal, "integration");
@@ -2683,7 +2683,7 @@ export class TeamService {
       const now = this.currentDate(), activeLimits = this.limits.active(now), hostLoadReason = this.manager.hostLoad.held();
       if (run.replay && this.replays.launchBlocked(stored, member, activeLimits, this.options?.replayLaunchGate)) return;
       const workerCapacityFull = (member.role === "scout" || member.role === "implementer") && run.members.filter(other => other !== member && holdsWorkerSlot(other, run.revision) && (isDeferredWorkerMember(member) || other.status !== "queued")).length >= run.parallelism;
-      const checkSessionSlotFull = async () => (await this.manager.list()).filter(session => session.status === "running" || session.status === "starting").length >= this.config.maxSessions;
+      const checkSessionSlotFull = async () => (await this.manager.list()).filter(session => session.status === "running" || session.status === "starting").length >= (member.role === "permission-coordinator" && this.config.maxSessions > 0 ? this.config.maxSessions + 1 : this.config.maxSessions);
       const gate = await evaluateLaunchAdmissionAsync(run, member, activeLimits, this.limits.limited(now), SESSION_SLOT_REASON, text => this.event(stored, text), { planMemberId: stored.intentCheck?.planMemberId, workerCapacityFull, hostLoadReason, checkSessionSlotFull, promptSections: getMemberPromptSections(stored, member) });
       if (gate.changed) this.save(stored);
       if (!gate.proceed) return;

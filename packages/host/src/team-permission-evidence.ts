@@ -101,12 +101,163 @@ function completeCommand(prompt: Prompt, limitations: string[]): string | undefi
   return input.command;
 }
 
+const OUTPUT_FILTERS = new Set(["head", "tail", "grep", "egrep", "fgrep", "rg", "wc", "sort", "uniq", "cut", "tr", "cat", "nl"]);
+const HEAD_TAIL_BOOL_FLAGS = new Set(["-q", "--quiet", "--silent", "-v", "--verbose", "-z", "--zero-terminated"]);
+const HEAD_TAIL_VALUE_FLAGS = new Set(["-n", "--lines", "-c", "--bytes"]);
+const WC_BOOL_FLAGS = new Set(["-l", "--lines", "-w", "--words", "-c", "--bytes", "-m", "--chars", "-L", "--max-line-length"]);
+const CAT_BOOL_FLAGS = new Set(["-A", "--show-all", "-b", "--number-nonblank", "-e", "-E", "--show-ends", "-n", "--number", "-s", "--squeeze-blank", "-t", "-T", "--show-tabs", "-u", "-v", "--show-nonprinting"]);
+const NL_BOOL_FLAGS = new Set(["-p", "--no-renumber"]);
+const NL_VALUE_FLAGS = new Set(["-b", "--body-numbering", "-h", "--header-numbering", "-f", "--footer-numbering", "-d", "--section-delimiter", "-i", "--line-increment", "-l", "--join-blank-lines", "-n", "--number-format", "-s", "--number-separator", "-v", "--starting-line-number", "-w", "--number-width"]);
+const SORT_BOOL_FLAGS = new Set(["-b", "--ignore-leading-blanks", "-d", "--dictionary-order", "-f", "--ignore-case", "-g", "--general-numeric-sort", "-i", "--ignore-nonprinting", "-M", "--month-sort", "-h", "--human-numeric-sort", "-n", "--numeric-sort", "-R", "--random-sort", "-r", "--reverse", "-V", "--version-sort", "-c", "--check", "-C", "-m", "--merge", "-s", "--stable", "-u", "--unique", "-z", "--zero-terminated"]);
+const SORT_VALUE_FLAGS = new Set(["-k", "--key", "-t", "--field-separator", "-S", "--buffer-size", "--parallel"]);
+const UNIQ_BOOL_FLAGS = new Set(["-c", "--count", "-d", "--repeated", "-D", "-u", "--unique", "-i", "--ignore-case", "-z", "--zero-terminated", "--all-repeated", "--group"]);
+const UNIQ_VALUE_FLAGS = new Set(["-f", "--skip-fields", "-s", "--skip-chars", "-w", "--check-chars"]);
+const UNIQ_INLINE_ONLY_FLAGS = new Set(["--all-repeated", "--group"]);
+const CUT_BOOL_FLAGS = new Set(["-s", "--only-delimited", "-z", "--zero-terminated", "--complement", "-n"]);
+const CUT_VALUE_FLAGS = new Set(["-b", "--bytes", "-c", "--characters", "-d", "--delimiter", "-f", "--fields", "--output-delimiter"]);
+const TR_BOOL_FLAGS = new Set(["-c", "-C", "--complement", "-d", "--delete", "-s", "--squeeze-repeats", "-t", "--truncate-set1"]);
+const GREP_COMMON_BOOL_FLAGS = new Set(["-E", "-F", "-G", "-P", "-i", "-v", "-w", "-x", "-c", "-l", "-L", "-n", "-h", "-H", "-o", "-q", "-s", "-b", "-u", "-z", "-a", "-I", "--extended-regexp", "--fixed-strings", "--basic-regexp", "--perl-regexp", "--ignore-case", "--invert-match", "--word-regexp", "--line-regexp", "--count", "--files-with-matches", "--files-without-match", "--line-number", "--no-filename", "--with-filename", "--only-matching", "--quiet", "--silent", "--no-messages", "--byte-offset", "--null-data", "--text", "--line-buffered"]);
+const GREP_ONLY_BOOL_FLAGS = new Set(["-T", "--initial-tab", "--color", "--colour"]);
+const GREP_INLINE_ONLY_FLAGS = new Set(["--color", "--colour"]);
+const GREP_COMMON_VALUE_FLAGS = new Set(["-e", "--regexp", "-A", "--after-context", "-B", "--before-context", "-C", "--context", "-m", "--max-count"]);
+const RG_ONLY_BOOL_FLAGS = new Set(["--smart-case", "-S", "--case-sensitive", "--no-heading", "--no-line-number", "--vimgrep", "--json"]);
+const RG_ONLY_VALUE_FLAGS = new Set(["--color", "--colour", "-M", "--max-columns", "-t", "--type", "-T", "--type-not"]);
+
+function matchLongValueFlag(arg: string, flags: ReadonlySet<string>): { name: string; inlineValue?: string } | undefined {
+  if (flags.has(arg)) return { name: arg };
+  const eq = arg.indexOf("=");
+  if (eq <= 0) return undefined;
+  const name = arg.slice(0, eq);
+  return flags.has(name) ? { name, inlineValue: arg.slice(eq + 1) } : undefined;
+}
+
+function isSafeOutputFilterStage(stage: string): boolean {
+  const tokens = tokenize(stage, []);
+  if (!tokens || !tokens.words.length || tokens.environmentAssignments.some(Boolean)) return false;
+  const rawExec = tokens.words[0];
+  if (/[\\/]/.test(rawExec)) return false;
+  const exec = /\.cmd$/i.test(rawExec) ? rawExec.slice(0, -4).toLowerCase() : rawExec;
+  if (!OUTPUT_FILTERS.has(exec)) return false;
+  const args = tokens.words.slice(1);
+  let afterDoubleDash = false;
+  let positionals = 0;
+  let hasExplicitPattern = false;
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (!afterDoubleDash && arg === "--") {
+      afterDoubleDash = true;
+      continue;
+    }
+    if (afterDoubleDash || !arg.startsWith("-") || arg === "-") {
+      if (arg === "-") return false;
+      positionals++;
+      continue;
+    }
+    if (exec === "head" || exec === "tail") {
+      if (HEAD_TAIL_BOOL_FLAGS.has(arg) || /^-[0-9]+$/.test(arg) || /^-[nc]\+?[0-9]+[bkmgtpezyBKMGTP]*$/.test(arg)) continue;
+      const valFlag = matchLongValueFlag(arg, HEAD_TAIL_VALUE_FLAGS);
+      if (!valFlag) return false;
+      const value = valFlag.inlineValue ?? args[++i];
+      if (!value || !/^\+?[0-9]+[bkmgtpezyBKMGTP]*$/.test(value)) return false;
+      continue;
+    }
+    if (exec === "wc") {
+      if (!WC_BOOL_FLAGS.has(arg) && !/^-[lwcmL]+$/.test(arg)) return false;
+      continue;
+    }
+    if (exec === "cat") {
+      if (!CAT_BOOL_FLAGS.has(arg) && !/^-[AbeEnstTuv]+$/.test(arg)) return false;
+      continue;
+    }
+    if (exec === "nl") {
+      if (NL_BOOL_FLAGS.has(arg)) continue;
+      const valFlag = matchLongValueFlag(arg, NL_VALUE_FLAGS);
+      if (!valFlag) return false;
+      if (valFlag.inlineValue === undefined && args[++i] === undefined) return false;
+      continue;
+    }
+    if (exec === "sort") {
+      if (SORT_BOOL_FLAGS.has(arg) || /^-[bdfgiMhnRrVcmsuz]+$/.test(arg)) continue;
+      const valFlag = matchLongValueFlag(arg, SORT_VALUE_FLAGS);
+      if (!valFlag) return false;
+      if (valFlag.inlineValue === undefined && args[++i] === undefined) return false;
+      continue;
+    }
+    if (exec === "uniq") {
+      if (UNIQ_BOOL_FLAGS.has(arg) || /^-[cdDiuwz]+$/.test(arg)) continue;
+      const inlineFlag = matchLongValueFlag(arg, UNIQ_INLINE_ONLY_FLAGS);
+      if (inlineFlag?.inlineValue !== undefined) continue;
+      const valFlag = matchLongValueFlag(arg, UNIQ_VALUE_FLAGS);
+      if (!valFlag) return false;
+      if (valFlag.inlineValue === undefined && args[++i] === undefined) return false;
+      continue;
+    }
+    if (exec === "cut") {
+      if (CUT_BOOL_FLAGS.has(arg)) continue;
+      if (/^-[bcdf].+$/.test(arg)) continue;
+      const valFlag = matchLongValueFlag(arg, CUT_VALUE_FLAGS);
+      if (!valFlag) return false;
+      if (valFlag.inlineValue === undefined && args[++i] === undefined) return false;
+      continue;
+    }
+    if (exec === "tr") {
+      if (!TR_BOOL_FLAGS.has(arg) && !/^-[cCdst]+$/.test(arg)) return false;
+      continue;
+    }
+    if (GREP_COMMON_BOOL_FLAGS.has(arg)
+      || (exec === "rg" ? RG_ONLY_BOOL_FLAGS.has(arg) || /^-[EFGPivwxclLnhHoqsbuzSa]+$/.test(arg)
+        : GREP_ONLY_BOOL_FLAGS.has(arg) || /^-[EFGPivwxclLnhHoqsbuzT]+$/.test(arg))) {
+      continue;
+    }
+    if (exec !== "rg") {
+      const inlineFlag = matchLongValueFlag(arg, GREP_INLINE_ONLY_FLAGS);
+      if (inlineFlag?.inlineValue !== undefined) continue;
+    }
+    if (/^-[ABCm][0-9]+$/.test(arg)) continue;
+    if (/^-e.+$/.test(arg)) { hasExplicitPattern = true; continue; }
+    const valFlag = matchLongValueFlag(arg, GREP_COMMON_VALUE_FLAGS)
+      ?? (exec === "rg" ? matchLongValueFlag(arg, RG_ONLY_VALUE_FLAGS) : undefined);
+    if (!valFlag) return false;
+    if (valFlag.name === "-e" || valFlag.name === "--regexp") hasExplicitPattern = true;
+    if (valFlag.inlineValue === undefined && args[++i] === undefined) return false;
+  }
+  if (exec === "tr") return positionals >= 1 && positionals <= 2;
+  if (exec === "grep" || exec === "egrep" || exec === "fgrep" || exec === "rg") {
+    return hasExplicitPattern ? positionals === 0 : positionals === 1;
+  }
+  return positionals === 0;
+}
+
+function splitPipeStages(segment: string): string[] | undefined {
+  const stages: string[] = [];
+  let start = 0, quote: "'" | '"' | undefined, escaped = false;
+  for (let index = 0; index < segment.length; index++) {
+    const char = segment[index];
+    if (escaped) { escaped = false; continue; }
+    if (char === "\\" && quote !== "'") { escaped = true; continue; }
+    if (quote) { if (char === quote) quote = undefined; continue; }
+    if (char === "'" || char === '"') { quote = char; continue; }
+    if (char === "|") {
+      const next = segment[index + 1];
+      if (next === "|" || next === "&") return undefined;
+      const part = segment.slice(start, index).trim();
+      if (!part) return undefined;
+      stages.push(part);
+      start = index + 1;
+    }
+  }
+  const final = segment.slice(start).trim();
+  if (!final) return undefined;
+  stages.push(final);
+  return stages;
+}
+
 function splitLiteralCommandChain(command: string, limitations: string[]): string[] | undefined {
-  if (/[\n\r\0]/.test(command) || /[|;<>`]/.test(command) || /\$\(|\$\{|\$[A-Za-z_]/.test(command)) {
+  if (/[\n\r\0]/.test(command) || /[;<>`]/.test(command) || /\$\(|\$\{|\$[A-Za-z_]/.test(command)) {
     limitations.push("The command uses shell composition, expansion, or multiple lines; source collection is incomplete.");
     return undefined;
   }
-  const parts: string[] = [];
+  const rawParts: string[] = [];
   let start = 0, quote: "'" | '"' | undefined, escaped = false;
   for (let index = 0; index < command.length; index++) {
     const char = command[index];
@@ -118,14 +269,29 @@ function splitLiteralCommandChain(command: string, limitations: string[]): strin
       if (command[index + 1] !== "&") { limitations.push("A standalone shell background operator is unsupported."); return undefined; }
       const part = command.slice(start, index).trim();
       if (!part) { limitations.push("The shell command chain contains an empty command."); return undefined; }
-      parts.push(part);
+      rawParts.push(part);
       start = ++index + 1;
     }
   }
   if (quote || escaped) { limitations.push("The command contains an unterminated quote or escape."); return undefined; }
   const final = command.slice(start).trim();
   if (!final) { limitations.push("The shell command chain ends without a command."); return undefined; }
-  parts.push(final);
+  rawParts.push(final);
+  const parts: string[] = [];
+  for (const segment of rawParts) {
+    const stages = splitPipeStages(segment);
+    if (!stages) {
+      limitations.push("The command uses shell composition, expansion, or multiple lines; source collection is incomplete.");
+      return undefined;
+    }
+    for (let index = 1; index < stages.length; index++) {
+      if (!isSafeOutputFilterStage(stages[index])) {
+        limitations.push("The command uses shell composition, expansion, or multiple lines; source collection is incomplete.");
+        return undefined;
+      }
+    }
+    parts.push(stages[0]);
+  }
   return parts;
 }
 

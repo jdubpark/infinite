@@ -34,15 +34,21 @@ type Snapshot = {
   sessions: StoredSession[];
   bySession: Map<string, UsageRecord[]>;
   briefings: { projectId: string; at: string; record?: UsageRecord }[];
+  byProject: ReadonlyMap<string, readonly StoredSession[]>;
+  byRun: ReadonlyMap<string, readonly StoredSession[]>;
+  briefingsByProject: ReadonlyMap<string, readonly { projectId: string; at: string; record?: UsageRecord }[]>;
   taskKey?: string;
 };
 type Ledger = {
   sessions: readonly StoredSession[];
   byId: ReadonlyMap<string, StoredSession>;
   byMember: ReadonlyMap<string, readonly StoredSession[]>;
+  byProject: ReadonlyMap<string, readonly StoredSession[]>;
+  byRun: ReadonlyMap<string, readonly StoredSession[]>;
   bySession: Map<string, UsageRecord[]>;
   order: ReadonlyMap<UsageRecord, number>;
   briefings: Snapshot["briefings"];
+  briefingsByProject: ReadonlyMap<string, Snapshot["briefings"]>;
 };
 const memberKey = (runId: string, memberId: string) => `${runId}\u0000${memberId}`;
 export const LEDGER_KEEP_MS = 2_000;
@@ -134,6 +140,7 @@ export class UsageService {
   private kept?: Ledger;
   private keptAt = 0;
   private failedAt?: number;
+  private readonly dateFormatters = new Map<string, Intl.DateTimeFormat>();
   private readonly planFile: string;
   private planOverrides: Record<string, number> = Object.create(null) as Record<string, number>;
   private balances?: { get(id: string): Balance };
@@ -428,12 +435,21 @@ export class UsageService {
     }
     this.failedAt = undefined;
     const byId = new Map<string, StoredSession>(), members = new Map<string, StoredSession[]>();
+    const byProject = new Map<string, StoredSession[]>(), byRun = new Map<string, StoredSession[]>();
+    const briefingsByProject = new Map<string, Snapshot["briefings"]>();
     for (const session of data.sessions) {
       Object.freeze(session);
       byId.set(session.sessionId, session);
+      (byProject.get(session.projectId) ?? byProject.set(session.projectId, []).get(session.projectId)!).push(session);
+      if (session.runId !== undefined) {
+        (byRun.get(session.runId) ?? byRun.set(session.runId, []).get(session.runId)!).push(session);
+      }
       if (session.runId === undefined || session.memberId === undefined) continue;
       const key = memberKey(session.runId, session.memberId);
       (members.get(key) ?? members.set(key, []).get(key)!).push(session);
+    }
+    for (const row of data.briefings) {
+      (briefingsByProject.get(row.projectId) ?? briefingsByProject.set(row.projectId, []).get(row.projectId)!).push(row);
     }
     const bySession = new Map<string, UsageRecord[]>(), order = new Map<UsageRecord, number>();
     data.records.forEach(({ sessionId, record }, index) => {
@@ -443,8 +459,11 @@ export class UsageService {
       (bySession.get(sessionId) ?? bySession.set(sessionId, []).get(sessionId)!).push(record);
     });
     for (const list of members.values()) Object.freeze(list);
+    for (const list of byProject.values()) Object.freeze(list);
+    for (const list of byRun.values()) Object.freeze(list);
+    for (const list of briefingsByProject.values()) Object.freeze(list);
     for (const list of bySession.values()) Object.freeze(list);
-    this.kept = { sessions: Object.freeze(data.sessions), byId, byMember: members, bySession, order, briefings: Object.freeze(data.briefings) as Snapshot["briefings"] };
+    this.kept = { sessions: Object.freeze(data.sessions), byId, byMember: members, byProject, byRun, bySession, order, briefings: Object.freeze(data.briefings) as Snapshot["briefings"], briefingsByProject };
     this.keptAt = now;
     return this.kept;
   }
@@ -456,7 +475,15 @@ export class UsageService {
       try { taskKey = this.store.read(db => db.index("task", taskId)); }
       catch { throw new EvidenceError("unavailable", "The usage ledger is unavailable."); }
     }
-    return { sessions: ledger.sessions as StoredSession[], bySession: ledger.bySession, briefings: ledger.briefings, ...(taskKey === undefined ? {} : { taskKey }) };
+    return {
+      sessions: ledger.sessions as StoredSession[],
+      bySession: ledger.bySession,
+      briefings: ledger.briefings,
+      byProject: ledger.byProject,
+      byRun: ledger.byRun,
+      briefingsByProject: ledger.briefingsByProject,
+      ...(taskKey === undefined ? {} : { taskKey }),
+    };
   }
   private price(record: UsageRecord): { cost: number; pricing: Pricing } {
     return record.provider === "opencode" ? priceUsage(record, this.config.usage?.prices) : { cost: 0, pricing: "unknown" };
@@ -467,28 +494,52 @@ export class UsageService {
   private priced(records: UsageRecord[]) {
     return records.map(record => ({ ...this.price(record), tokens: record.tokens }));
   }
-  private measuredRecords(data: Snapshot) {
-    const sessions = new Map(data.sessions.map(session => [session.sessionId, session]));
-    return [...data.bySession].flatMap(([id, records]) => { const session = sessions.get(id); return session ? records.map(record => ({ id, projectId: session.projectId, record, ...this.price(record) })) : []; });
+  private measuredRecords(data: Snapshot, projectId?: string) {
+    const sessions = projectId === undefined ? data.sessions : (data.byProject.get(projectId) ?? []);
+    const rows: { id: string; projectId: string; record: UsageRecord; cost: number; pricing: Pricing }[] = [];
+    for (const session of sessions) {
+      if (!measured(session)) continue;
+      const records = data.bySession.get(session.sessionId);
+      if (!records) continue;
+      for (const record of records) rows.push({ id: session.sessionId, projectId: session.projectId, record, ...this.price(record) });
+    }
+    return rows;
   }
-  private allMeasuredRecords(data: Snapshot) {
-    return [...this.measuredRecords(data), ...data.briefings.flatMap(row => row.record ? [{ id: `briefing:${row.at}`, projectId: row.projectId, record: row.record, ...this.price(row.record) }] : [])];
+  private allMeasuredRecords(data: Snapshot, projectId?: string) {
+    const briefings = projectId === undefined ? data.briefings : (data.briefingsByProject.get(projectId) ?? []);
+    const rows = this.measuredRecords(data, projectId);
+    for (const row of briefings) {
+      if (row.record) rows.push({ id: `briefing:${row.at}`, projectId: row.projectId, record: row.record, ...this.price(row.record) });
+    }
+    return rows;
   }
   private money(rows: { cost: number; pricing: string }[]): Money { return { usd: Math.round(rows.reduce((sum, row) => sum + row.cost, 0) * 1_000_000) / 1_000_000, unpriced: rows.filter(row => row.pricing === "unknown").length }; }
   private dateKey(at: string, tz: string) {
-    const parts = new Intl.DateTimeFormat("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(new Date(at));
-    const value = Object.fromEntries(parts.map(part => [part.type, part.value])); return `${value.year}-${value.month}-${value.day}`;
+    let formatter = this.dateFormatters.get(tz);
+    if (!formatter) {
+      formatter = new Intl.DateTimeFormat("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" });
+      if (this.dateFormatters.size >= 64) this.dateFormatters.delete(this.dateFormatters.keys().next().value!);
+      this.dateFormatters.set(tz, formatter);
+    }
+    let year = "", month = "", day = "";
+    for (const part of formatter.formatToParts(new Date(at))) {
+      if (part.type === "year") year = part.value;
+      else if (part.type === "month") month = part.value;
+      else if (part.type === "day") day = part.value;
+    }
+    return `${year}-${month}-${day}`;
   }
   daily({ days, tz = "UTC", projectId, now = new Date() }: { days: number; tz?: string; projectId?: string; now?: Date }) {
     if (!Number.isInteger(days) || days < 1 || days > 366) throw new RangeError("days must be between 1 and 366");
     this.dateKey(now.toISOString(), tz);
     return this.dailyFrom(this.snapshot(), { days, tz, projectId, now });
   }
-  private dailyFrom(data: Snapshot, { days, tz, projectId, now }: { days: number; tz: string; projectId?: string; now: Date }) {
+  private dailyFrom(data: Snapshot, { days, tz, projectId, now }: { days: number; tz: string; projectId?: string; now: Date }, precomputed?: ReturnType<UsageService["allMeasuredRecords"]>) {
     const last = this.dateKey(now.toISOString(), tz), [year, month, day] = last.split("-").map(Number), date = new Date(Date.UTC(year, month - 1, day));
     const dates = Array.from({ length: days }, (_, index) => { const d = new Date(date.getTime() - (days - index - 1) * 86_400_000); return d.toISOString().slice(0, 10); });
     const accounts = new Set<string>(Object.keys(this.config.usage?.accounts ?? {})), map = new Map(dates.map(key => [key, {} as Record<string, number>]));
-    for (const row of this.allMeasuredRecords(data)) {
+    const rows = precomputed ?? this.allMeasuredRecords(data, projectId);
+    for (const row of rows) {
       if (projectId && row.projectId !== projectId) continue;
       const key = this.dateKey(row.record.completedAt, tz), account = accountOf(row.record.providerId, row.record.modelId, this.config.usage?.accounts ?? {});
       accounts.add(account); if (map.has(key)) map.get(key)![account] = (map.get(key)![account] ?? 0) + row.cost;
@@ -499,20 +550,34 @@ export class UsageService {
     this.dateKey(now.toISOString(), tz);
     const data = this.snapshot();
     const ids = new Set([...data.sessions.map(s => s.projectId), ...data.briefings.map(b => b.projectId)]);
-    return { projects: [...ids].map(id => { const rows = this.projectRows(data, id), recent = this.dailyFrom(data, { days: 30, tz, projectId: id, now }), monthStart = periodStart("month", now); return { id, name: this.resolvers.projectName(id) ?? id, total: this.money(rows), month: { ...this.money(rows.filter(row => { const at = Date.parse(row.at); return at >= monthStart.getTime() && at <= now.getTime(); })), unmeasured: this.projectUnmeasured(data, id, monthStart, now), partial: this.projectPartial(data, id, monthStart, now) }, unmeasured: this.projectUnmeasured(data, id), partial: this.projectPartial(data, id), spark: recent.days.map(day => day.usd) }; }).sort((a, b) => b.total.usd - a.total.usd) };
+    const byProject = new Map<string, ReturnType<UsageService["allMeasuredRecords"]>>();
+    for (const row of this.allMeasuredRecords(data)) {
+      (byProject.get(row.projectId) ?? byProject.set(row.projectId, []).get(row.projectId)!).push(row);
+    }
+    const monthStart = periodStart("month", now);
+    const monthStartMs = monthStart.getTime(), nowMs = now.getTime();
+    return { projects: [...ids].map(id => {
+      const projectRecords = byProject.get(id) ?? [];
+      const rows = projectRecords.map(row => ({ ...row, at: row.record.completedAt }));
+      const recent = this.dailyFrom(data, { days: 30, tz, projectId: id, now }, projectRecords);
+      return { id, name: this.resolvers.projectName(id) ?? id, total: this.money(rows), month: { ...this.money(rows.filter(row => { const at = Date.parse(row.at); return at >= monthStartMs && at <= nowMs; })), unmeasured: this.projectUnmeasured(data, id, monthStart, now), partial: this.projectPartial(data, id, monthStart, now) }, unmeasured: this.projectUnmeasured(data, id), partial: this.projectPartial(data, id), spark: recent.days.map(day => day.usd) };
+    }).sort((a, b) => b.total.usd - a.total.usd) };
   }
   private projectUnmeasured(data: Snapshot, id: string, from?: Date, to?: Date) {
-    return data.sessions.filter(session => session.projectId === id && !measured(session) && inWindow(session.lastActiveAt ?? session.createdAt, from, to)).length
-      + data.briefings.filter(row => row.projectId === id && !row.record && inWindow(row.at, from, to)).length;
+    const sessions = data.byProject.get(id) ?? [];
+    const briefings = data.briefingsByProject.get(id) ?? [];
+    return sessions.filter(session => !measured(session) && inWindow(session.lastActiveAt ?? session.createdAt, from, to)).length
+      + briefings.filter(row => !row.record && inWindow(row.at, from, to)).length;
   }
   private projectPartial(data: Snapshot, id: string, from?: Date, to?: Date) {
-    return data.sessions.filter(session => session.projectId === id && partial(session) && inWindow(session.lastActiveAt ?? session.createdAt, from, to)).length;
+    const sessions = data.byProject.get(id) ?? [];
+    return sessions.filter(session => partial(session) && inWindow(session.lastActiveAt ?? session.createdAt, from, to)).length;
   }
   private projectRows(data: Snapshot, id: string) {
-    return this.allMeasuredRecords(data).filter(row => row.projectId === id).map(row => ({ ...row, at: row.record.completedAt }));
+    return this.allMeasuredRecords(data, id).map(row => ({ ...row, at: row.record.completedAt }));
   }
   private byPurpose(data: Snapshot, id: string): Record<SessionPurpose, { total: Money; members: number }> {
-    const members = data.sessions.filter(session => session.projectId === id && session.runId !== undefined && session.memberId !== undefined);
+    const members = (data.byProject.get(id) ?? []).filter(session => session.runId !== undefined && session.memberId !== undefined);
     return Object.fromEntries(SESSION_PURPOSES.map(purpose => {
       const mine = members.filter(session => session.purpose === purpose);
       const records = this.priced(mine.filter(measured).flatMap(session => data.bySession.get(session.sessionId) ?? []));
@@ -523,7 +588,7 @@ export class UsageService {
   project(id: string, { tz = "UTC", now = new Date() }: { tz?: string; now?: Date } = {}) {
     this.dateKey(now.toISOString(), tz);
     const data = this.snapshot();
-    const sessions = data.sessions.filter(session => session.projectId === id), briefings = data.briefings.filter(row => row.projectId === id);
+    const sessions = data.byProject.get(id) ?? [], briefings = data.briefingsByProject.get(id) ?? [];
     if (!sessions.length && !briefings.length) return undefined;
     const total = this.money(this.projectRows(data, id)), unmeasured = this.projectUnmeasured(data, id), partialCount = this.projectPartial(data, id), grouped = { goals: [] as any[], teams: [] as any[], sessions: [] as any[], briefings: [] as any[] };
     const resolved = new Map<string, ReturnType<UsageResolvers["goalOfRun"]>>();
@@ -546,7 +611,7 @@ export class UsageService {
     for (const row of grouped.teams.filter(item => item.goalId)) {
       const goal = goalOfRun(row.id)!; const current = goals.get(goal.id) ?? { id: goal.id, title: goal.title, total: { usd: 0, unpriced: 0 }, tasks: 0 };
       current.total.usd = Math.round((current.total.usd + row.total.usd) * 1_000_000) / 1_000_000; current.total.unpriced += row.total.unpriced; goals.set(goal.id, current);
-      const ids = goalTasks.get(goal.id) ?? new Set<string>(); for (const session of data.sessions) { if (!session.runId || session.runId !== row.id || !session.taskKey) continue; ids.add(`${row.id}/${session.taskKey}`); } goalTasks.set(goal.id, ids);
+      const ids = goalTasks.get(goal.id) ?? new Set<string>(); for (const session of data.byRun.get(row.id) ?? []) { if (!session.taskKey) continue; ids.add(`${row.id}/${session.taskKey}`); } goalTasks.set(goal.id, ids);
     }
     for (const [goalId, row] of goals) row.tasks = goalTasks.get(goalId)?.size ?? 0;
     const briefingMoney = this.money(grouped.briefings.flatMap(({ cost }) => cost ? [cost] : []));
@@ -555,7 +620,7 @@ export class UsageService {
   taskUsage(runId: string, taskId: string, revision: number): TaskUsage | undefined {
     let data: Snapshot;
     try { data = this.snapshot({ taskId }); } catch { return undefined; }
-    const sessions = data.sessions.filter(session => session.runId === runId && session.taskKey === data.taskKey && session.revision === revision);
+    const sessions = (data.byRun.get(runId) ?? []).filter(session => session.taskKey === data.taskKey && session.revision === revision);
     if (!sessions.length) return undefined;
     const rows = sessions.flatMap(session => data.bySession.get(session.sessionId) ?? []), totals = this.priced(rows), sum = sumUsage(totals);
     if (!rows.length) return undefined;
@@ -640,22 +705,45 @@ export class UsageService {
     const end = periodEnd(period, start);
     const startMs = start.getTime();
     const endMs = end.getTime();
+    const nowMs = now.getTime();
     const observed = provider === "opencode";
-    const sessions = data.sessions.filter(s => s.provider === provider && (projectId === undefined || s.projectId === projectId));
+    const baseSessions = projectId === undefined ? data.sessions : (data.byProject.get(projectId) ?? []);
     const briefings = provider === "opencode"
-      ? data.briefings.filter(row => projectId === undefined || row.projectId === projectId)
+      ? (projectId === undefined ? data.briefings : (data.briefingsByProject.get(projectId) ?? []))
       : [];
-    const unmeasuredBriefings = briefings.filter(row => !row.record && Date.parse(row.at) >= startMs && Date.parse(row.at) <= now.getTime()).length;
-    const unmeasuredSessions = sessions.filter(s => !measured(s) && sessionOverlaps(s, data.bySession.get(s.sessionId), startMs, endMs)).length + unmeasuredBriefings;
-    const partialSessions = sessions.filter(s => partial(s) && sessionOverlaps(s, data.bySession.get(s.sessionId), startMs, endMs)).length;
-    const recordingErrorSessions = sessions.filter(s => s.coverage === "partial" && s.reason === "recording-error" && sessionOverlaps(s, data.bySession.get(s.sessionId), startMs, endMs)).length;
+    const measuredSessions: StoredSession[] = [];
+    let unmeasuredSessions = 0, partialSessions = 0, recordingErrorSessions = 0;
+    for (const s of baseSessions) {
+      if (s.provider !== provider) continue;
+      if (measured(s)) measuredSessions.push(s);
+      const overlaps = sessionOverlaps(s, data.bySession.get(s.sessionId), startMs, endMs);
+      if (!overlaps) continue;
+      if (!measured(s)) unmeasuredSessions++;
+      if (partial(s)) partialSessions++;
+      if (s.coverage === "partial" && s.reason === "recording-error") recordingErrorSessions++;
+    }
+    if (provider === "opencode") {
+      for (const row of briefings) {
+        if (!row.record) {
+          const at = Date.parse(row.at);
+          if (at >= startMs && at <= nowMs) unmeasuredSessions++;
+        }
+      }
+    }
     const within = (from: Date, to: Date) => {
-      const rows = this.priced(sessions.filter(measured).flatMap(s => data.bySession.get(s.sessionId) ?? [])
-        .filter(record => { const at = Date.parse(record.completedAt); return at >= from.getTime() && at < to.getTime(); }));
-      if (provider === "opencode") rows.push(...briefings.flatMap(row => row.record && Date.parse(row.at) >= from.getTime() && Date.parse(row.at) < to.getTime() ? this.priced([row.record]) : []));
+      const fromMs = from.getTime(), toMs = to.getTime();
+      const rows = this.priced(measuredSessions.flatMap(s => data.bySession.get(s.sessionId) ?? [])
+        .filter(record => { const at = Date.parse(record.completedAt); return at >= fromMs && at < toMs; }));
+      if (provider === "opencode") {
+        for (const row of briefings) {
+          if (!row.record) continue;
+          const at = Date.parse(row.at);
+          if (at >= fromMs && at < toMs) rows.push(...this.priced([row.record]));
+        }
+      }
       return rows;
     };
-    const current = sumUsage(within(start, new Date(now.getTime() + 1)));
+    const current = sumUsage(within(start, new Date(nowMs + 1)));
     const previous = includePrevious && observed ? sumUsage(within(periodStart(period, new Date(startMs - 1)), start)) : undefined;
     return { start, end, observed, unmeasuredSessions, partialSessions, recordingErrorSessions, current, previous };
   }
@@ -690,8 +778,8 @@ export class UsageService {
       : this.clock() - this.lastReconciledAt > this.reconcileStaleMs ? "reconciliation-stale" as const
       : undefined;
     const ingestion = this.ingestionGap(provider, projectId);
-    const undrainedStored = data.sessions.some(session => session.provider === provider
-      && (projectId === undefined || session.projectId === projectId)
+    const baseSessions = projectId === undefined ? data.sessions : (data.byProject.get(projectId) ?? []);
+    const undrainedStored = baseSessions.some(session => session.provider === provider
       && !session.exited && session.coverage === "partial" && session.reason === "drain-incomplete");
     const gap = reconciliation !== undefined ? reconciliation
       : ingestion !== undefined ? ingestion
@@ -749,12 +837,24 @@ export class UsageService {
       };
     }
     const end = periodEnd("month", monthStart);
-    const records = this.allMeasuredRecords(data), previousStart = periodStart("month", new Date(monthStart.getTime() - 1));
-    const inRange = (from: Date, to: Date) => records.filter(row => Date.parse(row.record.completedAt) >= from.getTime() && Date.parse(row.record.completedAt) < to.getTime());
+    const monthStartMs = monthStart.getTime(), endMs = end.getTime(), nowPlus1Ms = now.getTime() + 1;
+    const previousStartMs = periodStart("month", new Date(monthStartMs - 1)).getTime();
+    const records = this.allMeasuredRecords(data);
+    const currentMonthRows: typeof records = [];
+    const previousMonthRows: typeof records = [];
+    for (const row of records) {
+      const at = Date.parse(row.record.completedAt);
+      if (at >= monthStartMs && at < nowPlus1Ms) currentMonthRows.push(row);
+      else if (at >= previousStartMs && at < monthStartMs) previousMonthRows.push(row);
+    }
     const accountConfigs = this.config.usage?.accounts ?? {};
+    const rowsByAccount = new Map<string, typeof records>();
+    for (const row of currentMonthRows) {
+      const accountId = accountOf(row.record.providerId, row.record.modelId, accountConfigs);
+      (rowsByAccount.get(accountId) ?? rowsByAccount.set(accountId, []).get(accountId)!).push(row);
+    }
     const accounts: AccountView[] = Object.entries(accountConfigs).map(([id, account]) => {
-      const matching = (rows: typeof records) => rows.filter(({ record }) => accountOf(record.providerId, record.modelId, accountConfigs) === id);
-      const monthRows = matching(inRange(monthStart, new Date(now.getTime() + 1)));
+      const monthRows = rowsByAccount.get(id) ?? [];
       const overridden = account.kind === "subscription" && Object.hasOwn(this.planOverrides, id);
       const planUsd = overridden ? this.planOverrides[id] : account.planUsd;
       const planSource = account.kind === "subscription" ? overridden ? "owner" as const : account.planUsd !== undefined ? "config" as const : undefined : undefined;
@@ -762,9 +862,20 @@ export class UsageService {
         ...(planUsd !== undefined ? { planUsd } : {}), ...(planSource ? { planSource } : {}),
         balance: this.balances?.get(id) ?? null };
     });
-    const unmeasuredSessions = data.sessions.filter(session => !measured(session) && Date.parse(session.lastActiveAt ?? session.createdAt) >= monthStart.getTime() && Date.parse(session.lastActiveAt ?? session.createdAt) < end.getTime()).length + data.briefings.filter(row => !row.record && Date.parse(row.at) >= monthStart.getTime() && Date.parse(row.at) <= now.getTime()).length;
+    let unmeasuredSessions = 0, partialSessions = 0;
+    for (const session of data.sessions) {
+      const at = Date.parse(session.lastActiveAt ?? session.createdAt);
+      if (!(at >= monthStartMs && at < endMs)) continue;
+      if (!measured(session)) unmeasuredSessions++;
+      if (partial(session)) partialSessions++;
+    }
+    for (const row of data.briefings) {
+      if (row.record) continue;
+      const at = Date.parse(row.at);
+      if (at >= monthStartMs && at <= now.getTime()) unmeasuredSessions++;
+    }
     return { period: { start: monthStart.toISOString(), end: end.toISOString() }, providers,
-      month: { start: monthStart.toISOString(), end: end.toISOString(), spent: this.money(inRange(monthStart, new Date(now.getTime() + 1))), previous: this.money(inRange(previousStart, monthStart)), plansUsd: accounts.filter(account => account.kind === "subscription").reduce((sum, account) => sum + (account.planUsd ?? 0), 0), unmeasuredSessions,
-        partialSessions: data.sessions.filter(session => partial(session) && Date.parse(session.lastActiveAt ?? session.createdAt) >= monthStart.getTime() && Date.parse(session.lastActiveAt ?? session.createdAt) < end.getTime()).length }, accounts };
+      month: { start: monthStart.toISOString(), end: end.toISOString(), spent: this.money(currentMonthRows), previous: this.money(previousMonthRows), plansUsd: accounts.filter(account => account.kind === "subscription").reduce((sum, account) => sum + (account.planUsd ?? 0), 0), unmeasuredSessions,
+        partialSessions }, accounts };
   }
 }

@@ -348,7 +348,7 @@ export function outcomeModule(options?: { now?: () => string }): EvidenceModule 
   const now = options?.now ?? (() => new Date().toISOString());
   return {
     name: OUTCOMES_MODULE,
-    version: 5,
+    version: 6,
     readVersion: 2,
     migrate(tx, from) {
       if (from < 1) migrateVersion1(tx);
@@ -356,6 +356,7 @@ export function outcomeModule(options?: { now?: () => string }): EvidenceModule 
       if (from < 3) migrateVersion3(tx);
       if (from < 4) migrateVersion4(tx);
       if (from < 5) migrateVersion5(tx);
+      if (from < 6) migrateVersion6(tx);
     },
     deleteRun(tx, runId) {
       const stamp = now();
@@ -555,6 +556,13 @@ function migrateVersion5(tx: EvidenceTx): void {
     } catch {
     }
   }
+}
+
+function migrateVersion6(tx: EvidenceTx): void {
+  tx.exec(
+    "CREATE INDEX IF NOT EXISTS outcomes_pending_list_usd ON outcomes (outcome_id) "
+    + "WHERE source <> 'legacy' AND disposition <> 'open' AND list_usd IS NULL AND (session_id IS NOT NULL OR run_id IS NOT NULL)",
+  );
 }
 
 type RoutingPointValue = "start" | "escalation";

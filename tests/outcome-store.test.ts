@@ -591,7 +591,7 @@ test("a version 1 store migrates in place", () => {
       .map(table => table.name);
     for (const table of ["outcome_signals", "base_scans", "base_scan_state"]) assert.ok(tables.includes(table), table);
     const stored = store.read(db => db.get<{ version: number }>("SELECT version FROM schema_modules WHERE name='outcomes'"));
-    assert.equal(stored?.version, 5);
+    assert.equal(stored?.version, 6);
     const columns = store.read(db => db.all<{ name: string }>("SELECT name FROM pragma_table_info('outcomes')"))
       .map(column => column.name);
     const summaryColumns = store.read(db => db.all<{ name: string }>("SELECT name FROM pragma_table_info('run_summaries')"))
@@ -932,7 +932,7 @@ test("a version 2 store migrates to version 3 and indexes goals and missions", (
     const stored = store.read(db => db.get<{ version: number; read_version: number }>(
       "SELECT version, read_version FROM schema_modules WHERE name='outcomes'",
     ));
-    assert.deepEqual({ ...stored }, { version: 5, read_version: 2 });
+    assert.deepEqual({ ...stored }, { version: 6, read_version: 2 });
 
     const refs = store.read(db => ({
       goal: db.index("goal", GOAL),
@@ -1331,7 +1331,7 @@ test("a version 3 store migrates to version 4 and fills the routing columns", ()
     const stored = store.read(db => db.get<{ version: number; read_version: number }>(
       "SELECT version, read_version FROM schema_modules WHERE name='outcomes'",
     ));
-    assert.deepEqual({ ...stored }, { version: 5, read_version: 2 });
+    assert.deepEqual({ ...stored }, { version: 6, read_version: 2 });
 
     const migrated = store.read(db => ({
       featureMap: db.index("feature-map", "map-1"),

@@ -265,16 +265,20 @@ export class TeamPermissionAgent {
     const delivery = this.permissionAgent?.delivery;
     if (!delivery) return undefined;
     const run = stored.run, runId = run.id, { memberId, sessionId } = member;
+    const pipeline = this.permissionAgent?.pipeline;
+    if (pipeline && (!pipeline.serves(run.projectId).served || pipeline.halted?.(run.projectId))) return undefined;
     const sessionRoot = realpathSync(member.cwd);
     this.host.assertRunPath(stored, sessionRoot);
     const prefix = this.host.prefixFor(run);
     const scratch = member.scratchDirectory ? [member.scratchDirectory] : [];
+    const signal = this.agentController(runId).signal;
     const workspace = async () => {
-      const changedPaths = await memberChangedPaths(sessionRoot, member.baseCommit, prefix);
+      const changedPaths = await memberChangedPaths(sessionRoot, member.baseCommit, prefix, signal);
       return { changedPaths, evidence: collectPermissionEvidence({ prompt, cwd: sessionRoot, changedPaths, approvedScratchRoots: scratch }) };
     };
     const task = memberTaskOf(run, member.taskId);
-    const request = teamPermissionRequest({ run, member, task, prompt, sessionRoot, workspace: await workspace(), acceptedChecks: this.host.requiredChecks(run) ?? null });
+    const initialWorkspace = await workspace();
+    const request = teamPermissionRequest({ run, member, task, prompt, sessionRoot, workspace: initialWorkspace, acceptedChecks: this.host.requiredChecks(run) ?? null });
     const target = teamPermissionTarget(request, {
       manager: this.host.manager,
       assignment: assignment(member),
@@ -290,6 +294,7 @@ export class TeamPermissionAgent {
         await assertMemberReadOnly(sessionRoot, current.run.headCommit!, prefix);
       } } : {}),
       workspace,
+      initialWorkspace,
       task: () => { const current = this.host.record(runId).run; return teamPermissionTask(current, memberTaskOf(current, member.taskId)); },
       collect: async paths => {
         const normalized = this.normalizeRequestedPermissionPaths(paths, sessionRoot, member.scratchDirectory);
@@ -297,11 +302,11 @@ export class TeamPermissionAgent {
           const limitations = ["The requested paths are malformed or outside the member's workspace; nothing was collected."];
           return { files: [], limitations, digest: permissionEvidenceDigest({ files: [], limitations }) };
         }
-        const changedPaths = await memberChangedPaths(sessionRoot, member.baseCommit, prefix);
+        const changedPaths = await memberChangedPaths(sessionRoot, member.baseCommit, prefix, signal);
         return collectPermissionEvidence({ prompt, cwd: sessionRoot, changedPaths, approvedScratchRoots: scratch, requestedPaths: normalized });
       },
       delivering: (deliveryId, active) => this.trackAgentDelivery(runId, sessionId, deliveryId, active),
-      signal: this.agentController(runId).signal,
+      signal,
     });
     return { request, handled: await delivery.handle(target) };
   }

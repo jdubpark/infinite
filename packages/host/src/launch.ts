@@ -10,6 +10,7 @@ import { codexTrustArgs } from "./workspace-trust.js";
 import { sudoShape } from "./sudo-profile.js";
 import { EGRESS_ENVIRONMENT_NAMES } from "./egress.js";
 import { CLAUDE_CODE_MODE_ENV, codeModeEnabled } from "./code-mode.js";
+import { openCodeModelArg, type OpenCodeMajor } from "./opencode-version.js";
 
 const HOST_LAUNCH_FIELDS = ["executionIdentity", "purpose", "configId", "team", "teamCwd", "teamModelProfile", "recordedCodeMode"] as const;
 
@@ -60,7 +61,7 @@ export function withoutSharedContext<T extends { text: string; sources: readonly
   return executionIdentity === "eval" ? { ...context, text: "", sources: [] } : context;
 }
 
-export function teamModelLaunch(profile: AgentProfile, input: TeamModelProfile): AgentProfile {
+export function teamModelLaunch(profile: AgentProfile, input: TeamModelProfile, openCodeMajor: OpenCodeMajor = 1): AgentProfile {
   const selection = teamModelProfileSchema.parse(input);
   let providerArgs = profile.args;
   if (/(^|\/)sudo$/.test(profile.command)) {
@@ -96,10 +97,11 @@ export function teamModelLaunch(profile: AgentProfile, input: TeamModelProfile):
       throw new Error("OpenCode team profiles support only --agent, --pure, --print-logs, --log-level, --format, --title, --thinking, and explicitly configured --auto; remove positional arguments, alternate commands, and session or directory overrides.");
     }
     const wrapper = profile.args.slice(0, profile.args.length - providerArgs.length);
-    return { ...profile, args: [...wrapper, "run", ...providerArgs,
+    const second = openCodeMajor === 2;
+    return { ...profile, args: [...wrapper, "run", ...(second ? ["--standalone"] : []), ...(second ? providerArgs.filter(arg => arg !== "--pure" && !arg.startsWith("--pure=")) : providerArgs),
       ...(providerArgs.some(arg => arg === "--format" || arg.startsWith("--format=")) ? [] : ["--format", "json"]),
-      "--model", selection.model,
-      ...(selection.variant ? ["--variant", selection.variant] : []),
+      "--model", openCodeModelArg(selection.model, selection.variant, openCodeMajor),
+      ...(selection.variant && !second ? ["--variant", selection.variant] : []),
     ] };
   }
   return { ...profile, args: [...profile.args, "--model", selection.model,

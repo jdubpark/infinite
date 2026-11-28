@@ -562,6 +562,32 @@ The record covers only the case above. A process that a command leaves behind
 without holding the command's output is never noted, so the host takes no look
 for it, and the run's directory may be removed while that process runs.
 
+What holds a run's directories, in three rules:
+
+- A process that nothing can inspect holds them only if the host recorded it:
+  the settle look or the operation's record names it by process, group or
+  session id. A process that the census cannot inspect and the host never
+  recorded, such as an unrelated process of another account, holds nothing.
+  The look at a left-behind process record and the look before a removal
+  count it as not seen. A look that fails as a whole still answers `unknown`.
+  The census of a stopped operation (see the stop fence) keeps answering
+  `unknown` for a process it cannot inspect.
+- Before the owner's removal and before retention removes a run's directories,
+  the host looks for processes that use them, even when the run has no
+  operation record and no left-behind record. A process whose working
+  directory, open file or command line is under the run's directory holds the
+  directories. The owner's removal answers `team-leftover-running` (409) with a
+  message that names the directories, not an earlier command. Retention skips
+  the run, and the view carries `leftoverProcesses` with `state` `in-use`. The
+  event reads "N process(es) use this run's directories. The host keeps them
+  until a census finds none." A look that finds none clears the hold, and the
+  removal proceeds. A look that cannot run at all holds nothing for a run
+  that has no record.
+- A hold does not expire. The owner's statement clears only a look that
+  answers `unknown`, never one that sees a process. Runs from before the
+  host recorded live processes at settle have no hold of that kind; the
+  look at removal covers them.
+
 **Rollback.** A host without this change keeps the record in the sealed run
 file but ignores it. It removes a held run's directories under its retention
 policy and on the owner's removal while the process may still run. Before a
@@ -2397,7 +2423,7 @@ A profile on a limited provider is skipped. The router does not avoid `evaluator
 
 | Producer | State |
 | --- | --- |
-| `host`, check `command` or `artifact` | The register's receipt for that criterion at the head, whatever the evaluator said: `pass` is `met`, `fail` is `not-met`, `unknown` is `inconclusive` (`receipt-unknown`). No receipt is `inconclusive` (`no-receipt`). |
+| `host`, check `command` or `artifact` | The register's receipt for that criterion at the head, whatever the evaluator said: `pass` is `met`, `fail` is `not-met`, `unknown` is `inconclusive` (`receipt-unknown`). A receipt whose definition digest (check, threshold and pinned files, not the wording) differs from the criterion now, or that has none, is `inconclusive` (`receipt-stale`). No receipt is `inconclusive` (`no-receipt`). |
 | `host`, check `receipt` | `checks-passed` and `review-approved` are host facts at the hold. No fact is `inconclusive` (`no-receipt`). `merged` and `landed` are `inconclusive` (`before-delivery`) until the host sees the delivery; see Late delivery receipts. |
 | `owner` | The owner's newest rating on the same head, against the threshold: `met` or `not-met`. Otherwise `pending-owner`. A rating on an older head judges older work, so a new head waits for a new rating. An owner criterion whose check is not an owner rating is `inconclusive` (`no-receipt`). |
 | `evaluator` | The evaluator's state, when every handle it gave resolves and a `met` gives at least one. A handle resolves when it names a receipt in the context, or a `file:` path (at most 300 characters) that is one of the changed paths or is named by an active artifact check. The host reads no file to resolve it. Otherwise `inconclusive` (`unresolved-evidence`). Citation handles never resolve yet. A criterion the evaluator did not judge is `inconclusive` (`not-assessed`). With no evaluator answer at all, `inconclusive` (`no-evaluator`). |
@@ -2429,7 +2455,7 @@ The composed result is `not-met` when any criterion is `not-met`, whoever produc
 - **On the run:** `run.assessment`, with ids, enumerations, and counts only: the verdict id, revision, head, kind (`reviewed` or `no-change`), the composed result, the evaluator's result, the reason, the four counts, and each criterion's state. It reaches every team view and relay device.
 - **In the record:** each active criterion's `latest` (`{ state, verdictId }`, never a note) and one `verdict.recorded` log entry per verdict (a late verdict, below, is another verdict), plus one `evaluator-contradicted-receipt` entry for each contradicted criterion. Verdict entries write only while the log stays under 300 entries and 160 KiB.
 - **In the ledger:** one `objective_verdicts` row per verdict, in the evidence store module `objective-verdicts`, projected from the run's `verdict.recorded` event. The row holds the verdict id, blind indexes of the project and the goal, the run id, the cycle, the revision, the kind, the record version, the rubric version, the evaluator's profile id, provider, model, and family, the flags `shared_family` and `also_reviewed`, the composed and the evaluator's result, the reason, one count per state, and the time. It holds no note, handle, or other text. A run revision can hold several verdicts, and the newest row wins. Rows are kept 730 days, and a deleted run's rows are marked, not removed.
-- **Reasons.** A verdict carries at most one of four reasons: `no-independent-evaluator`, `evaluator-unavailable`, `record-unavailable`, and `context-too-large`. A criterion carries at most one of seven: `no-receipt`, `receipt-unknown`, `before-delivery`, `pinned-changed`, `unresolved-evidence`, `not-assessed`, and `no-evaluator`.
+- **Reasons.** A verdict carries at most one of four reasons: `no-independent-evaluator`, `evaluator-unavailable`, `record-unavailable`, and `context-too-large`. A criterion carries at most one of eight: `no-receipt`, `receipt-unknown`, `receipt-stale`, `before-delivery`, `pinned-changed`, `unresolved-evidence`, `not-assessed`, and `no-evaluator`.
 - **In events:** fixed text with a result and counts. They never hold evaluator text.
 
 **Late delivery receipts.** A verdict comes before the delivery, so a `merged` or `landed` criterion first reads `inconclusive` (`before-delivery`). Later the host's outcome ledger can show the delivery, and the team service composes the verdict again. Two definitions apply:
@@ -3082,6 +3108,9 @@ outlives the anchor, so it also reaches a process left in the group after the
 anchor exited. So a process that ignores SIGTERM still ends about five seconds
 after the stop, unless it moved to a process group or session of its own. Other
 prefixed commands, such as Git and workspace removal, run without the anchor.
+Under a prefix, the fence's first census after a stop retries, once a second for
+up to 8 s, while the census still sees the anchor's group ending, and records
+only the last result.
 Without a prefix there is no anchor: the group SIGKILL already ends every
 process in the group. A command whose stop comes
 before its start, for example while it waits for its turn to start, is never
@@ -3187,9 +3216,12 @@ way; a replaced steer's direction stays in the goal's steering and does not
 reach the run. A mission's pause or cancel is not held by such a request: the
 request waits while the mission is paused, and a cancel drops it.
 
-The look supports no prefix, or a `sudo` prefix whose launcher has the
-`process-census` wrapper beside it. Under any other prefix, the instance
-skeleton's root-owned launcher among them, the look cannot tell whether the
+The look supports no prefix, a `sudo` prefix whose launcher has the
+`process-census` wrapper beside it, and the instance skeleton's direct
+`/usr/local/libexec/infinite[-NAME]/team-command` launcher with no arguments:
+there the host runs `sudo -n -H -u infinite[-NAME]-agent` on the `process-census`
+wrapper in the launcher's directory. Under any other prefix, or a direct
+launcher without the wrapper beside it, the look cannot tell whether the
 command ended. The run's reason then says that the owner's statement is the
 only way out and names its command. After checking the host, the owner runs
 `infinite team processes-ended RUN_ID`, which sends
@@ -3362,7 +3394,16 @@ model when a requested selection is unavailable.
 
 Claude launches receive `--model` and `--effort`; Codex receives `--model` and
 `-c model_reasoning_effort=...`; OpenCode launches in headless `run` mode with
-`--model` and optional `--variant`. These are requested settings, not evidence
+`--model` and optional `--variant`.
+On OpenCode 2 the host launches `run --standalone` with the variant inside the
+model string (`provider/model#variant`) and no `--variant`. Version 2 has no
+`--pure`, so the argument is dropped and plugins from the agent account's
+OpenCode configuration load into members; a plugin one member writes reaches
+later members. The host reads the version by running `opencode --version` as
+the agent account (5 s timeout, 4 KiB of output), caches it for 10 s, and reads
+it again when the executable changes. An unreadable version is retried at the
+next launch and uses the OpenCode 1 form meanwhile. Local native OpenCode
+sessions need version 1 and are refused on version 2. These are requested settings, not evidence
 of the backend model that served a turn. Provider account access and
 organization restrictions still apply. A provider failure leaves the assignment
 unresolved. The configuration example does not establish model availability on
@@ -3956,7 +3997,7 @@ The owner can stop autonomous work on the whole host or in one project, and it s
 
 Engaging also pauses the running work in scope through each item's own pause path: routines first, so they start nothing, then goals, missions, and the team runs that no goal or mission owns. A goal or mission pauses its own runs. A goal is in scope while it runs and while its run waits for input. A mission is in scope when any of its repositories is the halted project, including while it waits for the owner's answer, and it pauses only the subteams that are working or waiting for input when the pause reaches them; each subteam decides that in its own queue. A team run that waits for input, whether it stands alone, belongs to a goal, or is a subteam, is paused where it waits when nothing else in it is in flight: it keeps its revision and its open questions, and an answer given during the halt is recorded but starts nothing until the run resumes. A member that is queued but not yet launched is not at work, so it does not prevent this: it stays queued and launches after the release. That covers the replacement that an answer queues while the run still waits, which then starts with the answer. A run that waits while one of its members still works is paused like a working run, and its release gives it a fresh plan: a question still open in the stopped revision is no longer current, and the owner's answers carry into the new plan. A goal's run or a subteam the halt paused carries the halt's mark from its first saved paused state, and any accepted owner action on it except an answer clears the mark. On release the mission resumes a subteam only if it is still paused and still carries that mark, so an owner action after the pause reached the subteam always wins. While the halt is engaged, a halt pause that has not reached a subteam yet, or that the mission repeats after a restart, still pauses the subteam if it is working or waiting for input when the pause arrives, even if the owner paused and resumed it in the meantime; the subteam then resumes on release. The release withdraws every halt pause that has not been delivered. If the mission stays paused, each of those subteams gets the mission's ordinary pause instead, the one the owner's pause of a mission sends: it carries no halt mark and resumes with the mission. Items the owner paused, blocked items, and ended items are not touched. A mission that waits for the owner's answer keeps its questions while paused. The owner can answer one during the halt: the answer is recorded, a forwarded answer reaches the subteam that the halt holds, and nothing starts until the release, which resumes the mission with the answer applied; the mission waits again while another question is open. Sessions the owner started directly keep running. Each item the halt paused is marked with that halt. An item that could not be paused is listed in the response, and the halt stays engaged.
 
-`infinite halt off --host` or `--project PROJECT_ID` releases it. The gate lifts first. Then each marked item that is still paused, and that the owner did not change during the halt, resumes in reverse order under the same rules as the owner's resume. A team run resumes with a fresh plan, except a run the halt paused where it waited for input: that run continues its revision, its open questions are still there, and an answer given during the halt starts the requesting member's next attempt. An item that those rules refuse stays paused and says why, for example a team whose members are still stopping, a team that needs workspace reconciliation, a goal or mission past its deadline, or a standing goal whose project is no longer autonomous. A standing goal has no deadline of its own, so a halt that outlasts its last cycle's time window does not end it: on release it returns to its cadence. A mission whose time limit passed during the halt is blocked at its time limit and stays blocked; extend it to continue (see [missions](missions.md)). Resume it when it is ready. A host halt and a project halt are independent: an item resumes only when no remaining halt covers it, and otherwise it moves to the remaining halt. `--keep-paused` lifts the gate and resumes nothing; each marked item, and each run that a marked goal or mission paused, then says that the owner kept it paused. A run paused where it waited stays that way, so it still takes an answer, and the owner's later resume continues where it waited. Whenever a release leaves a goal or mission paused, the runs it paused show the goal's or mission's new reason instead of the halt's.
+`infinite halt off --host` or `--project PROJECT_ID` releases it. The gate lifts first. Then each marked item that is still paused, and that the owner did not change during the halt, resumes in reverse order under the same rules as the owner's resume. A team run resumes with a fresh plan, except a run the halt paused where it waited for input, or whose answered member had not started yet: that run continues its revision, its open questions are still there, a queued replacement that carries an answer stays queued and starts after the release with that answer, and an answer given during the halt starts the requesting member's next attempt. An item that those rules refuse stays paused and says why, for example a team whose members are still stopping, a team that needs workspace reconciliation, a goal or mission past its deadline, or a standing goal whose project is no longer autonomous. A standing goal has no deadline of its own, so a halt that outlasts its last cycle's time window does not end it: on release it returns to its cadence. A mission whose time limit passed during the halt is blocked at its time limit and stays blocked; extend it to continue (see [missions](missions.md)). Resume it when it is ready. A host halt and a project halt are independent: an item resumes only when no remaining halt covers it, and otherwise it moves to the remaining halt. `--keep-paused` lifts the gate and resumes nothing; each marked item, and each run that a marked goal or mission paused, then says that the owner kept it paused. A run paused where it waited stays that way, so it still takes an answer, and the owner's later resume continues where it waited. Whenever a release leaves a goal or mission paused, the runs it paused show the goal's or mission's new reason instead of the halt's.
 
 Engage and release are idempotent by request ID. Engaging a scope that is already halted, or releasing one that is not, changes nothing and returns the current state. The halt is recorded in `halt.sealed` in the host state directory with its time, reason, and the owner device that engaged it. A restart keeps it, and a restart in the middle of a pause or resume pass finishes that pass without repeating what was done. If the host cannot read the record, it treats the whole host as halted and refuses every change to the halt until the record can be read; it checks again every minute. Once the record can be read again, any pause or resume pass it holds as unfinished runs before the next change to the halt. When the record cannot be restored, removing that file on the host clears every halt at the next check; nothing resumes, so resume each paused item yourself. A second file, `halt-epochs.sealed`, holds the halt epochs that the permission agent reads: every engage and release renews the epoch of its scope, so a verdict reached before a halt or its release is never delivered after it. Restoring or removing `halt.sealed` leaves it as it is. Do not restore it from a copy; removing it makes the permission agent retire every verdict not yet delivered. A Git read that runs outside a team operation, such as the first evidence read for a permission request, has no abort signal, so a halt does not interrupt it. A halt never infers completion and approves nothing. `infinite halt` lists every halted scope; add `--json` for the full view.
 

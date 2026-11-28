@@ -28,8 +28,15 @@ export function hasQueuedAnswer(stored: Stored) {
   });
 }
 
-export function heldStage(stored: Stored) {
-  return stored.run.status === "paused" && stored.ownerHalt?.waiting ? stored.ownerHalt.resumeStage ?? "needs-input" : undefined;
+export function heldStage(stored: Stored, unlaunched?: (member: TeamMember) => boolean) {
+  if (stored.run.status !== "paused" || !stored.ownerHalt?.waiting) return undefined;
+  if (stored.ownerHalt.resumeStage) return stored.ownerHalt.resumeStage;
+  if (!unlaunched) return "needs-input";
+  const { run } = stored, decisions = run.decisions.filter(item => item.revision === run.revision);
+  if (decisions.some(item => !item.answer) || run.members.some(member => member.revision === run.revision && member.status === "waiting" && member.role !== "permission-coordinator")) return "needs-input";
+  const queued = run.members.filter(member => member.revision === run.revision && ACTIVE_MEMBER_STATUSES.includes(member.status) && member.role !== "permission-coordinator");
+  return decisions.length && queued.length && queued.every(member => unlaunched(member))
+    ? activeStageForRole(queued[0]!.role) : "needs-input";
 }
 
 export type TeamKernel = {

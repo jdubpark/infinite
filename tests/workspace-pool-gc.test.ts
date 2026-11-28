@@ -373,9 +373,6 @@ test("an admitted writer keeps its lease while GC closes admission for a sweep",
         const record = JSON.parse(readFileSync(String(args[0]), "utf8")) as { phase?: string };
         if (record.phase === "sweep") {
           injected = true;
-          // Admit a real writer after GC has chosen to close admission but
-          // before that barrier is published. The ensuing assertion checks
-          // whether this handoff revoked a lease GC must drain first.
           const admittedLease = await acquireSharedPoolLease(f.sharedPoolDirectory, "write", { scope: writerScope.directory });
           lease = admittedLease;
           const result = await originalRename(...args);

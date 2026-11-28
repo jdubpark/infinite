@@ -54,7 +54,6 @@ export interface PoolGcLeaseRecord {
   bootId?: string;
   processStart?: string;
   phase: "mark" | "sweep";
-  /** A closing sweep blocks new admissions while existing leases are drained. */
   sweepState?: "closing";
   startedAt: number;
   updatedAt: number;

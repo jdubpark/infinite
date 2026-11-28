@@ -329,22 +329,51 @@ def record_output(stream, job_path: Path, job: dict) -> bytes:
     return tail
 
 
-def has_receipt_for_sha(receipt_dir: Path, sha: str) -> bool:
+def has_relevant_receipt(receipt_dir: Path, sha: str, config: dict, command_digest: str,
+                         candidate_names: set[str] | None) -> bool:
     if not receipt_dir.is_dir():
         return False
-    for path in receipt_dir.glob("*.json"):
+    names = candidate_names if candidate_names is not None else {path.name for path in receipt_dir.glob("*.json")}
+    project_digest = hashlib.sha256(config["origin"].encode()).hexdigest()
+    for name in names:
+        path = receipt_dir / name
         try:
-            if path.is_symlink() or not path.is_file():
-                continue
+            info = path.lstat()
+            if path.is_symlink() or not stat.S_ISREG(info.st_mode) or info.st_size > MAX_BODY:
+                return True
             record = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError):
-            continue
-        if isinstance(record, dict) and record.get("base") == sha:
             return True
+        if not isinstance(record, dict) or not isinstance(record.get("base"), str) or not SHA.fullmatch(record["base"]):
+            return True
+        if record["base"] != sha:
+            continue
+        project = record.get("project")
+        workspace = record.get("workspace")
+        if ((isinstance(project, str) and project != project_digest)
+                or (isinstance(workspace, str) and workspace != config["workspace"])):
+            continue
+        runs = record.get("runs")
+        if not isinstance(runs, list) or len(runs) != 1 or not isinstance(runs[0], dict):
+            return True
+        runner = runs[0].get("runner")
+        guest = runs[0].get("receipt")
+        if runner is not None and runner != config["runner"]:
+            continue
+        if not isinstance(guest, dict):
+            return True
+        recorded_command = guest.get("commandSha256")
+        if isinstance(recorded_command, str) and recorded_command != command_digest:
+            continue
+        if (project != project_digest or workspace != config["workspace"] or runner != config["runner"]
+                or recorded_command != command_digest):
+            return True
+        return True
     return False
 
 
-def confirmed_capacity_wait(job_path: Path, job: dict, config: dict) -> bool:
+def confirmed_capacity_wait(job_path: Path, job: dict, config: dict,
+                            candidate_receipts: set[str] | None = None) -> bool:
     size = job.get("outputBytes")
     digest = job.get("outputSha256")
     command, _mode = check_argv(config)
@@ -352,7 +381,8 @@ def confirmed_capacity_wait(job_path: Path, job: dict, config: dict) -> bool:
     if (job.get("launcherExit") != 2 or job.get("runner") != config["runner"]
             or job.get("profileSha256") != config["profileSha256"] or job.get("commandSha256") != command_digest
             or not isinstance(job.get("sha"), str) or not SHA.fullmatch(job["sha"])
-            or has_receipt_for_sha(effective_state_home() / config["workspace"] / "cloud-check/receipts", job["sha"])
+            or has_relevant_receipt(effective_state_home() / config["workspace"] / "cloud-check/receipts",
+                                    job["sha"], config, command_digest, candidate_receipts)
             or type(size) is not int
             or size < 1 or size > MAX_CAPACITY_OUTPUT
             or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest)):
@@ -486,7 +516,9 @@ def run_job(config: dict, state: Path, job_path: Path, api: str) -> None:
             job["runner"] = config["runner"]
             job["profileSha256"] = config["profileSha256"]
             job["commandSha256"] = hashlib.sha256(json.dumps(check, separators=(",", ":"), ensure_ascii=True).encode("ascii")).hexdigest()
-            if confirmed_capacity_wait(job_path, job, config):
+            current_receipts = {path.name for path in receipt_dir.iterdir()} if receipt_dir.is_dir() else set()
+            candidate_receipts = {name for name in current_receipts - prior_receipts if name.endswith(".json")}
+            if confirmed_capacity_wait(job_path, job, config, candidate_receipts):
                 validated_capacity_wait = True
             else:
                 record = verify_receipt(config, sha, exit_code, output_bytes, check, mode, prior_receipts)

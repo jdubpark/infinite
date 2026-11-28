@@ -103,6 +103,9 @@ guest = {"base": head, "snapshot": "fixture-snapshot", "envelope": envelope, "ex
 receipt = {"version": 1, "workspace": "fixture-workspace", "project": ${JSON.stringify(projectHash)}, "base": head, "archive": "fixture-archive", "envelope": envelope, "requiredTip": None, "current": True, "worktreeChanges": 0, "comparison": None, "runs": [{"runner": "fixture-runner", "exit": exit_code, "receipt": guest}], "exit": exit_code}
 if Path("busy-timeout.txt").exists() and (not Path(${JSON.stringify(capacityOpen)}).exists() or Path("ambiguous-receipt.txt").exists()):
     if Path("ambiguous-receipt.txt").exists():
+        receipt["exit"] = 2
+        receipt["runs"][0]["exit"] = 2
+        receipt["runs"][0]["receipt"]["exit"] = 2
         path = root / (head + ".json")
         path.write_text(json.dumps(receipt), encoding="utf-8")
         path.chmod(0o600)
@@ -312,6 +315,31 @@ raise SystemExit(exit_code)
   published.push({ sha: busyHead, state: "error", context: "infinite/cloud-check", token: "Bearer controller-only-token", description: busyJob.description });
   delete busyJob.admissionWaits;
   writeFileSync(busyJobPath, JSON.stringify(busyJob));
+  const receiptDirectory = join(xdgState, "fixture-workspace", "cloud-check", "receipts");
+  writeFileSync(join(receiptDirectory, "same-sha-different-command.json"), JSON.stringify({
+    version: 1,
+    archive: "prior-archive",
+    envelope: "prior-envelope",
+    base: busyHead,
+    project: projectHash,
+    workspace: "fixture-workspace",
+    requiredTip: null,
+    current: true,
+    worktreeChanges: 0,
+    comparison: null,
+    runs: [{ runner: "fixture-runner", exit: 0, receipt: {
+      base: busyHead,
+      snapshot: "prior-snapshot",
+      envelope: "prior-envelope",
+      exit: 0,
+      mode: "npm",
+      commandSha256: "f".repeat(64),
+      profile: profileValue,
+      machine: "fixture-machine",
+      engine: "fixture-engine",
+    } }],
+    exit: 0,
+  }), { mode: 0o600 });
   const busyLogPath = busyJobPath.replace(/\.json$/, ".log");
   writeFileSync(busyLogPath, firstBusyOutput.subarray(0, firstBusyOutput.length - 2));
   assert.equal((await runOnce()).status, 0);
@@ -355,6 +383,8 @@ raise SystemExit(exit_code)
   assert.equal(published.some(row => row.sha === extraOutputHead && row.state === "error"), true);
 
   writeFileSync(capacityOpen, "operator confirms runner capacity is available\n");
+  rmSync(join(source, "extra-output.txt"));
+  git("add", "-u", "extra-output.txt");
   writeFileSync(join(source, "ambiguous-receipt.txt"), "capacity text with a receipt present\n");
   git("add", "ambiguous-receipt.txt");
   git("commit", "-qm", "receipt blocks admission retry");
@@ -363,9 +393,25 @@ raise SystemExit(exit_code)
   assert.equal((await push(ambiguousReceiptHead)).status, 202);
   assert.equal((await runOnce()).status, 0);
   assert.equal(published.some(row => row.sha === ambiguousReceiptHead && row.state === "error"), true);
+  const ambiguousJobPath = join(state, "jobs", readdirSync(join(state, "jobs")).find(name => name.endsWith(".json") && JSON.parse(readFileSync(join(state, "jobs", name), "utf8")).sha === ambiguousReceiptHead)!);
+  const ambiguousJob = JSON.parse(readFileSync(ambiguousJobPath, "utf8"));
+  const ambiguousReceipt = JSON.parse(readFileSync(join(receiptDirectory, `${ambiguousReceiptHead}.json`), "utf8"));
+  assert.equal(ambiguousJob.result, "error");
+  assert.equal(ambiguousJob.admissionWaits, 0);
+  assert.equal(ambiguousJob.receiptSha256, undefined);
+  assert.equal(ambiguousReceipt.base, ambiguousReceiptHead);
+  assert.equal(ambiguousReceipt.project, projectHash);
+  assert.equal(ambiguousReceipt.workspace, "fixture-workspace");
+  assert.equal(ambiguousReceipt.runs[0].runner, "fixture-runner");
+  assert.equal(ambiguousReceipt.runs[0].receipt.commandSha256, ambiguousJob.commandSha256);
+  const ambiguousCalls = readFileSync(launcherCalls, "utf8").trim().split("\n").length;
+  const ambiguousPendingCount = published.filter(row => row.sha === ambiguousReceiptHead && row.state === "pending").length;
+  assert.equal((await runOnce()).status, 0);
+  assert.equal(JSON.parse(readFileSync(ambiguousJobPath, "utf8")).attempts, 1);
+  assert.equal(readFileSync(launcherCalls, "utf8").trim().split("\n").length, ambiguousCalls);
+  assert.equal(published.filter(row => row.sha === ambiguousReceiptHead && row.state === "pending").length, ambiguousPendingCount);
 
   rmSync(join(source, "busy-timeout.txt"));
-  rmSync(join(source, "extra-output.txt"));
   rmSync(join(source, "ambiguous-receipt.txt"));
   git("add", "-u");
   git("commit", "-qm", "remove runner capacity fixtures");

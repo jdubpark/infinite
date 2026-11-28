@@ -555,7 +555,7 @@ export class TeamVerdicts {
     }
     const record = this.readyRecord(holder);
     if (!record) {
-      if (state.earlier !== undefined) return;
+      if (state.earlier !== undefined && holder.run.assessment?.result !== "met") return;
       this.finalize(holder, state, emptyVerdict("record-unavailable"), "record-unavailable", commit.at);
       return;
     }

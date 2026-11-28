@@ -789,7 +789,7 @@ export class MissionService {
   private reportHeld(stored: Stored, subtask: Mission["subtasks"][number], reviewId?: string) {
     if ((stored.attempts.at(-1)?.status ?? "stopped") !== "stopped") return;
     if (stored.mission.subtasks.some(item => item.repoProjectId === subtask.repoProjectId && (item.status === "running" || stored.launches[item.id]))) return;
-    const holders = holdersOf(this.teams.list(), subtask.repoProjectId);
+    const holders = projectHoldersOf(this.teams, subtask.repoProjectId);
     if (!holders.length || holders.some(run => run.missionId === stored.mission.id || !waitsOnPerson(run.status))) return;
     for (const run of holders)
       this.message(stored, `${subtask.id}:held:${reviewId ? `${reviewId}:` : ""}${run.id}:${run.status}`, { type: "repository-held", subtaskId: subtask.id, repoProjectId: subtask.repoProjectId,
@@ -1183,7 +1183,7 @@ export class MissionService {
     const mission = stored.mission;
     if (mission.decisions.some(item => !item.answer)) return true;
     if (openFollowUps(mission).length) return true;
-    const free = (projectId: string) => holdersOf(this.teams.list(), projectId).every(run => !waitsOnPerson(run.status));
+    const free = (projectId: string) => projectHoldersOf(this.teams, projectId).every(run => !waitsOnPerson(run.status));
     if (stored.ops.some(op => op.kind === "review-forward" && mission.subtasks.some(item => item.id === op.subtaskId && free(item.repoProjectId)))) return true;
     const working = (teamId: string) => {
       if (stored.ops.some(op => op.kind === "resume" && op.teamId === teamId)) return true;
@@ -1415,7 +1415,7 @@ export class MissionService {
   }
 }
 
-const holdersOf = (runs: TeamView[], projectId: string) => runs.filter(run => run.projectId === projectId && !["cancelled", "ready-for-review", "merged", "no-change"].includes(run.status));
+const projectHoldersOf = (teams: Pick<TeamService, "list"> & Partial<Pick<TeamService, "projectHolders">>, projectId: string) => teams.projectHolders ? teams.projectHolders(projectId) : teams.list().filter(run => run.projectId === projectId && !["cancelled", "ready-for-review", "merged", "no-change"].includes(run.status));
 const waitsOnPerson = (status: TeamView["status"]) => status === "paused" || status === "blocked";
 
 function stalledSubtasks(mission: Mission) {

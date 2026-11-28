@@ -28,7 +28,18 @@ export const usageConfigSchema = z.object({
 export type UsageConfig = z.infer<typeof usageConfigSchema>;
 export const machineLabelSchema = z.string().trim().min(1).max(80);
 
-const fuseCeilingsSchema = z.object({ launchesPerHour: z.number().int().min(1).max(1000).optional() }).strict();
+const fusePeriodCeilingsSchema = z.object({
+  tokens: z.number().int().min(1).max(1_000_000_000).optional(),
+  listUsd: z.number().positive().max(1_000_000).optional(),
+  spentUsd: z.number().positive().max(1_000_000).optional(),
+}).strict();
+const fuseCeilingsSchema = z.object({
+  launchesPerHour: z.number().int().min(1).max(1000).optional(),
+  day: fusePeriodCeilingsSchema.optional(),
+  week: fusePeriodCeilingsSchema.optional(),
+  unmeasuredTokenEstimate: z.number().int().min(1).max(10_000_000).optional(),
+  unmeasuredUsdEstimate: z.number().positive().max(1000).optional(),
+}).strict();
 export const fuseConfigSchema = z.object({
   project: fuseCeilingsSchema.optional(),
   host: fuseCeilingsSchema.optional(),

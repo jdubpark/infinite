@@ -354,7 +354,7 @@ or an expiring enrollment protocol.
 The allowlist (`allowedPath()` in `packages/host/src/remote-access.ts`) admits only explicit method-and-path operations (never wildcards), plus multiplexed `terminal-*` and `events-*` streams:
 
 - **Status, queues, push, dictation:** `GET /api/me`, `GET /api/machine/resources`, `GET /api/board`, `GET /api/decision-queue`, `POST`/`DELETE /api/devices/push`, and `POST /api/dictation/cleanup`.
-- **Halt (read-only):** `GET /api/halt` only (`POST /api/halt` and `POST /api/halt/release` are denied).
+- **Halt and spend fuse (read-only):** `GET /api/halt` and `GET /api/fuse` only (`POST /api/halt`, `POST /api/halt/release`, and `POST /api/fuse/close` are denied).
 - **Permissions (audit reads and marks only):** `GET /api/permissions/log`, `GET /api/permissions/candidates`, `GET /api/permissions/decisions/:id`, and `POST /api/permissions/marks` (delegation, revocation, unlock/reopen, and replay mutations are denied).
 - **Usage and plans:** `GET /api/usage`, `GET /api/usage/daily`, `GET /api/usage/models`, `GET /api/usage/projects`, `GET /api/usage/projects/:id`, `GET /api/usage/repair-loops`, `GET /api/usage/interrupted-tasks`, `POST /api/usage/balances/refresh`, and `PUT /api/usage/accounts/:id/plan`.
 - **Sessions:** `GET`/`POST /api/sessions` (excluding `workspace`, `nativeArgs`, and `localUi` body fields), `GET`/`DELETE /api/sessions/:id`, `GET /api/sessions/:id/{events,messages,summary,file,handoff,context}`, and `POST /api/sessions/:id/{control,input,answer,key,stop,resize,resume,archive}` (`workspace-export` and native/OpenCode/executor bridges are denied).
@@ -364,7 +364,7 @@ The allowlist (`allowedPath()` in `packages/host/src/remote-access.ts`) admits o
 - **Goals:** `GET`/`POST /api/goals`, `GET /api/goals/:id`, `GET /api/goals/:id/metrics`, and `POST /api/goals/:id/{steer,pause,resume,cancel,outcome}` (`record`, `verdicts`, `extend`, and `parallelism` are denied). The metrics read returns the numbers the goal's checks printed, one series per check name with a point per cycle, plus each series' command label (at most 200 characters) and counts of what was left out. It adds no field that the goal read and check output do not already carry to a relay device, and it is readable by every device role, as on the host.
 - **Missions:** `GET`/`POST /api/missions`, `GET /api/missions/:id`, `GET /api/missions/:id/progress`, `POST /api/missions/:id/{steer,pause,resume,cancel,extend}`, and `POST /api/missions/:id/answer/:decisionId`.
 
-Routines, launch-rate fuse, intake, outcomes, routing, eval, duels, and evidence-status routes remain outside the remote allowlist. The three read-only `GET`
+Routines, intake, outcomes, routing, eval, duels, and evidence-status routes remain outside the remote allowlist. The three read-only `GET`
 paths for the web [Swarm view](swarm.md)—a project's directory-level code map
 (`/api/projects/:id/graph/map`) and the touched-file sets of a team or a
 session (`/api/teams/:id/context`, `/api/sessions/:id/context`)—carry

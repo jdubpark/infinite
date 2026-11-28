@@ -6,8 +6,18 @@ const KEPT = "Sessions started directly keep running.";
 
 const since = (halt: HaltState) => `Since ${haltSince(halt.at)} · from ${halt.by}`;
 
-export function HaltBanner({ notice, name, owner, compact = false, className = "" }: {
-  notice: HaltNotice | null; name: (projectId: string) => string; owner: boolean; compact?: boolean; className?: string;
+export type HaltReleaseScope = { scope: "host" } | { scope: "project"; projectId: string };
+
+export function HaltBanner({ notice, name, owner, online = true, compact = false, className = "", onRelease, busy = false, error = "" }: {
+  notice: HaltNotice | null;
+  name: (projectId: string) => string;
+  owner: boolean;
+  online?: boolean;
+  compact?: boolean;
+  className?: string;
+  onRelease?: (scope: HaltReleaseScope) => Promise<void> | void;
+  busy?: boolean;
+  error?: string;
 }) {
   if (!notice) return null;
   if (compact && (notice.kind === "host" || notice.kind === "unreadable")) return <div className={`halt-banner halt-compact ${className}`} role="status">
@@ -27,6 +37,15 @@ export function HaltBanner({ notice, name, owner, compact = false, className = "
     : notice.kind === "host" ? "Halted by the owner for the whole host"
       : notice.halts.length === 1 ? "Halted by the owner for this project"
         : `Halted by the owner for ${notice.halts.map(halt => name(halt.projectId)).join(", ")}`;
+  const releaseTargets: { label: string; confirm: string; scope: HaltReleaseScope }[] = notice.kind === "host"
+    ? [{ label: "Release halt", confirm: "Release the host halt? Queued teams, goals, missions, and routines can launch again.", scope: { scope: "host" } }]
+    : notice.kind === "project"
+      ? notice.halts.map(halt => ({
+        label: notice.halts.length === 1 ? "Release halt" : `Release halt (${name(halt.projectId)})`,
+        confirm: `Release the halt for ${name(halt.projectId)}? Queued work in this project can launch again.`,
+        scope: { scope: "project" as const, projectId: halt.projectId },
+      }))
+      : [];
   return <div className={`halt-banner ${className}`} role="status">
     <OctagonPause size={18} aria-hidden="true" />
     <div className="halt-body">
@@ -39,7 +58,19 @@ export function HaltBanner({ notice, name, owner, compact = false, className = "
             : `${HELD} ${notice.halts.length === 1 ? "in this project, and its" : "in these projects, and their"} running goals and missions stay paused. ${KEPT}`}
         {notice.kind === "host" && notice.projects.length > 0 && ` Also halted on their own: ${notice.projects.map(halt => name(halt.projectId)).join(", ")}; releasing the host halt leaves ${notice.projects.length === 1 ? "it" : "them"} halted.`}
         {owner && notice.kind !== "unreadable" && <span className="halt-release"> Release it with {(notice.kind === "host" ? ["--host"] : notice.halts.map(halt => `--project ${halt.projectId}`)).map((flag, index) => <span key={flag}>{index ? ", " : ""}<code>infinite halt off {flag}</code></span>)}.</span>}
+        {owner && notice.kind !== "unreadable" && onRelease && <span className="halt-actions">
+          {releaseTargets.map(target => <button
+            key={target.scope.scope === "host" ? "host" : target.scope.projectId}
+            type="button"
+            className="halt-action-button"
+            disabled={busy || !online}
+            onClick={() => { if (window.confirm(target.confirm)) void onRelease(target.scope); }}
+          >
+            {busy ? "Releasing…" : target.label}
+          </button>)}
+        </span>}
       </p>
+      {error && <p className="halt-action-error" role="alert">{error}</p>}
     </div>
   </div>;
 }

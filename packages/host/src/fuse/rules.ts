@@ -37,7 +37,14 @@ export function rollingCount(
 ): number {
   let cutoff = Number.NEGATIVE_INFINITY;
   for (const trip of trips) {
-    if (trip.closedBy === "owner" && trip.closedAt !== undefined && trip.closedAt <= now && trip.scope === scope && (scope === "host" || trip.projectId === projectId)) {
+    if (
+      trip.cause === "launch-rate" &&
+      trip.closedBy === "owner" &&
+      trip.closedAt !== undefined &&
+      trip.closedAt <= now &&
+      trip.scope === scope &&
+      (scope === "host" || trip.projectId === projectId)
+    ) {
       cutoff = Math.max(cutoff, trip.closedAt);
     }
   }
@@ -124,15 +131,23 @@ export function workLaunch(input: {
 
 export function fuseReason(result: FuseOpen | "write-failed"): string {
   if (result === "write-failed") return `${FUSE_PREFIX} the host could not record the launch.`;
+  const target = result.scope === "project" ? "this project" : "the host";
+  const period = result.window === "day" ? "daily" : result.window === "week" ? "weekly" : "hourly";
   let text: string;
   if (result.cause === "unmeasurable") {
-    text = `${FUSE_PREFIX} the host cannot read its fuse baseline.`;
-  } else if (result.scope === "project") {
-    text = `${FUSE_PREFIX} this project reached its hourly launch limit.`;
+    text = result.window === "day" || result.window === "week"
+      ? `${FUSE_PREFIX} ${target} cannot measure its ${period} spend baseline.`
+      : `${FUSE_PREFIX} the host cannot read its fuse baseline.`;
+  } else if (result.cause === "tokens") {
+    text = `${FUSE_PREFIX} ${target} reached its ${period} token limit.`;
+  } else if (result.cause === "list-usd") {
+    text = `${FUSE_PREFIX} ${target} reached its ${period} list-price spend limit.`;
+  } else if (result.cause === "spent-usd") {
+    text = `${FUSE_PREFIX} ${target} reached its ${period} metered spend limit.`;
   } else {
-    text = `${FUSE_PREFIX} the host reached its hourly launch limit.`;
+    text = `${FUSE_PREFIX} ${target} reached its hourly launch limit.`;
   }
-  return result.ownerClose && result.cause === "launch-rate" ? `${text} It stays open until the owner closes it.` : text;
+  return result.ownerClose && result.cause !== "unmeasurable" ? `${text} It stays open until the owner closes it.` : text;
 }
 
 export function isFuseReason(text: string | undefined): boolean {

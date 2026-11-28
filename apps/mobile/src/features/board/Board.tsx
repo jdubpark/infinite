@@ -11,6 +11,7 @@ import { age } from "../../status";
 import { theme } from "../../theme";
 import { visibleGroups } from "../projects/model";
 import { HaltBanner } from "../halt/HaltBanner";
+import { FuseBanner } from "../halt/FuseBanner";
 import { queueEntryLabel } from "../queue/model";
 import { useDecisionCount } from "../queue/useDecisionQueue";
 import { Composer } from "./Composer";
@@ -64,7 +65,8 @@ export function Board({ connection, machines, pushNote, onSelectMachine, onAddMa
         <Text style={[s.queueText, decisions.count ? s.attention : null]}>{queueEntryLabel(decisions.count)}</Text>
         <Glyph name="forward" size={12} color={theme.colors.mutedInk} />
       </Pressable> : null}
-      <HaltBanner connection={connection} place="overview" names={id => poll.data?.me.projects?.find(project => project.id === id)?.name} style={s.halt} />
+      <HaltBanner connection={connection} place="overview" role={poll.data?.me.role} online={poll.online} names={id => poll.data?.me.projects?.find(project => project.id === id)?.name} style={s.halt} />
+      <FuseBanner connection={connection} role={poll.data?.me.role} online={poll.online} names={id => poll.data?.me.projects?.find(project => project.id === id)?.name} style={s.halt} />
       <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={s.filters}>
         <Chip label="All" accessibilityLabel="All projects" selected={!projectId} onPress={() => setProjectId("")} />
         {chips.map(group => <Chip key={group.id} label={group.name} selected={projectId === group.id} onPress={() => setProjectId(group.id)} accessibilityLabel={`Filter by ${group.name}`} />)}

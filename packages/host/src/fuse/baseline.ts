@@ -32,7 +32,7 @@ const launchSchema = z.object({
 
 const tripBase = {
   tripId: id,
-  cause: z.enum(["launch-rate", "unmeasurable"]),
+  cause: z.enum(["launch-rate", "tokens", "list-usd", "spent-usd", "unmeasurable"]),
   window: z.enum(["hour", "day", "week"]).optional(),
   openedAt: time,
   ownerClose: z.boolean(),
@@ -92,11 +92,17 @@ export function mergeBaselines(file: FuseBaseline | undefined, store: FuseBaseli
 
 export function pruneBaseline(baseline: FuseBaseline, now: number): FuseBaseline {
   const today = utcDay(now);
+  const weekAgo = now - 7 * 86_400_000;
   return {
     ...baseline,
     launches: baseline.launches.filter((item) => item.state === "admitted" || item.admittedAt > now - HOUR_MS),
     trips: baseline.trips.filter(
-      (item) => item.closedAt === undefined || utcDay(item.openedAt) >= today || item.closedAt >= now - HOUR_MS,
+      (item) =>
+        item.closedAt === undefined ||
+        utcDay(item.openedAt) >= today ||
+        item.closedAt >= now - HOUR_MS ||
+        (item.closedBy === "owner" && item.window === "day" && utcDay(item.closedAt) >= today) ||
+        (item.closedBy === "owner" && item.window === "week" && item.closedAt > weekAgo),
     ),
   };
 }

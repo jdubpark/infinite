@@ -14,7 +14,7 @@ export function useLiveRefresh(
     taskRef.current = task;
     unavailableRef.current = unavailable;
   });
-  const refreshRef = useRef<() => void>(() => {});
+  const refreshRef = useRef<() => Promise<void>>(async () => {});
   const [fresh, setFresh] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [seen, setSeen] = useState("");
@@ -24,6 +24,10 @@ export function useLiveRefresh(
     let active = true, polling = false, queued = false, generation = 0;
     let timer: ReturnType<typeof setTimeout>;
     let staleTimer: ReturnType<typeof setTimeout> | undefined;
+    let waiters: (() => void)[] = [];
+    const flushWaiters = () => {
+      for (const resolve of waiters.splice(0)) resolve();
+    };
     const markStaleLater = () => {
       if (!identity || staleTimer !== undefined) return;
       staleTimer = setTimeout(() => { staleTimer = undefined; if (active) setStale(true); }, 3000);
@@ -37,28 +41,41 @@ export function useLiveRefresh(
     setFailed(false);
     setSeen("");
     setStale(false);
-    const poll = async () => {
+    const poll = async (): Promise<void> => {
       clearTimeout(timer);
       if (!active || !identity || !foreground()) return;
-      if (polling) { queued = true; return; }
-      polling = true;
-      setRefreshing(true);
-      const started = generation;
-      const current = () => active && foreground() && started === generation;
-      let delay = interval;
-      try {
-        delay = await taskRef.current(current) ?? interval;
-        if (current()) { recover(); setFresh(true); setFailed(false); setSeen(new Date().toISOString()); }
-      } catch {
-        if (current()) { setFresh(false); setFailed(true); markStaleLater(); unavailableRef.current?.(); }
-      } finally {
-        polling = false;
-        if (active) {
-          setRefreshing(false);
-          if (foreground()) timer = setTimeout(poll, queued ? 0 : delay);
-          queued = false;
-        }
+      if (polling) {
+        queued = true;
+        await new Promise<void>(resolve => waiters.push(resolve));
+        return;
       }
+      do {
+        queued = false;
+        const roundWaiters = waiters.splice(0);
+        polling = true;
+        setRefreshing(true);
+        const started = generation;
+        const current = () => active && foreground() && started === generation;
+        let delay = interval;
+        try {
+          delay = await taskRef.current(current) ?? interval;
+          if (current()) { recover(); setFresh(true); setFailed(false); setSeen(new Date().toISOString()); }
+        } catch {
+          if (current()) { setFresh(false); setFailed(true); markStaleLater(); unavailableRef.current?.(); }
+        } finally {
+          polling = false;
+          if (active) setRefreshing(false);
+        }
+        for (const resolve of roundWaiters) resolve();
+        if (!active || !foreground()) {
+          flushWaiters();
+          return;
+        }
+        if (!queued) {
+          timer = setTimeout(() => { void poll(); }, delay);
+          return;
+        }
+      } while (true);
     };
     const resync = () => {
       generation++;
@@ -69,7 +86,7 @@ export function useLiveRefresh(
       if (foreground()) void poll();
       else unavailableRef.current?.();
     };
-    refreshRef.current = () => { void poll(); };
+    refreshRef.current = () => poll();
     document.addEventListener("visibilitychange", resync);
     window.addEventListener("online", resync);
     window.addEventListener("offline", resync);
@@ -80,7 +97,8 @@ export function useLiveRefresh(
       active = false;
       clearTimeout(timer);
       clearTimeout(staleTimer);
-      refreshRef.current = () => {};
+      flushWaiters();
+      refreshRef.current = async () => {};
       document.removeEventListener("visibilitychange", resync);
       window.removeEventListener("online", resync);
       window.removeEventListener("offline", resync);

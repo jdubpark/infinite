@@ -28,12 +28,12 @@ export function usePoll<T>(
   fn: () => Promise<T>,
   intervalMs: number,
   deps: unknown[],
-): { data: T | null; online: boolean; stale: boolean; loading: boolean; refreshing: boolean; seen: string; refresh: () => void } {
+): { data: T | null; online: boolean; stale: boolean; loading: boolean; refreshing: boolean; seen: string; refresh: () => Promise<void> } {
   const [freshness, setFreshness] = useState<Freshness<T>>({ kind: "loading" });
   const latest = useRef(fn);
   const onlineNow = useRef(false);
   const lastSuccessAt = useRef(0);
-  const pollNow = useRef<() => void>(() => {});
+  const pollNow = useRef<() => Promise<void>>(async () => {});
   const focused = useIsFocused();
   const blurred = useRef(false);
   useEffect(() => {
@@ -42,7 +42,7 @@ export function usePoll<T>(
   useEffect(() => {
     if (!focused) {
       blurred.current = true;
-      pollNow.current = () => {};
+      pollNow.current = async () => {};
       return;
     }
     const refocused = blurred.current;
@@ -53,6 +53,10 @@ export function usePoll<T>(
     let staleTimer: ReturnType<typeof setTimeout> | undefined;
     let resumeStateTimer: ReturnType<typeof setTimeout> | undefined;
     let staleDeadline = 0;
+    let waiters: (() => void)[] = [];
+    const flushWaiters = () => {
+      for (const resolve of waiters.splice(0)) resolve();
+    };
     const clearPollTimer = () => {
       if (phase.kind === "idle" && phase.timer !== undefined) {
         clearTimeout(phase.timer);
@@ -91,48 +95,58 @@ export function usePoll<T>(
         if (active && !onlineNow.current) toOffline(true);
       }, Math.max(0, staleDeadline - Date.now()));
     };
-    const poll = async () => {
+    const poll = async (): Promise<void> => {
       if (!active || !inForeground()) return;
       if (phase.kind === "polling") {
         phase.rerunRequested = true;
+        await new Promise<void>(resolve => waiters.push(resolve));
         return;
       }
       clearPollTimer();
-      phase = { kind: "polling", rerunRequested: false };
-      const revision = generation;
-      const current = () => active && inForeground() && revision === generation;
-      try {
-        const value = await latest.current();
-        if (current()) {
-          lastSuccessAt.current = Date.now();
-          onlineNow.current = true;
-          clearTimeout(staleTimer);
-          staleTimer = undefined;
-          staleDeadline = 0;
-          setFreshness({ kind: "online", data: value, seen: new Date().toLocaleTimeString(), refreshing: false });
+      do {
+        const roundWaiters = waiters.splice(0);
+        phase = { kind: "polling", rerunRequested: false };
+        const revision = generation;
+        const current = () => active && inForeground() && revision === generation;
+        try {
+          const value = await latest.current();
+          if (current()) {
+            lastSuccessAt.current = Date.now();
+            onlineNow.current = true;
+            clearTimeout(staleTimer);
+            staleTimer = undefined;
+            staleDeadline = 0;
+            setFreshness({ kind: "online", data: value, seen: new Date().toLocaleTimeString(), refreshing: false });
+          }
+        } catch {
+          if (current()) {
+            onlineNow.current = false;
+            toOffline();
+            delayStale();
+          }
         }
-      } catch {
-        if (current()) {
-          onlineNow.current = false;
-          toOffline();
-          delayStale();
+        const rerun = active && inForeground() && phase.kind === "polling" && phase.rerunRequested;
+        if (!rerun) {
+          phase = { kind: "idle" };
+          if (active) {
+            setFreshness((prev) => {
+              switch (prev.kind) {
+                case "loading":
+                  return current() ? { kind: "offline", data: null, seen: "", stale: false, refreshing: false } : prev;
+                case "online":
+                case "offline":
+                  return prev.refreshing ? { ...prev, refreshing: false } : prev;
+              }
+            });
+            if (inForeground()) phase = { kind: "idle", timer: setTimeout(() => { void poll(); }, intervalMs) };
+          }
         }
-      } finally {
-        const rerun = phase.kind === "polling" && phase.rerunRequested;
-        phase = { kind: "idle" };
-        if (active) {
-          setFreshness((prev) => {
-            switch (prev.kind) {
-              case "loading":
-                return current() ? { kind: "offline", data: null, seen: "", stale: false, refreshing: false } : prev;
-              case "online":
-              case "offline":
-                return prev.refreshing ? { ...prev, refreshing: false } : prev;
-            }
-          });
-          if (inForeground()) phase = { kind: "idle", timer: setTimeout(poll, rerun ? 0 : intervalMs) };
+        for (const resolve of roundWaiters) resolve();
+        if (!rerun) {
+          flushWaiters();
+          return;
         }
-      }
+      } while (true);
     };
     pollNow.current = () => {
       clearPollTimer();
@@ -147,7 +161,7 @@ export function usePoll<T>(
           }
         });
       }
-      void poll();
+      return poll();
     };
     const removeForegroundListener = onForegroundChange((foreground) => {
       generation++;
@@ -183,7 +197,8 @@ export function usePoll<T>(
       clearTimeout(staleTimer);
       clearTimeout(resumeStateTimer);
       removeForegroundListener();
-      pollNow.current = () => {};
+      flushWaiters();
+      pollNow.current = async () => {};
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [focused, intervalMs, ...deps]);

@@ -3,9 +3,43 @@ import type { LaunchHalted } from "../halt/rules.js";
 
 export type FuseScope = "project" | "host";
 export type FuseWindow = "hour" | "day" | "week";
-export type FuseCause = "launch-rate" | "unmeasurable";
+export type FuseCause = "launch-rate" | "tokens" | "list-usd" | "spent-usd" | "unmeasurable";
 export type SessionPurpose = "work" | "duel" | "replay" | "gate";
 export type LaunchRole = TeamAssignment["role"];
+
+export type FusePeriodCeilings = { tokens?: number; listUsd?: number; spentUsd?: number };
+export type FuseSpendLimits = {
+  day?: FusePeriodCeilings;
+  week?: FusePeriodCeilings;
+  unmeasuredTokenEstimate: number;
+  unmeasuredUsdEstimate: number;
+};
+export type FuseSpendSample = {
+  tokens: number;
+  listUsd: number;
+  spentUsd: number;
+  unmeasuredSessions: number;
+  unmeasuredListSessions?: number;
+  unmeasuredSpentSessions?: number;
+  available: boolean;
+};
+export type FuseSpendReader = (input: {
+  scope: FuseScope;
+  projectId?: string;
+  window: "day" | "week";
+  sinceMs: number;
+  now: number;
+}) => FuseSpendSample;
+export type FusePeriodReading = {
+  tokens: number;
+  tokensLimit?: number;
+  listUsd: number;
+  listUsdLimit?: number;
+  spentUsd: number;
+  spentUsdLimit?: number;
+  unmeasuredSessions: number;
+  available: boolean;
+};
 
 export type FuseLaunch = {
   launchId: string;

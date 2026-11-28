@@ -7,6 +7,7 @@ import {
   boardFocusOffset,
   boardKindFilter,
   createTeamBoardState,
+  syncBoardEntryCache,
   teamBoardText,
 } from "../packages/host/src/team-watch-board.js";
 
@@ -192,4 +193,29 @@ test("teamBoardText renders WAIT REASONS and annotates stalled and spinner-only 
   assert.match(rendered, /\[worker-slot\] Waiting for worker slot \(2\/2\)\./);
   assert.match(rendered, /Implementer running\(t1\) \[spinner-only\]/);
   assert.match(rendered, /Integrator running\(t2\) \[stalled\]/);
+});
+
+test("syncBoardEntryCache terminates in one request when page.cursor is malformed even with more: true", async () => {
+  for (const malformedCursor of [Number.NaN, undefined, Number.POSITIVE_INFINITY, "99", -1]) {
+    let calls = 0;
+    const result = await syncBoardEntryCache(
+      {
+        json: async () => {
+          calls += 1;
+          return {
+            entries: [entries[0]!],
+            cursor: malformedCursor as number,
+            more: true,
+          };
+        },
+      } as never,
+      team.id,
+      { entries: [], cursor: 0, ticks: 0 },
+      new AbortController().signal,
+    );
+    assert.equal(calls, 1);
+    assert.equal(result.cursor, 0);
+    assert.equal(result.entries.length, 1);
+    assert.equal(result.entries[0]!.entryId, entries[0]!.entryId);
+  }
 });

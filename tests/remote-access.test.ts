@@ -510,14 +510,20 @@ test("the relay refuses the verdicts read", async () => {
   } finally { client.close(); runner.close(); }
 });
 
-test("the relay refuses the reported-numbers curve", async () => {
+test("the relay carries the reported-numbers curve read and nothing beside it", async () => {
   const runner = await httpRunner();
   const client = createRemoteClient({ url: runner.url, token: runner.token });
+  const id = randomUUID();
+  const denied = (error: RemoteError) => error.status === 403 && error.code === "remote-endpoint-denied";
   try {
     await client.request("/me");
-    for (const path of [`/goals/${randomUUID()}/metrics`, `/goals/${randomUUID()}/metrics?view=full`])
-      await assert.rejects(client.request(path), (error: RemoteError) => error.status === 403 && error.code === "remote-endpoint-denied");
-    assert.equal(runner.requests.length, 1, "a refused curve read does not reach the host");
+    assert.deepEqual(await client.request(`/goals/${id}/metrics`), { count: 2, method: "GET", path: `/api/goals/${id}/metrics` });
+    for (const method of ["POST", "PUT", "DELETE"] as const)
+      await assert.rejects(client.request(`/goals/${id}/metrics`, { method, body: {} }), denied);
+    await assert.rejects(client.request(`/goals/${id}/metrics/extra`), denied);
+    await assert.rejects(client.request(`/goals/not-a-uuid/metrics`), denied);
+    await assert.rejects(client.request(`/goals/${id}/verdicts`), denied);
+    assert.equal(runner.requests.length, 2, "only the one allowed curve read reached the host");
   } finally { client.close(); runner.close(); }
 });
 

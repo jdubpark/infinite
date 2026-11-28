@@ -230,6 +230,13 @@ export class ProjectGroupService {
     }
     if (identityChanged) this.persistIdentities(identities);
 
+    const assigned = new Set<string>();
+    for (const group of Object.values(this.state.groups)) {
+      for (const memberId of group.members) assigned.add(memberId);
+    }
+    const hasUnassignedWithIdentity = this.config.projects.some(project => Boolean(own(this.identities, project.id)) && !assigned.has(project.id));
+    if (!this.needsMigration && !hasUnassignedWithIdentity) return;
+
     const candidate = structuredClone(this.state);
     let changed = this.needsMigration;
     for (const project of this.config.projects) {
@@ -280,10 +287,11 @@ export class ProjectGroupService {
     }
   }
 
-  private storedGroup(group: StoredGroup): ProjectGroup {
+  private storedGroup(group: StoredGroup, projectsById?: Map<string, Project>): ProjectGroup {
+    const byProject = projectsById ?? new Map(this.config.projects.map(project => [project.id, project]));
     const byKey = new Map<string, Project[]>();
     for (const id of group.members) {
-      const project = this.config.projects.find(value => value.id === id);
+      const project = byProject.get(id);
       if (!project) continue;
       const key = this.identityKey(id);
       byKey.set(key, [...(byKey.get(key) ?? []), project]);
@@ -452,12 +460,13 @@ export class ProjectGroupService {
 
   list(): ProjectGroupList {
     this.reconcile();
-    const groups = Object.values(this.state.groups).map(group => this.storedGroup(group));
+    const projectsById = new Map(this.config.projects.map(project => [project.id, project]));
+    const groups = Object.values(this.state.groups).map(group => this.storedGroup(group, projectsById));
     const grouped = new Set(Object.values(this.state.groups).flatMap(group => group.members));
     for (const project of this.config.projects)
       if (!grouped.has(project.id) && !own(this.identities, project.id)) groups.push(this.implicit(project));
     groups.sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id));
-    return { groups, suggestions: this.suggestions(groups) };
+    return { groups, suggestions: this.suggestions(groups, projectsById) };
   }
 
   get(idOrProjectId: string): ProjectGroup {
@@ -607,7 +616,8 @@ export class ProjectGroupService {
     return this.record(candidate, request.requestId, fingerprint, result);
   }
 
-  private suggestions(groups: ProjectGroup[]): ProjectGroupSuggestion[] {
+  private suggestions(groups: ProjectGroup[], projectsById?: Map<string, Project>): ProjectGroupSuggestion[] {
+    const byProject = projectsById ?? new Map(this.config.projects.map(project => [project.id, project]));
     const eligible = groups.filter(group => group.kind === "repository" || group.kind === "implicit");
     const byId = new Map(eligible.map(group => [group.id, group]));
     const suggestions: ProjectGroupSuggestion[] = [];
@@ -643,7 +653,7 @@ export class ProjectGroupService {
 
     const byLinear = new Map<string, string[]>();
     for (const group of eligible) for (const checkout of group.repos.flatMap(repo => repo.checkouts)) {
-      const project = this.config.projects.find(value => value.id === checkout.projectId);
+      const project = byProject.get(checkout.projectId);
       if (project?.linear?.projectId)
         byLinear.set(project.linear.projectId, [...(byLinear.get(project.linear.projectId) ?? []), group.id]);
     }

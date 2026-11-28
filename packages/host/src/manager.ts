@@ -268,13 +268,13 @@ export class Manager {
   }
   private serializeSession<T>(id: string, fn: () => Promise<T>): Promise<T> { return this.serializeKeyed(this.sessionQueues, id.toLowerCase(), fn); }
   private serializeConversation<T>(key: string, task: () => Promise<T>): Promise<T> { return this.serializeKeyed(this.conversationQueues, key, task); }
-  private reserveCreateSlot(id: string): Promise<void> {
+  private reserveCreateSlot(id: string, permissionCoordinator = false): Promise<void> {
     const key = id.toLowerCase();
     const operation = this.createAdmission.then(async () => {
       const pendingBeforeList = new Set(this.pendingCreates);
       const listed = await this.list();
       const active = new Set([...listed.filter(s => s.status === "running" || s.status === "starting").map(s => s.id.toLowerCase()), ...pendingBeforeList, ...this.pendingCreates]);
-      if (active.size >= this.config.maxSessions)
+      if (active.size >= (permissionCoordinator && this.config.maxSessions > 0 ? this.config.maxSessions + 1 : this.config.maxSessions))
         throw new Error("The configured session limit has been reached");
       this.pendingCreates.add(key);
     });
@@ -977,7 +977,7 @@ export class Manager {
       throw new Error("Demo is disabled");
     const assertHostLoad = () => { const hold = request.team ? this.hostLoad.held() : undefined; if (hold) throw new LaunchHeldError(hold); };
     assertHostLoad();
-    await this.reserveCreateSlot(id);
+    await this.reserveCreateSlot(id, request.team?.role === "permission-coordinator");
     try {
       assertHostLoad();
       if (request.team && this.fuse) {

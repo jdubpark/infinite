@@ -402,7 +402,8 @@ export async function prepareTeamWorkspaceFromMirror(mirror: string, head: strin
   await git(workspace, ["checkout", "-b", branch, head], prefix, 30000, signal);
   return { workspace, branch, baseCommit: head };
 }
-export async function prepareMemberWorkspace(workspace: string, memberId: string, baseCommit: string, prefix?: TeamCommand, signal?: AbortSignal) {
+export async function prepareMemberWorkspace(workspace: string, memberId: string, baseCommit: string, prefix?: TeamCommand, signal?: AbortSignal, options?: { readOnly?: boolean }) {
+  safeWorkspaceId(memberId);
   const parent = join(workspace, "..", "members");
   let info;
   try { info = lstatSync(parent); }
@@ -411,8 +412,19 @@ export async function prepareMemberWorkspace(workspace: string, memberId: string
   if (!info.isDirectory() || info.isSymbolicLink() || !hostOwned(info)) throw unsafeTeamRoot();
   chmodDirectoryNoFollow(parent, 0o2770);
   const cwd = join(parent, memberId);
-  if (existsSync(cwd)) throw new TeamError(409, "workspace-exists", "A member workspace already exists and needs explicit reconciliation.");
-  await git(parent, ["clone", "--no-local", "--no-hardlinks", "--", workspace, cwd], prefix, 120000, signal);
+  try { lstatSync(cwd); throw new TeamError(409, "workspace-exists", "A member workspace already exists and needs explicit reconciliation."); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+  if (options?.readOnly && !prefix) {
+    try {
+      await git(parent, ["clone", "--local", "--no-checkout", "--", workspace, cwd], prefix, 120000, signal);
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      await rmAsync(cwd, { recursive: true, force: true }).catch(() => {});
+      await git(parent, ["clone", "--no-local", "--no-hardlinks", "--no-checkout", "--", workspace, cwd], prefix, 120000, signal);
+    }
+  } else {
+    await git(parent, ["clone", "--no-local", "--no-hardlinks", "--no-checkout", "--", workspace, cwd], prefix, 120000, signal);
+  }
   await git(cwd, ["remote", "remove", "origin"], prefix, 30000, signal);
   await git(cwd, ["checkout", "--detach", baseCommit], prefix, 30000, signal);
   return realpathSync(cwd);
@@ -664,12 +676,20 @@ export async function prepareRecoveryWorkspaceFromSource(workspace: string, sour
 }
 export function teamPathAllowed(path: string, allowed: string[]) { return allowed.some(prefix => prefix === "." || path === prefix || path.startsWith(`${prefix}/`)); }
 export async function memberChangedPaths(cwd: string, base: string, prefix?: TeamCommand, signal?: AbortSignal) {
-  const changed = [
-    ...lines(await git(cwd, ["diff", "--no-ext-diff", "--no-textconv", "--name-only", "--no-renames", "-z", base, "--"], prefix, 30000, signal)),
-    ...lines(await git(cwd, ["diff", "--cached", "--no-ext-diff", "--no-textconv", "--name-only", "--no-renames", "-z", base, "--"], prefix, 30000, signal)),
-    ...lines(await git(cwd, ["ls-files", "--others", "--exclude-standard", "-z"], prefix, 30000, signal)),
-  ];
-  return [...new Set(changed)].sort();
+  if (prefix) {
+    const changed = [
+      ...lines(await git(cwd, ["diff", "--no-ext-diff", "--no-textconv", "--name-only", "--no-renames", "-z", base, "--"], prefix, 30000, signal)),
+      ...lines(await git(cwd, ["diff", "--cached", "--no-ext-diff", "--no-textconv", "--name-only", "--no-renames", "-z", base, "--"], prefix, 30000, signal)),
+      ...lines(await git(cwd, ["ls-files", "--others", "--exclude-standard", "-z"], prefix, 30000, signal)),
+    ];
+    return [...new Set(changed)].sort();
+  }
+  const [unstaged, staged, untracked] = await Promise.all([
+    git(cwd, ["diff", "--no-ext-diff", "--no-textconv", "--name-only", "--no-renames", "-z", base, "--"], undefined, 30000, signal),
+    git(cwd, ["diff", "--cached", "--no-ext-diff", "--no-textconv", "--name-only", "--no-renames", "-z", base, "--"], undefined, 30000, signal),
+    git(cwd, ["ls-files", "--others", "--exclude-standard", "-z"], undefined, 30000, signal),
+  ]);
+  return [...new Set([...lines(unstaged), ...lines(staged), ...lines(untracked)])].sort();
 }
 export async function assertMemberScope(cwd: string, base: string, paths?: string[], prefix?: TeamCommand, signal?: AbortSignal) {
   await git(cwd, ["merge-base", "--is-ancestor", base, "HEAD"], prefix, 30000, signal);

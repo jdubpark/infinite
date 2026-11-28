@@ -446,7 +446,7 @@ export class TeamPermissionReview extends TeamPermissionRecovery {
     this.host.save(stored);
     this.host.operation(stored, "member", async signal => {
       this.host.assertRunPath(stored, run.workspace);
-      const cwd = await prepareMemberWorkspace(run.workspace, member.memberId, member.baseCommit, this.host.prefixFor(run), signal);
+      const cwd = await prepareMemberWorkspace(run.workspace, member.memberId, member.baseCommit, this.host.prefixFor(run), signal, { readOnly: true });
       await assertMemberReadOnly(cwd, member.baseCommit, this.host.prefixFor(run), signal);
       return cwd;
     }, cwd => {

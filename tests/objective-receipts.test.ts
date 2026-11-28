@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { commandDigest } from "../packages/host/src/objective-input.js";
-import { passReads, passSubjects, receiptsFor } from "../packages/host/src/objective-receipts.js";
+import { definitionDigest, passReads, passSubjects, receiptsFor } from "../packages/host/src/objective-receipts.js";
 import type { BlobResult, PassInput, Subject } from "../packages/host/src/objective-receipts.js";
 import type { Assumption, AssumptionTest, Check, Criterion, ObjectiveRecord, Threshold } from "../packages/host/src/objective-types.js";
 import type { TeamCheck, TeamCommand } from "../packages/host/src/team-types.js";
@@ -52,6 +52,16 @@ function blobAt(path: string, result: BlobResult, commit = HEAD): Map<string, Bl
 function json(value: unknown): BlobResult {
   return { state: "read", bytes: Buffer.from(JSON.stringify(value)) };
 }
+
+test("a criterion receipt carries the digest of its definition and an assumption receipt carries none", () => {
+  const pinned = { ...criterion("c2", { kind: "artifact", path: ENTRIES, count: "/entries" }, { kind: "count", min: 1, max: 5 }), pinned: [{ path: ENTRIES, blob: "3".repeat(40) }] };
+  const criteria = [criterion("c1", { kind: "command", command: RANK_DIGEST }), pinned];
+  const assumptions = [assumption("a4", { kind: "command", command: RANK_DIGEST, refutesOn: "fail" })];
+  const receipts = receiptsOf(criteria, assumptions, { checks: [check(RANK, "passed", 1)], configured: [RANK], blobs: blobAt(ENTRIES, json({ entries: [1] })) });
+  for (const item of criteria) assert.equal(receipts.find(receipt => receipt.id === item.id)?.digest, definitionDigest(item), item.id);
+  assert.notEqual(definitionDigest(pinned), definitionDigest({ ...pinned, pinned: undefined }));
+  assert.equal("digest" in receipts.find(receipt => receipt.id === "a4")!, false);
+});
 
 test("command tests read the final round and run nothing", () => {
   const rankFails = [check(RANK, "passed", 1), check(TESTS, "passed", 2), check(RANK, "passed", 2, { phase: "setup" }), check(RANK, "failed", 2)];

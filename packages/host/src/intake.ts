@@ -229,6 +229,10 @@ export class IntakeService {
   private readonly log: (line: string, error: unknown) => void;
   private readonly pollMs: number;
   private readonly pendingMentions = new Map<string, string>();
+  private scopedAudienceCheck() {
+    return (this.config.intake?.slack ? this.options.audience?.snapshotRecordAllowed?.() : undefined) ?? this.options.audience?.recordAllowed;
+  }
+
   private recordAudienceAllowed(record: IntakeRecord, check = this.options.audience?.recordAllowed): boolean {
     if (!intakeRecordAudienceIdentityMatches(this.config, record)) return false;
     if (!this.config.intake?.slack) return true;
@@ -300,7 +304,8 @@ export class IntakeService {
     if (!this.enabled() || this.closed) return "duplicate";
     const slackAudienceId = slackAudienceIdentity(this.config);
     if (!slackAudienceId) return "duplicate";
-    if (this.store.list().some(record => this.recordAudienceAllowed(record) && record.direct && (record.direct.eventId === input.eventId
+    const check = this.scopedAudienceCheck();
+    if (this.store.list().some(record => this.recordAudienceAllowed(record, check) && record.direct && (record.direct.eventId === input.eventId
       || (record.direct.ts === input.ts && record.thread?.channelId === input.thread.channelId)))) return "duplicate";
     const slack = this.config.intake?.slack;
     const explicit = slack?.answerQuestions ? explicitRoute(input.text) : undefined;
@@ -328,8 +333,7 @@ export class IntakeService {
 
   list(): IntakeView[] {
     const records = this.store.list();
-    const scopedCheck = this.config.intake?.slack ? this.options.audience?.snapshotRecordAllowed?.() : undefined;
-    const check = scopedCheck ?? this.options.audience?.recordAllowed;
+    const check = this.scopedAudienceCheck();
     return records.filter(record => this.recordAudienceAllowed(record, check)).map(record => {
       const started = record.comments.started, outcome = record.comments.outcome;
       return {
@@ -358,9 +362,10 @@ export class IntakeService {
     await this.attempt("start", () => this.startQueued());
     const reopening = this.reopenScan;
     this.reopenScan = false;
+    const check = this.scopedAudienceCheck();
     for (const record of this.store.list())
       if (record.state === "started" || reopening && record.state === "finished") {
-        if (!this.recordAudienceAllowed(record)) continue;
+        if (!this.recordAudienceAllowed(record, check)) continue;
         const mission = this.missions.peek(record.missionId);
         if (mission) this.observe(mission);
       }
@@ -396,18 +401,19 @@ export class IntakeService {
   }
 
   private async file(): Promise<void> {
-    for (const record of this.store.list().filter(item => item.state === "queued" && item.external && !item.external.filedAt
-      && this.recordAudienceAllowed(item))) {
+    for (const record of this.store.list().filter(item => item.state === "queued" && item.external && !item.external.filedAt)) {
       if (this.closed) return;
+      if (!this.recordAudienceAllowed(record)) continue;
       try { await this.fileExternal(record); }
       catch (error) {
         this.fail("file", error);
         this.hold(record.issueId, "External tracking or scope is unavailable.");
       }
     }
-    for (const record of this.store.list().filter(item => item.state === "queued" && item.direct && !item.request && this.recordAudienceAllowed(item)
+    for (const record of this.store.list().filter(item => item.state === "queued" && item.direct && !item.request
       && (item.direct.route !== undefined || !item.direct.routable))) {
       if (this.closed) return;
+      if (!this.recordAudienceAllowed(record)) continue;
       try {
         this.requireRecordAudience(record);
         await this.requireOrganizationSource(record.thread);
@@ -426,10 +432,10 @@ export class IntakeService {
   private async route(): Promise<void> {
     const slack = this.config.intake?.slack;
     const router = slack?.answerQuestions && slack.classify ? this.options.router : undefined;
-    const pending = this.store.list().filter(item => item.direct?.routable === true && !item.request && !item.direct.route
-      && this.recordAudienceAllowed(item));
+    const pending = this.store.list().filter(item => item.direct?.routable === true && !item.request && !item.direct.route);
     for (const record of pending) {
       if (this.closed) return;
+      if (!this.recordAudienceAllowed(record)) continue;
       try {
         this.requireRecordAudience(record);
         await this.requireOrganizationSource(record.thread);
@@ -721,8 +727,9 @@ export class IntakeService {
   }
 
   private async watch(): Promise<void> {
+    const check = this.scopedAudienceCheck();
     const watched = this.store.list().filter((record): record is Extract<IntakeRecord, { state: "started" | "finished" }> =>
-      record.state === "started" && record.closure === undefined && !isAnswerRecord(record) && this.recordAudienceAllowed(record));
+      record.state === "started" && record.closure === undefined && !isAnswerRecord(record) && this.recordAudienceAllowed(record, check));
     if (watched.length === 0) return;
     let states: Map<string, IntakeIssue | "deleted">;
     try { states = await this.linear.states(watched.map(record => record.issueId)); }
@@ -764,11 +771,11 @@ export class IntakeService {
 
   private async deliver(): Promise<void> {
     for (const record of this.store.list()) {
-      if (!this.recordAudienceAllowed(record)) continue;
       for (const kind of ["started", "outcome"] as const) {
         if (this.closed) return;
         const pending = record.comments[kind];
         if (!pending || pending.delivered) continue;
+        if (!this.recordAudienceAllowed(record)) break;
         try {
           if (record.thread && this.config.intake!.slack) {
             if (!await this.organizationSourceAllowed(record.thread)) continue;

@@ -90,6 +90,7 @@ export class CommandFence {
     const { run } = stored, pending = stored.pending?.witness ? stored.pending : undefined, leftover = withLeftover ? stored.leftover : undefined;
     if ((!pending && !leftover) || this.host.commands.has(run.id)) return undefined;
     const previous = pending && stored.census?.pendingId === pending.id ? stored.census : undefined;
+    if (!force && !leftover && stopFenced(stored) && this.host.config.teams?.commandPrefix && pending?.failure?.at && this.now() - Date.parse(pending.failure.at) < ANCHOR_SETTLE_MS) return previous?.state;
     if (!force && !leftover && previous && this.now() - Date.parse(previous.at) < CENSUS_TTL_MS) return previous.state;
     const taken = await this.take(run.id, true, withLeftover);
     return taken && this.apply(stored, taken);

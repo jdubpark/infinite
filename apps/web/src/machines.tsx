@@ -7,6 +7,7 @@ type Machines = { active: Machine; profiles: Machine[]; select: (id: string) => 
 const local: Machine = { instance: "direct", id: "direct", label: "This host", api };
 const MachinesContext = createContext<Machines | null>(null);
 export const useMachines = () => useContext(MachinesContext)!;
+export const useMachineId = () => useContext(MachinesContext)?.active.id ?? "direct";
 const routeMachine = () => window.location.hash.match(/^#\/machines\/([^/]+)/)?.[1] ?? "direct";
 
 export function MachineProvider({ children }: { children: ReactNode }) {

@@ -1376,7 +1376,7 @@ export function createApp(config: Config, key: Buffer, options: { configFile?: s
       if (projectSync.applying(projectId)) throw new TeamError(409, "sync-applying", "A workspace sync is being applied to this project. Retry after it finishes.");
       if (projectFileChanges.has(projectId)) throw new TeamError(409, "project-files-changing", "Project files are being changed. Retry after the transfer finishes.");
       assertNoHandoff(projectId);
-      if (teams.list().some(team => team.projectId === projectId && !["ready-for-review", "no-change", "cancelled"].includes(team.status)))
+      if (teams.list().some(team => team.projectId === projectId && !["ready-for-review", "merged", "no-change", "cancelled"].includes(team.status)))
         throw new TeamError(409, "project-team-active", "A team run for this project is still active. Finish or cancel it before forgetting the mirror.");
       if (goals.list().some(goal => goal.projectId === projectId && ["running", "needs-input", "paused"].includes(goal.status)))
         throw new TeamError(409, "project-goal-active", "A goal for this project is still active. Finish or cancel it before forgetting the mirror.");

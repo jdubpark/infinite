@@ -154,7 +154,10 @@ export class MissionReview<S extends MissionReviewStored> implements MissionRevi
       await this.host.teams.steer(op.teamId, { requestId: op.requestId, revision: review.revision, text: op.text }, op.source ?? "coordinator", HALT_CENSUS_MS);
     } catch (error) {
       if (!(error instanceof TeamError)) throw error;
-      if (["members-stopping", "team-operation-running", "team-paused"].includes(error.code)) return true;
+      if (["members-stopping", "team-operation-running", "team-paused"].includes(error.code)) {
+        this.reads.set(op.requestId, read);
+        return true;
+      }
       if (error.code === "team-command-running") {
         if (op.waiting !== error.message) this.host.event(stored, `The owner's review ${review.reviewId} for subtask ${op.subtaskId} waits for its subteam. ${error.message}`);
         op.waiting = error.message;

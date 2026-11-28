@@ -215,6 +215,7 @@ export function connectRemoteAccess(server: Server, config: Config): () => void 
       });
     }
     function refreshIdle() {
+      if (dead) return;
       clearTimeout(timeout); clearTimeout(idle);
       idle = setTimeout(close, 90000); idle.unref();
     }
@@ -281,6 +282,7 @@ export function connectRemoteAccess(server: Server, config: Config): () => void 
               stopEvents(command.id, 1013, true, "Remote event stream buffer limit exceeded"); return;
             }
             stream.buffered += eventBytes;
+            refreshIdle();
             reply({ type: "events-event", streamId: command.id, topic: update.topic, data: update.data }, () => { stream.buffered = Math.max(0, stream.buffered - eventBytes); });
           }
           if (Buffer.byteLength(pendingText) > MAX_EVENTS_EVENT_BYTES + 128) {
@@ -401,6 +403,7 @@ export function connectRemoteAccess(server: Server, config: Config): () => void 
           const welcome = createServerHello(authenticatedKey, hello, machineId!, randomBytes);
           channel = createCipherChannel(authenticatedKey, hello, welcome, "server");
           if (!send(JSON.stringify(welcome))) close();
+          else refreshIdle();
           return;
         }
         const value = object(channel.open(frame));

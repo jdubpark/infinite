@@ -128,7 +128,7 @@ let state: WorkerState = {
 };
 let child: ReturnType<typeof spawn> | undefined;
 let native: Awaited<ReturnType<typeof startNativeCodex>> | Awaited<ReturnType<typeof startNativeOpenCode>> | undefined;
-let nativeRestartHold = false;
+let nativeRestartHold = false, heldExit: { pty: NonNullable<typeof child>; exitCode: number } | undefined, flushHeldExit: (() => void) | undefined;
 let executor: ExecutorTunnel | undefined;
 let hybrid: Awaited<ReturnType<typeof createHybridWorkspace>> | undefined;
 terminal.onData((data) => {
@@ -1257,6 +1257,7 @@ const server = createServer((socket) => {
       } else if (request.op === "resize") {
         if (!isPtyTerminalSize(request.cols, request.rows)) throw new Error("Invalid terminal size");
         result = await serialize(async () => {
+          if (state.status !== "running" || !child) throw new Refusal("resize-refused", "Session is not running");
           checkControl(request);
           let drainRefused = false;
           await withTerminalBarrier(() => {
@@ -1514,8 +1515,7 @@ server.listen(workerSocket, async () => {
             nativeRestartHold = true;
           } else if (phase === "restored" && restoredThreadId) {
             hybrid?.providerReady(native && "supportsExecutionSelection" in native ? native.supportsExecutionSelection : false);
-            restartNativeObserver?.(restoredThreadId);
-            nativeRestartHold = false;
+            try { restartNativeObserver?.(restoredThreadId); } finally { nativeRestartHold = false; flushHeldExit?.(); }
           } else {
             nativeRestartHold = true;
             hybrid?.providerReady(false);
@@ -1532,7 +1532,7 @@ server.listen(workerSocket, async () => {
           state = { ...state, nativeSession: { id, source: "protocol" }, capabilities: { terminalSnapshot: 1, inputControl: 1, nativeUi: "codex" } };
           persist();
         },
-        onExit: () => { child?.kill("SIGTERM"); },
+        onExit: () => { nativeRestartHold = false; flushHeldExit?.(); child?.kill("SIGTERM"); },
         onSignal: (signal) => {
           if (signal.kind === "provider-limit") limitTracker.fromProtocol(signal); else record(signal, "protocol");
         },
@@ -1556,7 +1556,7 @@ server.listen(workerSocket, async () => {
           state = { ...state, nativeSession: { id, source: "protocol" }, capabilities: { terminalSnapshot: 1, inputControl: 1, nativeUi: "opencode" } };
           persist();
         },
-        onExit: () => { child?.kill("SIGTERM"); },
+        onExit: () => { nativeRestartHold = false; flushHeldExit?.(); child?.kill("SIGTERM"); },
         onSignal: signal => { record(signal, "protocol"); return attention.prompt?.id; },
         onUsage: usage => { append("usage", { ...usage }); },
         record: method => { append("input-intent", { op: "native", method }); },
@@ -1673,8 +1673,10 @@ server.listen(workerSocket, async () => {
         setTimeout(finish, 1500);
       })();
     };
+    flushHeldExit = () => { if (heldExit && child && heldExit.pty === child) { const exit = heldExit; heldExit = undefined; terminalBarrier.dispatch(() => exited(exit.exitCode)); } };
     const bindExit = (pty: typeof child) => ({ exitCode }: { exitCode: number }) => {
-      if (pty !== child || nativeRestartHold) return;
+      if (pty !== child) return;
+      if (nativeRestartHold) { heldExit = { pty: pty!, exitCode }; return; }
       terminalBarrier.dispatch(() => exited(exitCode));
     };
     const initialPty = child;
@@ -1685,7 +1687,7 @@ server.listen(workerSocket, async () => {
       const args = [...profile.args, "--remote", native.url, "--remote-auth-token-env", "INFINITE_NATIVE_TOKEN",
         ...nativeCodexObserverArgs(session.nativeArgs ?? [], config.prompt, Boolean(session.workspace), restoredThreadId)];
       const pty = spawnPty(profile.command, args, { cwd: session.cwd, env, cols: terminal.cols, rows: terminal.rows, name: "xterm-256color" });
-      child = pty;
+      child = pty; heldExit = undefined;
       previous?.kill("SIGTERM");
       state = { ...state, status: "running", pid: pty.pid };
       const restartedEvent = append("lifecycle", { status: "running", pid: pty.pid, cols: terminal.cols, rows: terminal.rows, providerRestarted: true });
@@ -1704,7 +1706,7 @@ server.listen(workerSocket, async () => {
         config.codeMode,
       );
       const pty = spawnPty(next.command, next.args, { cwd: session.cwd, env, cols: terminal.cols, rows: terminal.rows, name: "xterm-256color" });
-      child = pty;
+      child = pty; heldExit = undefined;
       state = { ...state, status: "running", pid: pty.pid };
       const resumedEvent = append("lifecycle", { status: "running", pid: pty.pid, cols: terminal.cols, rows: terminal.rows, permissionChannel: { event: "resumed" } });
       sizeIndex.append(resumedEvent.seq, { cols: terminal.cols, rows: terminal.rows });
@@ -1715,13 +1717,11 @@ server.listen(workerSocket, async () => {
     };
     endSession = () => { nativeRestartHold = false; terminalBarrier.dispatch(() => exited(0, true)); };
   } catch (error) {
+    try { child?.kill("SIGTERM"); } catch {}
     state = { ...state, status: "exited", exitCode: 1 };
     publish(applyLifecycle(attention, "exited", new Date().toISOString()));
     try {
-      journal.append("lifecycle", {
-        status: "exited",
-        error: (error as Error).message,
-      });
+      journal.append("lifecycle", { status: "exited", error: (error as Error).message });
       signalIndex?.checkpoint(journal.seq);
       persist();
     } catch {}

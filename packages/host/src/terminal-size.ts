@@ -1,5 +1,6 @@
 import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, writeSync } from "node:fs";
 import { dirname } from "node:path";
+import { replyDeadline } from "./deadline.js";
 import { seal, unseal } from "./vault.js";
 import type { Event, TerminalSize } from "./types.js";
 
@@ -109,9 +110,12 @@ export class TerminalBarrier {
       flush();
       beforeDrain?.();
       await new Promise<void>((resolve, reject) => {
-        this.abort = reject;
-        deadline = setTimeout(() => reject(new Error("Terminal renderer is busy")), 1000);
-        drain(resolve);
+        let settled = false;
+        const finish = () => { if (!settled) { settled = true; resolve(); } };
+        const fail = (error: Error) => { if (!settled) { settled = true; reject(error); } };
+        this.abort = fail;
+        deadline = replyDeadline(1000, () => fail(new Error("Terminal renderer is busy")));
+        drain(finish);
       }).catch(error => {
         refused?.();
         throw error;

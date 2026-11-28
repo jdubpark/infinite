@@ -196,7 +196,10 @@ export function SessionLifecycle({ session, role, online, controlId, refresh }: 
       const settled = lifecycles.complete(key, request.requestId, request.action === "resume" && result.id ? { id: result.id } : undefined, request.action === "stop" ? "End requested. Refreshing." : "");
       if (settled && mounted.current && request.action === "resume" && result.id) window.location.hash = `${machine === "direct" ? "" : `/machines/${machine}`}/sessions/${result.id}/chat`;
       if (mounted.current) refresh();
-    } catch (error) { lifecycles.fail(key, request.requestId, isMissionManaged(error) ? error.message : `${(error as Error).message} Check the session state before retrying.`); }
+    } catch (error) {
+      const refused = error instanceof ApiError && error.status >= 400 && error.status < 500 && (error.status !== 409 || Boolean(error.code));
+      lifecycles.fail(key, request.requestId, isMissionManaged(error) ? error.message : `${(error as Error).message}${refused ? "" : " Check the session state before retrying."}`, refused);
+    }
     finally { inFlight.current.delete(request.requestId); if (mounted.current) setSendingId(current => current === request.requestId ? undefined : current); }
   }
   if (role !== "owner") return null;

@@ -162,11 +162,15 @@ export function PermissionOverview({ onSelect }: { onSelect: (id: string) => voi
   const [status, setStatus] = useState<Status | null>(null);
   const [candidates, setCandidates] = useState<Candidate[] | null>(null);
   const view = useLiveRefresh(async current => {
-    const [nextStatus, nextCandidates] = await Promise.all([
+    const [statusResult, candidatesResult] = await Promise.allSettled([
       api<Status>("/permissions/status"),
       api<{ candidates: Candidate[] }>("/permissions/candidates?limit=20"),
     ]);
-    if (current()) { setStatus(nextStatus); setCandidates(nextCandidates.candidates); }
+    if (statusResult.status === "fulfilled" && current()) setStatus(statusResult.value);
+    if (candidatesResult.status === "fulfilled" && current()) setCandidates(candidatesResult.value.candidates);
+    if (candidatesResult.status === "rejected") throw candidatesResult.reason;
+    if (statusResult.status === "rejected" && !(statusResult.reason instanceof ApiError && statusResult.reason.status === 403 && statusResult.reason.code === "remote-endpoint-denied"))
+      throw statusResult.reason;
     return 30000;
   }, 30000, "permission-overview");
   const figure = (label: string, rates: Rates | undefined) => <div><dt>{label}</dt><dd>{rates ? rates.decisions : "—"}</dd>

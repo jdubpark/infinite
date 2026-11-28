@@ -739,7 +739,13 @@ What can decide:
 - A report outside the closed schema is no verdict.
 
 A reviewer turn runs through Claude Code or OpenCode with no tools, no MCP
-servers, no hooks and no project settings, in an empty directory. The task
+servers, no hooks and no project settings, in an empty directory. OpenCode 2
+cannot serve as the reviewer: it has no equivalent of `--pure`, so plugins from
+the agent account's OpenCode configuration would load into the reviewer and
+could forge its verdict. A reviewer turn on OpenCode 2 fails as `unsupported`
+before any process other than the version probe starts. A failed turn is no
+verdict: after a failed light turn the request goes to the strong tier, and
+when no strong turn reports, the result is a reject with `unavailable`. The task
 text, the request and the collected source are passed as marked untrusted
 evidence. The strong model can ask once for at most eight source paths. The
 host collects them read-only with the root, secret-path, symlink and size

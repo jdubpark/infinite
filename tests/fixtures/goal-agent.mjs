@@ -122,6 +122,10 @@ async function main() {
     writeFileSync("features/progress.json", JSON.stringify({ completed: progress.completed + 1 }) + "\n");
     await report({ kind: "result", summary: "Implemented the next scoped progress step" });
   } else if (assignment.role === "delivery") {
+    if (existsSync(join(receipts, "hold-delivery"))) {
+      writeFileSync(join(receipts, "delivery-held"), assignment.runId, { mode: 0o600 });
+      await until(() => !existsSync(join(receipts, "hold-delivery")));
+    }
     const head = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
     const base = execFileSync("git", ["rev-list", "--max-parents=0", "HEAD"], { encoding: "utf8" }).trim().split("\n")[0];
     const mergeCommit = execFileSync("git", ["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit-tree", `${head}^{tree}`, "-p", base, "-m", "Synthetic squash delivery"], { encoding: "utf8" }).trim();

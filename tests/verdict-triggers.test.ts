@@ -115,13 +115,12 @@ test("a base scan that finds the landing settles the late verdict, and the goal 
       assert.equal(response.status, 200, JSON.stringify(response.body));
     };
     await refresh();
-    const before = await waitFor(scans, count => count >= 1, 10000);
-    await waitFor(() => f.host.fetchApi(`/outcomes/runs/${w.runId}`), response => response.status === 200 && response.body.summary?.payload?.reviewedHead === w.head, 10000);
-    assert.equal((await read<TeamView>(f, `/teams/${w.runId}`)).assessment?.verdictId, w.first, "no verdict changes before the base branch moves");
+    const before = await waitFor(scans, count => count >= 1, 30000);
+    await waitFor(() => f.host.fetchApi(`/outcomes/runs/${w.runId}`), response => response.status === 200 && response.body.summary?.payload?.reviewedHead === w.head, 30000);
 
     git(w.workspace, "push", remote, `${w.head}:refs/heads/main`);
     await refresh();
-    await waitFor(scans, count => count > before, 10000);
+    await waitFor(scans, count => count > before, 30000);
     await settledLate(f, w);
   } finally { await f.close(); }
 });

@@ -36,8 +36,8 @@ async function report(value) {
   if (response.status !== 204) throw new Error(`Goal report refused: ${response.status}`);
 }
 
-async function until(ready) {
-  const deadline = Date.now() + 30000;
+async function until(ready, ms = 30000) {
+  const deadline = Date.now() + ms;
   while (!ready()) {
     if (Date.now() >= deadline) throw new Error("Goal fixture coordination timed out");
     await new Promise(resolve => setTimeout(resolve, 40));
@@ -123,8 +123,9 @@ async function main() {
     await report({ kind: "result", summary: "Implemented the next scoped progress step" });
   } else if (assignment.role === "delivery") {
     if (existsSync(join(receipts, "hold-delivery"))) {
-      writeFileSync(join(receipts, "delivery-held"), assignment.runId, { mode: 0o600 });
-      await until(() => !existsSync(join(receipts, "hold-delivery")));
+      writeFileSync(join(receipts, "delivery-held.tmp"), assignment.runId, { mode: 0o600 });
+      renameSync(join(receipts, "delivery-held.tmp"), join(receipts, "delivery-held"));
+      await until(() => !existsSync(join(receipts, "hold-delivery")), 120000);
     }
     const head = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
     const base = execFileSync("git", ["rev-list", "--max-parents=0", "HEAD"], { encoding: "utf8" }).trim().split("\n")[0];

@@ -863,7 +863,7 @@ test("runTeamWatch --board uses incremental cursor on tick 2, fetches past 600 e
       }).finally(() => {
         settled = true;
       });
-      await waitFor(() => teamFetches >= (withdrawSeqOnTick ? 6 : 2), "expected team watch ticks");
+      await waitFor(() => withdrawSeqOnTick ? teamFetches >= 6 : entryQueries.length >= 3, "expected team watch requests");
       if (withdrawSeqOnTick) {
         await waitFor(
           () => (frames[frames.length - 1] ?? "").includes(`seq ${withdrawSeqOnTick.seq}`) && (frames[frames.length - 1] ?? "").includes("withdrawn"),

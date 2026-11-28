@@ -5,6 +5,8 @@ import type { Provider } from "./types.js";
 import type { StoredRollup, UsageRollup } from "./team-usage.js";
 import { projectGroupIdSchema } from "./project-group-types.js";
 import { questionRecommendationSchema, refineQuestion, requiredQuestionRecommendationSchema, type DecisionRecommendation } from "./question-recommendation.js";
+import { questionInterruptSchema, type QuestionInterruptKind } from "./autonomous-questions.js";
+import type { AutonomyMode } from "./autonomy.js";
 
 export const missionCoordinatorProviderSchema = z.literal("claude");
 export type MissionCoordinatorProvider = z.infer<typeof missionCoordinatorProviderSchema>;
@@ -69,7 +71,7 @@ export const missionSubtaskPlanSchema = z.object({
 }).strict();
 export type MissionSubtaskPlan = z.infer<typeof missionSubtaskPlanSchema>;
 
-const missionQuestionShape = { kind: z.literal("question"), question: z.string().trim().min(1).max(4000), options: z.array(z.string().min(1).max(500)).max(4).default([]), answerMode: z.enum(["approval", "single", "multiple"]).optional(), subtaskId: subtaskId.optional(), childDecisionId: z.uuid().optional() };
+const missionQuestionShape = { kind: z.literal("question"), question: z.string().trim().min(1).max(4000), options: z.array(z.string().min(1).max(500)).max(4).default([]), answerMode: z.enum(["approval", "single", "multiple"]).optional(), interrupt: questionInterruptSchema.optional(), subtaskId: subtaskId.optional(), childDecisionId: z.uuid().optional() };
 const missionReportVariants = [
   z.object({ kind: z.literal("dispatch"), summary: z.string().trim().min(1).max(4000), subtasks: z.array(missionSubtaskPlanSchema).min(1).max(12) }).strict(),
   z.object({ kind: z.literal("resize-subtask"), subtaskId, parallelism: z.number().int().min(1).max(4), summary: z.string().trim().min(1).max(4000) }).strict(),
@@ -210,16 +212,18 @@ export interface MissionDecision {
   question: string;
   options: string[];
   answerMode?: "approval" | "single" | "multiple";
+  interrupt?: QuestionInterruptKind;
   createdAt: string;
   subtaskId?: string;
   childDecisionId?: string;
   answer?: string;
   answeredAt?: string;
   answeredBy?: "owner" | "coordinator" | "connector";
+  defaultContinued?: true;
   source?: ConnectorSource;
   recommendation?: DecisionRecommendation;
 }
-type MissionDecisionBase = Omit<MissionDecision, "subtaskId" | "childDecisionId" | "answer" | "answeredAt" | "answeredBy" | "source">;
+type MissionDecisionBase = Omit<MissionDecision, "subtaskId" | "childDecisionId" | "answer" | "answeredAt" | "answeredBy" | "source" | "defaultContinued">;
 type MissionDecisionForwarding =
   | { subtaskId?: string; childDecisionId?: never }
   | { subtaskId: string; childDecisionId: string };
@@ -229,10 +233,11 @@ export type OpenMissionDecision = MissionDecisionCore & {
   answeredAt?: never;
   answeredBy?: never;
   source?: never;
+  defaultContinued?: never;
 };
 export type AnsweredMissionDecision = MissionDecisionCore & (
-  | { answer: string; answeredAt?: string; answeredBy?: "owner" | "coordinator"; source?: never }
-  | { answer: string; answeredAt?: string; answeredBy: "connector"; source?: ConnectorSource }
+  | { answer: string; answeredAt?: string; answeredBy?: "owner" | "coordinator"; source?: never; defaultContinued?: true }
+  | { answer: string; answeredAt?: string; answeredBy: "connector"; source?: ConnectorSource; defaultContinued?: never }
 );
 export type MissionDecisionState =
   | { state: "open"; decision: OpenMissionDecision }
@@ -244,12 +249,14 @@ export function isOpenMissionDecision(decision: MissionDecision): decision is Op
     && decision.answer === undefined
     && decision.answeredAt === undefined
     && decision.answeredBy === undefined
-    && decision.source === undefined;
+    && decision.source === undefined
+    && decision.defaultContinued === undefined;
 }
 export function isAnsweredMissionDecision(decision: MissionDecision): decision is AnsweredMissionDecision {
   if (!validMissionDecisionForwarding(decision)) return false;
   if (typeof decision.answer !== "string" || decision.answer.length === 0) return false;
   if (decision.source !== undefined && decision.answeredBy !== "connector") return false;
+  if (decision.defaultContinued !== undefined && decision.answeredBy === "connector") return false;
   return true;
 }
 export function projectMissionDecision(decision: MissionDecision): MissionDecisionState {
@@ -262,6 +269,7 @@ const missionDecisionBaseShape = {
   question: z.string().min(1),
   options: z.array(z.string()),
   answerMode: z.enum(["approval", "single", "multiple"]).optional(),
+  interrupt: questionInterruptSchema.optional(),
   createdAt: z.iso.datetime(),
   recommendation: decisionRecommendationSchema.optional(),
 };
@@ -275,12 +283,14 @@ export const missionDecisionSchema: z.ZodType<OpenMissionDecision | AnsweredMiss
     answer: z.string().min(1),
     answeredAt: z.iso.datetime().optional(),
     answeredBy: z.enum(["owner", "coordinator"]).optional(),
+    defaultContinued: z.literal(true).optional(),
   }).strict(),
   z.object({
     ...forwardedMissionDecisionShape,
     answer: z.string().min(1),
     answeredAt: z.iso.datetime().optional(),
     answeredBy: z.enum(["owner", "coordinator"]).optional(),
+    defaultContinued: z.literal(true).optional(),
   }).strict(),
   z.object({
     ...directMissionDecisionShape,
@@ -332,6 +342,7 @@ export type MissionInputSource = "slack" | ConnectorSource;
 export interface Mission {
   id: string;
   groupId: string;
+  autonomy?: AutonomyMode;
   origin?: MissionOrigin;
   mode?: "answer";
   groupName: string;

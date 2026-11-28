@@ -66,12 +66,18 @@ const BASE_DIGESTS: Record<string, string> = {
   "record/evaluator/context": "391a0bcfff56a8606174793eaf8804dbad07f987e916ab6835ee2778fe22e44f"
 };
 
+const autonomousQuestionInstruction = "In autonomous mode, non-approval questions with a recommendation proceed on the proposed default";
+const withoutAutonomousQuestionInstruction = (text: string) => text.split("\n\n").filter(paragraph => !paragraph.startsWith(autonomousQuestionInstruction)).join("\n\n");
+
 test("without criteria rows the prompts are byte for byte", () => {
   const seen: Record<string, string> = {};
   for (const variant of GOAL_VARIANTS) {
     for (const role of GOAL_ROLES) {
       const rendered = renderFor(variant.run(), role);
-      seen[`${variant.name}/${role}/prompt`] = digestOf(rendered.prompt);
+      const shouldAutonomousQuestion = variant.name === "record" && role === "project-manager";
+      assert.equal(rendered.prompt.includes(autonomousQuestionInstruction), shouldAutonomousQuestion, `${variant.name}/${role}/autonomous-question`);
+      const prompt = shouldAutonomousQuestion ? withoutAutonomousQuestionInstruction(rendered.prompt) : rendered.prompt;
+      seen[`${variant.name}/${role}/prompt`] = digestOf(prompt);
       seen[`${variant.name}/${role}/context`] = digestOf(rendered.context);
     }
   }

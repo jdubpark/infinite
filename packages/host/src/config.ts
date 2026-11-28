@@ -177,6 +177,7 @@ const schema = z
         events: z
           .array(z.enum(["needs-you", "turn-finished", "exited", "recording-error", "goal-started", "goal-finished", "goal-stuck", "goal-cancelled", "team-started", "team-finished", "team-stuck", "team-cancelled", "team-blocked", "host-storage", "autonomy-interrupt", "main-check"]))
           .default(["needs-you", "recording-error", "goal-started", "goal-finished", "goal-stuck", "goal-cancelled", "team-started", "team-finished", "team-stuck", "team-cancelled", "host-storage", "autonomy-interrupt", "main-check"]),
+        quietAutonomous: z.boolean().optional(),
       })
       .strict()
       .optional(),

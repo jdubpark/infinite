@@ -445,7 +445,7 @@ test("the register changes the prompt version only where the prompt changes", ()
   const autonomous = promptVersion("implementer", "claude", undefined, false, true, "register-autonomous");
   assert.equal(new Set([flag, register, autonomous]).size, 3);
   assert.equal(promptVersion("implementer", "claude", undefined, false, false, "register"), promptVersion("implementer", "claude", undefined, false, false, "register-autonomous"));
-  assert.equal(promptVersion("project-manager", "claude", undefined, false, true, "register"), promptVersion("project-manager", "claude", undefined, false, true, "register-autonomous"));
+  assert.notEqual(promptVersion("project-manager", "claude", undefined, false, true, "register"), promptVersion("project-manager", "claude", undefined, false, true, "register-autonomous"));
 });
 
 test("the criteria shapes change the coordinator's prompt version only", () => {

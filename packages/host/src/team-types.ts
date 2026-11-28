@@ -18,6 +18,7 @@ import {
   ownedPathSchema,
 } from "./schema-primitives.js";
 import { questionRecommendationSchema, refineQuestion, requiredQuestionRecommendationSchema } from "./question-recommendation.js";
+import { questionInterruptSchema } from "./autonomous-questions.js";
 import type { RoutingKnobs, TeamRunRouting } from "./routing-types.js";
 import type { Prompt, AnswerResult } from "@infinite/attention";
 import type { Receipt, Provider } from "./types.js";
@@ -550,7 +551,7 @@ export const blockerEvidenceSchema = z.object({
     context.addIssue({ code: "custom", message: "Blocker evidence must fit within 12 KiB of UTF-8 JSON" });
 });
 export type BlockerEvidence = z.infer<typeof blockerEvidenceSchema>;
-const questionReportShape = { kind: z.literal("question"), question: z.string().min(1).max(4000), options: z.array(z.string().min(1).max(500)).max(4).default([]), answerMode: z.enum(["approval", "single", "multiple"]).optional() };
+const questionReportShape = { kind: z.literal("question"), question: z.string().min(1).max(4000), options: z.array(z.string().min(1).max(500)).max(4).default([]), answerMode: z.enum(["approval", "single", "multiple"]).optional(), interrupt: questionInterruptSchema.optional() };
 const recordedDeliveryReconciliationReportSchema = z.object({ kind: z.literal("delivery-reconciliation"), headCommit: commitHashSchema, repository: githubRepository, branch: gitBranch, baseHeadCommit: commitHashSchema, disposition: z.enum(["no-publication", "owned-branch", "pull-request"]), remoteHeadCommit: commitHashSchema.optional(), pullRequestUrl: z.string().trim().min(1).max(500).optional(), summary: z.string().trim().min(1).max(4000) }).strict();
 export const strictDeliveryReconciliationReportSchema = deliveryReconciliationReportSchema;
 export const taskLimitationsSchema = z.array(z.string().trim().min(1).max(MAX_TASK_LIMITATION_CHARS)).max(MAX_TASK_LIMITATIONS)
@@ -810,7 +811,7 @@ export type ReviewFeedbackEntry = { reviewId: string; state: "CHANGES_REQUESTED"
 export const ownerSteering = (item: { source?: SteeringSource }) => !item.source || typeof item.source === "object" && item.source.kind === "github-review";
 export const inputSourceLabel = (source?: SteeringSource | "slack") =>
   typeof source === "object" ? (source.kind === "github-review" ? "Owner (GitHub review)" : `Connector (${source.name})`) : source === "coordinator" ? "Mission coordinator" : "Owner";
-export const decisionAnswerLabel = (decision: Pick<TeamDecision, "answeredBy" | "source">) =>
-  decision.answeredBy === "connector" ? (decision.source ? inputSourceLabel(decision.source) : "Connector") : decision.answeredBy === "coordinator" ? "Mission coordinator" : "User";
+export const decisionAnswerLabel = (decision: Pick<TeamDecision, "answeredBy" | "source" | "defaultContinued">) =>
+  decision.defaultContinued ? "Autonomous default" : decision.answeredBy === "connector" ? (decision.source ? inputSourceLabel(decision.source) : "Connector") : decision.answeredBy === "coordinator" ? "Mission coordinator" : "User";
 export const decisionAuthorityQuestion = (decision: Pick<TeamDecision, "question" | "intentQuestions">) =>
   decision.intentQuestions ? `The intent check's questions ${decision.intentQuestions.join(", ")}` : decision.question;

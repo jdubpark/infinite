@@ -13,6 +13,8 @@ import type { ProjectGroup } from "./project-group-types.js";
 import { createMissionSchema, missionActionSchema, missionExtendSchema, missionLineupSchema, missionReportEnvelopeSchema, missionTextSchema, type Board, type BoardColumn, type BoardItem, type CreateMission, type Mission, type MissionFollowUp, type MissionInputSource, type MissionOrigin, type MissionReport, type MissionSubtaskPlan, type RecordedMissionFollowUp } from "./mission-types.js";
 import { askedRecommendation, isDirectionMessage, missionFollowUpPromptWithMessageCount, missionPromptWithMessageCount, subteamReport, type MissionCoordinatorNote, type MissionMessage, type MissionOpenChildDecision, type MissionPromptRepo } from "./team-prompts.js";
 import { questionProblem, recommendationOutcome } from "./question-recommendation.js";
+import { autonomyOf, type AutonomyMode } from "./autonomy.js";
+import { evaluateAutonomousQuestion } from "./autonomous-questions.js";
 import { addRollups, emptyRollup, teamUsage } from "./team-usage.js";
 import type { UsageService } from "./usage-service.js";
 import { missionCoordinatorLaunch, teamModelLaunch } from "./launch.js";
@@ -26,16 +28,7 @@ import { HALT_PAUSED_TEAM, KEPT_PAUSED, LEFT_AS_IS, LEFT_PAUSED, STILL_HALTED, i
 import { missionDecisionQueueCandidates } from "./decision-queue.js";
 import { projectMissionSource } from "./mission-progress.js";
 import { MissionReview, type MissionReviewRecord, type ReviewDirection, type ReviewForwardOp } from "./mission-review.js";
-import {
-  CoordinatorContextReadTracker,
-  readSessionPromptContext, sameRealPath,
-  reconcileDeliveredUnapplied,
-  returnConsumedMessages,
-  selectCoordinatorContinuation,
-  settleCoordinatorReport,
-  settleUnappliedConsumed,
-  type DeliveredUnappliedBatch,
-} from "./mission-coordinator.js";
+import { CoordinatorContextReadTracker, readSessionPromptContext, sameRealPath, reconcileDeliveredUnapplied, returnConsumedMessages, selectCoordinatorContinuation, settleCoordinatorReport, settleUnappliedConsumed, type DeliveredUnappliedBatch } from "./mission-coordinator.js";
 
 export type ProjectGroupLookup = { get(id: string): ProjectGroup };
 
@@ -146,7 +139,7 @@ export class MissionService {
     reportHeld: (stored, subtask, reviewId) => service.reportHeld(stored, subtask, reviewId) }))(this));
   private readonly contextReads = new CoordinatorContextReadTracker();
 
-  constructor(private readonly config: Config, private readonly key: Buffer, private readonly manager: Manager, private readonly teams: TeamService, private readonly groups: ProjectGroupLookup) {
+  constructor(private readonly config: Config, private readonly key: Buffer, private readonly manager: Manager, private readonly teams: TeamService, private readonly groups: ProjectGroupLookup, private readonly projectAutonomy?: (projectId: string) => AutonomyMode) {
     this.directory = join(config.stateDir, "missions");
     mkdirSync(this.directory, { recursive: true, mode: 0o700 });
     for (const file of readdirSync(this.directory).filter(name => /^[a-f0-9-]{36}\.sealed$/.test(name))) {
@@ -184,14 +177,12 @@ export class MissionService {
   useFuse(fuse: FuseGate) { this.fuse = fuse; }
   hasRecordFile(id: string) {
     if (!/^[a-f0-9-]{36}$/.test(id)) return false;
-    try {
-      lstatSync(join(this.directory, `${id}.sealed`));
-      return true;
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      if (code === "ENOENT" || code === "ENOTDIR") return false;
-      throw error;
-    }
+    try { lstatSync(join(this.directory, `${id}.sealed`)); return true; }
+    catch (error) { const code = (error as NodeJS.ErrnoException).code; if (code === "ENOENT" || code === "ENOTDIR") return false; throw error; }
+  }
+  private autonomyForProject(projectId: string): AutonomyMode { return this.projectAutonomy?.(projectId) ?? autonomyOf(this.config.projects.find(item => item.id === projectId)); }
+  private missionAutonomy(mission: Pick<Mission, "autonomy" | "repoProjectIds">): AutonomyMode {
+    return mission.autonomy ?? (mission.repoProjectIds.length > 0 && mission.repoProjectIds.every(id => this.autonomyForProject(id) === "autonomous") ? "autonomous" : "supervised");
   }
   ownsActiveSubteam(teamId: string) {
     return [...this.records.values()].some(({ mission }) =>
@@ -204,14 +195,8 @@ export class MissionService {
       mission.subtasks.some(subtask => subtask.teamId === teamId));
   }
   enabled() { return this.records.size > 0 || missionLineupSchema.safeParse(this.config.teams?.lineup).success; }
-  private enqueue<T>(id: string, task: () => T | Promise<T>): Promise<T> {
-    return this.queues.enqueue(id, task);
-  }
-  private record(id: string) {
-    const stored = this.records.get(id);
-    if (!stored) throw new TeamError(404, "mission-not-found", "This mission does not exist.");
-    return stored;
-  }
+  private enqueue<T>(id: string, task: () => T | Promise<T>): Promise<T> { return this.queues.enqueue(id, task); }
+  private record(id: string) { const stored = this.records.get(id); if (!stored) throw new TeamError(404, "mission-not-found", "This mission does not exist."); return stored; }
   onChange(listener: (mission: Mission) => void) {
     this.listeners.add(listener);
     return () => { this.listeners.delete(listener); };
@@ -340,7 +325,7 @@ export class MissionService {
       const createdAt = now();
       const stored: Stored = { fingerprint, ...(originalFingerprint && originalFingerprint !== fingerprint ? { requestFingerprints: [originalFingerprint] } : {}),
         receipts: {}, folder, repos, attempts: [], inbox: [{ type: "start" }], notes: [], notified: [], launches: {}, ops: [], refusals: 0, mission: {
-        id: request.requestId, ...(origin ? { origin: structuredClone(origin) } : {}), ...(request.mode ? { mode: request.mode } : {}), groupId: group.id, groupName: group.name, repoProjectIds: repos.map(repo => repo.projectId),
+        id: request.requestId, autonomy: repos.every(repo => this.autonomyForProject(repo.projectId) === "autonomous") ? "autonomous" : "supervised", ...(origin ? { origin: structuredClone(origin) } : {}), ...(request.mode ? { mode: request.mode } : {}), groupId: group.id, groupName: group.name, repoProjectIds: repos.map(repo => repo.projectId),
         title: request.title ?? request.objective.split("\n")[0].trim().slice(0, 100), objective: request.objective,
         maxSubtasks: request.maxSubtasks, maxMinutes: request.maxMinutes, deadlineAt: new Date(Date.parse(createdAt) + request.maxMinutes * 60000).toISOString(),
         revision: 1, status: "planning", createdAt, updatedAt: createdAt, lineup, subtasks: [], decisions: [], steering: [], events: [],
@@ -1322,8 +1307,16 @@ export class MissionService {
         if (mission.decisions.length >= 40) return this.refuse(stored, report.kind, "The mission reached its limit of 40 owner decisions.");
         const answerMode = report.answerMode ?? forwardedDecision?.answerMode, problem = questionProblem(report, answerMode);
         if (problem) return this.refuse(stored, report.kind, problem.message);
-        mission.decisions.push({ id: randomUUID(), question: report.question, options: report.options, createdAt: now(),
-          ...(answerMode ? { answerMode } : {}), ...(report.recommendation ? { recommendation: { ...report.recommendation } } : {}),
+        const decisionId = randomUUID();
+        const evaluated = evaluateAutonomousQuestion({ autonomy: this.missionAutonomy(mission), answerMode, interrupt: report.interrupt, recommendation: report.recommendation, hasChildDecision: Boolean(report.childDecisionId) });
+        if (evaluated.action === "continue") {
+          mission.decisions.push({ id: decisionId, question: report.question, options: report.options, createdAt: now(), ...(answerMode ? { answerMode } : {}), recommendation: { ...report.recommendation!, outcome: "matched" }, ...(subtask ? { subtaskId: subtask.id } : {}), answer: evaluated.answer, answeredAt: now(), answeredBy: "coordinator", defaultContinued: true });
+          this.event(stored, "Autonomous mode: recorded proposed default answer and continued; owner may override.");
+          this.message(stored, `default-answer:${decisionId}`, { type: "default-answer", decisionId, question: report.question, answer: evaluated.answer, reason: evaluated.reason });
+          break;
+        }
+        mission.decisions.push({ id: decisionId, question: report.question, options: report.options, createdAt: now(),
+          ...(answerMode ? { answerMode } : {}), ...(report.interrupt ? { interrupt: report.interrupt } : {}), ...(report.recommendation ? { recommendation: { ...report.recommendation } } : {}),
           ...(subtask ? { subtaskId: subtask.id } : {}), ...(report.childDecisionId ? { childDecisionId: report.childDecisionId } : {}) });
         this.event(stored, "The coordinator asked the owner a question.");
         break;

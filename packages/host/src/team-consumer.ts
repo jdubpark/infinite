@@ -20,6 +20,8 @@ import { validateGoalTaskCriterionRefs } from "./team-goal-criteria.js";
 import { advanceDeliveryReviewLineage, rebaseDeliveryReviewLineage, workspaceContributorFamilies } from "./delivery-review.js";
 import { changeIndex, changedPathList, diffStat } from "./team-changes.js";
 import { recommendationLine } from "./question-recommendation.js";
+import { autonomyOf } from "./autonomy.js";
+import { evaluateAutonomousQuestion } from "./autonomous-questions.js";
 import { integrationGauge } from "./outcome-gauges.js";
 import type { TeamReplay } from "./team-replay.js";
 import type { TeamIntent } from "./team-intent.js";
@@ -77,9 +79,22 @@ export class TeamConsumer {
     }
     if (report.kind === "question") {
       if (run.decisions.length >= 40) { this.host.block(stored, new TeamError(409, "team-decision-limit", "The team reached its limit of 40 decisions. Review its evidence before starting another team.")); return; }
+      const evaluated = member.role === "project-manager"
+        ? evaluateAutonomousQuestion({ autonomy: autonomyOf(run), answerMode: report.answerMode, interrupt: report.interrupt, recommendation: report.recommendation })
+        : { action: "wait" as const };
+      if (evaluated.action === "continue") {
+        member.status = "stopped";
+        run.decisions.push({ id: randomUUID(), memberId: member.memberId, revision: run.revision, question: report.question, options: report.options,
+          ...(report.answerMode ? { answerMode: report.answerMode } : {}), recommendation: { ...report.recommendation!, outcome: "matched" },
+          answer: evaluated.answer, answeredAt: timestamp(), answeredBy: "coordinator", defaultContinued: true, createdAt: timestamp() });
+        this.host.event(stored, `Autonomous mode: recorded proposed default answer for ${member.title}'s question and continued; owner may override via steering.`);
+        run.status = "planning";
+        this.host.prepareMember(stored, "project-manager", undefined, `Autonomous mode recorded your proposed default answer (${evaluated.answer}; reason: ${evaluated.reason}) for question "${report.question}". Proceed with your plan under this recorded assumption; the owner can override it at any time.`);
+        this.host.save(stored); return;
+      }
       member.status = "waiting";
       run.decisions.push({ id: randomUUID(), memberId: member.memberId, revision: run.revision, question: report.question, options: report.options,
-        ...(report.answerMode ? { answerMode: report.answerMode } : {}), ...(report.recommendation ? { recommendation: { ...report.recommendation } } : {}), createdAt: timestamp() });
+        ...(report.answerMode ? { answerMode: report.answerMode } : {}), ...(report.interrupt ? { interrupt: report.interrupt } : {}), ...(report.recommendation ? { recommendation: { ...report.recommendation } } : {}), createdAt: timestamp() });
       const task = member.role === "scout" ? run.discovery?.tasks.find(item => item.id === member.taskId) : run.tasks.find(item => item.id === member.taskId); if (task) task.status = "waiting";
       run.status = "needs-input"; this.host.event(stored, `${member.title} requested a user decision.`); this.host.save(stored); return;
     }

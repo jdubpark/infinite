@@ -310,6 +310,10 @@ export type GoalVerdictView = {
   detail: "available" | "expired";
 };
 
+export type GoalMetricsPoint = { cycle: number; run: string; revision: number; head: string; value: number; at: string };
+export type GoalMetricsSeries = { command: string; label?: string; name: string; configured: boolean; points: GoalMetricsPoint[] };
+export type GoalMetricsView = { series: GoalMetricsSeries[]; omittedSeries: number; omittedValues: number; dropped: number };
+
 export const TEAM_ENTRY_KINDS = ["contract", "finding", "blocker", "handoff", "report", "integration", "check", "direction"] as const;
 export type TeamEntryKind = (typeof TEAM_ENTRY_KINDS)[number];
 export type TeamEntryAuthority = "receipt" | "claim" | "direction";
